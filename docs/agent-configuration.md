@@ -100,6 +100,22 @@ context-room doctor
 context-room start --port 4317
 ```
 
+9. If commits should be blocked until watched docs are verified, install the local Git hook:
+
+```bash
+context-room install-hook
+```
+
+The hook writes `.git/hooks/pre-commit` in the current clone. Git hooks are local and are not committed to the repository, so each developer or agent environment must run this once after cloning.
+
+To check what the hook will enforce without committing, run:
+
+```bash
+context-room guard
+```
+
+`guard` exits with status `1` when the watched docs review queue is not empty. A blocked commit means someone must open Context Room, inspect the watched-document diffs, and mark the changes verified before committing.
+
 ## Agent setup prompt
 
 ```text
@@ -116,5 +132,7 @@ Goal: make the documentation and agent skills easy to navigate, maintain, and ve
 5. Organize `hubSections` into clear cards and nested cards.
 6. Keep IDs stable and lowercase with dashes.
 7. Run `context-room doctor`.
-8. Do not include secrets, .env files, build outputs, node_modules, private exports, or generated artifacts.
+8. If the project wants commit protection, run `context-room install-hook`.
+9. Run `context-room guard` to verify the watched docs queue is clean or correctly blocking.
+10. Do not include secrets, .env files, build outputs, node_modules, private exports, or generated artifacts.
 ```
