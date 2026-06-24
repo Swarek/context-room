@@ -13,6 +13,7 @@ import {
   initializeContextRoomProject,
   isAllowedMemoryPath,
   listMemoryFiles,
+  readFileDiff,
   readMemoryWebappSettings,
   writeDocReviewDecision,
 } from "../src/context_room.mjs";
@@ -120,4 +121,25 @@ test("CLI guard blocks commits when watched docs changed without review", () => 
   writeDocReviewDecision(root, "README.md", { status: "verified", note: "test baseline" });
   const output = execFileSync(process.execPath, [cli, "guard"], { cwd: root, encoding: "utf8" });
   assert.match(output, /No unverified watched documentation changes/);
+});
+
+test("file diff renders new untracked watched docs as a Git new-file patch", () => {
+  const root = makeRoot();
+  execFileSync("git", ["init"], { cwd: root, stdio: "ignore" });
+  execFileSync("git", ["config", "user.email", "context-room@example.test"], { cwd: root, stdio: "ignore" });
+  execFileSync("git", ["config", "user.name", "Context Room Test"], { cwd: root, stdio: "ignore" });
+  fs.writeFileSync(path.join(root, "README.md"), "# Demo\n");
+  execFileSync("git", ["add", "README.md"], { cwd: root, stdio: "ignore" });
+  execFileSync("git", ["commit", "-m", "initial"], { cwd: root, stdio: "ignore" });
+  fs.mkdirSync(path.join(root, "docs"));
+  fs.writeFileSync(path.join(root, "docs/new.md"), "# New doc\n\nAgent-written docs.\n");
+
+  const diff = readFileDiff(root, "docs/new.md");
+
+  assert.equal(diff.available, true);
+  assert.equal(diff.changed, true);
+  assert.equal(diff.additions, 3);
+  assert.equal(diff.deletions, 0);
+  assert.match(diff.patch, /new file mode/);
+  assert.match(diff.patch, /\+Agent-written docs\./);
 });

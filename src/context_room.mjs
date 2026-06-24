@@ -308,13 +308,15 @@ export function deleteMemoryPaths(root, relPaths = []) {
 
 export function readFileDiff(root, relPath) {
   const normalized = normalizeRelPath(relPath);
-  resolveMemoryPath(root, normalized);
+  const abs = resolveMemoryPath(root, normalized);
   if (resolveExternalPath(normalized)) {
     return { path: normalized, changed: false, additions: 0, deletions: 0, patch: "", available: false, reason: "Git diff is unavailable for files outside the repo."};
   }
   try {
-    const patch = execFileSync("git", ["diff", "--", normalized], { cwd: root, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] });
-    const numstat = execFileSync("git", ["diff", "--numstat", "--", normalized], { cwd: root, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).trim();
+    const status = execFileSync("git", ["status", "--porcelain=v1", "--untracked-files=all", "--", normalized], { cwd: root, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).split("\n").find(Boolean) || "";
+    if (status.startsWith("?? ")) return buildNewFileDiff(root, normalized, abs);
+    const patch = execFileSync("git", ["diff", "HEAD", "--", normalized], { cwd: root, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] });
+    const numstat = execFileSync("git", ["diff", "HEAD", "--numstat", "--", normalized], { cwd: root, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).trim();
     const [rawAdditions = "0", rawDeletions = "0"] = numstat.split(/\s+/);
     const additions = Number.parseInt(rawAdditions, 10) || 0;
     const deletions = Number.parseInt(rawDeletions, 10) || 0;
@@ -322,6 +324,24 @@ export function readFileDiff(root, relPath) {
   } catch {
     return { path: normalized, changed: false, additions: 0, deletions: 0, patch: "", available: false, reason: "Git diff is unavailable for this file."};
   }
+}
+
+function buildNewFileDiff(root, normalized, abs) {
+  if (!fs.existsSync(abs) || !fs.statSync(abs).isFile()) return { path: normalized, changed: false, additions: 0, deletions: 0, patch: "", available: false, reason: "Git diff is unavailable for this file."};
+  const content = fs.readFileSync(abs, "utf8");
+  const lines = content.endsWith("\n") ? content.slice(0, -1).split("\n") : content.split("\n");
+  const additions = content.length ? lines.length : 0;
+  const patch = [
+    `diff --git a/${normalized} b/${normalized}`,
+    "new file mode 100644",
+    "index 0000000..0000000",
+    "--- /dev/null",
+    `+++ b/${normalized}`,
+    `@@ -0,0 +1,${additions} @@`,
+    ...lines.map((line) => `+${line}`),
+    "",
+  ].join("\n");
+  return { path: normalized, changed: true, additions, deletions: 0, patch, available: true };
 }
 
 export function readDocReviewState(root = process.cwd()) {
