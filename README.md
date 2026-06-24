@@ -1,17 +1,43 @@
 # Context Room
 
-Local-first project context control room for humans and AI agents.
+Documentation control room for the era of AI agent loops.
 
-Context Room gives any repository a small browser UI to:
+AI agents can now write code, refactor systems, create files, and loop on tasks for hours. In that world, the highest-leverage part of a project is no longer only the source code. It is the documentation that tells agents what the project is, how it works, what matters, what not to touch, and which reusable skills or procedures should guide future work.
 
-- browse and edit allowed project files;
-- configure cards and nested cards for project navigation;
-- mark folders/files as watched;
-- review changed or newly-created watched files from Git;
-- keep review state local to the project;
-- let an AI agent install and configure the project map without inventing a custom dashboard.
+Context Room is built around one belief: if you maintain excellent documentation, you can build better AI-native projects.
 
-It is the generic/open-source version of the LifeOS memory webapp prototype.
+It gives any repository a local browser UI to manage, navigate, and verify the docs and skills that keep agents aligned.
+
+## What it does
+
+Context Room helps you:
+
+- organize project documentation into cards and nested cards;
+- define which folders and files matter most;
+- mark critical documentation as watched;
+- see what an agent changed in watched docs;
+- review those changes with Git-backed diffs;
+- verify that documentation updates are correct;
+- keep the review state local to the project;
+- let an AI agent install and configure the documentation map for you.
+
+Documentation can include traditional docs, project instructions, agent context files, runbooks, operating procedures, prompts, skills, decision records, or any other text files that shape how humans and agents understand the project.
+
+## Why this exists
+
+AI agents are only as good as the context they inherit.
+
+When documentation drifts, agents make worse decisions. When skills are stale, agents repeat old mistakes. When important files change without review, the whole project can slowly lose coherence.
+
+Context Room gives you a simple loop:
+
+1. choose the docs and skills that matter;
+2. let humans and agents improve them;
+3. see every important documentation change;
+4. inspect the diff;
+5. mark it verified when it is actually correct.
+
+The goal is not to replace your editor or Git workflow. The goal is to make documentation maintenance visible, reviewable, and easy enough that it actually happens.
 
 ## Install
 
@@ -50,20 +76,31 @@ Minimal config:
 ```json
 {
   "title": "My Project",
-  "allowedPaths": ["docs/", "src/", "tests/", "README.md"],
-  "watchAllow": ["docs/architecture/"],
+  "allowedPaths": ["docs/", "skills/", "README.md", "AGENTS.md"],
+  "watchAllow": ["docs/", "skills/", "AGENTS.md"],
   "hubSections": [
     {
       "id": "main",
-      "title": "Main",
+      "title": "Documentation",
       "cards": [
         {
           "id": "docs",
           "title": "Docs",
           "path": "docs/",
           "cards": [
-            { "id": "architecture", "title": "Architecture", "path": "docs/architecture/" }
+            { "id": "architecture", "title": "Architecture", "path": "docs/architecture/" },
+            { "id": "decisions", "title": "Decisions", "path": "docs/decisions/" }
           ]
+        },
+        {
+          "id": "skills",
+          "title": "Skills",
+          "path": "skills/"
+        },
+        {
+          "id": "agent-context",
+          "title": "Agent context",
+          "paths": ["AGENTS.md", "CLAUDE.md", ".hermes.md"]
         }
       ]
     }
@@ -78,7 +115,7 @@ Minimal config:
 ## CLI
 
 ```bash
-context-room init [--title "My Project"] [--allow docs/,src/,README.md] [--watch docs/]
+context-room init [--title "My Project"] [--allow docs/,skills/,README.md,AGENTS.md] [--watch docs/,skills/]
 context-room start [--root .] [--port 4317]
 context-room doctor [--root .]
 ```
@@ -89,14 +126,19 @@ Use this in Hermes, Claude Code, Codex, OpenCode, or another coding agent:
 
 ```text
 Install Context Room in this repository.
+
+Goal: make the project documentation and agent skills easy to navigate, maintain, and verify.
+
 1. Run `npx context-room init` or the local `node bin/context-room.mjs init`.
 2. Inspect the repo structure.
-3. Configure `.context-room/config.json` with useful cards and nested cards.
-4. Put only safe editable text surfaces in `allowedPaths`.
-5. Put the important docs/context folders in `watchAllow`.
-6. Run `context-room doctor` and `context-room start`.
-7. Smoke-test the UI at http://127.0.0.1:4317.
-Do not include secrets, .env files, build outputs, node_modules, or private data exports.
+3. Identify the documentation, agent instructions, skills, runbooks, and decision records that shape future agent work.
+4. Configure `.context-room/config.json` with useful cards and nested cards.
+5. Put only safe editable text surfaces in `allowedPaths`.
+6. Put the important docs and skills in `watchAllow`.
+7. Run `context-room doctor` and `context-room start`.
+8. Smoke-test the UI at http://127.0.0.1:4317.
+
+Do not include secrets, .env files, build outputs, node_modules, private data exports, or generated artifacts.
 ```
 
 ## Open-source release checklist

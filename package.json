@@ -1,7 +1,7 @@
 {
   "name": "context-room",
   "version": "0.1.0",
-  "description": "Local-first project context control room for humans and AI agents.",
+  "description": "Documentation control room for the era of AI agent loops.",
   "type": "module",
   "homepage": "https://github.com/Swarek/context-room#readme",
   "repository": {
@@ -35,6 +35,9 @@
     "ai-agent",
     "context",
     "documentation",
+    "docs",
+    "skills",
+    "agent-loops",
     "local-first",
     "review-queue",
     "developer-tools"
