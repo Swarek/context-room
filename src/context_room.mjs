@@ -1750,7 +1750,49 @@ export function renderAppHtml() {
     @keyframes orbitSpin { to { transform: rotate(352deg); } }
     @keyframes orbFloat { from { transform: translateY(0); } to { transform: translateY(12px); } }
     @media (prefers-reduced-motion: reduce) { *, *::before, *::after { animation: none !important; transition: none !important; } }
-    @media (max-width: 980px) { .app, .app.sidebar-collapsed { grid-template-columns: 1fr; height: auto; overflow: auto; } aside { border-right: 0; border-bottom: 1px solid var(--line); height: auto; max-height: 70vh; } .planet-system { min-height: 720px; } .planet.root.hermes { left: 50%; top: 20%; } .planet.root.life { left: 50%; top: 50%; } .planet.root.explorer { left: 50%; top: 80%; } }
+    @media (max-width: 980px) {
+      body { overflow: hidden; }
+      .app, .app.sidebar-collapsed { grid-template-columns: 1fr; height: 100dvh; overflow: hidden; padding-top: 58px; }
+      aside { position: fixed; z-index: 30; top: 0; left: 0; right: 0; height: min(78dvh, 680px); max-height: min(78dvh, 680px); border-right: 0; border-bottom: 1px solid var(--line); padding: 10px; overflow: auto; box-shadow: 0 18px 60px rgba(0,0,0,0.42); }
+      .app.sidebar-collapsed aside { height: 58px; max-height: 58px; padding: 8px 10px; overflow: hidden; }
+      .app.sidebar-collapsed .sidebar-toggle { position: absolute; left: auto; right: 10px; top: 8px; z-index: 31; width: 40px; height: 40px; }
+      .app.sidebar-collapsed .sidebar-copy, .app.sidebar-collapsed .search-row, .app.sidebar-collapsed .watch-filter-row, .app.sidebar-collapsed .selection-bar, .app.sidebar-collapsed .explorer-title, .app.sidebar-collapsed .tree, .app.sidebar-collapsed .hint { opacity: 0; pointer-events: none; transform: translateY(-8px); }
+      .app.sidebar-collapsed .workspace-dock { opacity: 1; pointer-events: auto; transform: none; width: calc(100% - 50px); margin: 0; padding: 5px; overflow-x: auto; flex-wrap: nowrap; scrollbar-width: none; }
+      .app.sidebar-collapsed .workspace-dock::-webkit-scrollbar { display: none; }
+      .workspace-dock { margin-right: 50px; }
+      .dock-button { padding: 8px 10px; white-space: nowrap; }
+      .sidebar-head { position: absolute; right: 10px; top: 8px; display: block; }
+      .sidebar-copy { padding-right: 52px; }
+      .sidebar-toggle { width: 40px; height: 40px; }
+      main { height: calc(100dvh - 58px); padding: 10px; overflow: hidden; }
+      .editor-shell { height: 100%; min-height: 0; border-radius: 18px; }
+      .docqa-home, .settings-page { height: 100%; padding: 12px; overflow: auto; }
+      .docqa-panel { border-radius: 18px; }
+      .docqa-panel header { padding: 14px; align-items: flex-start; flex-direction: column; }
+      .review-summary { width: 100%; }
+      .review-summary-item { flex: 1; min-width: 0; }
+      .review-list { max-height: none; }
+      .review-item { padding: 11px; }
+      .review-top { align-items: flex-start; }
+      .hub-section-grid, .settings-grid, .hub-card-editor-grid { grid-template-columns: 1fr; }
+      .hub-folders { gap: 18px; }
+      .hub-folder-card { min-height: 116px; padding: 15px; border-radius: 18px; }
+      .hub-folder-card strong { font-size: 18px; }
+      textarea, .viewer { min-height: 100%; padding: 16px; font-size: 14px; line-height: 1.58; }
+      .review-workspace { grid-template-columns: 1fr; gap: 12px; }
+      .diff-code, .doc-content, .doc-editor { max-height: none; padding: 12px; font-size: 12px; }
+      .diff-header, .file-panel header { padding: 12px; align-items: flex-start; }
+      .file-actions { gap: 6px; flex-wrap: wrap; justify-content: flex-end; }
+      .file-action { padding: 8px 10px; }
+      .planet-system { min-height: 620px; }
+      .cosmos-home { min-height: 100%; padding: 16px; overflow: auto; }
+      .planet-stage { min-height: 560px; }
+      .planet.root.hermes { left: 50%; top: 20%; }
+      .planet.root.life { left: 50%; top: 50%; }
+      .planet.root.explorer { left: 50%; top: 80%; }
+      .editor-shell.planet-file-open .cosmos-home { padding-right: 16px; }
+      .editor-shell.planet-file-open .viewer, .editor-shell.planet-file-open textarea { position: static; width: 100%; height: 100%; min-height: 100%; border-radius: 18px; box-shadow: none; }
+    }
   </style>
 </head>
 <body>
@@ -1823,7 +1865,7 @@ export function renderAppHtml() {
     </main>
   </div>
 <script>
-const state = { files: [], docqa: null, settings: null, settingsOpen: false, page: "hub", availableHubCards: [], hubFolders: [], hubSections: [], rootHubSections: [], activeHubCardId: null, selectedReview: null, selected: null, selectedDiff: null, diffCollapsed: false, saved: "", savedHash: null, dirty: false, mode: "view", homeView: "root", planetStack: ["root"], filePanel: false, history: [], historyIndex: -1, pathFilters: [], explorerWatchFilter: "all", selectedForDelete: new Set(), selectionRequest: 0, expanded: new Set(["data", "automations", "integrations", "skills", "tools", "~", "~/.hermes", "~/.hermes/memories", "~/.hermes/skills"]) };
+const state = { files: [], docqa: null, settings: null, settingsOpen: false, page: "hub", availableHubCards: [], hubFolders: [], hubSections: [], rootHubSections: [], activeHubCardId: null, selectedReview: null, selected: null, selectedDiff: null, diffCollapsed: false, saved: "", savedHash: null, dirty: false, mode: "view", homeView: "root", planetStack: ["root"], filePanel: false, history: [], historyIndex: -1, pathFilters: [], explorerWatchFilter: "all", selectedForDelete: new Set(), selectionRequest: 0, mobileSidebarTouched: false, expanded: new Set(["data", "automations", "integrations", "skills", "tools", "~", "~/.hermes", "~/.hermes/memories", "~/.hermes/skills"]) };
 const MAIN_FILE_PATHS = new Set([
   "~/.hermes/memories/USER.md",
   "~/.hermes/memories/MEMORY.md",
@@ -2030,7 +2072,27 @@ function shouldToggleSelection(event) {
 }
 
 function openSidebarIfCollapsed() {
-  document.querySelector(".app")?.classList.remove("sidebar-collapsed");
+  const app = document.querySelector(".app");
+  app?.classList.remove("sidebar-collapsed");
+  if (app && window.matchMedia("(max-width: 980px)").matches) state.mobileSidebarTouched = true;
+}
+
+function syncResponsiveSidebar({ force = false } = {}) {
+  const app = document.querySelector(".app");
+  if (!app) return;
+  if (window.matchMedia("(max-width: 980px)").matches) {
+    if (force || !state.mobileSidebarTouched) app.classList.add("sidebar-collapsed");
+  } else if (!state.mobileSidebarTouched) {
+    app.classList.remove("sidebar-collapsed");
+  }
+}
+
+function collapseSidebarOnNarrow() {
+  if (window.matchMedia("(max-width: 980px)").matches) document.querySelector(".app")?.classList.add("sidebar-collapsed");
+}
+
+function isNarrowLayout() {
+  return window.matchMedia("(max-width: 980px)").matches;
 }
 
 function toggleDeleteSelection(path) {
@@ -2252,6 +2314,8 @@ async function selectFile(path, options = {}) {
     state.pathFilters = [];
     el("search").value = "";
     document.querySelector(".app").classList.remove("sidebar-collapsed");
+  } else {
+    collapseSidebarOnNarrow();
   }
   for (const folder of parentFolders(path).slice(0, -1)) state.expanded.add(folder);
   document.querySelector(".editor-shell").classList.remove("planet-file-open");
@@ -2337,7 +2401,7 @@ function renderDocQaDashboard() {
   const queue = report.queue.length ? report.queue : [];
   el("reviewQueue").innerHTML = queue.length ? queue.map(renderReviewItem).join("") : '<div class="issue">No watched files changed or created in the current worktree.</div>';
   document.querySelectorAll("[data-review-path]").forEach((button) => button.addEventListener("click", () => {
-    selectFile(button.dataset.reviewPath, { revealInExplorer: true }).catch((error) => setStatus(error.message));
+    selectFile(button.dataset.reviewPath, { revealInExplorer: !isNarrowLayout() }).catch((error) => setStatus(error.message));
   }));
   renderHubFolders();
 }
@@ -2898,6 +2962,7 @@ async function goHistory(delta) {
 
 function goHub() {
   if (state.dirty && !confirm("You have unsaved changes. Return to hub?")) return;
+  collapseSidebarOnNarrow();
   state.selected = null;
   state.selectedDiff = null;
   state.savedHash = null;
@@ -3108,7 +3173,10 @@ el("editor").addEventListener("input", () => {
 el("search").addEventListener("input", () => { state.pathFilters = []; expandSearchMatches(); renderFiles(); });
 el("clearSearch").addEventListener("click", () => clearExplorerFilter());
 document.querySelectorAll("[data-watch-filter]").forEach((button) => button.addEventListener("click", () => setExplorerWatchFilter(button.dataset.watchFilter)));
-el("sidebarToggle").addEventListener("click", () => document.querySelector(".app").classList.toggle("sidebar-collapsed"));
+el("sidebarToggle").addEventListener("click", () => {
+  state.mobileSidebarTouched = true;
+  document.querySelector(".app").classList.toggle("sidebar-collapsed");
+});
 el("refreshDocQa")?.addEventListener("click", () => loadFiles().catch((error) => setStatus(error.message)));
 document.querySelectorAll("[data-home-action]").forEach((button) => button.addEventListener("click", () => homeAction(button.dataset.homeAction)));
 document.querySelectorAll("[data-home-file]").forEach((button) => button.addEventListener("click", () => selectFile(button.dataset.homeFile).catch((error) => setStatus(error.message))));
@@ -3128,6 +3196,8 @@ window.addEventListener("beforeunload", (event) => {
   event.preventDefault();
   event.returnValue = "";
 });
+syncResponsiveSidebar({ force: true });
+window.addEventListener("resize", () => syncResponsiveSidebar());
 setMode("view");
 loadFiles().catch((error) => setStatus(error.message));
 window.setInterval(() => refreshFromDisk(), 2200);
