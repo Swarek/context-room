@@ -2,9 +2,9 @@
 
 Documentation control room for the era of AI agent loops.
 
-AI agents can now write code, refactor systems, create files, and loop on tasks for hours. In that world, the highest-leverage part of a project is no longer only the source code. It is the documentation that tells agents what the project is, how it works, what matters, what not to touch, and which reusable skills or procedures should guide future work.
+AI agents can now loop on tasks for hours and days to create the biggest projects. In that world, the highest-leverage part of a project is no longer the source code. It is the documentation that tells agents what the project is, how it works, what matters, what are the features, all the details of the features it needs, and which reusable skills or procedures should guide future work.
 
-Context Room is built around one belief: if you maintain excellent documentation, you can build better AI-native projects.
+Context Room is built around one belief: if you maintain excellent documentation, you can build the bests AI-native projects.
 
 It gives any repository a local browser UI to manage, navigate, and verify the docs and skills that keep agents aligned.
 
