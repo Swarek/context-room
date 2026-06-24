@@ -1721,6 +1721,9 @@ export function renderAppHtml() {
     .diff-line.del { color: #ffc0c8; background: rgba(255,140,157,0.08); }
     .diff-line.hunk { color: #b69cff; background: rgba(182,156,255,0.08); }
     .diff-line.meta { color: var(--muted); }
+    .diff-raw-meta { margin: 10px 18px 0; padding: 10px 12px; border: 1px solid rgba(148,163,184,0.14); border-radius: 14px; background: rgba(255,255,255,0.035); color: var(--muted); font: 12px/1.5 ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; }
+    .diff-raw-meta summary { cursor: pointer; font-family: Inter, ui-sans-serif, system-ui, sans-serif; font-weight: 850; color: #cbd7ec; }
+    .diff-raw-meta pre { margin: 9px 0 0; white-space: pre-wrap; }
     .diff-empty { padding: 18px; color: var(--muted); font: 14px/1.5 Inter, ui-sans-serif, system-ui, sans-serif; }
     .file-header-copy { min-width: 0; display: grid; gap: 5px; }
     .file-header-copy .diff-meta { white-space: normal; line-height: 1.35; }
@@ -2980,8 +2983,16 @@ function syncWorkspaceScroll() {
 
 function renderDiffPanel(diff) {
   const meta = "+" + diff.additions + " / -" + diff.deletions;
-  const body = '<pre class="diff-code">' + diff.patch.split("\n").map(renderDiffLine).join("") + '</pre>';
+  const lines = diff.patch.split("\n");
+  const gitMeta = lines.filter(isGitDiffMetadataLine);
+  const reviewLines = lines.filter((line) => !isGitDiffMetadataLine(line));
+  const rawMeta = gitMeta.length ? '<details class="diff-raw-meta"><summary>Git metadata</summary><pre>' + gitMeta.map(escapeHtml).join("\n") + '</pre></details>' : "";
+  const body = rawMeta + '<pre class="diff-code">' + reviewLines.map(renderDiffLine).join("") + '</pre>';
   return '<section class="diff-panel"><div class="diff-header"><strong>Git diff</strong><div class="file-actions"><span class="diff-meta">' + escapeHtml(meta) + '</span><button class="file-action" type="button" data-hide-diff>Hide</button></div></div>' + body + '</section>';
+}
+
+function isGitDiffMetadataLine(line) {
+  return line.startsWith("diff --git") || line.startsWith("new file mode") || line.startsWith("deleted file mode") || line.startsWith("old mode") || line.startsWith("new mode") || line.startsWith("index ") || line.startsWith("--- ") || line.startsWith("+++ ") || line.startsWith("@@");
 }
 
 function renderDiffLine(line) {
