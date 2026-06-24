@@ -1,0 +1,5 @@
+node_modules/
+npm-debug.log*
+.context-room/review-state.json
+.context-room/backups/
+.DS_Store

@@ -1,0 +1,55 @@
+{
+  "title": "Agentic Codebase",
+  "allowedPaths": [
+    "README.md",
+    "AGENTS.md",
+    "CLAUDE.md",
+    ".hermes.md",
+    "docs/",
+    "src/",
+    "tests/",
+    "scripts/"
+  ],
+  "watchAllow": [
+    "README.md",
+    "AGENTS.md",
+    "docs/"
+  ],
+  "integrations": {
+    "hermes": false
+  },
+  "hubSections": [
+    {
+      "id": "main",
+      "title": "Main",
+      "cards": [
+        {
+          "id": "agent-context",
+          "title": "Agent context",
+          "paths": ["AGENTS.md", "CLAUDE.md", ".hermes.md"],
+          "description": "Instructions that shape AI agent behavior."
+        },
+        {
+          "id": "docs",
+          "title": "Docs",
+          "path": "docs/",
+          "description": "Project documentation.",
+          "cards": [
+            { "id": "architecture", "title": "Architecture", "path": "docs/architecture/" },
+            { "id": "decisions", "title": "Decisions", "path": "docs/decisions/" }
+          ]
+        },
+        {
+          "id": "source",
+          "title": "Source",
+          "path": "src/"
+        },
+        {
+          "id": "tests",
+          "title": "Tests",
+          "path": "tests/"
+        }
+      ]
+    }
+  ]
+}

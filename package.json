@@ -1,0 +1,47 @@
+{
+  "name": "context-room",
+  "version": "0.1.0",
+  "description": "Local-first project context control room for humans and AI agents.",
+  "type": "module",
+  "homepage": "https://github.com/Swarek/context-room#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Swarek/context-room.git"
+  },
+  "bugs": {
+    "url": "https://github.com/Swarek/context-room/issues"
+  },
+  "bin": {
+    "context-room": "./bin/context-room.mjs"
+  },
+  "exports": {
+    ".": "./src/context_room.mjs"
+  },
+  "files": [
+    "bin/",
+    "src/",
+    "examples/",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "start": "node bin/context-room.mjs start",
+    "init": "node bin/context-room.mjs init",
+    "doctor": "node bin/context-room.mjs doctor",
+    "test": "node --check src/context_room.mjs && node --check bin/context-room.mjs && node --test test/*.test.mjs",
+    "pack:dry-run": "npm pack --dry-run"
+  },
+  "keywords": [
+    "ai-agent",
+    "context",
+    "documentation",
+    "local-first",
+    "review-queue",
+    "developer-tools"
+  ],
+  "author": "Mathis Blanc",
+  "license": "MIT",
+  "engines": {
+    "node": ">=20"
+  }
+}
