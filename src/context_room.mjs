@@ -1523,6 +1523,8 @@ export function renderAppHtml() {
     .sidebar-head { display: grid; grid-template-columns: 1fr auto; gap: 10px; align-items: start; }
     .sidebar-toggle { border: 1px solid rgba(139,211,255,0.28); border-radius: 14px; background: rgba(255,255,255,0.06); color: var(--text); width: 42px; height: 42px; cursor: pointer; box-shadow: 0 0 28px rgba(139,211,255,0.12); transition: transform 160ms ease, background 160ms ease; }
     .sidebar-toggle:hover { transform: translateY(-1px); background: rgba(139,211,255,0.12); }
+    .explorer-open { display: none; border: 1px solid rgba(139,211,255,0.28); border-radius: 14px; background: rgba(255,255,255,0.06); color: var(--text); width: 42px; height: 42px; cursor: pointer; align-items: center; justify-content: center; box-shadow: 0 0 28px rgba(139,211,255,0.12); transition: transform 160ms ease, background 160ms ease; }
+    .explorer-open:hover { transform: translateY(-1px); background: rgba(139,211,255,0.12); }
     .app.sidebar-collapsed .sidebar-copy, .app.sidebar-collapsed .workspace-dock, .app.sidebar-collapsed .search-row, .app.sidebar-collapsed .explorer-title, .app.sidebar-collapsed .tree, .app.sidebar-collapsed .hint { opacity: 0; pointer-events: none; transform: translateX(-10px); }
     .sidebar-copy, .workspace-dock, .search-row, .explorer-title, .tree, .hint { transition: opacity 180ms ease, transform 180ms ease; }
     main { padding: 24px; display: grid; grid-template-rows: 1fr; gap: 18px; min-width: 0; min-height: 0; overflow: hidden; }
@@ -1753,16 +1755,19 @@ export function renderAppHtml() {
     @media (max-width: 980px) {
       body { overflow: hidden; }
       .app, .app.sidebar-collapsed { grid-template-columns: 1fr; height: 100dvh; overflow: hidden; padding-top: 58px; }
-      aside { position: fixed; z-index: 30; top: 0; left: 0; right: 0; height: min(78dvh, 680px); max-height: min(78dvh, 680px); border-right: 0; border-bottom: 1px solid var(--line); padding: 10px; overflow: auto; box-shadow: 0 18px 60px rgba(0,0,0,0.42); }
+      aside { position: fixed; z-index: 30; top: 0; left: 0; right: 0; height: min(62dvh, 560px); max-height: min(62dvh, 560px); border-right: 0; border-bottom: 1px solid var(--line); padding: 10px; overflow: auto; box-shadow: 0 18px 60px rgba(0,0,0,0.42); }
       .app.sidebar-collapsed aside { height: 58px; max-height: 58px; padding: 8px 10px; overflow: hidden; }
       .app.sidebar-collapsed .sidebar-toggle { position: absolute; left: auto; right: 10px; top: 8px; z-index: 31; width: 40px; height: 40px; }
       .app.sidebar-collapsed .sidebar-copy, .app.sidebar-collapsed .search-row, .app.sidebar-collapsed .watch-filter-row, .app.sidebar-collapsed .selection-bar, .app.sidebar-collapsed .explorer-title, .app.sidebar-collapsed .tree, .app.sidebar-collapsed .hint { opacity: 0; pointer-events: none; transform: translateY(-8px); }
       .app.sidebar-collapsed .workspace-dock { opacity: 1; pointer-events: auto; transform: none; width: calc(100% - 50px); margin: 0; padding: 5px; overflow-x: auto; flex-wrap: nowrap; scrollbar-width: none; }
       .app.sidebar-collapsed .workspace-dock::-webkit-scrollbar { display: none; }
       .workspace-dock { margin-right: 50px; }
+      .app:not(.sidebar-collapsed) .workspace-dock { margin-right: 0; }
       .dock-button { padding: 8px 10px; white-space: nowrap; }
       .sidebar-head { position: absolute; right: 10px; top: 8px; display: block; }
+      .app:not(.sidebar-collapsed) .sidebar-head { position: static; display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 4px 2px 8px; }
       .sidebar-copy { padding-right: 52px; }
+      .app:not(.sidebar-collapsed) .sidebar-copy { padding-right: 0; flex: 1 1 auto; min-width: 0; }
       .sidebar-toggle { width: 40px; height: 40px; }
       main { height: calc(100dvh - 58px); padding: 10px; overflow: hidden; }
       .editor-shell { height: 100%; min-height: 0; border-radius: 18px; }
@@ -1793,10 +1798,71 @@ export function renderAppHtml() {
       .editor-shell.planet-file-open .cosmos-home { padding-right: 16px; }
       .editor-shell.planet-file-open .viewer, .editor-shell.planet-file-open textarea { position: static; width: 100%; height: 100%; min-height: 100%; border-radius: 18px; box-shadow: none; }
     }
+    @media (max-width: 640px) {
+      body { overflow: hidden; }
+      .app, .app.sidebar-collapsed { grid-template-columns: 1fr; grid-template-rows: 1fr; height: 100dvh; padding: 54px 0 0; overflow: hidden; }
+      .explorer-open { display: inline-flex; position: fixed; top: 8px; right: 8px; z-index: 35; width: 38px; height: 38px; border-radius: 12px; }
+      .app.explorer-expanded .explorer-open { display: none; }
+      .workspace-dock, .app.sidebar-collapsed .workspace-dock { position: fixed; top: 0; left: 0; right: 0; z-index: 33; width: 100%; height: 54px; margin: 0; padding: 7px 52px 7px 8px; gap: 5px; border: 0; border-bottom: 1px solid var(--line); border-radius: 0; background: rgba(8,13,27,0.94); backdrop-filter: blur(18px); box-shadow: 0 8px 24px rgba(0,0,0,0.32); flex-wrap: nowrap; overflow-x: auto; scrollbar-width: none; opacity: 1; pointer-events: auto; transform: none; }
+      .app.sidebar-collapsed .workspace-dock { width: 100%; padding: 7px 52px 7px 8px; margin: 0; opacity: 1; }
+      .app.explorer-expanded .workspace-dock { display: none; }
+      .workspace-dock::-webkit-scrollbar { display: none; }
+      .workspace-dock .dock-button { padding: 8px 11px; white-space: nowrap; flex: 0 0 auto; }
+      .workspace-dock .dock-status { display: none; }
+      aside { position: fixed; left: 0; right: 0; bottom: 0; top: auto; width: 100%; height: auto; max-height: 0; min-height: 0; margin: 0; padding: 0; border: 0; border-radius: 22px 22px 0 0; background: rgba(6,10,22,0.985); backdrop-filter: none; box-shadow: 0 -20px 70px rgba(0,0,0,0.55); overflow: auto; overscroll-behavior: contain; transition: transform 280ms cubic-bezier(.2,.9,.2,1), max-height 280ms ease, padding 280ms ease; transform: translateY(100%); pointer-events: none; }
+      .app.explorer-expanded aside { height: min(66dvh, 560px) !important; max-height: min(66dvh, 560px) !important; padding: 0 12px 14px !important; border-top: 1px solid var(--line) !important; transform: translateY(0) !important; pointer-events: auto !important; }
+      .app.sidebar-collapsed aside { height: auto; max-height: 0; padding: 0; border: 0; transform: translateY(100%); pointer-events: none; }
+      .sidebar-head { position: sticky; top: 0; z-index: 2; display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 12px 2px 10px; background: rgba(6,10,22,0.98); border-bottom: 1px solid rgba(148,163,184,0.16); }
+      .sidebar-copy { padding-right: 0; flex: 1 1 auto; min-width: 0; }
+      .sidebar-copy h1 { font-size: 15px; margin: 0; }
+      .sidebar-copy .subtitle { font-size: 11px; }
+      .sidebar-toggle { position: static; width: 38px; height: 38px; flex: 0 0 auto; }
+      .search-row { margin: 10px 0 8px; }
+      .search { margin: 0; padding: 11px 12px; font-size: 15px; }
+      .clear-search { padding: 11px 12px; }
+      .watch-filter-row { margin: 0 0 8px; }
+      .explorer-title { margin: 8px 0 4px; }
+      .tree { font-size: 13px; padding-right: 2px; }
+      .hint { font-size: 11px; line-height: 1.4; padding: 8px 0 2px; }
+      main { height: calc(100dvh - 54px); padding: 10px; overflow: hidden; }
+      .editor-shell { height: 100%; min-height: 0; border-radius: 16px; }
+      .docqa-home, .settings-page { padding: 12px 10px; }
+      .docqa-panel { border-radius: 16px; }
+      .docqa-panel header { padding: 12px; }
+      .review-summary-item { min-width: 0; }
+      .review-item { padding: 10px; }
+      .hub-folders { gap: 14px; margin-top: 12px; }
+      .hub-folder-card { min-height: 104px; padding: 14px; border-radius: 16px; }
+      .hub-folder-card strong { font-size: 17px; }
+      .hub-folder-card span { font-size: 12px; }
+      .hub-breadcrumb { padding: 8px 10px; font-size: 11px; gap: 5px; }
+      .hub-crumb { padding: 6px 9px; font-size: 11px; }
+      textarea, .viewer { min-height: 100%; padding: 14px; font-size: 14px; line-height: 1.6; overflow-wrap: anywhere; }
+      .diff-code, .doc-content, .doc-editor { padding: 10px; font-size: 12px; line-height: 1.5; overflow-wrap: anywhere; }
+      .diff-header, .file-panel header { padding: 10px 12px; }
+      .file-actions { gap: 6px; }
+      .file-action { padding: 8px 10px; font-size: 13px; }
+      .selected-title { font-size: 18px; }
+      .selected-path, .selected-impact { font-size: 12px; }
+      .selected-impact { margin-top: 8px; }
+      .actions { gap: 8px; }
+      button.primary, button.secondary { padding: 10px 13px; font-size: 13px; }
+      .history-nav button { min-width: 38px; padding: 8px 10px; }
+      .mode-toggle button { padding: 9px 11px; font-size: 13px; }
+      .diff-toggle { padding: 9px 11px; margin-bottom: 8px; }
+      .settings-field textarea, .settings-field input { font-size: 12px; }
+      .settings-footer { flex-direction: column; align-items: flex-start; gap: 8px; }
+      .planet-system { min-height: 560px; }
+      .cosmos-home { padding: 12px; }
+      .planet-stage { min-height: 520px; }
+      .editor-shell.planet-file-open .cosmos-home { padding-right: 12px; }
+      .editor-shell.planet-file-open .viewer, .editor-shell.planet-file-open textarea { position: static; width: 100%; height: 100%; min-height: 100%; border-radius: 16px; box-shadow: none; }
+    }
   </style>
 </head>
 <body>
   <div class="app">
+    <button id="explorerOpen" class="explorer-open" type="button" title="Open explorer" aria-label="Open explorer">☰</button>
     <aside>
       <div class="workspace-dock">
         <button id="hub" class="dock-button" type="button" title="Hub / settings">hub</button>
@@ -2076,23 +2142,36 @@ function openSidebarIfCollapsed() {
   app?.classList.remove("sidebar-collapsed");
   if (app && window.matchMedia("(max-width: 980px)").matches) state.mobileSidebarTouched = true;
 }
-
 function syncResponsiveSidebar({ force = false } = {}) {
   const app = document.querySelector(".app");
   if (!app) return;
-  if (window.matchMedia("(max-width: 980px)").matches) {
+  const isMobile = window.matchMedia("(max-width: 980px)").matches;
+  const isDrawer = window.matchMedia("(max-width: 640px)").matches;
+  if (isMobile) {
     if (force || !state.mobileSidebarTouched) app.classList.add("sidebar-collapsed");
-  } else if (!state.mobileSidebarTouched) {
+  } else {
     app.classList.remove("sidebar-collapsed");
+    app.classList.remove("explorer-expanded");
+    state.mobileSidebarTouched = false;
   }
+  if (!isDrawer || app.classList.contains("sidebar-collapsed")) app.classList.remove("explorer-expanded");
+  syncSidebarToggleIcon();
 }
 
 function collapseSidebarOnNarrow() {
-  if (window.matchMedia("(max-width: 980px)").matches) document.querySelector(".app")?.classList.add("sidebar-collapsed");
+  const app = document.querySelector(".app");
+  if (window.matchMedia("(max-width: 980px)").matches) app?.classList.add("sidebar-collapsed");
+  app?.classList.remove("explorer-expanded");
+  syncSidebarToggleIcon();
 }
 
 function isNarrowLayout() {
   return window.matchMedia("(max-width: 980px)").matches;
+}
+
+function syncSidebarToggleIcon() {
+  const toggle = el("sidebarToggle");
+  if (toggle) toggle.textContent = window.matchMedia("(max-width: 640px)").matches ? "✕" : "☰";
 }
 
 function toggleDeleteSelection(path) {
@@ -3175,7 +3254,18 @@ el("clearSearch").addEventListener("click", () => clearExplorerFilter());
 document.querySelectorAll("[data-watch-filter]").forEach((button) => button.addEventListener("click", () => setExplorerWatchFilter(button.dataset.watchFilter)));
 el("sidebarToggle").addEventListener("click", () => {
   state.mobileSidebarTouched = true;
-  document.querySelector(".app").classList.toggle("sidebar-collapsed");
+  const app = document.querySelector(".app");
+  app.classList.toggle("sidebar-collapsed");
+  if (window.matchMedia("(max-width: 640px)").matches && !app.classList.contains("sidebar-collapsed")) app.classList.add("explorer-expanded");
+  else app.classList.remove("explorer-expanded");
+  syncSidebarToggleIcon();
+});
+el("explorerOpen")?.addEventListener("click", () => {
+  state.mobileSidebarTouched = true;
+  const app = document.querySelector(".app");
+  app.classList.remove("sidebar-collapsed");
+  if (window.matchMedia("(max-width: 640px)").matches) app.classList.add("explorer-expanded");
+  syncSidebarToggleIcon();
 });
 el("refreshDocQa")?.addEventListener("click", () => loadFiles().catch((error) => setStatus(error.message)));
 document.querySelectorAll("[data-home-action]").forEach((button) => button.addEventListener("click", () => homeAction(button.dataset.homeAction)));
