@@ -1721,8 +1721,8 @@ export function renderAppHtml() {
     .diff-line.del { color: #ffc0c8; background: rgba(255,140,157,0.08); }
     .diff-line.hunk { color: #b69cff; background: rgba(182,156,255,0.08); }
     .diff-line.meta { color: var(--muted); }
-    .diff-raw-meta { margin: 6px 18px 0; color: rgba(148,163,184,0.62); font: 10px/1.45 ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; }
-    .diff-raw-meta summary { cursor: pointer; width: fit-content; list-style: none; font-family: Inter, ui-sans-serif, system-ui, sans-serif; font-size: 10px; font-weight: 750; letter-spacing: 0.08em; text-transform: uppercase; color: rgba(148,163,184,0.48); }
+    .diff-raw-meta { margin: 2px 18px 0; color: rgba(148,163,184,0.55); font: 10px/1.45 ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; }
+    .diff-raw-meta summary { cursor: pointer; width: fit-content; list-style: none; font-family: Inter, ui-sans-serif, system-ui, sans-serif; font-size: 9px; font-weight: 750; color: rgba(148,163,184,0.42); }
     .diff-raw-meta summary::-webkit-details-marker { display: none; }
     .diff-raw-meta pre { margin: 6px 0 0; padding: 8px 10px; border-radius: 10px; background: rgba(255,255,255,0.025); white-space: pre-wrap; }
     .diff-empty { padding: 18px; color: var(--muted); font: 14px/1.5 Inter, ui-sans-serif, system-ui, sans-serif; }
@@ -2987,7 +2987,7 @@ function renderDiffPanel(diff) {
   const lines = diff.patch.split("\n");
   const gitMeta = lines.filter(isGitDiffMetadataLine);
   const reviewLines = lines.filter((line) => !isGitDiffMetadataLine(line));
-  const rawMeta = gitMeta.length ? '<details class="diff-raw-meta"><summary>raw</summary><pre>' + gitMeta.map(escapeHtml).join("\n") + '</pre></details>' : "";
+  const rawMeta = gitMeta.length ? '<details class="diff-raw-meta"><summary title="Raw Git metadata">⋯</summary><pre>' + gitMeta.map(escapeHtml).join("\n") + '</pre></details>' : "";
   const body = rawMeta + '<pre class="diff-code">' + reviewLines.map(renderDiffLine).join("") + '</pre>';
   return '<section class="diff-panel"><div class="diff-header"><strong>Git diff</strong><div class="file-actions"><span class="diff-meta">' + escapeHtml(meta) + '</span><button class="file-action" type="button" data-hide-diff>Hide</button></div></div>' + body + '</section>';
 }
