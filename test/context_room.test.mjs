@@ -14,6 +14,7 @@ import {
   isAllowedMemoryPath,
   listMemoryFiles,
   readMemoryWebappSettings,
+  writeDocReviewDecision,
 } from "../src/context_room.mjs";
 
 function makeRoot() {
@@ -92,4 +93,31 @@ test("CLI init and doctor work in a fresh project", () => {
   assert.equal(saved.title, "CLI Demo");
   assert.deepEqual(saved.watchAllow, ["docs/"]);
   assert.match(doctor, /Context Room OK/);
+});
+
+test("CLI guard blocks commits when watched docs changed without review", () => {
+  const root = makeRoot();
+  execFileSync("git", ["init"], { cwd: root, stdio: "ignore" });
+  execFileSync("git", ["config", "user.email", "context-room@example.test"], { cwd: root, stdio: "ignore" });
+  execFileSync("git", ["config", "user.name", "Context Room Test"], { cwd: root, stdio: "ignore" });
+  fs.writeFileSync(path.join(root, "README.md"), "# Demo\n");
+  initializeContextRoomProject(root, { allowedPaths: ["README.md"], watchAllow: ["README.md"] });
+  execFileSync("git", ["add", "."], { cwd: root, stdio: "ignore" });
+  execFileSync("git", ["commit", "-m", "initial"], { cwd: root, stdio: "ignore" });
+  fs.writeFileSync(path.join(root, "README.md"), "# Demo\n\nAgent change.\n");
+
+  const cli = path.resolve("bin/context-room.mjs");
+  assert.throws(
+    () => execFileSync(process.execPath, [cli, "guard"], { cwd: root, encoding: "utf8", stdio: "pipe" }),
+    (error) => {
+      const output = `${error.stdout || ""}${error.stderr || ""}`;
+      assert.match(output, /Unverified watched documentation changes/);
+      assert.match(output, /README\.md/);
+      return true;
+    },
+  );
+
+  writeDocReviewDecision(root, "README.md", { status: "verified", note: "test baseline" });
+  const output = execFileSync(process.execPath, [cli, "guard"], { cwd: root, encoding: "utf8" });
+  assert.match(output, /No unverified watched documentation changes/);
 });

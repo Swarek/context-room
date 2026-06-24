@@ -123,7 +123,11 @@ Minimal config:
 context-room init [--title "My Project"] [--allow docs/,skills/,README.md,AGENTS.md] [--watch docs/,skills/]
 context-room start [--root .] [--port 4317]
 context-room doctor [--root .]
+context-room guard [--root .]
+context-room install-hook [--root .]
 ```
+
+`guard` exits with a non-zero status when watched documentation has changed but has not been marked verified in Context Room. `install-hook` wires that guard into `.git/hooks/pre-commit`, so commits are blocked until the watched docs review queue is clear.
 
 ## Agent setup prompt
 
@@ -140,8 +144,9 @@ Goal: make the project documentation and agent skills easy to navigate, maintain
 4. Configure `.context-room/config.json` with useful cards and nested cards.
 5. Put only safe editable text surfaces in `allowedPaths`.
 6. Put the important docs and skills in `watchAllow`.
-7. Run `context-room doctor` and `context-room start`.
-8. Smoke-test the UI at http://127.0.0.1:4317.
+7. Run `context-room install-hook` if commits should be blocked until watched docs are verified.
+8. Run `context-room doctor` and `context-room start`.
+9. Smoke-test the UI at http://127.0.0.1:4317.
 
 Do not include secrets, .env files, build outputs, node_modules, private data exports, or generated artifacts.
 ```
