@@ -11,6 +11,7 @@ const DEFAULT_PORT = 4317;
 const MAX_FILE_BYTES = 750_000;
 export const CONFIG_DIR = ".context-room";
 export const CONFIG_FILE = `${CONFIG_DIR}/config.json`;
+const CONFIG_SCHEMA_URL = "https://raw.githubusercontent.com/Swarek/context-room/main/schemas/config.schema.json";
 const DOCQA_REVIEW_STATE = `${CONFIG_DIR}/review-state.json`;
 const MEMORY_WEBAPP_SETTINGS = CONFIG_FILE;
 const HERMES_CRON_JOBS_FILE = "~/.hermes/cron/jobs.json";
@@ -872,6 +873,7 @@ export function folderFilterSearchQuery(folderPaths = []) {
 export function createDefaultProjectConfig({ title = "Context Room", allowedPaths = ALLOWED_PREFIXES, watchAllow = [] } = {}) {
   const hubSections = DEFAULT_HUB_SECTIONS.map(normalizeHubSectionDefinition).filter(Boolean);
   return {
+    $schema: CONFIG_SCHEMA_URL,
     title,
     allowedPaths: sanitizePathList(allowedPaths),
     watchAllow: sanitizePathList(watchAllow),
@@ -1050,6 +1052,7 @@ function normalizeMemoryWebappSettings(raw = {}, base = defaultMemoryWebappSetti
   const customHubCards = flattenHubCards(hubSections).filter((card) => hubCardPaths(card).length > 0).map((card) => ({ ...card, cards: undefined }));
   for (const card of flattenHubCards(hubSections)) hubCards[card.id] = card.enabled !== false;
   return {
+    $schema: String(raw.$schema || base.$schema || CONFIG_SCHEMA_URL),
     title: String(raw.title || base.title || "Context Room").trim() || "Context Room",
     allowedPaths: sanitizePathList(raw.allowedPaths ?? base.allowedPaths ?? ALLOWED_PREFIXES),
     watchAllow: sanitizePathList(raw.watchAllow ?? base.watchAllow),

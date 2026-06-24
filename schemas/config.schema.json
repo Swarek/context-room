@@ -1,0 +1,105 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/Swarek/context-room/main/schemas/config.schema.json",
+  "title": "Context Room project configuration",
+  "description": "Configuration for the local Context Room documentation control room.",
+  "type": "object",
+  "additionalProperties": true,
+  "properties": {
+    "$schema": {
+      "type": "string",
+      "description": "Optional JSON Schema URL for editor autocomplete."
+    },
+    "title": {
+      "type": "string",
+      "description": "Display title for this project."
+    },
+    "allowedPaths": {
+      "type": "array",
+      "description": "Safety boundary. Context Room can only read/write editable text files inside these files or folders.",
+      "items": { "$ref": "#/$defs/projectPath" },
+      "uniqueItems": true,
+      "default": ["docs/", "skills/", "README.md", "AGENTS.md"]
+    },
+    "watchAllow": {
+      "type": "array",
+      "description": "Files or folders to monitor for the review queue. Changed tracked files and new untracked files under watched folders appear for verification.",
+      "items": { "$ref": "#/$defs/projectPath" },
+      "uniqueItems": true,
+      "default": []
+    },
+    "hubSections": {
+      "type": "array",
+      "description": "Top-level groups shown in the Context Room hub.",
+      "items": { "$ref": "#/$defs/section" }
+    },
+    "integrations": {
+      "type": "object",
+      "description": "Optional integrations. Keep false/empty for generic projects.",
+      "additionalProperties": true,
+      "properties": {
+        "hermes": {
+          "type": "boolean",
+          "description": "Enable Hermes-specific files and external skill paths. Off by default for generic projects.",
+          "default": false
+        }
+      }
+    }
+  },
+  "required": ["title", "allowedPaths", "watchAllow", "hubSections"],
+  "$defs": {
+    "projectPath": {
+      "type": "string",
+      "minLength": 1,
+      "not": { "pattern": "(^/|^\\.\\.|/\\.\\./|\\u0000)" },
+      "examples": ["README.md", "AGENTS.md", "docs/", "skills/review.md"]
+    },
+    "section": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": ["id", "title", "cards"],
+      "properties": {
+        "id": { "$ref": "#/$defs/id" },
+        "title": { "type": "string" },
+        "description": { "type": "string" },
+        "enabled": { "type": "boolean", "default": true },
+        "cards": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/card" }
+        }
+      }
+    },
+    "card": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": ["id", "title"],
+      "oneOf": [
+        { "required": ["path"] },
+        { "required": ["paths"] },
+        { "required": ["cards"] }
+      ],
+      "properties": {
+        "id": { "$ref": "#/$defs/id" },
+        "title": { "type": "string" },
+        "description": { "type": "string" },
+        "path": { "$ref": "#/$defs/projectPath" },
+        "paths": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/projectPath" },
+          "uniqueItems": true
+        },
+        "enabled": { "type": "boolean", "default": true },
+        "cards": {
+          "type": "array",
+          "description": "Nested cards/sub-cards.",
+          "items": { "$ref": "#/$defs/card" }
+        }
+      }
+    },
+    "id": {
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9_-]*$",
+      "examples": ["docs", "agent-context", "skills"]
+    }
+  }
+}

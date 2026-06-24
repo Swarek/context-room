@@ -71,10 +71,15 @@ http://127.0.0.1:4317
 .context-room/review-state.json
 ```
 
+Everything an agent needs to configure lives in `.context-room/config.json`: cards, nested cards, editable paths, watched docs, and optional integrations. The file includes a JSON Schema for editor autocomplete and agent validation.
+
+See [`docs/agent-configuration.md`](docs/agent-configuration.md) for the agent-facing configuration guide.
+
 Minimal config:
 
 ```json
 {
+  "$schema": "https://raw.githubusercontent.com/Swarek/context-room/main/schemas/config.schema.json",
   "title": "My Project",
   "allowedPaths": ["docs/", "skills/", "README.md", "AGENTS.md"],
   "watchAllow": ["docs/", "skills/", "AGENTS.md"],

@@ -26,6 +26,7 @@ test("default config is project-agnostic and supports cards, nested cards, allow
   assert.equal(CONFIG_DIR, ".context-room");
   assert.equal(CONFIG_FILE, ".context-room/config.json");
   assert.equal(config.title, "Demo Project");
+  assert.match(config.$schema, /schemas\/config\.schema\.json$/);
   assert.deepEqual(config.watchAllow, []);
   assert.ok(config.allowedPaths.includes("docs/"));
   assert.ok(config.allowedPaths.includes("src/"));
@@ -45,6 +46,7 @@ test("init writes a reusable project config without LifeOS-specific paths", () =
 
   assert.equal(result.configPath, configPath);
   assert.equal(saved.title, "Demo");
+  assert.match(saved.$schema, /schemas\/config\.schema\.json$/);
   assert.ok(saved.allowedPaths.includes("docs/"));
   assert.ok(saved.allowedPaths.includes("src/"));
   assert.equal(JSON.stringify(saved).includes("Life OS"), false);
