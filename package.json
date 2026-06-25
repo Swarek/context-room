@@ -12,7 +12,7 @@
     "url": "https://github.com/Swarek/context-room/issues"
   },
   "bin": {
-    "context-room": "./bin/context-room.mjs"
+    "context-room": "bin/context-room.mjs"
   },
   "exports": {
     ".": "./src/context_room.mjs"
