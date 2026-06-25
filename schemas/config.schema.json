@@ -19,13 +19,25 @@
       "description": "Safety boundary. Context Room can only read/write editable text files inside these files or folders.",
       "items": { "$ref": "#/$defs/projectPath" },
       "uniqueItems": true,
-      "default": ["docs/", "skills/", "README.md", "AGENTS.md"]
+      "default": ["docs/", "context/", "skills/", "README.md", "AGENTS.md"]
     },
     "watchAllow": {
       "type": "array",
       "description": "Files or folders to monitor for the review queue. Changed tracked files and new untracked files under watched folders appear for verification.",
       "items": { "$ref": "#/$defs/projectPath" },
       "uniqueItems": true,
+      "default": []
+    },
+    "bestPractices": {
+      "type": "array",
+      "description": "Short documentation best practices shown in the Context Room hub.",
+      "items": { "type": "string", "minLength": 1 },
+      "default": []
+    },
+    "markdownTemplates": {
+      "type": "array",
+      "description": "Markdown templates available when creating new .md files from the site.",
+      "items": { "$ref": "#/$defs/markdownTemplate" },
       "default": []
     },
     "hubSections": {
@@ -52,7 +64,7 @@
       "type": "string",
       "minLength": 1,
       "not": { "pattern": "(^/|^\\.\\.|/\\.\\./|\\u0000)" },
-      "examples": ["README.md", "AGENTS.md", "docs/", "skills/review.md"]
+      "examples": ["README.md", "AGENTS.md", "docs/", "context/architecture.md", "skills/review.md"]
     },
     "section": {
       "type": "object",
@@ -93,6 +105,25 @@
           "type": "array",
           "description": "Nested cards/sub-cards.",
           "items": { "$ref": "#/$defs/card" }
+        }
+      }
+    },
+    "markdownTemplate": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": ["id", "title", "content"],
+      "properties": {
+        "id": { "$ref": "#/$defs/id" },
+        "title": { "type": "string" },
+        "description": { "type": "string" },
+        "enabled": {
+          "type": "boolean",
+          "description": "When false, keep this template editable in settings but hide it from the apply-template selector.",
+          "default": true
+        },
+        "content": {
+          "type": "string",
+          "description": "Template body. Supports {{title}} and {{path}} placeholders."
         }
       }
     },

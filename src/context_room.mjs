@@ -17,8 +17,62 @@ const MEMORY_WEBAPP_SETTINGS = CONFIG_FILE;
 const HERMES_CRON_JOBS_FILE = "~/.hermes/cron/jobs.json";
 const HERMES_CRON_JOBS_FOLDER = "~/.hermes/cron/jobs/";
 const HERMES_CRON_MD_FOLDER = "~/.hermes/cron/jobs-md/";
+export const DOCUMENTATION_BEST_PRACTICES = [
+  "One file, one clear scope: name what this document is responsible for and what belongs elsewhere.",
+  "Start with the goal, then the few durable facts that change decisions.",
+  "Keep sections stable and short; prefer links to source files over copied truth.",
+  "Use explicit rules for agents and humans: what to do, avoid, verify, or ask.",
+  "Update or delete stale context instead of accumulating contradictory prose.",
+];
+export const DEFAULT_MARKDOWN_TEMPLATES = [
+  {
+    id: "context-golden",
+    title: "Golden context file",
+    description: "Balanced default for readable agent/human context: not too heavy, not too vague.",
+    content: `# {{title}}
+
+## Purpose
+Why this file exists, who uses it, and what decision or action it should support.
+
+## Key facts
+The 5 to 10 most important durable facts. Short, concrete, current.
+
+## Structure
+What lives here, what lives elsewhere, and the important paths to know.
+
+## Rules
+Conventions, guardrails, pitfalls, quality criteria, and things not to do.
+
+## References
+Sources of truth, related files, commands, or useful links. Do not copy what can be linked.
+`,
+  },
+  {
+    id: "decision-record",
+    title: "Decision record",
+    description: "Small ADR-style note for decisions that should be easy to revisit.",
+    content: `# {{title}}
+
+## Decision
+The decision made, in one or two sentences.
+
+## Context
+Why this question matters now.
+
+## Options considered
+The serious alternatives and their main trade-off.
+
+## Consequences
+What this changes concretely, and what to watch next.
+
+## References
+Sources, discussions, PRs, or related files.
+`,
+  },
+];
 const DEFAULT_HUB_CARDS = [
   { id: "docs", title: "Docs", path: "docs/", description: "Project documentation.", cards: [{ id: "agent-docs", title: "Agent docs", paths: ["AGENTS.md", "CLAUDE.md", ".hermes.md"], description: "Instructions loaded by AI agents." }] },
+  { id: "context", title: "Context", path: "context/", description: "Scoped context files created from lightweight templates." },
   { id: "source", title: "Source", paths: ["src/", "lib/", "app/"], description: "Application/source code." },
   { id: "tests", title: "Tests", paths: ["test/", "tests/"], description: "Automated tests." },
   { id: "scripts", title: "Scripts", paths: ["scripts/", "tools/"], description: "Project scripts and tooling." },
@@ -76,6 +130,7 @@ const MAIN_FILE_PATHS = new Set([
 const ALLOWED_EXACT = new Set([...HERMES_MEMORY_FILES, ...HERMES_CRON_FILES, ...CORE_FILES].map((file) => file.path));
 const ALLOWED_PREFIXES = [
   "docs/",
+  "context/",
   "src/",
   "lib/",
   "app/",
@@ -244,8 +299,119 @@ export function writeMemoryFile(root, relPath, content) {
   };
 }
 
+export function createMarkdownFile(root, { path: relPath, title = "New document", templateId = "context-golden" } = {}) {
+  const normalized = normalizeMarkdownTemplateTarget(relPath);
+  const abs = resolveMemoryPath(root, normalized);
+  if (fs.existsSync(abs)) throw new Error(`Markdown file already exists: ${normalized}`);
+  return writeMemoryFile(root, normalized, "");
+}
+
+export function createFolder(root, { path: relPath } = {}) {
+  const settings = readMemoryWebappSettings(root);
+  const normalized = normalizeRelPath(String(relPath || "")).replace(/\/$/, "");
+  if (!normalized) throw new Error("Folder path is required");
+  if (!isAllowedFolderPath(normalized, settings)) throw new Error(`Folder path not allowed in context room: ${relPath}`);
+  const resolvedRoot = path.resolve(root);
+  const abs = path.resolve(resolvedRoot, normalized);
+  if (abs !== resolvedRoot && !abs.startsWith(`${resolvedRoot}${path.sep}`)) throw new Error(`Path escapes repository root: ${relPath}`);
+  if (fs.existsSync(abs)) throw new Error(`Folder already exists: ${normalized}`);
+  fs.mkdirSync(abs, { recursive: true });
+  return { path: normalized + "/", existed: false };
+}
+
+export function applyMarkdownTemplateToFile(root, { path: relPath, title = "New document", templateId = "context-golden" } = {}) {
+  const normalized = normalizeMarkdownTemplateTarget(relPath);
+  const abs = resolveMemoryPath(root, normalized);
+  if (!fs.existsSync(abs)) throw new Error(`Markdown file does not exist: ${normalized}`);
+  const stats = fs.statSync(abs);
+  if (!stats.isFile()) throw new Error(`Not a file: ${normalized}`);
+  if (stats.size > 0) {
+    const current = fs.readFileSync(abs, "utf8");
+    if (current.trim()) throw new Error(`Markdown file is not empty: ${normalized}`);
+  }
+  const content = renderMarkdownTemplateForPath(root, normalized, { title, templateId });
+  return writeMemoryFile(root, normalized, content);
+}
+
+export function renderExplorerContextMenuMarkup({ targetPath = "", directory = "", selectionCount = 1, templates = DEFAULT_MARKDOWN_TEMPLATES } = {}) {
+  const normalizedTarget = normalizeRelPath(String(targetPath || ""));
+  const cleanDirectory = normalizeRelPath(String(directory || "")).replace(/\/$/, "");
+  const directoryLabel = cleanDirectory || "project root";
+  const defaultPath = defaultMarkdownPathForDirectory(cleanDirectory);
+  const selectionLabel = selectionCount > 1 ? `${selectionCount} selected` : (normalizedTarget || directoryLabel);
+  const defaultFolderPath = defaultFolderPathForDirectory(cleanDirectory);
+  return '<div class="explorer-context-title"><span>Actions</span><code>' + escapeHtmlServer(selectionLabel) + '</code></div>' +
+    '<div class="explorer-context-actions menu-actions" data-context-action-list>' +
+      '<button class="secondary" type="button" data-context-watch>Watch</button>' +
+      '<button class="secondary" type="button" data-context-new-file>New file</button>' +
+      '<button class="secondary" type="button" data-context-new-folder>New folder</button>' +
+      '<button class="secondary" type="button" data-context-select>Select</button>' +
+      '<button class="secondary danger-action" type="button" data-context-delete>Delete</button>' +
+    '</div>' +
+    '<div class="explorer-context-form" data-context-new-file-form hidden>' +
+      '<div class="explorer-context-title"><span>New file</span><code>' + escapeHtmlServer(directoryLabel) + '</code></div>' +
+      '<label class="explorer-context-label" for="contextMarkdownTitle">Name</label>' +
+      '<input id="contextMarkdownTitle" placeholder="Document title" value="New document" />' +
+      '<label class="explorer-context-label" for="contextMarkdownPath">Path</label>' +
+      '<input id="contextMarkdownPath" data-auto-path="true" placeholder="path/to/file.md" value="' + escapeHtmlServer(defaultPath) + '" />' +
+      '<div class="explorer-context-actions form-actions"><button id="contextCancelMarkdown" class="secondary" type="button" title="Cancel" aria-label="Cancel">Cancel</button><button id="contextCreateMarkdown" class="primary" type="button">Create</button></div>' +
+    '</div>' +
+    '<div class="explorer-context-form" data-context-new-folder-form hidden>' +
+      '<div class="explorer-context-title"><span>New folder</span><code>' + escapeHtmlServer(directoryLabel) + '</code></div>' +
+      '<label class="explorer-context-label" for="contextFolderPath">Path</label>' +
+      '<input id="contextFolderPath" placeholder="path/to/folder" value="' + escapeHtmlServer(defaultFolderPath) + '" />' +
+      '<div class="explorer-context-actions form-actions"><button id="contextCancelFolder" class="secondary" type="button" title="Cancel" aria-label="Cancel">Cancel</button><button id="contextCreateFolder" class="primary" type="button">Create</button></div>' +
+    '</div>';
+}
+
+function defaultMarkdownPathForDirectory(directory, title = "New document") {
+  const slug = slugifyServer(String(title || "New document")) || "new-document";
+  return (directory ? directory.replace(/\/$/, "") + "/" : "") + slug + ".md";
+}
+
+function defaultFolderPathForDirectory(directory, title = "New folder") {
+  const slug = slugifyServer(String(title || "New folder")) || "new-folder";
+  return (directory ? directory.replace(/\/$/, "") + "/" : "") + slug;
+}
+
+function slugifyServer(value) {
+  return String(value || "")
+    .toLowerCase()
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "");
+}
+
+export function renderTemplateOptionsMarkup(templates = DEFAULT_MARKDOWN_TEMPLATES, selectedId = "context-golden") {
+  return visibleMarkdownTemplates(templates).map((template) => '<option value="' + escapeHtmlServer(template.id) + '" ' + (template.id === selectedId ? 'selected' : '') + '>' + escapeHtmlServer(template.title) + '</option>').join("");
+}
+
+function escapeHtmlServer(value) {
+  return String(value).replace(/[&<>"]/g, (ch) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", "\"": "&quot;" }[ch]));
+}
+
+function normalizeMarkdownTemplateTarget(relPath) {
+  const normalized = normalizeRelPath(String(relPath || ""));
+  if (!normalized) throw new Error("Markdown path is required");
+  if (path.extname(normalized) !== ".md") throw new Error("Template target must be Markdown (.md)");
+  return normalized;
+}
+
+function renderMarkdownTemplateForPath(root, normalized, { title = "New document", templateId = "context-golden" } = {}) {
+  const template = markdownTemplatesForSettings(readMemoryWebappSettings(root)).find((item) => item.id === templateId);
+  if (!template) throw new Error(`Unknown markdown template: ${templateId}`);
+  const safeTitle = String(title || path.basename(normalized, ".md")).trim() || path.basename(normalized, ".md");
+  return renderMarkdownTemplate(template.content, { title: safeTitle, path: normalized });
+}
+
+function renderMarkdownTemplate(content, values = {}) {
+  return String(content || "").replace(/\{\{\s*(title|path)\s*\}\}/g, (_match, key) => values[key] || "");
+}
+
 export function deleteMemoryPaths(root, relPaths = []) {
   if (!Array.isArray(relPaths) || relPaths.length === 0) throw new Error("No paths selected for deletion");
+  const settings = readMemoryWebappSettings(root);
   const deleted = [];
   const uniquePaths = [...new Set(relPaths.map((item) => normalizeRelPath(String(item || ""))).filter(Boolean))];
   for (const relPath of uniquePaths) {
@@ -268,7 +434,7 @@ export function deleteMemoryPaths(root, relPaths = []) {
       const prefix = externalPrefixForPath(normalized);
       const baseDir = resolveExternalPath(prefix);
       if (!prefix || !baseDir) throw new Error(`Path not allowed in context room: ${relPath}`);
-      const files = walkExternalTextFiles(abs, baseDir, prefix).filter((file) => isAllowedMemoryPath(file));
+      const files = walkExternalTextFiles(abs, baseDir, prefix).filter((file) => isAllowedMemoryPath(file, settings));
       for (const file of files.sort((a, b) => b.length - a.length)) {
         const fileAbs = resolveExternalPath(file);
         if (fileAbs && fs.existsSync(fileAbs)) {
@@ -279,7 +445,7 @@ export function deleteMemoryPaths(root, relPaths = []) {
       pruneEmptyDirs(abs, baseDir);
       continue;
     }
-    if (isAllowedMemoryPath(normalized)) {
+    if (isAllowedMemoryPath(normalized, settings)) {
       const abs = resolveMemoryPath(root, normalized);
       if (fs.existsSync(abs)) {
         const stats = fs.statSync(abs);
@@ -289,11 +455,11 @@ export function deleteMemoryPaths(root, relPaths = []) {
       }
       continue;
     }
-    if (!isAllowedFolderPath(normalized)) throw new Error(`Path not allowed in context room: ${relPath}`);
+    if (!isAllowedFolderPath(normalized, settings)) throw new Error(`Path not allowed in context room: ${relPath}`);
     const absDir = path.resolve(root, normalized);
     if (!fs.existsSync(absDir)) continue;
     if (!fs.statSync(absDir).isDirectory()) throw new Error(`Not a folder: ${relPath}`);
-    const files = walkTextFiles(absDir, root).filter((file) => isAllowedMemoryPath(file));
+    const files = walkTextFiles(absDir, root, settings).filter((file) => isAllowedMemoryPath(file, settings));
     for (const file of files.sort((a, b) => b.length - a.length)) {
       const abs = resolveMemoryPath(root, file);
       if (fs.existsSync(abs)) {
@@ -898,6 +1064,8 @@ export function createDefaultProjectConfig({ title = "Context Room", allowedPath
     allowedPaths: sanitizePathList(allowedPaths),
     watchAllow: sanitizePathList(watchAllow),
     integrations: { hermes: false },
+    bestPractices: [...DOCUMENTATION_BEST_PRACTICES],
+    markdownTemplates: DEFAULT_MARKDOWN_TEMPLATES.map(normalizeMarkdownTemplate).filter(Boolean),
     hubCards: { ...DEFAULT_HUB_CARD_VISIBILITY },
     customHubCards: DEFAULT_HUB_CARDS.map(normalizeHubCardDefinition),
     hubSections,
@@ -1077,10 +1245,49 @@ function normalizeMemoryWebappSettings(raw = {}, base = defaultMemoryWebappSetti
     allowedPaths: sanitizePathList(raw.allowedPaths ?? base.allowedPaths ?? ALLOWED_PREFIXES),
     watchAllow: sanitizePathList(raw.watchAllow ?? base.watchAllow),
     integrations: { hermes: Boolean(raw.integrations?.hermes ?? base.integrations?.hermes ?? false) },
+    bestPractices: sanitizeTextList(raw.bestPractices ?? base.bestPractices ?? DOCUMENTATION_BEST_PRACTICES),
+    markdownTemplates: sanitizeMarkdownTemplates(raw.markdownTemplates ?? base.markdownTemplates ?? DEFAULT_MARKDOWN_TEMPLATES),
     hubCards,
     customHubCards,
     hubSections,
   };
+}
+
+function markdownTemplatesForSettings(settings = defaultMemoryWebappSettings()) {
+  return sanitizeMarkdownTemplates(settings.markdownTemplates?.length ? settings.markdownTemplates : DEFAULT_MARKDOWN_TEMPLATES);
+}
+
+function sanitizeTextList(value) {
+  if (!Array.isArray(value)) return [];
+  return value.map((item) => String(item || "").trim()).filter(Boolean).slice(0, 12);
+}
+
+function sanitizeMarkdownTemplates(value) {
+  if (!Array.isArray(value)) return [];
+  const seen = new Set();
+  return value.map(normalizeMarkdownTemplate).filter((template) => {
+    if (!template || seen.has(template.id)) return false;
+    seen.add(template.id);
+    return true;
+  });
+}
+
+function normalizeMarkdownTemplate(template = {}, index = 0) {
+  const title = String(template.title || template.name || "").trim() || `Template ${index + 1}`;
+  const id = sanitizeHubCardId(template.id || title || `template-${index + 1}`);
+  const content = String(template.content || "").trimEnd() + "\n";
+  if (!id || !title || !content.trim()) return null;
+  return {
+    id,
+    title,
+    description: String(template.description || "").trim(),
+    content,
+    enabled: template.enabled !== false,
+  };
+}
+
+function visibleMarkdownTemplates(templates = []) {
+  return templates.filter((template) => template.enabled !== false);
 }
 
 function sanitizeHubSectionDefinitions(sections = []) {
@@ -1266,6 +1473,21 @@ async function routeRequest(req, res, root) {
     sendJson(res, 200, writeMemoryFile(root, body.path, body.content));
     return;
   }
+  if (req.method === "POST" && url.pathname === "/api/markdown/create") {
+    const body = await readJsonBody(req);
+    sendJson(res, 200, createMarkdownFile(root, { path: body.path, title: body.title, templateId: body.templateId }));
+    return;
+  }
+  if (req.method === "POST" && url.pathname === "/api/folder/create") {
+    const body = await readJsonBody(req);
+    sendJson(res, 200, createFolder(root, { path: body.path }));
+    return;
+  }
+  if (req.method === "POST" && url.pathname === "/api/markdown/apply-template") {
+    const body = await readJsonBody(req);
+    sendJson(res, 200, applyMarkdownTemplateToFile(root, { path: body.path, title: body.title, templateId: body.templateId }));
+    return;
+  }
   if (req.method === "POST" && url.pathname === "/api/files/delete") {
     const body = await readJsonBody(req);
     sendJson(res, 200, deleteMemoryPaths(root, body.paths));
@@ -1326,12 +1548,16 @@ function walkExternalTextFiles(dir, baseDir, virtualPrefix) {
   return results;
 }
 
-function isAllowedFolderPath(relPath) {
+function isAllowedFolderPath(relPath, settings = defaultMemoryWebappSettings()) {
   const normalized = normalizeRelPath(relPath).replace(/\/$/, "");
   if (!normalized || normalized.startsWith("../") || normalized.includes("/../") || path.isAbsolute(normalized)) return false;
   if (isBlockedPath(normalized)) return false;
   if (normalized.startsWith("~")) return false;
-  return ALLOWED_PREFIXES.some((prefix) => normalized === prefix.replace(/\/$/, "") || normalized.startsWith(prefix));
+  const allowed = sanitizePathList(settings.allowedPaths || ALLOWED_PREFIXES);
+  return allowed.some((prefix) => {
+    const clean = prefix.replace(/\/$/, "");
+    return normalized === clean || normalized.startsWith(clean + "/");
+  });
 }
 
 function isAllowedExternalPath(relPath) {
@@ -1554,6 +1780,22 @@ export function renderAppHtml() {
     .watch-filter { border: 1px solid rgba(148,163,184,0.16); border-radius: 999px; padding: 4px 7px; background: rgba(255,255,255,0.035); color: var(--muted); cursor: pointer; font-size: 10px; font-weight: 850; line-height: 1; }
     .watch-filter:hover { color: var(--text); background: rgba(139,211,255,0.08); }
     .watch-filter.active { color: #07101e; border-color: transparent; background: linear-gradient(135deg, var(--accent), var(--accent-2)); }
+    .explorer-context-menu { position: fixed; z-index: 80; width: min(245px, calc(100vw - 24px)); border: 1px solid rgba(139,211,255,0.24); border-radius: 14px; background: rgba(8,13,27,0.96); box-shadow: 0 18px 48px rgba(0,0,0,0.38); backdrop-filter: blur(20px); padding: 8px; display: grid; gap: 7px; }
+    .explorer-context-menu[hidden] { display: none; }
+    .explorer-context-title { display: grid; gap: 2px; color: #dce8fb; font-size: 11px; font-weight: 900; padding: 2px 4px; }
+    .explorer-context-title code { color: var(--accent); font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 10px; font-weight: 700; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .explorer-context-form { display: grid; gap: 7px; }
+    .explorer-context-form[hidden] { display: none; }
+    .explorer-context-label { color: var(--muted); font-size: 10px; font-weight: 850; text-transform: uppercase; letter-spacing: 0.08em; padding: 0 2px; }
+    .explorer-context-form input, .explorer-context-form select, .file-template-select { width: 100%; padding: 8px 10px; border: 1px solid rgba(148,163,184,0.18); border-radius: 10px; background: rgba(255,255,255,0.045); color: var(--text); font: 12px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace; }
+    .explorer-context-form input:focus { outline: none; border-color: rgba(139,211,255,0.5); background: rgba(139,211,255,0.06); }
+    .explorer-context-actions { display: grid; grid-template-columns: 1fr auto; gap: 6px; align-items: center; }
+    .explorer-context-actions[hidden] { display: none; }
+    .explorer-context-actions.menu-actions { grid-template-columns: 1fr; }
+    .explorer-context-actions.form-actions { grid-template-columns: 1fr 1fr; gap: 8px; }
+    .explorer-context-menu .explorer-context-actions button { padding: 8px 10px; border-radius: 10px; font-size: 12px; line-height: 1.2; }
+    .empty-template-actions { display: grid; grid-template-columns: minmax(140px, 220px) auto; gap: 8px; align-items: center; }
+    .empty-template-actions .file-template-select { min-width: 0; }
     .explorer-title { color: var(--accent); font-size: 11px; font-weight: 850; text-transform: uppercase; letter-spacing: 0.12em; margin: 10px 0 6px; }
     .tree { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; font-size: 13px; line-height: 1.35; overflow: visible; padding-right: 4px; }
     .tree-node { min-width: 0; }
@@ -1613,6 +1855,10 @@ export function renderAppHtml() {
     .issue.critical { border-left-color: var(--danger); }
     .issue.high { border-left-color: #ffc46b; }
     .docqa-actions { display: flex; gap: 8px; flex-wrap: wrap; }
+    .markdown-tools { padding: 16px 18px 18px; display: grid; gap: 16px; }
+    .best-practice-list { margin: 0; padding-left: 20px; display: grid; gap: 7px; color: #d7e2f4; font-size: 13px; line-height: 1.45; }
+    .markdown-create { display: grid; grid-template-columns: 1fr 1fr auto auto; gap: 10px; align-items: end; }
+    .markdown-create .settings-field select { display: block; width: 100%; padding: 10px; border: 1px solid rgba(148,163,184,0.18); border-radius: 14px; background: rgba(255,255,255,0.045); color: var(--text); font: 12px/1.45 ui-monospace, SFMono-Regular, Menlo, monospace; }
     .settings-page { height: 100%; overflow: auto; padding: 24px; background: radial-gradient(circle at 20% 0%, rgba(182,156,255,0.14), transparent 28rem), rgba(3, 7, 18, 0.36); }
     .settings-page .settings-card { max-width: 1180px; margin: 0 auto; }
     .settings-card { box-shadow: var(--shadow); background: rgba(8,13,27,0.76); border: 1px solid var(--line); backdrop-filter: blur(18px); }
@@ -1636,6 +1882,13 @@ export function renderAppHtml() {
     .hub-card-editor-title { display: flex; gap: 8px; align-items: center; color: #dce8fb; font-size: 12px; font-weight: 850; }
     .hub-card-editor-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
     .hub-card-editor .paths { grid-column: 1 / -1; }
+    .template-editor { display: grid; gap: 10px; padding: 12px; border: 1px solid rgba(148,163,184,0.16); border-radius: 18px; background: rgba(255,255,255,0.035); }
+    .template-editor-head { display: flex; justify-content: space-between; gap: 10px; align-items: center; color: #dce8fb; font-size: 12px; font-weight: 850; }
+    .template-enabled-toggle { display: inline-flex; gap: 8px; align-items: center; color: #dce8fb; font-size: 12px; font-weight: 850; }
+    .template-enabled-toggle input { width: auto; accent-color: var(--accent); }
+    .template-editor-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+    .template-editor .template-body { grid-column: 1 / -1; }
+    .template-editor .template-body textarea { min-height: 220px; height: 220px; }
     .settings-footer { display: flex; justify-content: space-between; gap: 12px; align-items: center; color: var(--muted); font-size: 12px; }
     .hub-folders { margin-top: 16px; display: grid; gap: 26px; }
     .hub-breadcrumb { display: flex; flex-wrap: wrap; align-items: center; gap: 7px; margin-bottom: -6px; padding: 10px 12px; border: 1px solid rgba(139,211,255,0.18); border-radius: 18px; background: rgba(8,13,27,0.58); color: var(--muted); font-size: 12px; font-weight: 800; }
@@ -1779,7 +2032,7 @@ export function renderAppHtml() {
       .review-list { max-height: none; }
       .review-item { padding: 11px; }
       .review-top { align-items: flex-start; }
-      .hub-section-grid, .settings-grid, .hub-card-editor-grid { grid-template-columns: 1fr; }
+      .hub-section-grid, .settings-grid, .hub-card-editor-grid, .template-editor-grid, .markdown-create { grid-template-columns: 1fr; }
       .hub-folders { gap: 18px; }
       .hub-folder-card { min-height: 116px; padding: 15px; border-radius: 18px; }
       .hub-folder-card strong { font-size: 18px; }
@@ -1911,6 +2164,15 @@ export function renderAppHtml() {
               </header>
               <div id="reviewQueue" class="review-list"></div>
             </section>
+            <section class="docqa-panel markdown-panel">
+              <header>
+                <div>
+                  <h2>Docs best practices</h2>
+                  <div class="muted">create scoped Markdown files from lightweight templates</div>
+                </div>
+              </header>
+              <div id="markdownTools" class="markdown-tools"></div>
+            </section>
           </div>
           <div id="hubFolders" class="hub-folders"></div>
         </div>
@@ -1930,6 +2192,7 @@ export function renderAppHtml() {
       </section>
     </main>
   </div>
+  <div id="explorerContextMenu" class="explorer-context-menu" hidden></div>
 <script>
 const state = { files: [], docqa: null, settings: null, settingsOpen: false, page: "hub", availableHubCards: [], hubFolders: [], hubSections: [], rootHubSections: [], activeHubCardId: null, selectedReview: null, selected: null, selectedDiff: null, diffCollapsed: false, saved: "", savedHash: null, dirty: false, mode: "view", homeView: "root", planetStack: ["root"], filePanel: false, history: [], historyIndex: -1, pathFilters: [], explorerWatchFilter: "all", selectedForDelete: new Set(), selectionRequest: 0, mobileSidebarTouched: false, expanded: new Set(["data", "automations", "integrations", "skills", "tools", "~", "~/.hermes", "~/.hermes/memories", "~/.hermes/skills"]) };
 const MAIN_FILE_PATHS = new Set([
@@ -2103,16 +2366,15 @@ function renderFiles() {
   updateExplorerWatchFilterButtons();
   document.querySelectorAll("[data-file-path]").forEach((button) => {
     button.addEventListener("click", (event) => {
+      hideExplorerContextMenu();
       if (shouldToggleSelection(event)) toggleDeleteSelection(button.dataset.filePath);
       else selectFile(button.dataset.filePath).catch((error) => setStatus(error.message));
     });
-    button.addEventListener("contextmenu", (event) => {
-      event.preventDefault();
-      toggleDeleteSelection(button.dataset.filePath);
-    });
+    button.addEventListener("contextmenu", (event) => openExplorerContextMenu(event, { kind: "file", path: button.dataset.filePath }));
   });
   document.querySelectorAll("[data-folder-path]").forEach((button) => {
     button.addEventListener("click", (event) => {
+      hideExplorerContextMenu();
       const selectPath = button.dataset.folderPath + "/";
       if (shouldToggleSelection(event)) toggleDeleteSelection(selectPath);
       else {
@@ -2120,10 +2382,7 @@ function renderFiles() {
         toggleFolder(button.dataset.folderPath);
       }
     });
-    button.addEventListener("contextmenu", (event) => {
-      event.preventDefault();
-      toggleDeleteSelection(button.dataset.folderPath + "/");
-    });
+    button.addEventListener("contextmenu", (event) => openExplorerContextMenu(event, { kind: "folder", path: button.dataset.folderPath }));
   });
   document.querySelectorAll("[data-toggle-folder]").forEach((button) => button.addEventListener("click", (event) => {
     event.stopPropagation();
@@ -2135,6 +2394,204 @@ function renderFiles() {
 
 function shouldToggleSelection(event) {
   return event.metaKey || event.ctrlKey || event.shiftKey || state.selectedForDelete.size > 0;
+}
+
+function openExplorerContextMenu(event, target) {
+  event.preventDefault();
+  event.stopPropagation();
+  const directory = explorerTargetDirectory(target);
+  state.explorerContextTarget = { kind: target.kind, path: normalizeUiPath(target.path), directory };
+  renderExplorerContextMenu(event.clientX, event.clientY);
+}
+
+function explorerTargetDirectory(target = {}) {
+  const relPath = normalizeUiPath(target.path || "");
+  if (target.kind === "folder") return relPath.replace(/\/$/, "");
+  return parentDirectoryFromUiPath(relPath);
+}
+
+function parentDirectoryFromUiPath(relPath) {
+  const parts = normalizeUiPath(relPath).split("/").filter(Boolean);
+  parts.pop();
+  return parts.join("/");
+}
+
+function defaultMarkdownPathForDirectory(directory, title = "New document") {
+  const slug = slugifyUiId(title) || "new-document";
+  return (directory ? directory.replace(/\/$/, "") + "/" : "") + slug + ".md";
+}
+
+function defaultFolderPathForDirectory(directory, title = "New folder") {
+  const slug = slugifyUiId(title) || "new-folder";
+  return (directory ? directory.replace(/\/$/, "") + "/" : "") + slug;
+}
+
+function renderExplorerContextMenu(x, y) {
+  const menu = el("explorerContextMenu");
+  const target = state.explorerContextTarget;
+  if (!menu || !target || !state.settings) return;
+  const directoryLabel = target.directory || "project root";
+  const label = target.path || directoryLabel;
+  menu.innerHTML = '<div class="explorer-context-title"><span>Actions</span><code>' + escapeHtml(label) + '</code></div>' +
+    '<div class="explorer-context-actions menu-actions" data-context-action-list>' +
+      '<button class="secondary" type="button" data-context-watch>Watch</button>' +
+      '<button class="secondary" type="button" data-context-new-file>New file</button>' +
+      '<button class="secondary" type="button" data-context-new-folder>New folder</button>' +
+      '<button class="secondary" type="button" data-context-select>Select</button>' +
+      '<button class="secondary danger-action" type="button" data-context-delete>Delete</button>' +
+    '</div>' +
+    '<div class="explorer-context-form" data-context-new-file-form hidden>' +
+      '<div class="explorer-context-title"><span>New file</span><code>' + escapeHtml(directoryLabel) + '</code></div>' +
+      '<label class="explorer-context-label" for="contextMarkdownTitle">Name</label>' +
+      '<input id="contextMarkdownTitle" placeholder="Document title" value="New document" />' +
+      '<label class="explorer-context-label" for="contextMarkdownPath">Path</label>' +
+      '<input id="contextMarkdownPath" data-auto-path="true" placeholder="path/to/file.md" value="' + escapeHtml(defaultMarkdownPathForDirectory(target.directory)) + '" />' +
+      '<div class="explorer-context-actions form-actions"><button id="contextCancelMarkdown" class="secondary" type="button" title="Cancel" aria-label="Cancel">Cancel</button><button id="contextCreateMarkdown" class="primary" type="button">Create</button></div>' +
+    '</div>' +
+    '<div class="explorer-context-form" data-context-new-folder-form hidden>' +
+      '<div class="explorer-context-title"><span>New folder</span><code>' + escapeHtml(directoryLabel) + '</code></div>' +
+      '<label class="explorer-context-label" for="contextFolderPath">Path</label>' +
+      '<input id="contextFolderPath" placeholder="path/to/folder" value="' + escapeHtml(defaultFolderPathForDirectory(target.directory)) + '" />' +
+      '<div class="explorer-context-actions form-actions"><button id="contextCancelFolder" class="secondary" type="button" title="Cancel" aria-label="Cancel">Cancel</button><button id="contextCreateFolder" class="primary" type="button">Create</button></div>' +
+    '</div>';
+  menu.hidden = false;
+  menu.style.left = x + "px";
+  menu.style.top = y + "px";
+  clampContextMenuToViewport(menu);
+  document.querySelector("[data-context-watch]")?.addEventListener("click", () => watchExplorerContextTarget().catch((error) => setStatus(error.message)));
+  document.querySelector("[data-context-new-file]")?.addEventListener("click", showContextNewFileForm);
+  document.querySelector("[data-context-new-folder]")?.addEventListener("click", showContextNewFolderForm);
+  document.querySelector("[data-context-select]")?.addEventListener("click", selectExplorerContextTarget);
+  document.querySelector("[data-context-delete]")?.addEventListener("click", () => deleteExplorerContextTarget().catch((error) => setStatus(error.message)));
+  el("contextMarkdownTitle")?.addEventListener("input", suggestContextMarkdownPath);
+  el("contextMarkdownPath")?.addEventListener("input", () => { el("contextMarkdownPath").dataset.autoPath = "false"; });
+  el("contextCreateMarkdown")?.addEventListener("click", () => createMarkdownFromContextMenu().catch((error) => setStatus(error.message)));
+  el("contextCancelMarkdown")?.addEventListener("click", hideExplorerContextMenu);
+  el("contextCreateFolder")?.addEventListener("click", () => createFolderFromContextMenu().catch((error) => setStatus(error.message)));
+  el("contextCancelFolder")?.addEventListener("click", hideExplorerContextMenu);
+}
+
+function hideContextCreationForms() {
+  const actionList = document.querySelector("[data-context-action-list]");
+  const fileForm = document.querySelector("[data-context-new-file-form]");
+  const folderForm = document.querySelector("[data-context-new-folder-form]");
+  if (actionList) actionList.hidden = false;
+  if (fileForm) fileForm.hidden = true;
+  if (folderForm) folderForm.hidden = true;
+}
+
+function showContextNewFileForm() {
+  hideContextCreationForms();
+  const actionList = document.querySelector("[data-context-action-list]");
+  const form = document.querySelector("[data-context-new-file-form]");
+  if (actionList) actionList.hidden = true;
+  if (!form) return;
+  form.hidden = false;
+  el("contextMarkdownTitle")?.focus();
+  el("contextMarkdownTitle")?.select();
+}
+
+function showContextNewFolderForm() {
+  hideContextCreationForms();
+  const actionList = document.querySelector("[data-context-action-list]");
+  const form = document.querySelector("[data-context-new-folder-form]");
+  if (actionList) actionList.hidden = true;
+  if (!form) return;
+  form.hidden = false;
+  el("contextFolderPath")?.focus();
+  el("contextFolderPath")?.select();
+}
+
+function clampContextMenuToViewport(menu) {
+  window.requestAnimationFrame(() => {
+    const rect = menu.getBoundingClientRect();
+    const left = Math.min(Math.max(8, rect.left), window.innerWidth - rect.width - 8);
+    const top = Math.min(Math.max(8, rect.top), window.innerHeight - rect.height - 8);
+    menu.style.left = left + "px";
+    menu.style.top = top + "px";
+  });
+}
+
+function suggestContextMarkdownPath() {
+  const pathInput = el("contextMarkdownPath");
+  if (!pathInput || pathInput.dataset.autoPath === "false") return;
+  const title = el("contextMarkdownTitle")?.value || "New document";
+  pathInput.value = defaultMarkdownPathForDirectory(state.explorerContextTarget?.directory || "", title);
+}
+
+function hideExplorerContextMenu() {
+  const menu = el("explorerContextMenu");
+  if (menu) menu.hidden = true;
+}
+
+function selectionPathForExplorerTarget(target) {
+  if (!target?.path) return "";
+  return target.kind === "folder" ? target.path.replace(/\/$/, "") + "/" : target.path;
+}
+
+function contextTargetSelectionPath() {
+  return selectionPathForExplorerTarget(state.explorerContextTarget);
+}
+
+function contextMenuActionPaths() {
+  const selectionPath = contextTargetSelectionPath();
+  return selectionPath ? [selectionPath] : [];
+}
+
+function selectExplorerContextTarget() {
+  const selectionPath = contextTargetSelectionPath();
+  if (!selectionPath) return;
+  hideExplorerContextMenu();
+  toggleDeleteSelection(selectionPath);
+}
+
+async function watchExplorerContextTarget() {
+  const selectionPath = contextTargetSelectionPath();
+  if (!selectionPath) return;
+  hideExplorerContextMenu();
+  await updateWatchSelection(selectionPath, "allow");
+}
+
+async function deleteExplorerContextTarget() {
+  const paths = contextMenuActionPaths();
+  if (!paths.length) return;
+  hideExplorerContextMenu();
+  await deletePaths(paths);
+}
+
+async function createMarkdownFromContextMenu() {
+  const relPath = normalizeUiPath(el("contextMarkdownPath")?.value || "");
+  if (!relPath) throw new Error("New markdown path is required");
+  setStatus("creating markdown...");
+  const result = await api("/api/markdown/create", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ path: relPath }),
+  });
+  hideExplorerContextMenu();
+  const parent = parentDirectoryFromUiPath(result.path);
+  if (parent) state.expanded.add(parent);
+  await loadFiles();
+  await selectFile(result.path, { revealInExplorer: true });
+  setStatus("markdown file created");
+}
+
+async function createFolderFromContextMenu() {
+  const relPath = normalizeUiPath(el("contextFolderPath")?.value || "");
+  if (!relPath) throw new Error("New folder path is required");
+  setStatus("creating folder...");
+  const result = await api("/api/folder/create", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ path: relPath }),
+  });
+  hideExplorerContextMenu();
+  const folderPath = result.path.replace(/\/$/, "");
+  if (folderPath) state.expanded.add(folderPath);
+  const parent = parentDirectoryFromUiPath(folderPath);
+  if (parent) state.expanded.add(parent);
+  await loadFiles();
+  setStatus("folder created");
 }
 
 function openSidebarIfCollapsed() {
@@ -2226,7 +2683,7 @@ function renderTreeNode(node, depth) {
     const selected = state.selectedForDelete.has(file.path);
     const watchClass = watchStateForPath(file.path, state.settings?.watchAllow || []);
     return '<div class="tree-node tree-entry ' + [selected ? "selected" : "", watchClass].filter(Boolean).join(" ") + '">' +
-      '<button class="tree-row file ' + (state.selected === file.path ? "active" : "") + '" style="padding-left:' + (depth * 12 + 7) + 'px" data-file-path="' + escapeHtml(file.path) + '" title="open · right-click or ⌘-click to select">' +
+      '<button class="tree-row file ' + (state.selected === file.path ? "active" : "") + '" style="padding-left:' + (depth * 12 + 7) + 'px" data-file-path="' + escapeHtml(file.path) + '" title="open · right-click for actions · ⌘-click to select">' +
         '<span class="twisty"></span><span class="icon">' + iconForPath(file.path) + '</span><span class="tree-name">' + escapeHtml(file.label || node.name) + '</span>' +
       '</button>' +
     '</div>';
@@ -2237,7 +2694,7 @@ function renderTreeNode(node, depth) {
   const watchClass = watchStateForPath(selectPath, state.settings?.watchAllow || []);
   return '<div class="tree-node">' +
     '<div class="tree-entry ' + [selected ? "selected" : "", watchClass].filter(Boolean).join(" ") + '">' +
-      '<button class="tree-row folder" style="padding-left:' + (depth * 12 + 7) + 'px" data-folder-path="' + escapeHtml(node.path) + '" title="open · right-click or ⌘-click to select">' +
+      '<button class="tree-row folder" style="padding-left:' + (depth * 12 + 7) + 'px" data-folder-path="' + escapeHtml(node.path) + '" title="open · right-click for actions · ⌘-click to select">' +
         '<span class="twisty" data-toggle-folder="' + escapeHtml(node.path) + '" title="ouvrir/fermer">' + (open ? "▾" : "▸") + '</span><span class="icon">' + (open ? "📂" : "📁") + '</span><span class="tree-name">' + escapeHtml(node.name) + '</span>' +
       '</button>' +
     '</div>' +
@@ -2482,7 +2939,24 @@ function renderDocQaDashboard() {
   document.querySelectorAll("[data-review-path]").forEach((button) => button.addEventListener("click", () => {
     selectFile(button.dataset.reviewPath, { revealInExplorer: !isNarrowLayout() }).catch((error) => setStatus(error.message));
   }));
+  renderMarkdownTools();
   renderHubFolders();
+}
+
+function renderMarkdownTools() {
+  const holder = el("markdownTools");
+  if (!holder || !state.settings) return;
+  const bestPractices = state.settings.bestPractices || [];
+  holder.innerHTML = '<ol class="best-practice-list">' + bestPractices.map((item) => '<li>' + escapeHtml(item) + '</li>').join("") + '</ol>';
+}
+
+function visibleMarkdownTemplates(templates = []) {
+  return templates.filter((template) => template.enabled !== false);
+}
+
+function renderTemplateOptions(selectedId = "context-golden") {
+  const templates = state.settings?.markdownTemplates || [];
+  return visibleMarkdownTemplates(templates).map((template) => '<option value="' + escapeHtml(template.id) + '" ' + (template.id === selectedId ? 'selected' : '') + '>' + escapeHtml(template.title) + '</option>').join("");
 }
 
 function renderReviewSummary(summary = {}) {
@@ -2513,8 +2987,9 @@ function renderReviewItem(item) {
   '</button>';
 }
 
-function renderFileActionButtons({ hasReviewItem = false, dirty = false } = {}) {
+function renderFileActionButtons({ hasReviewItem = false, dirty = false, canApplyTemplate = false } = {}) {
   return '<div class="file-actions">' +
+    (canApplyTemplate ? '<div class="empty-template-actions"><select class="file-template-select" data-empty-template-select aria-label="Template">' + renderTemplateOptions() + '</select><button class="file-action" type="button" data-apply-template>Use template</button></div>' : '') +
     (hasReviewItem ? '<button class="file-action" type="button" data-file-verify>Mark verified</button>' : '') +
     '<button class="file-action danger-action" type="button" data-file-delete>Delete</button>' +
     '<button class="file-action primary" type="button" data-file-save ' + (!dirty ? 'disabled' : '') + '>Save</button>' +
@@ -2529,17 +3004,49 @@ function renderSettingsPanel() {
   const holder = el("settingsPanel");
   if (!holder || !state.settings) return;
   const watchAllow = (state.settings.watchAllow || []).join("\n");
+  const bestPractices = (state.settings.bestPractices || []).join("\n");
+  const markdownTemplates = state.settings.markdownTemplates || [];
   const sections = state.settings.hubSections?.length ? state.settings.hubSections : [{ id: "main", title: "Main", cards: state.settings.customHubCards || state.availableHubCards || [] }];
   holder.innerHTML = '<div class="settings-grid">' +
     '<div class="settings-field"><label for="watchAllow">Watched folders/files</label><textarea id="watchAllow" placeholder="one path per line · empty = nothing to review">' + escapeHtml(watchAllow) + '</textarea></div>' +
+    '<div class="settings-field"><label for="bestPractices">Docs best practices</label><textarea id="bestPractices" placeholder="one practice per line">' + escapeHtml(bestPractices) + '</textarea></div>' +
   '</div>' +
+  '<div><div class="settings-title">Markdown templates</div><div class="hub-card-options" id="markdownTemplateEditors">' +
+    markdownTemplates.map(renderMarkdownTemplateEditor).join("") +
+  '</div></div>' +
   '<div><div class="settings-title">Hub sections and cards</div><div class="hub-card-options" id="hubSectionEditors">' +
     sections.map(renderHubSectionEditor).join("") +
   '</div></div>' +
-  '<div class="settings-footer"><span>A card can open files/folders or contain child cards.</span><div class="docqa-actions"><button id="addHubSection" class="secondary" type="button">+ section</button><button id="saveSettings" class="secondary" type="button">save settings</button></div></div>';
+  '<div class="settings-footer"><span>A card can open files/folders or contain child cards.</span><div class="docqa-actions"><button id="addMarkdownTemplate" class="secondary" type="button">+ template</button><button id="addHubSection" class="secondary" type="button">+ section</button><button id="saveSettings" class="secondary" type="button">save settings</button></div></div>';
   wireHubSettingsButtons(holder);
+  wireMarkdownTemplateButtons(holder);
+  el("addMarkdownTemplate")?.addEventListener("click", addMarkdownTemplateEditor);
   el("addHubSection")?.addEventListener("click", addHubSectionEditor);
   el("saveSettings")?.addEventListener("click", saveSettings);
+}
+
+function renderMarkdownTemplateEditor(template = {}) {
+  const enabled = template.enabled !== false;
+  return '<div class="template-editor" data-markdown-template-editor data-template-id="' + escapeHtml(template.id || "") + '">' +
+    '<div class="template-editor-head"><label class="template-enabled-toggle"><input type="checkbox" data-template-enabled ' + (enabled ? 'checked' : '') + ' /> Show in selector</label><button class="selection-action danger-action" type="button" data-remove-markdown-template title="remove this template">×</button></div>' +
+    '<div class="template-editor-grid">' +
+      '<div class="settings-field"><label>Id</label><input data-template-id-input value="' + escapeHtml(template.id || "") + '" placeholder="context-golden" /></div>' +
+      '<div class="settings-field"><label>Name</label><input data-template-title value="' + escapeHtml(template.title || "") + '" placeholder="Golden context file" /></div>' +
+      '<div class="settings-field"><label>Description</label><input data-template-description value="' + escapeHtml(template.description || "") + '" placeholder="When to use this template" /></div>' +
+      '<div class="settings-field template-body"><label>Content</label><textarea data-template-content placeholder="# {{title}}&#10;&#10;## Purpose&#10;...">' + escapeHtml(template.content || "") + '</textarea></div>' +
+    '</div>' +
+  '</div>';
+}
+
+function wireMarkdownTemplateButtons(root) {
+  root.querySelectorAll("[data-remove-markdown-template]").forEach((button) => button.addEventListener("click", () => button.closest(".template-editor")?.remove()));
+}
+
+function addMarkdownTemplateEditor() {
+  const holder = el("markdownTemplateEditors");
+  if (!holder) return;
+  holder.insertAdjacentHTML("beforeend", renderMarkdownTemplateEditor({ id: "custom-" + Date.now().toString(36), title: "New template", description: "", content: "# {{title}}\n\n## Purpose\n\n## Key facts\n\n## References\n" }));
+  wireMarkdownTemplateButtons(holder.lastElementChild);
 }
 
 function renderHubSectionEditor(section) {
@@ -2587,6 +3094,8 @@ function addHubCardEditor(holder) {
 
 async function saveSettings() {
   const watchAllow = linesFromTextarea("watchAllow");
+  const bestPractices = linesFromTextarea("bestPractices");
+  const markdownTemplates = collectMarkdownTemplateEditors();
   const hubSections = collectHubSectionEditors();
   const allCards = flattenUiCards(hubSections.flatMap((section) => section.cards));
   const hubCards = Object.fromEntries(allCards.map((card) => [card.id, card.enabled !== false]));
@@ -2594,7 +3103,7 @@ async function saveSettings() {
   const result = await api("/api/settings", {
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify({ settings: { watchAllow, hubCards, hubSections } }),
+    body: JSON.stringify({ settings: { watchAllow, bestPractices, markdownTemplates, hubCards, hubSections } }),
   });
   state.settings = result.settings;
   state.availableHubCards = result.availableHubCards || state.availableHubCards;
@@ -2606,6 +3115,17 @@ async function saveSettings() {
   if (state.page === "settings") renderSettingsPanel();
   else renderDocQaDashboard();
   setStatus("settings saved");
+}
+
+function collectMarkdownTemplateEditors() {
+  return [...document.querySelectorAll("[data-markdown-template-editor]")].map((row, index) => {
+    const title = row.querySelector("[data-template-title]")?.value.trim() || "Template " + (index + 1);
+    const id = slugifyUiId(row.querySelector("[data-template-id-input]")?.value || title) || "template-" + (index + 1);
+    const description = row.querySelector("[data-template-description]")?.value.trim() || "";
+    const content = row.querySelector("[data-template-content]")?.value || "";
+    const enabled = row.querySelector("[data-template-enabled]")?.checked !== false;
+    return { id, title, description, content, enabled };
+  }).filter((template) => template.title && template.content.trim());
 }
 
 function collectHubSectionEditors() {
@@ -3082,6 +3602,27 @@ function setMode() {
   if (state.selected) renderViewer();
 }
 
+async function applyTemplateToCurrentFile() {
+  if (!state.selected) return;
+  if (activeEditor().value.trim() && !confirm("This editor is not empty. Apply template anyway?")) return;
+  const templateId = document.querySelector("[data-empty-template-select]")?.value || "context-golden";
+  const title = pathTitleFromUiPath(state.selected);
+  setStatus("applying template...");
+  await api("/api/markdown/apply-template", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ path: state.selected, title, templateId }),
+  });
+  await loadFiles();
+  await selectFile(state.selected, { pushHistory: false, revealInExplorer: false });
+  setStatus("template applied");
+}
+
+function pathTitleFromUiPath(relPath) {
+  const name = normalizeUiPath(relPath).split("/").pop() || "New document";
+  return name.replace(/\.md$/i, "").split(/[-_]+/).filter(Boolean).map((part) => part.charAt(0).toUpperCase() + part.slice(1)).join(" ") || "New document";
+}
+
 function renderViewer() {
   const text = el("editor").value;
   const diff = state.selectedDiff || { changed: false, additions: 0, deletions: 0, patch: "", available: false };
@@ -3089,14 +3630,16 @@ function renderViewer() {
   const hasDiff = diff.available !== false && diff.changed;
   const diffMarkup = hasDiff ? renderDiffPanel(diff) : "";
   const showDiffButton = hasDiff && state.diffCollapsed ? '<button class="diff-toggle" type="button" data-show-diff>Show Git diff</button>' : "";
+  const canApplyTemplate = Boolean(state.selected?.endsWith(".md") && !text.trim());
   el("viewer").innerHTML = '<div class="review-workspace ' + (!hasDiff || state.diffCollapsed ? 'no-diff' : '') + '">' +
     (state.diffCollapsed ? "" : diffMarkup) +
-    '<section class="file-panel">' + showDiffButton + '<header><div class="file-header-copy"><strong>' + escapeHtml(file.label || "Document") + '</strong></div>' + renderFileActionButtons({ hasReviewItem: selectedFileNeedsReview(), dirty: state.dirty }) + '</header><textarea id="docEditor" class="doc-editor" spellcheck="false">' + escapeHtml(text) + '</textarea></section></div>';
+    '<section class="file-panel">' + showDiffButton + '<header><div class="file-header-copy"><strong>' + escapeHtml(file.label || "Document") + '</strong></div>' + renderFileActionButtons({ hasReviewItem: selectedFileNeedsReview(), dirty: state.dirty, canApplyTemplate }) + '</header><textarea id="docEditor" class="doc-editor" spellcheck="false">' + escapeHtml(text) + '</textarea></section></div>';
   document.querySelector("[data-hide-diff]")?.addEventListener("click", () => { state.diffCollapsed = true; renderViewer(); });
   document.querySelector("[data-show-diff]")?.addEventListener("click", () => { state.diffCollapsed = false; renderViewer(); });
   document.querySelector("[data-file-save]")?.addEventListener("click", () => saveCurrent().catch((error) => setStatus(error.message)));
   document.querySelector("[data-file-verify]")?.addEventListener("click", () => verifyCurrentFile().catch((error) => setStatus(error.message)));
   document.querySelector("[data-file-delete]")?.addEventListener("click", () => deletePaths([state.selected]).catch((error) => setStatus(error.message)));
+  document.querySelector("[data-apply-template]")?.addEventListener("click", () => applyTemplateToCurrentFile().catch((error) => setStatus(error.message)));
   const docEditor = el("docEditor");
   if (docEditor) {
     docEditor.addEventListener("input", () => {
@@ -3252,6 +3795,14 @@ el("editor").addEventListener("input", () => {
 el("search").addEventListener("input", () => { state.pathFilters = []; expandSearchMatches(); renderFiles(); });
 el("clearSearch").addEventListener("click", () => clearExplorerFilter());
 document.querySelectorAll("[data-watch-filter]").forEach((button) => button.addEventListener("click", () => setExplorerWatchFilter(button.dataset.watchFilter)));
+document.addEventListener("click", (event) => {
+  const menu = el("explorerContextMenu");
+  if (!menu || menu.hidden || menu.contains(event.target)) return;
+  hideExplorerContextMenu();
+});
+document.addEventListener("keydown", (event) => {
+  if (event.key === "Escape") hideExplorerContextMenu();
+});
 el("sidebarToggle").addEventListener("click", () => {
   state.mobileSidebarTouched = true;
   const app = document.querySelector(".app");
