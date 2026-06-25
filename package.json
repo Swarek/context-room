@@ -1,6 +1,6 @@
 {
   "name": "context-room",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Documentation control room for the era of AI agent loops.",
   "type": "module",
   "homepage": "https://github.com/Swarek/context-room#readme",

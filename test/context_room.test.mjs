@@ -314,3 +314,24 @@ test("app CSS keeps hidden context menu forms hidden despite form display rules"
   assert.match(html, /\.explorer-context-actions\.form-actions\s*\{\s*grid-template-columns:\s*1fr 1fr/);
   assert.match(html, /\.explorer-context-menu \.explorer-context-actions button\s*\{[^}]*padding:\s*8px 10px/);
 });
+
+test("app CSS keeps hub sections stacked and cards responsive", () => {
+  const html = renderAppHtml();
+  const hubFoldersRule = html.match(/\.hub-folders\s*\{[^}]*\}/)?.[0] || "";
+
+  assert.doesNotMatch(hubFoldersRule, /grid-template-columns/);
+  assert.doesNotMatch(html, /@media \(max-width: 1200px\)\s*\{[^}]*\.hub-folders[^}]*grid-template-columns:\s*1fr 1fr/);
+  assert.match(html, /\.hub-section-grid\s*\{[^}]*grid-template-columns:\s*repeat\(auto-fit, minmax\(min\(100%, 260px\), 1fr\)\)/);
+  assert.match(html, /\.hub-folder-card\s*\{[^}]*min-width:\s*0;[^}]*overflow:\s*hidden/);
+  assert.match(html, /\.hub-folder-card strong\s*\{[^}]*letter-spacing:\s*0;[^}]*overflow-wrap:\s*anywhere/);
+  assert.match(html, /\.hub-folder-meta code\s*\{\s*flex:\s*1 1 auto;\s*\}/);
+});
+
+test("hub cards open direct file paths without filtering folders", () => {
+  const html = renderAppHtml();
+
+  assert.match(html, /\[data-hub-file\]/);
+  assert.match(html, /selectFile\(button\.dataset\.hubFile\)/);
+  assert.match(html, /data-hub-file="[^"]*directFilePath/);
+  assert.match(html, /data-hub-folders="[^"]*paths\.join/);
+});

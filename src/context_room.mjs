@@ -1899,14 +1899,16 @@ export function renderAppHtml() {
     .hub-section { display: grid; gap: 14px; padding-top: 18px; border-top: 1px solid rgba(139,211,255,0.24); }
     .hub-section:first-child { border-top: 0; padding-top: 0; }
     .hub-section-title { color: var(--muted); font-size: 12px; font-weight: 900; text-transform: uppercase; letter-spacing: 0.13em; }
-    .hub-section-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 14px; }
-    .hub-folder-card { border: 1px solid rgba(148,163,184,0.16); border-radius: 22px; padding: 18px; min-height: 132px; background: linear-gradient(145deg, rgba(139,211,255,0.10), rgba(182,156,255,0.06)); color: var(--text); text-align: left; cursor: pointer; display: grid; align-content: space-between; gap: 12px; box-shadow: 0 18px 54px rgba(0,0,0,0.24); }
+    .hub-section-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 260px), 1fr)); gap: 14px; }
+    .hub-folder-card { min-width: 0; border: 1px solid rgba(148,163,184,0.16); border-radius: 22px; padding: 18px; min-height: 132px; background: linear-gradient(145deg, rgba(139,211,255,0.10), rgba(182,156,255,0.06)); color: var(--text); text-align: left; cursor: pointer; display: grid; align-content: space-between; gap: 12px; box-shadow: 0 18px 54px rgba(0,0,0,0.24); overflow: hidden; }
     .hub-folder-card.navigation { background: linear-gradient(145deg, rgba(182,156,255,0.13), rgba(139,211,255,0.07)); }
     .hub-folder-card:hover { transform: translateY(-2px); border-color: rgba(139,211,255,0.42); background: linear-gradient(145deg, rgba(139,211,255,0.16), rgba(182,156,255,0.10)); }
-    .hub-folder-card strong { display: block; font-size: 20px; letter-spacing: -0.04em; }
-    .hub-folder-card span { color: var(--muted); font-size: 13px; line-height: 1.35; }
-    .hub-folder-card code { color: var(--accent); font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; }
-    .hub-folder-meta { display: flex; justify-content: space-between; gap: 10px; align-items: center; color: #cbd7ec; font-size: 12px; text-transform: uppercase; letter-spacing: 0.08em; }
+    .hub-folder-card strong { display: block; min-width: 0; font-size: 20px; line-height: 1.05; letter-spacing: 0; overflow-wrap: anywhere; }
+    .hub-folder-card span { min-width: 0; color: var(--muted); font-size: 13px; line-height: 1.35; overflow-wrap: anywhere; }
+    .hub-folder-card code { min-width: 0; color: var(--accent); font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; line-height: 1.25; overflow-wrap: anywhere; white-space: normal; }
+    .hub-folder-meta { min-width: 0; display: flex; justify-content: space-between; gap: 10px; align-items: end; color: #cbd7ec; font-size: 12px; text-transform: uppercase; letter-spacing: 0.08em; }
+    .hub-folder-meta code { flex: 1 1 auto; }
+    .hub-folder-meta span { flex: 0 0 auto; text-align: right; white-space: nowrap; }
     .selection-bar { margin: 6px 0 8px; padding: 5px 6px 5px 10px; border: 1px solid rgba(139,211,255,0.18); border-radius: 999px; background: rgba(8,13,27,0.72); display: flex; gap: 8px; align-items: center; justify-content: space-between; box-shadow: 0 10px 28px rgba(0,0,0,0.18); }
     .selection-bar[hidden] { display: none; }
     .selection-summary { min-width: 0; color: #dce8fb; font-size: 11px; font-weight: 850; letter-spacing: 0.02em; white-space: nowrap; }
@@ -1922,8 +1924,7 @@ export function renderAppHtml() {
     .tree-entry.watched-inherited .tree-name { color: #bff5d0; }
 
     .danger-action { border-color: rgba(255,140,157,0.38) !important; color: #ffc0c8 !important; }
-    @media (max-width: 1200px) { .hub-folders { grid-template-columns: 1fr 1fr; } }
-    @media (max-width: 860px) { .settings-card { position: static; width: 100%; max-height: none; margin-bottom: 12px; } .hub-folders { grid-template-columns: 1fr; } }
+    @media (max-width: 860px) { .settings-card { position: static; width: 100%; max-height: none; margin-bottom: 12px; } }
     .cosmos-home { height: 100%; min-height: calc(100vh - 168px); padding: 34px; overflow: hidden; background: radial-gradient(circle at 50% 38%, rgba(139,211,255,0.13), transparent 24rem), rgba(3, 7, 18, 0.36); transition: padding-right 320ms ease; }
     .editor-shell.planet-file-open .cosmos-home { padding-right: min(46vw, 660px); }
     .planet-stage { position: relative; height: 100%; min-height: calc(100vh - 236px); border-radius: 28px; overflow: hidden; display: grid; place-items: center; background: radial-gradient(circle at 50% 50%, rgba(182,156,255,0.10), transparent 22rem); }
@@ -2032,7 +2033,7 @@ export function renderAppHtml() {
       .review-list { max-height: none; }
       .review-item { padding: 11px; }
       .review-top { align-items: flex-start; }
-      .hub-section-grid, .settings-grid, .hub-card-editor-grid, .template-editor-grid, .markdown-create { grid-template-columns: 1fr; }
+      .settings-grid, .hub-card-editor-grid, .template-editor-grid, .markdown-create { grid-template-columns: 1fr; }
       .hub-folders { gap: 18px; }
       .hub-folder-card { min-height: 116px; padding: 15px; border-radius: 18px; }
       .hub-folder-card strong { font-size: 18px; }
@@ -3281,6 +3282,7 @@ function renderHubFolders() {
   if (!holder) return;
   const sections = state.hubSections?.length ? state.hubSections : [{ id: "main", title: "Main", cards: state.hubFolders || [] }];
   holder.innerHTML = renderHubBreadcrumb() + sections.map((section) => '<section class="hub-section"><div class="hub-section-title">' + escapeHtml(section.title || "Section") + '</div><div class="hub-section-grid">' + (section.cards || []).map(renderHubFolderCard).join("") + '</div></section>').join("");
+  document.querySelectorAll("[data-hub-file]").forEach((button) => button.addEventListener("click", () => selectFile(button.dataset.hubFile).catch((error) => setStatus(error.message))));
   document.querySelectorAll("[data-hub-folders]").forEach((button) => button.addEventListener("click", () => filterFolders(button.dataset.hubFolders.split('|'))));
   document.querySelectorAll("[data-hub-card-children]").forEach((button) => button.addEventListener("click", () => openHubChildren(button.dataset.hubCardChildren)));
   document.querySelectorAll("[data-hub-crumb]").forEach((button) => button.addEventListener("click", () => openHubPath(button.dataset.hubCrumb || null)));
@@ -3299,13 +3301,25 @@ function renderHubBreadcrumb() {
 function renderHubFolderCard(folder) {
   const children = folder.cards || [];
   const paths = folderPaths(folder);
+  const directFilePath = hubCardDirectFilePath(paths, children);
   const count = countFolderFiles(paths) + children.reduce((sum, child) => sum + countFolderFiles(folderPaths(child)), 0);
   const meta = children.length ? children.length + ' child card' + (children.length > 1 ? 's' : '') : (paths.length > 1 ? paths.length + ' sources' : paths[0]);
-  const data = children.length ? ' data-hub-card-children="' + escapeHtml(folder.id) + '"' : ' data-hub-folders="' + escapeHtml(paths.join('|')) + '"';
+  const data = children.length
+    ? ' data-hub-card-children="' + escapeHtml(folder.id) + '"'
+    : directFilePath
+      ? ' data-hub-file="' + escapeHtml(directFilePath) + '"'
+      : ' data-hub-folders="' + escapeHtml(paths.join('|')) + '"';
   return '<button class="hub-folder-card ' + (children.length ? 'navigation' : '') + '" type="button"' + data + '>' +
     '<div><strong>' + escapeHtml(folder.title) + '</strong><span>' + escapeHtml(folder.description) + '</span></div>' +
     '<div class="hub-folder-meta"><code>' + escapeHtml(meta || "navigation") + '</code><span>' + count + ' file' + (count > 1 ? 's' : '') + '</span></div>' +
   '</button>';
+}
+
+function hubCardDirectFilePath(paths = [], children = []) {
+  if (children.length || paths.length !== 1) return null;
+  const clean = normalizeUiPath(paths[0]);
+  if (!clean || clean.endsWith("/")) return null;
+  return state.files.some((file) => file.path === clean) ? clean : null;
 }
 
 function openHubChildren(cardId) {
