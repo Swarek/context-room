@@ -2,7 +2,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { buildDocQaReport, createMemoryServer, initializeContextRoomProject, readMemoryWebappSettings, CONFIG_FILE } from "../src/context_room.mjs";
+import { buildAgentBrief, buildContextRoomDoctorReport, buildDocQaReport, createMemoryServer, initializeContextRoomProject, readMemoryWebappSettings, CONFIG_FILE } from "../src/context_room.mjs";
 
 function parseArgs(argv) {
   const args = { _: [] };
@@ -29,7 +29,7 @@ function splitList(value) {
 }
 
 function usage() {
-  return `Context Room\n\nUsage:\n  context-room init [--title "My Project"] [--allow docs/,src/] [--watch docs/]\n  context-room start [--port 4317] [--root .]\n  context-room doctor [--root .]\n  context-room guard [--root .]\n  context-room install-hook [--root .]\n\nConfig: ${CONFIG_FILE}\n`;
+  return `Context Room\n\nUsage:\n  context-room init [--title "My Project"] [--allow docs/,src/] [--watch docs/]\n  context-room start [--port 4317] [--root .]\n  context-room doctor [--root .] [--strict]\n  context-room guard [--root .] [--profile review-only|strict|advisory]\n  context-room brief [--root .] [--task "what the agent will do"] [--limit 12]\n  context-room install-hook [--root .]\n\nConfig: ${CONFIG_FILE}\n`;
 }
 
 const args = parseArgs(process.argv.slice(2));
@@ -55,23 +55,51 @@ if (command === "init") {
 
 if (command === "doctor") {
   const settings = readMemoryWebappSettings(root);
+  const report = buildContextRoomDoctorReport(root);
+  const blocking = report.issues.filter((issue) => ["critical", "high"].includes(issue.severity));
   console.log(`Context Room OK`);
   console.log(`Root: ${root}`);
   console.log(`Config: ${path.join(root, CONFIG_FILE)}`);
   console.log(`Allowed paths: ${settings.allowedPaths.length}`);
   console.log(`Watched paths: ${settings.watchAllow.length}`);
+  console.log(`Docs in graph: ${report.graph.docs}`);
+  console.log(`Missing metadata: ${report.graph.missingMetadata}`);
+  console.log(`Health issues: ${report.issues.length}`);
+  for (const issue of report.issues.slice(0, 20)) {
+    console.log(`- [${issue.severity}] ${issue.path ? `${issue.path}: ` : ""}${issue.message}`);
+  }
+  if ((args.strict || args.profile === "strict") && blocking.length) process.exit(1);
   process.exit(0);
 }
 
 if (command === "guard") {
+  const profile = args.strict ? "strict" : args.advisory ? "advisory" : String(args.profile || "review-only");
   const report = buildDocQaReport(root);
+  const doctor = profile === "strict" || profile === "advisory" ? buildContextRoomDoctorReport(root) : null;
+  const blockingHealth = doctor ? doctor.issues.filter((issue) => ["critical", "high"].includes(issue.severity)) : [];
+  const shouldBlock = profile !== "advisory" && (report.queue.length || (profile === "strict" && blockingHealth.length));
   if (report.queue.length) {
     console.error("Unverified watched documentation changes:");
     for (const item of report.queue) console.error(`- ${item.gitStatus.trim() || "changed"} ${item.path}`);
-    console.error("\nOpen Context Room, review the diffs, and mark each item verified before committing.");
+  }
+  if (blockingHealth.length) {
+    console.error("High-impact Context Room health issues:");
+    for (const issue of blockingHealth.slice(0, 20)) console.error(`- [${issue.severity}] ${issue.path ? `${issue.path}: ` : ""}${issue.message}`);
+  }
+  if (shouldBlock) {
+    console.error("\nOpen Context Room, fix health issues if strict, review diffs, and mark watched docs verified before committing.");
     process.exit(1);
   }
-  console.log("No unverified watched documentation changes.");
+  if (profile === "advisory" && (report.queue.length || blockingHealth.length)) {
+    console.log("Context Room advisory guard found issues but did not block.");
+  } else {
+    console.log(profile === "strict" ? "Strict Context Room guard passed." : "No unverified watched documentation changes.");
+  }
+  process.exit(0);
+}
+
+if (command === "brief") {
+  process.stdout.write(buildAgentBrief(root, { task: args.task || "", limit: Number(args.limit || 12) }));
   process.exit(0);
 }
 
@@ -83,7 +111,7 @@ if (command === "install-hook") {
   }
   const hookPath = path.join(hooksDir, "pre-commit");
   const cliPath = fileURLToPath(import.meta.url);
-  const script = `#!/bin/sh\n# Installed by Context Room. Blocks commits until watched documentation changes are verified.\nnode "${cliPath}" guard --root "${root}"\n`;
+  const script = `#!/bin/sh\n# Installed by Context Room. Blocks commits until watched documentation changes are verified.\nnode "${cliPath}" guard --root "${root}" --profile review-only\n`;
   fs.writeFileSync(hookPath, script, { mode: 0o755 });
   fs.chmodSync(hookPath, 0o755);
   console.log(`Context Room pre-commit hook installed: ${hookPath}`);

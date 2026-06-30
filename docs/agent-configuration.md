@@ -16,6 +16,10 @@ That file is the contract between the project owner, the UI, and AI agents. If a
   "title": "My Project",
   "allowedPaths": ["docs/", "skills/", "README.md", "AGENTS.md"],
   "watchAllow": ["docs/", "skills/", "AGENTS.md"],
+  "startupContext": {
+    "enabled": true,
+    "fileNames": ["AGENTS.md", "CLAUDE.md"]
+  },
   "hubSections": []
 }
 ```
@@ -61,6 +65,7 @@ A section contains cards. A card can point to one file/folder, multiple files/fo
       "id": "docs",
       "title": "Docs",
       "path": "docs/",
+      "autoChildren": true,
       "cards": [
         { "id": "architecture", "title": "Architecture", "path": "docs/architecture/" },
         { "id": "decisions", "title": "Decisions", "path": "docs/decisions/" }
@@ -80,6 +85,49 @@ A section contains cards. A card can point to one file/folder, multiple files/fo
 }
 ```
 
+Use `autoChildren: true` when a folder should automatically expose its immediate files and subfolders as sub-cards. Explicit `cards` still win when you need a curated hierarchy.
+
+### `startupContext`
+
+Startup context scanner.
+
+When enabled, Context Room lists matching files from the filesystem root down to the Context Room root. This is useful for checking which `AGENTS.md`, `CLAUDE.md`, or similar instruction files may be injected before an agent starts working.
+
+These files are read-only in Context Room and do not appear in the explorer.
+
+## Documentation metadata
+
+Structured Markdown docs should include frontmatter:
+
+```md
+---
+context_room:
+  kind: canonical
+  scope: website
+  status: current
+  canonical_for: billing
+  last_verified: 2026-06-26
+  sources: [src/billing.ts, docs/pricing.md]
+---
+```
+
+Kinds:
+
+- `agents`: instructions that shape agent behavior.
+- `index`: navigation and source-of-truth map.
+- `canonical`: current truth for a feature, system, or workflow.
+- `procedure`: runbook, workflow, checklist, deploy or testing procedure.
+- `decision`: decision record.
+
+Statuses:
+
+- `current`: can be trusted as current context.
+- `draft`: still being prepared.
+- `historical`: useful history, not current truth.
+- `superseded`: replaced by another document.
+
+Keep metadata small. The goal is not bureaucracy; it lets Context Room find stale docs, duplicate canonical truth, broken references, and missing source links.
+
 ## Rules for agents
 
 1. Treat `.context-room/config.json` as the source of truth for Context Room setup.
@@ -94,13 +142,28 @@ A section contains cards. A card can point to one file/folder, multiple files/fo
 context-room doctor
 ```
 
-8. If available, start the UI and smoke-test the hub and review queue:
+8. For stronger validation, run:
+
+```bash
+context-room doctor --strict
+context-room guard --profile strict
+```
+
+Use strict mode only when the project is ready to enforce metadata and graph health.
+
+9. To generate a local no-LLM context brief for a task, run:
+
+```bash
+context-room brief --task "change billing onboarding"
+```
+
+10. If available, start the UI and smoke-test the hub and review queue:
 
 ```bash
 context-room start --port 4317
 ```
 
-9. If commits should be blocked until watched docs are verified, install the local Git hook:
+11. If commits should be blocked until watched docs are verified, install the local Git hook:
 
 ```bash
 context-room install-hook
@@ -131,8 +194,10 @@ Goal: make the documentation and agent skills easy to navigate, maintain, and ve
 4. Add the critical ones to `watchAllow` so future agent changes are reviewable.
 5. Organize `hubSections` into clear cards and nested cards.
 6. Keep IDs stable and lowercase with dashes.
-7. Run `context-room doctor`.
-8. If the project wants commit protection, run `context-room install-hook`.
-9. Run `context-room guard` to verify the watched docs queue is clean or correctly blocking.
-10. Do not include secrets, .env files, build outputs, node_modules, private exports, or generated artifacts.
+7. Prefer structured Markdown templates with `context_room` metadata.
+8. Run `context-room doctor`.
+9. If the project wants commit protection, run `context-room install-hook`.
+10. Run `context-room guard` to verify the watched docs queue is clean or correctly blocking.
+11. Optionally run `context-room brief --task "..."` before an agent starts a focused change.
+12. Do not include secrets, .env files, build outputs, node_modules, private exports, or generated artifacts.
 ```

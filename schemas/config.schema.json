@@ -36,9 +36,33 @@
     },
     "markdownTemplates": {
       "type": "array",
-      "description": "Markdown templates available when creating new .md files from the site.",
+      "description": "Markdown templates available when creating new .md files from the site. Supports {{title}}, {{path}}, and metadata placeholders such as {{scope_yaml}}, {{status_yaml}}, {{canonical_for_yaml}}, {{last_verified_yaml}}, {{sources_inline}}, and {{sources_list}}.",
       "items": { "$ref": "#/$defs/markdownTemplate" },
       "default": []
+    },
+    "startupContext": {
+      "type": "object",
+      "description": "Optional scanner for agent instruction files above the Context Room root. These files are shown read-only and never added to the explorer.",
+      "additionalProperties": true,
+      "properties": {
+        "enabled": { "type": "boolean", "default": false },
+        "fileNames": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 },
+          "uniqueItems": true,
+          "default": ["AGENTS.md", "CLAUDE.md"]
+        }
+      }
+    },
+    "hubCards": {
+      "type": "object",
+      "description": "Legacy card visibility map. Prefer hubSections for new setups.",
+      "additionalProperties": { "type": "boolean" }
+    },
+    "customHubCards": {
+      "type": "array",
+      "description": "Legacy flat custom card list. Prefer hubSections for new setups.",
+      "items": { "$ref": "#/$defs/card" }
     },
     "hubSections": {
       "type": "array",
@@ -101,6 +125,11 @@
           "uniqueItems": true
         },
         "enabled": { "type": "boolean", "default": true },
+        "autoChildren": {
+          "type": "boolean",
+          "description": "When true and the card points to a folder, Context Room infers child cards from the folder's immediate files and subfolders.",
+          "default": false
+        },
         "cards": {
           "type": "array",
           "description": "Nested cards/sub-cards.",
@@ -123,7 +152,7 @@
         },
         "content": {
           "type": "string",
-          "description": "Template body. Supports {{title}} and {{path}} placeholders."
+          "description": "Template body. Supports {{title}}, {{path}}, and metadata placeholders such as {{scope_yaml}}, {{status_yaml}}, {{canonical_for_yaml}}, {{last_verified_yaml}}, {{sources_inline}}, and {{sources_list}}."
         }
       }
     },

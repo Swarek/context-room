@@ -5,6 +5,10 @@ import path from "node:path";
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
+import { collectInlinePathReferences, parseDocMetadata, renderDocMetadataTemplateValues } from "./doc_metadata.mjs";
+import { parseSimpleYaml, stringifyYaml } from "./yaml_utils.mjs";
+
+export { DOC_METADATA_KINDS, DOC_METADATA_STATUSES, parseDocMetadata } from "./doc_metadata.mjs";
 
 const __filename = fileURLToPath(import.meta.url);
 const DEFAULT_PORT = 4317;
@@ -17,6 +21,7 @@ const MEMORY_WEBAPP_SETTINGS = CONFIG_FILE;
 const HERMES_CRON_JOBS_FILE = "~/.hermes/cron/jobs.json";
 const HERMES_CRON_JOBS_FOLDER = "~/.hermes/cron/jobs/";
 const HERMES_CRON_MD_FOLDER = "~/.hermes/cron/jobs-md/";
+const DEFAULT_STARTUP_CONTEXT = { enabled: false, fileNames: ["AGENTS.md", "CLAUDE.md"] };
 export const DOCUMENTATION_BEST_PRACTICES = [
   "One file, one clear scope: name what this document is responsible for and what belongs elsewhere.",
   "Start with the goal, then the few durable facts that change decisions.",
@@ -26,10 +31,86 @@ export const DOCUMENTATION_BEST_PRACTICES = [
 ];
 export const DEFAULT_MARKDOWN_TEMPLATES = [
   {
+    id: "agents",
+    title: "Agent instructions",
+    description: "Root or scoped instructions that are injected into AI coding agents.",
+    content: `---
+context_room:
+  kind: agents
+  scope: {{scope_yaml}}
+  status: {{status_yaml}}
+  canonical_for: {{canonical_for_yaml}}
+  last_verified: {{last_verified_yaml}}
+  sources: {{sources_inline}}
+---
+
+# {{title}}
+
+## Purpose
+What this instruction file controls, which agents read it, and what it must keep stable.
+
+## Operating Rules
+- Rule one.
+- Rule two.
+- Rule three.
+
+## Read First
+- Files or docs the agent should inspect before changing this scope.
+
+## Do Not
+- Things that would hurt quality, safety, or maintainability.
+
+## Verification
+- Commands, checks, or review gates expected before work is called done.
+`,
+  },
+  {
+    id: "docs-index",
+    title: "Docs index",
+    description: "Short map of a documentation folder: what is canonical and where to go next.",
+    content: `---
+context_room:
+  kind: index
+  scope: {{scope_yaml}}
+  status: {{status_yaml}}
+  canonical_for: {{canonical_for_yaml}}
+  last_verified: {{last_verified_yaml}}
+  sources: {{sources_inline}}
+---
+
+# {{title}}
+
+## Purpose
+What this documentation area covers.
+
+## Start Here
+- Primary doc:
+- Agent instructions:
+- Runbooks:
+- Decisions:
+
+## Current Sources Of Truth
+- Document or source file:
+
+## Historical Or Secondary Docs
+- Older docs that may still be useful but are not canonical.
+`,
+  },
+  {
     id: "context-golden",
-    title: "Golden context file",
-    description: "Balanced default for readable agent/human context: not too heavy, not too vague.",
-    content: `# {{title}}
+    title: "Canonical doc",
+    description: "Default source-of-truth document for a product, system, feature, or workflow.",
+    content: `---
+context_room:
+  kind: canonical
+  scope: {{scope_yaml}}
+  status: {{status_yaml}}
+  canonical_for: {{canonical_for_yaml}}
+  last_verified: {{last_verified_yaml}}
+  sources: {{sources_inline}}
+---
+
+# {{title}}
 
 ## Purpose
 Why this file exists, who uses it, and what decision or action it should support.
@@ -48,10 +129,54 @@ Sources of truth, related files, commands, or useful links. Do not copy what can
 `,
   },
   {
+    id: "procedure",
+    title: "Procedure",
+    description: "A short repeatable workflow, runbook, checklist, or operational procedure.",
+    content: `---
+context_room:
+  kind: procedure
+  scope: {{scope_yaml}}
+  status: {{status_yaml}}
+  canonical_for: {{canonical_for_yaml}}
+  last_verified: {{last_verified_yaml}}
+  sources: {{sources_inline}}
+---
+
+# {{title}}
+
+## When To Use
+The exact situation where this procedure applies.
+
+## Inputs
+- Required files, environment, access, or context.
+
+## Steps
+1. First concrete step.
+2. Second concrete step.
+3. Verification step.
+
+## Failure Modes
+- What can go wrong and how to stop safely.
+
+## References
+{{sources_list}}
+`,
+  },
+  {
     id: "decision-record",
     title: "Decision record",
     description: "Small ADR-style note for decisions that should be easy to revisit.",
-    content: `# {{title}}
+    content: `---
+context_room:
+  kind: decision
+  scope: {{scope_yaml}}
+  status: {{status_yaml}}
+  canonical_for: {{canonical_for_yaml}}
+  last_verified: {{last_verified_yaml}}
+  sources: {{sources_inline}}
+---
+
+# {{title}}
 
 ## Decision
 The decision made, in one or two sentences.
@@ -153,16 +278,15 @@ export function isAllowedMemoryPath(relPath, settings = defaultMemoryWebappSetti
   if (settings.integrations?.hermes && ALLOWED_EXACT.has(normalized)) return true;
   if (settings.integrations?.hermes && isCronJobVirtualPath(normalized)) return true;
   if (settings.integrations?.hermes && isCronJobMarkdownPath(normalized)) return true;
-  if (normalized.startsWith("~")) {
-    return Boolean(settings.integrations?.hermes) && ALLOWED_EXTERNAL_PREFIXES.some((prefix) => normalized.startsWith(prefix)) && isEditableTextFile(normalized);
-  }
+  if (normalized.startsWith("~")) return isAllowedExternalMemoryPath(normalized, settings) && isEditableTextFile(normalized);
   const allowed = sanitizePathList(settings.allowedPaths || ALLOWED_PREFIXES);
   return allowed.some((pattern) => pathMatchesSetting(normalized, pattern) || normalized.startsWith(pattern.replace(/\/$/, "") + "/")) && isEditableTextFile(normalized);
 }
 
 export function resolveMemoryPath(root, relPath) {
   const normalized = normalizeRelPath(relPath);
-  if (!isAllowedMemoryPath(normalized, readMemoryWebappSettings(root))) {
+  const settings = readMemoryWebappSettings(root);
+  if (!isAllowedMemoryPath(normalized, settings)) {
     throw new Error(`Path not allowed in context room: ${relPath}`);
   }
   const external = resolveExternalPath(normalized);
@@ -190,6 +314,20 @@ export function listMemoryFiles(root = process.cwd()) {
   }
   for (const prefix of settings.allowedPaths || ALLOWED_PREFIXES) {
     const clean = normalizeRelPath(prefix).replace(/\/$/, "");
+    const externalPath = resolveExternalPath(normalizeRelPath(prefix));
+    if (externalPath && fs.existsSync(externalPath)) {
+      const stats = fs.statSync(externalPath);
+      const found = stats.isDirectory() ? walkExternalTextFiles(externalPath, externalPath, normalizeRelPath(prefix).replace(/\/$/, "") + "/") : [normalizeRelPath(prefix)];
+      for (const rel of found) {
+        if (byPath.has(rel) || !isAllowedMemoryPath(rel, settings)) continue;
+        byPath.set(rel, {
+          path: rel,
+          label: path.basename(rel),
+          category: categoryForPath(rel),
+        });
+      }
+      continue;
+    }
     const absPath = path.join(root, clean);
     if (!fs.existsSync(absPath)) continue;
     const stats = fs.statSync(absPath);
@@ -264,6 +402,76 @@ export function readMemoryFile(root, relPath) {
   };
 }
 
+export function listStartupContextFiles(root = process.cwd(), settings = readMemoryWebappSettings(root)) {
+  const config = normalizeStartupContextSettings(settings.startupContext);
+  if (!config.enabled) return [];
+  const resolvedRoot = path.resolve(root);
+  const dirs = [];
+  let current = resolvedRoot;
+  while (current && current !== path.dirname(current)) {
+    dirs.push(current);
+    current = path.dirname(current);
+  }
+  dirs.push(path.parse(resolvedRoot).root);
+  const seenDirs = [...new Set(dirs)].reverse();
+  const found = [];
+  for (const dir of seenDirs) {
+    for (const fileName of config.fileNames) {
+      const abs = path.join(dir, fileName);
+      if (!fs.existsSync(abs) || !fs.statSync(abs).isFile()) continue;
+      found.push({ abs, fileName, dir });
+    }
+  }
+  return found.map((item, index) => {
+    const order = index + 1;
+    return {
+      label: item.fileName,
+      category: "0 · startup context",
+      impact: "Startup context candidate loaded from " + displayPath(item.abs),
+      startupContext: {
+        order,
+        fileName: item.fileName,
+        absolutePath: item.abs,
+        displayPath: displayPath(item.abs),
+      },
+    };
+  });
+}
+
+export function readStartupContextFile(root = process.cwd(), order = 0, settings = readMemoryWebappSettings(root)) {
+  const normalizedOrder = Number(order);
+  const found = listStartupContextFiles(root, settings).find((file) => file.startupContext.order === normalizedOrder);
+  if (!found) throw new Error(`Startup context file not found: ${order}`);
+  const abs = found.startupContext.absolutePath;
+  const stats = fs.statSync(abs);
+  if (!stats.isFile()) throw new Error(`Not a file: ${found.startupContext.displayPath}`);
+  if (stats.size > MAX_FILE_BYTES) throw new Error(`File too large for context room: ${found.startupContext.displayPath}`);
+  const content = fs.readFileSync(abs, "utf8");
+  return {
+    label: found.label,
+    path: found.startupContext.displayPath,
+    content,
+    exists: true,
+    updatedAt: stats.mtime.toISOString(),
+    chars: content.length,
+    contentHash: hashContent(content),
+    startupContext: publicStartupContextFile(found).startupContext,
+  };
+}
+
+function publicStartupContextFile(file) {
+  return {
+    label: file.label,
+    category: file.category,
+    impact: file.impact,
+    startupContext: {
+      order: file.startupContext.order,
+      fileName: file.startupContext.fileName,
+      displayPath: file.startupContext.displayPath,
+    },
+  };
+}
+
 export function writeMemoryFile(root, relPath, content) {
   if (typeof content !== "string") throw new Error("Content must be a string");
   if (Buffer.byteLength(content, "utf8") > MAX_FILE_BYTES) {
@@ -299,11 +507,12 @@ export function writeMemoryFile(root, relPath, content) {
   };
 }
 
-export function createMarkdownFile(root, { path: relPath, title = "New document", templateId = "context-golden" } = {}) {
+export function createMarkdownFile(root, { path: relPath, title = "New document", templateId = "context-golden", applyTemplate = false, metadata = {} } = {}) {
   const normalized = normalizeMarkdownTemplateTarget(relPath);
   const abs = resolveMemoryPath(root, normalized);
   if (fs.existsSync(abs)) throw new Error(`Markdown file already exists: ${normalized}`);
-  return writeMemoryFile(root, normalized, "");
+  const content = applyTemplate ? renderMarkdownTemplateForPath(root, normalized, { title, templateId, metadata }) : "";
+  return writeMemoryFile(root, normalized, content);
 }
 
 export function createFolder(root, { path: relPath } = {}) {
@@ -337,23 +546,24 @@ export function renderExplorerContextMenuMarkup({ targetPath = "", directory = "
   const normalizedTarget = normalizeRelPath(String(targetPath || ""));
   const cleanDirectory = normalizeRelPath(String(directory || "")).replace(/\/$/, "");
   const directoryLabel = cleanDirectory || "project root";
-  const defaultPath = defaultMarkdownPathForDirectory(cleanDirectory);
   const selectionLabel = selectionCount > 1 ? `${selectionCount} selected` : (normalizedTarget || directoryLabel);
   const defaultFolderPath = defaultFolderPathForDirectory(cleanDirectory);
-  return '<div class="explorer-context-title"><span>Actions</span><code>' + escapeHtmlServer(selectionLabel) + '</code></div>' +
-    '<div class="explorer-context-actions menu-actions" data-context-action-list>' +
-      '<button class="secondary" type="button" data-context-watch>Watch</button>' +
+  const targetActions = normalizedTarget
+    ? '<button class="secondary" type="button" data-context-watch>Watch</button>' +
       '<button class="secondary" type="button" data-context-new-file>New file</button>' +
       '<button class="secondary" type="button" data-context-new-folder>New folder</button>' +
       '<button class="secondary" type="button" data-context-select>Select</button>' +
-      '<button class="secondary danger-action" type="button" data-context-delete>Delete</button>' +
+      '<button class="secondary danger-action" type="button" data-context-delete>Delete</button>'
+    : '<button class="secondary" type="button" data-context-new-file>New file</button>' +
+      '<button class="secondary" type="button" data-context-new-folder>New folder</button>';
+  return '<div class="explorer-context-title"><span>Actions</span><code>' + escapeHtmlServer(selectionLabel) + '</code></div>' +
+    '<div class="explorer-context-actions menu-actions" data-context-action-list>' +
+      targetActions +
     '</div>' +
     '<div class="explorer-context-form" data-context-new-file-form hidden>' +
       '<div class="explorer-context-title"><span>New file</span><code>' + escapeHtmlServer(directoryLabel) + '</code></div>' +
       '<label class="explorer-context-label" for="contextMarkdownTitle">Name</label>' +
       '<input id="contextMarkdownTitle" placeholder="Document title" value="New document" />' +
-      '<label class="explorer-context-label" for="contextMarkdownPath">Path</label>' +
-      '<input id="contextMarkdownPath" data-auto-path="true" placeholder="path/to/file.md" value="' + escapeHtmlServer(defaultPath) + '" />' +
       '<div class="explorer-context-actions form-actions"><button id="contextCancelMarkdown" class="secondary" type="button" title="Cancel" aria-label="Cancel">Cancel</button><button id="contextCreateMarkdown" class="primary" type="button">Create</button></div>' +
     '</div>' +
     '<div class="explorer-context-form" data-context-new-folder-form hidden>' +
@@ -362,11 +572,6 @@ export function renderExplorerContextMenuMarkup({ targetPath = "", directory = "
       '<input id="contextFolderPath" placeholder="path/to/folder" value="' + escapeHtmlServer(defaultFolderPath) + '" />' +
       '<div class="explorer-context-actions form-actions"><button id="contextCancelFolder" class="secondary" type="button" title="Cancel" aria-label="Cancel">Cancel</button><button id="contextCreateFolder" class="primary" type="button">Create</button></div>' +
     '</div>';
-}
-
-function defaultMarkdownPathForDirectory(directory, title = "New document") {
-  const slug = slugifyServer(String(title || "New document")) || "new-document";
-  return (directory ? directory.replace(/\/$/, "") + "/" : "") + slug + ".md";
 }
 
 function defaultFolderPathForDirectory(directory, title = "New folder") {
@@ -398,15 +603,16 @@ function normalizeMarkdownTemplateTarget(relPath) {
   return normalized;
 }
 
-function renderMarkdownTemplateForPath(root, normalized, { title = "New document", templateId = "context-golden" } = {}) {
+function renderMarkdownTemplateForPath(root, normalized, { title = "New document", templateId = "context-golden", metadata = {} } = {}) {
   const template = markdownTemplatesForSettings(readMemoryWebappSettings(root)).find((item) => item.id === templateId);
   if (!template) throw new Error(`Unknown markdown template: ${templateId}`);
   const safeTitle = String(title || path.basename(normalized, ".md")).trim() || path.basename(normalized, ".md");
-  return renderMarkdownTemplate(template.content, { title: safeTitle, path: normalized });
+  const values = renderDocMetadataTemplateValues({ title: safeTitle, normalized, metadata });
+  return renderMarkdownTemplate(template.content, values);
 }
 
 function renderMarkdownTemplate(content, values = {}) {
-  return String(content || "").replace(/\{\{\s*(title|path)\s*\}\}/g, (_match, key) => values[key] || "");
+  return String(content || "").replace(/\{\{\s*([A-Za-z0-9_-]+)\s*\}\}/g, (_match, key) => values[key] ?? "");
 }
 
 export function deleteMemoryPaths(root, relPaths = []) {
@@ -508,6 +714,30 @@ function buildNewFileDiff(root, normalized, abs) {
     "",
   ].join("\n");
   return { path: normalized, changed: true, additions, deletions: 0, patch, available: true };
+}
+
+export function revertMemoryFile(root, relPath) {
+  const normalized = normalizeRelPath(relPath);
+  if (!normalized) throw new Error("Path is required");
+  if (resolveExternalPath(normalized)) throw new Error("Git revert is unavailable for files outside the repo.");
+  if (!isAllowedMemoryPath(normalized, readMemoryWebappSettings(root))) throw new Error(`Path not allowed in context room: ${relPath}`);
+  const abs = resolveMemoryPath(root, normalized);
+  try {
+    const statusLine = execFileSync("git", ["status", "--porcelain=v1", "--untracked-files=all", "--", normalized], { cwd: root, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).split("\n").find(Boolean) || "";
+    if (!statusLine) return { path: normalized, reverted: false, deleted: false, reason: "No Git changes for this file." };
+    if (statusLine.startsWith("?? ")) {
+      if (fs.existsSync(abs)) {
+        if (!fs.statSync(abs).isFile()) throw new Error(`Not a file: ${normalized}`);
+        fs.unlinkSync(abs);
+      }
+      return { path: normalized, reverted: true, deleted: true };
+    }
+    execFileSync("git", ["restore", "--source=HEAD", "--staged", "--worktree", "--", normalized], { cwd: root, stdio: ["ignore", "ignore", "pipe"] });
+    return { path: normalized, reverted: true, deleted: false };
+  } catch (error) {
+    if (error?.message?.startsWith("Not a file:")) throw error;
+    throw new Error(`Git revert failed for ${normalized}`);
+  }
 }
 
 export function readDocReviewState(root = process.cwd()) {
@@ -881,89 +1111,297 @@ function markdownToCronJob(content, expectedId) {
   return { ...data, id: expectedId, prompt: match[2].trim() };
 }
 
-function stringifyYaml(value, indent = 0) {
-  return Object.entries(value || {}).map(([key, item]) => yamlLine(key, item, indent)).join("");
+function sourceReferenceExists(root, docPath, reference) {
+  const resolved = resolveSourceReference(root, docPath, reference);
+  if (!resolved) return true;
+  return fs.existsSync(resolved);
 }
 
-function yamlLine(key, value, indent = 0) {
-  const pad = " ".repeat(indent);
-  if (Array.isArray(value)) return `${pad}${key}: [${value.map(yamlScalar).join(", ")}]\n`;
-  if (value && typeof value === "object") return `${pad}${key}:\n${stringifyYaml(value, indent + 2)}`;
-  return `${pad}${key}: ${yamlScalar(value)}\n`;
+function resolveSourceReference(root, docPath, reference) {
+  const clean = String(reference || "").trim().replace(/#.*$/, "");
+  if (!clean || /^[a-z]+:/i.test(clean)) return null;
+  if (clean.startsWith("~")) return resolveExternalPath(clean) || null;
+  if (path.isAbsolute(clean)) return clean;
+  const normalized = normalizeRelPath(clean);
+  const candidate = path.resolve(root, normalized);
+  if (fs.existsSync(candidate)) return candidate;
+  const docRelative = path.resolve(root, path.dirname(normalizeRelPath(docPath)), normalized);
+  return docRelative;
 }
 
-function yamlScalar(value) {
-  if (value === null) return "null";
-  if (typeof value === "boolean" || typeof value === "number") return String(value);
-  const text = String(value ?? "");
-  if (!text || /[:#\[\]{},&*?|>'"%@`\n]|^[-?]|\s$|^\s/.test(text)) return JSON.stringify(text);
-  return text;
+function collectHubPathMatchers(sections = []) {
+  const paths = [];
+  const ids = [];
+  const visit = (cards = []) => {
+    for (const card of cards || []) {
+      if (card.id) ids.push(card.id);
+      paths.push(...hubCardPaths(card));
+      visit(card.cards || []);
+    }
+  };
+  for (const section of sections || []) {
+    if (section.id) ids.push(section.id);
+    visit(section.cards || []);
+  }
+  return { paths: [...new Set(paths)], ids };
 }
 
-function parseSimpleYaml(source) {
-  const root = {};
-  const stack = [{ indent: -1, value: root }];
-  for (const raw of String(source || "").split(/\r?\n/)) {
-    if (!raw.trim() || raw.trim().startsWith("#")) continue;
-    const indent = raw.match(/^ */)[0].length;
-    const match = raw.trim().match(/^([A-Za-z0-9_-]+):(?:\s*(.*))?$/);
-    if (!match) throw new Error(`Unsupported YAML: ${raw}`);
-    while (stack.length > 1 && indent <= stack.at(-1).indent) stack.pop();
-    const parent = stack.at(-1).value;
-    const key = match[1];
-    const rest = match[2] ?? "";
-    if (rest === "") {
-      parent[key] = {};
-      stack.push({ indent, value: parent[key] });
-    } else {
-      parent[key] = parseYamlScalar(rest);
+function pathIsInHub(relPath, hubPaths = []) {
+  return hubPaths.some((item) => pathMatchesSetting(relPath, item));
+}
+
+function startupRelPathsForRoot(root, startupFiles = []) {
+  const resolvedRoot = path.resolve(root);
+  const rels = new Set();
+  for (const file of startupFiles || []) {
+    const abs = file.startupContext?.absolutePath;
+    if (!abs) continue;
+    const resolved = path.resolve(abs);
+    if (resolved === resolvedRoot || !resolved.startsWith(`${resolvedRoot}${path.sep}`)) continue;
+    rels.add(path.relative(resolvedRoot, resolved).replaceAll(path.sep, "/"));
+  }
+  return rels;
+}
+
+export function buildDocumentationGraph(root = process.cwd()) {
+  const settings = readMemoryWebappSettings(root);
+  const files = listMemoryFiles(root);
+  const gitStatuses = readGitStatuses(root);
+  const startupFiles = listStartupContextFiles(root, settings);
+  const startupRelPaths = startupRelPathsForRoot(root, startupFiles);
+  const hubInfo = collectHubPathMatchers(settings.hubSections || []);
+  const nodes = [];
+  const edges = [];
+  const healthIssues = [];
+  const canonicalGroups = new Map();
+
+  for (const file of files) {
+    if (!file.exists || file.kind !== "markdown") continue;
+    const abs = resolveExternalPath(file.path) || path.join(root, file.path);
+    const content = fs.existsSync(abs) && fs.statSync(abs).isFile() && fs.statSync(abs).size <= MAX_FILE_BYTES ? fs.readFileSync(abs, "utf8") : "";
+    const metadata = parseDocMetadata(content, file.path);
+    const watched = isWatchedPath(file.path, settings);
+    const inHub = pathIsInHub(file.path, hubInfo.paths);
+    const startup = startupRelPaths.has(file.path);
+    const references = collectInlinePathReferences(content);
+    const issues = graphIssuesForDocument({ root, file, content, metadata, watched, inHub, startup, references });
+    healthIssues.push(...issues.map((issue) => ({ ...issue, path: file.path })));
+    const node = {
+      id: `doc:${file.path}`,
+      type: "doc",
+      path: file.path,
+      label: file.label || path.basename(file.path),
+      summary: file.summary || summarizeContent(content),
+      updatedAt: file.updatedAt,
+      gitStatus: gitStatuses.get(file.path) || "",
+      watched,
+      inHub,
+      startup,
+      metadata,
+      references,
+      health: issues,
+    };
+    nodes.push(node);
+    for (const source of metadata.sources) {
+      edges.push({ from: node.id, to: `source:${source}`, type: "declares-source", source });
+    }
+    for (const reference of references) {
+      edges.push({ from: node.id, to: `reference:${reference}`, type: "references", source: reference });
+    }
+    if (metadata.present && metadata.kind === "canonical" && metadata.status === "current" && metadata.canonical_for) {
+      const key = `${metadata.scope}:${metadata.canonical_for}`;
+      if (!canonicalGroups.has(key)) canonicalGroups.set(key, []);
+      canonicalGroups.get(key).push(file.path);
     }
   }
-  return root;
+
+  for (const [key, paths] of canonicalGroups.entries()) {
+    if (paths.length <= 1) continue;
+    for (const relPath of paths) {
+      healthIssues.push({
+        path: relPath,
+        type: "duplicate_canonical",
+        severity: "high",
+        message: `Multiple current canonical docs for ${key}: ${paths.join(", ")}.`,
+      });
+    }
+  }
+
+  const configIssues = buildConfigDiagnostics(root, settings, files, startupFiles, hubInfo);
+  healthIssues.push(...configIssues);
+  return {
+    generatedAt: new Date().toISOString(),
+    root,
+    summary: {
+      docs: nodes.length,
+      watched: nodes.filter((node) => node.watched).length,
+      inHub: nodes.filter((node) => node.inHub).length,
+      startup: nodes.filter((node) => node.startup).length,
+      missingMetadata: nodes.filter((node) => !node.metadata.present).length,
+      stale: healthIssues.filter((issue) => issue.type === "stale_last_verified").length,
+      highOrCritical: healthIssues.filter((issue) => ["critical", "high"].includes(issue.severity)).length,
+    },
+    nodes,
+    edges,
+    healthIssues: sortHealthIssues(healthIssues).slice(0, 200),
+    startupContext: startupFiles.map(publicStartupContextFile),
+  };
 }
 
-function parseYamlScalar(raw) {
-  const text = String(raw || "").trim();
-  if (text === "null" || text === "~") return null;
-  if (text === "true") return true;
-  if (text === "false") return false;
-  if (/^-?\d+(\.\d+)?$/.test(text)) return Number(text);
-  if (text.startsWith("[") && text.endsWith("]")) {
-    const inner = text.slice(1, -1).trim();
-    if (!inner) return [];
-    return splitInlineArray(inner).map(parseYamlScalar);
+function graphIssuesForDocument({ root, file, content, metadata, watched, inHub, startup, references }) {
+  const issues = [];
+  if (metadata.parseError) issues.push({ type: "metadata_parse_error", severity: "high", message: `Cannot parse context_room metadata: ${metadata.parseError}.` });
+  if (!metadata.present && watched) issues.push({ type: "missing_metadata", severity: "medium", message: "Watched Markdown doc has no context_room metadata." });
+  if (!metadata.present && (inHub || startup)) issues.push({ type: "missing_metadata", severity: "low", message: "Visible Markdown doc has no context_room metadata." });
+  if (["canonical", "procedure", "agents"].includes(metadata.kind) && metadata.status === "current" && !metadata.last_verified) {
+    issues.push({ type: "missing_last_verified", severity: watched ? "medium" : "low", message: "Current high-impact doc has no last_verified date." });
   }
-  if ((text.startsWith('"') && text.endsWith('"')) || (text.startsWith("'") && text.endsWith("'"))) {
-    try { return JSON.parse(text); } catch { return text.slice(1, -1); }
+  if (metadata.last_verified && Date.parse(metadata.last_verified) < Date.now() - 1000 * 60 * 60 * 24 * 120) {
+    issues.push({ type: "stale_last_verified", severity: watched ? "medium" : "low", message: `last_verified is older than 120 days: ${metadata.last_verified}.` });
   }
-  return text;
+  if (metadata.kind === "canonical" && metadata.status === "current" && !metadata.canonical_for) {
+    issues.push({ type: "missing_canonical_for", severity: "medium", message: "Current canonical doc should declare canonical_for." });
+  }
+  if (["canonical", "procedure"].includes(metadata.kind) && metadata.status === "current" && metadata.sources.length === 0) {
+    issues.push({ type: "missing_sources", severity: "low", message: "Current doc has no source files or links." });
+  }
+  for (const source of metadata.sources) {
+    if (!sourceReferenceExists(root, file.path, source)) issues.push({ type: "broken_source", severity: "high", message: `Declared source does not exist: ${source}.` });
+  }
+  for (const reference of references) {
+    if (!sourceReferenceExists(root, file.path, reference)) issues.push({ type: "broken_reference", severity: "medium", message: `Referenced file does not exist: ${reference}.` });
+  }
+  if (!inHub && !startup && watched) issues.push({ type: "watched_not_in_hub", severity: "low", message: "Watched doc is not reachable from any hub card." });
+  if (!content.trim()) issues.push({ type: "empty_doc", severity: watched ? "medium" : "low", message: "Document is empty." });
+  return issues;
 }
 
-function splitInlineArray(text) {
-  const items = [];
-  let current = "";
-  let quote = null;
-  for (let i = 0; i < text.length; i += 1) {
-    const ch = text[i];
-    if (quote) {
-      current += ch;
-      if (ch === quote && text[i - 1] !== "\\") quote = null;
-      continue;
-    }
-    if (ch === '"' || ch === "'") {
-      quote = ch;
-      current += ch;
-      continue;
-    }
-    if (ch === ",") {
-      items.push(current.trim());
-      current = "";
-      continue;
-    }
-    current += ch;
+export function buildConfigDiagnostics(root = process.cwd(), settings = readMemoryWebappSettings(root), files = listMemoryFiles(root), startupFiles = listStartupContextFiles(root, settings), hubInfo = collectHubPathMatchers(settings.hubSections || [])) {
+  const issues = [];
+  const configPath = path.join(root, CONFIG_FILE);
+  if (!fs.existsSync(configPath)) issues.push({ type: "missing_config", severity: "critical", message: `${CONFIG_FILE} is missing.` });
+  for (const relPath of settings.allowedPaths || []) {
+    if (resolveExternalPath(relPath)) continue;
+    if (!fs.existsSync(path.join(root, relPath.replace(/\/$/, "")))) issues.push({ type: "allowed_path_missing", severity: "low", message: `Allowed path does not exist: ${relPath}.` });
   }
-  if (current.trim()) items.push(current.trim());
-  return items;
+  for (const relPath of settings.watchAllow || []) {
+    const covered = (settings.allowedPaths || []).some((allowed) => pathMatchesSetting(relPath, allowed) || pathMatchesSetting(allowed, relPath));
+    if (!covered) issues.push({ type: "watch_not_allowed", severity: "high", message: `Watched path is not covered by allowedPaths: ${relPath}.` });
+  }
+  const duplicateIds = hubInfo.ids.filter((id, index) => hubInfo.ids.indexOf(id) !== index);
+  for (const id of [...new Set(duplicateIds)]) issues.push({ type: "duplicate_hub_id", severity: "medium", message: `Duplicate hub section/card id: ${id}.` });
+  for (const relPath of hubInfo.paths) {
+    const allowed = isAllowedMemoryPath(relPath, settings) || isAllowedFolderPath(relPath, settings);
+    if (!allowed) issues.push({ type: "hub_path_not_allowed", severity: "high", message: `Hub path is outside allowedPaths: ${relPath}.` });
+  }
+  if (!settings.markdownTemplates?.length) issues.push({ type: "missing_templates", severity: "medium", message: "No Markdown templates configured." });
+  const filePaths = new Set(files.map((file) => file.path));
+  for (const startupFile of startupFiles || []) {
+    const display = startupFile.startupContext?.displayPath || "";
+    const abs = startupFile.startupContext?.absolutePath;
+    const rel = abs ? path.relative(path.resolve(root), path.resolve(abs)).replaceAll(path.sep, "/") : "";
+    if (rel && !rel.startsWith("../") && !path.isAbsolute(rel) && filePaths.has(rel) && !isWatchedPath(rel, settings)) {
+      issues.push({ type: "startup_not_watched", severity: "medium", message: `Startup context file is editable but not watched: ${rel}.` });
+    } else if (display && (!rel || rel.startsWith("../"))) {
+      issues.push({ type: "external_startup_context", severity: "low", message: `External startup context affects agents: ${display}.` });
+    }
+  }
+  return issues;
+}
+
+function sortHealthIssues(issues = []) {
+  const rank = { critical: 0, high: 1, medium: 2, low: 3 };
+  return [...issues].sort((a, b) => (rank[a.severity] ?? 9) - (rank[b.severity] ?? 9) || String(a.path || "").localeCompare(String(b.path || ""), "fr") || String(a.type || "").localeCompare(String(b.type || ""), "fr"));
+}
+
+export function buildContextRoomDoctorReport(root = process.cwd()) {
+  const settings = readMemoryWebappSettings(root);
+  const graph = buildDocumentationGraph(root);
+  const docqa = buildDocQaReport(root);
+  return {
+    generatedAt: new Date().toISOString(),
+    root: path.resolve(root),
+    configPath: path.join(root, CONFIG_FILE),
+    settings: {
+      title: settings.title,
+      allowedPaths: settings.allowedPaths.length,
+      watchAllow: settings.watchAllow.length,
+      hubSections: settings.hubSections.length,
+      markdownTemplates: settings.markdownTemplates.length,
+      startupContext: settings.startupContext,
+    },
+    docqa: docqa.summary,
+    graph: graph.summary,
+    issues: graph.healthIssues,
+  };
+}
+
+export function buildAgentBrief(root = process.cwd(), { task = "", limit = 12 } = {}) {
+  const graph = buildDocumentationGraph(root);
+  const docqa = buildDocQaReport(root);
+  const terms = tokenizeBriefTask(task);
+  const scored = graph.nodes
+    .map((node) => ({ node, score: scoreBriefNode(node, terms) }))
+    .filter((item) => item.score > 0)
+    .sort((a, b) => b.score - a.score || a.node.path.localeCompare(b.node.path, "fr"))
+    .slice(0, Math.max(1, Number(limit) || 12));
+  const lines = [];
+  lines.push(`# Context Room Brief`);
+  if (task) lines.push(`Task: ${task}`);
+  lines.push("");
+  lines.push("## Startup Context");
+  const startup = graph.startupContext || [];
+  if (startup.length) {
+    for (const file of startup) lines.push(`- ${file.startupContext.order}. ${file.startupContext.fileName}: ${file.startupContext.displayPath}`);
+  } else {
+    lines.push("- No startup context files detected or scanner disabled.");
+  }
+  lines.push("");
+  lines.push("## Read First");
+  if (scored.length) {
+    for (const { node } of scored) {
+      const meta = node.metadata;
+      lines.push(`- ${node.path} (${meta.kind}, ${meta.status}, scope: ${meta.scope})${node.summary ? ` - ${node.summary}` : ""}`);
+    }
+  } else {
+    lines.push("- No matching docs. Start from the hub/index docs.");
+  }
+  lines.push("");
+  lines.push("## Review Warnings");
+  if (docqa.queue.length) {
+    lines.push(`- ${docqa.queue.length} watched changed file(s) still need review.`);
+    for (const item of docqa.queue.slice(0, 8)) lines.push(`- ${item.gitStatus.trim() || "changed"} ${item.path}`);
+  } else {
+    lines.push("- No watched documentation changes are pending review.");
+  }
+  const highIssues = graph.healthIssues.filter((issue) => ["critical", "high"].includes(issue.severity)).slice(0, 8);
+  if (highIssues.length) {
+    lines.push("");
+    lines.push("## Health Issues");
+    for (const issue of highIssues) lines.push(`- [${issue.severity}] ${issue.path ? `${issue.path}: ` : ""}${issue.message}`);
+  }
+  return `${lines.join("\n")}\n`;
+}
+
+function tokenizeBriefTask(task = "") {
+  return String(task || "").toLowerCase().split(/[^a-z0-9_/-]+/).map((term) => term.trim()).filter((term) => term.length >= 3);
+}
+
+function scoreBriefNode(node, terms = []) {
+  let score = 0;
+  if (node.startup) score += 80;
+  if (node.metadata.kind === "agents") score += 55;
+  if (node.metadata.kind === "index") score += 45;
+  if (node.metadata.status === "current") score += 25;
+  if (node.watched) score += 15;
+  if (node.inHub) score += 10;
+  const haystack = [node.path, node.label, node.summary, node.metadata.scope, node.metadata.canonical_for, node.metadata.kind, ...node.metadata.sources].join(" ").toLowerCase();
+  for (const term of terms) {
+    if (haystack.includes(term)) score += 35;
+  }
+  if (!terms.length && score < 40) return 0;
+  if (node.health.some((issue) => ["critical", "high"].includes(issue.severity))) score -= 20;
+  return score;
 }
 
 export function classifyDocPath(relPath) {
@@ -980,16 +1418,17 @@ export function classifyDocPath(relPath) {
   return { type: "unknown", authority: "low", sensitive: false };
 }
 
-export function computeDocIssues({ path: relPath, content = "", gitStatus = "" }) {
+export function computeDocIssues({ path: relPath, content = "", gitStatus = "", metadata = null }) {
   const classification = classifyDocPath(relPath);
   const issues = [];
   const text = String(content);
+  const docMetadata = metadata || parseDocMetadata(text, relPath);
   if (gitStatus.trim() && classification.sensitive) issues.push({ type: "sensitive_changed", severity: "critical", message: "Sensitive file changed: human review before canonical truth." });
   const todoCount = (text.match(/\b(TODO|FIXME|HACK|QUESTION|à clarifier|a verifier|à vérifier)\b/gi) || []).length;
-  if (todoCount) issues.push({ type: "todo", severity: classification.type === "canonical" ? "high" : "medium", message: `${todoCount} TODO/question to consolidate.` });
-  const verified = text.match(/last_verified:\s*(\d{4}-\d{2}-\d{2})/i)?.[1];
-  if ((classification.type === "canonical" || classification.type === "prompt" || classification.type === "memory") && !verified && gitStatus.trim()) issues.push({ type: "missing_last_verified", severity: "medium", message: "Missing last_verified while the file is modified." });
-  if (verified && Date.parse(verified) < Date.now() - 1000 * 60 * 60 * 24 * 120) issues.push({ type: "stale_verified", severity: "medium", message: `Old last_verified: ${verified}.` });
+  if (todoCount) issues.push({ type: "todo", severity: docMetadata.kind === "canonical" ? "high" : "medium", message: `${todoCount} TODO/question to consolidate.` });
+  if (path.extname(normalizeRelPath(relPath)) === ".md" && gitStatus.trim() && !docMetadata.present) issues.push({ type: "missing_metadata", severity: "medium", message: "Missing context_room metadata." });
+  if (["agents", "canonical", "procedure"].includes(docMetadata.kind) && docMetadata.status === "current" && !docMetadata.last_verified && gitStatus.trim()) issues.push({ type: "missing_last_verified", severity: "medium", message: "Missing last_verified while the file is modified." });
+  if (docMetadata.last_verified && Date.parse(docMetadata.last_verified) < Date.now() - 1000 * 60 * 60 * 24 * 120) issues.push({ type: "stale_verified", severity: "medium", message: `Old last_verified: ${docMetadata.last_verified}.` });
   if (classification.type === "daily" && /source of truth|canonique|vérité|source de vérité/i.test(text)) issues.push({ type: "temporary_truth_claim", severity: "high", message: "Temporary log presents itself as source of truth." });
   if (gitStatus.trim()) {
     for (const match of text.matchAll(/`([^`]+\.(?:md|mjs|js|py|json|yaml|yml|csv))`/g)) {
@@ -1011,14 +1450,18 @@ export function buildDocQaReport(root = process.cwd()) {
     const gitStatus = gitStatuses.get(file.path) || "";
     const abs = resolveExternalPath(file.path) || path.join(root, file.path);
     const content = file.exists && fs.existsSync(abs) && file.bytes <= MAX_FILE_BYTES ? fs.readFileSync(abs, "utf8") : "";
-    const issues = computeDocIssues({ path: file.path, content, gitStatus });
+    const metadata = parseDocMetadata(content, file.path);
+    const issues = computeDocIssues({ path: file.path, content, gitStatus, metadata });
     const riskScore = riskScoreFor({ classification, issues, gitStatus });
     const review = currentReviewFor(reviewState.reviews, file.path, content);
-    return { path: file.path, label: file.label, summary: file.summary, updatedAt: file.updatedAt, classification, gitStatus, issues, riskScore, review };
+    return { path: file.path, label: file.label, summary: file.summary, updatedAt: file.updatedAt, classification, metadata, gitStatus, issues, riskScore, review };
   }).filter((item) => item.gitStatus.trim()
   ).filter((item) => isWatchedPath(item.path, settings)
   ).filter((item) => !(item.review?.status === "verified" && item.review.current)
-  ).sort((a, b) => b.riskScore - a.riskScore || a.path.localeCompare(b.path, "fr"));
+  ).sort((a, b) => reviewSeverityRank(a) - reviewSeverityRank(b)
+    || reviewOrderRank(a.path) - reviewOrderRank(b.path)
+    || b.riskScore - a.riskScore
+    || a.path.localeCompare(b.path, "fr"));
   return {
     generatedAt: new Date().toISOString(),
     summary: {
@@ -1028,10 +1471,58 @@ export function buildDocQaReport(root = process.cwd()) {
       critical: queue.filter((item) => item.issues.some((issue) => issue.severity === "critical")).length,
       high: queue.filter((item) => item.issues.some((issue) => issue.severity === "high")).length,
       prompts: files.filter((file) => classifyDocPath(file.path).type === "prompt").length,
-      canonical: files.filter((file) => classifyDocPath(file.path).type === "canonical").length,
+      canonical: queue.filter((item) => item.metadata.kind === "canonical").length,
     },
     queue: queue.slice(0, 80),
   };
+}
+
+function reviewSeverityRank(item) {
+  if (item.issues.some((issue) => issue.severity === "critical")) return 0;
+  if (item.issues.some((issue) => issue.severity === "high")) return 1;
+  return 2;
+}
+
+function reviewOrderRank(relPath) {
+  const normalized = normalizeRelPath(relPath);
+  const exactOrder = new Map([
+    ["AGENTS.md", 0],
+    [".context-room/config.json", 1],
+    ["docs/INDEX.md", 10],
+    ["docs/DOCS_GUIDE.md", 11],
+    ["docs/PRODUCT.md", 20],
+    ["docs/ARCHITECTURE.md", 21],
+    ["docs/OPERATING.md", 22],
+    ["docs/INFRASTRUCTURE.md", 23],
+    ["docs/RUNBOOKS.md", 24],
+    ["website/AGENTS.md", 100],
+    ["website/docs/INDEX.md", 110],
+    ["website/docs/PRODUCT.md", 111],
+    ["website/docs/WORKSPACE_MODEL.md", 112],
+    ["website/docs/ARCHITECTURE.md", 113],
+    ["website/docs/SURFACE_MAP.md", 114],
+    ["website/docs/TESTING.md", 115],
+    ["website/docs/QA_PLAYBOOK.md", 116],
+    ["website/docs/DEPLOYMENT.md", 117],
+    ["website/docs/MONITORING.md", 118],
+    ["our_agentic_system/AGENTS.md", 200],
+    ["our_agentic_system/docs/INDEX.md", 210],
+    ["our_agentic_system/docs/PRODUCT.md", 211],
+    ["our_agentic_system/docs/ARCHITECTURE.md", 212],
+    ["our_agentic_system/docs/SURFACE_MAP.md", 213],
+    ["our_agentic_system/docs/PROVIDERS.md", 214],
+    ["our_agentic_system/docs/TESTING.md", 215],
+    ["our_agentic_system/docs/EVAL_CHECKLIST.md", 216],
+    ["our_agentic_system/docs/DEPLOYMENT.md", 217],
+    ["our_agentic_system/docs/MONITORING.md", 218],
+    [".codex/skills/README.md", 300],
+  ]);
+  if (exactOrder.has(normalized)) return exactOrder.get(normalized);
+  if (normalized.startsWith("docs/")) return 50;
+  if (normalized.startsWith("website/docs/")) return 140;
+  if (normalized.startsWith("our_agentic_system/docs/")) return 240;
+  if (normalized.startsWith(".codex/skills/")) return 310;
+  return 1000;
 }
 
 export function nextReviewPath(queue = [], currentPath = null) {
@@ -1064,6 +1555,7 @@ export function createDefaultProjectConfig({ title = "Context Room", allowedPath
     allowedPaths: sanitizePathList(allowedPaths),
     watchAllow: sanitizePathList(watchAllow),
     integrations: { hermes: false },
+    startupContext: { ...DEFAULT_STARTUP_CONTEXT },
     bestPractices: [...DOCUMENTATION_BEST_PRACTICES],
     markdownTemplates: DEFAULT_MARKDOWN_TEMPLATES.map(normalizeMarkdownTemplate).filter(Boolean),
     hubCards: { ...DEFAULT_HUB_CARD_VISIBILITY },
@@ -1120,12 +1612,12 @@ export function hubCardsForSettings(settings = defaultMemoryWebappSettings()) {
 }
 
 export function hubCardsForRoot(root = process.cwd(), settings = defaultMemoryWebappSettings()) {
-  return hubCardsForSettings(settings).map((card) => materializeHubCardForRoot(root, card)).filter(Boolean);
+  return hubCardsForSettings(settings).map((card) => materializeHubCardForRoot(root, card, settings)).filter(Boolean);
 }
 
 export function hubSectionsForRoot(root = process.cwd(), settings = defaultMemoryWebappSettings()) {
   return hubSectionsForSettings(settings)
-    .map((section) => ({ ...section, cards: materializeHubCardsForRoot(root, section.cards) }));
+    .map((section) => ({ ...section, cards: materializeHubCardsForRoot(root, section.cards, settings) }));
 }
 
 export function hubSectionViewForCard(sections = [], cardId = null) {
@@ -1179,20 +1671,69 @@ function hubSectionsForSettings(settings = defaultMemoryWebappSettings()) {
   return normalized.hubSections.map((section) => ({ ...section, cards: filterEnabledHubCards(section.cards) }));
 }
 
-function materializeHubCardsForRoot(root, cards = []) {
+function materializeHubCardsForRoot(root, cards = [], settings = readMemoryWebappSettings(root)) {
   return cards.map((card) => {
-    const children = materializeHubCardsForRoot(root, card.cards || []);
-    const materialized = materializeHubCardForRoot(root, card);
-    if (children.length) return { ...(materialized || stripHubCardRuntimeFields(card)), cards: children };
+    const explicitChildren = materializeHubCardsForRoot(root, card.cards || [], settings);
+    const materialized = materializeHubCardForRoot(root, card, settings);
+    const inferredChildren = explicitChildren.length || !card.autoChildren ? [] : inferHubCardChildrenForRoot(root, materialized || card, settings);
+    const children = explicitChildren.length ? explicitChildren : inferredChildren;
+    if (children.length) return { ...(materialized || stripHubCardRuntimeFields(card)), cards: children, autoChildren: Boolean(card.autoChildren) };
     return materialized;
   }).filter(Boolean);
 }
 
-function materializeHubCardForRoot(root, card) {
+function materializeHubCardForRoot(root, card, settings = readMemoryWebappSettings(root)) {
   const existingPaths = hubCardPaths(card).filter((folderPath) => hubCardPathExists(root, folderPath));
   if (existingPaths.length === 0) return stripHubCardRuntimeFields(card);
   const { path: _path, paths: _paths, cards: _cards, ...rest } = card;
   return existingPaths.length === 1 ? { ...rest, path: existingPaths[0] } : { ...rest, paths: existingPaths };
+}
+
+function inferHubCardChildrenForRoot(root, card, settings = readMemoryWebappSettings(root)) {
+  const children = [];
+  for (const folderPath of hubCardPaths(card)) {
+    const cleanFolder = normalizeRelPath(folderPath).replace(/\/$/, "");
+    if (!cleanFolder || resolveExternalPath(cleanFolder)) continue;
+    const absDir = path.join(root, cleanFolder);
+    if (!fs.existsSync(absDir) || !fs.statSync(absDir).isDirectory()) continue;
+    const entries = fs.readdirSync(absDir, { withFileTypes: true })
+      .filter((entry) => !entry.name.startsWith(".") && !SKIP_DIRS.has(entry.name))
+      .sort((a, b) => Number(b.isDirectory()) - Number(a.isDirectory()) || a.name.localeCompare(b.name, "fr"));
+    for (const entry of entries) {
+      const rel = normalizeRelPath(path.posix.join(cleanFolder, entry.name) + (entry.isDirectory() ? "/" : ""));
+      if (entry.isDirectory()) {
+        if (!isAllowedFolderPath(rel, settings)) continue;
+        children.push({
+          id: sanitizeHubCardId(`${card.id || cleanFolder}-${rel}`),
+          title: entry.name,
+          description: `Folder in ${card.title || cleanFolder}.`,
+          path: rel,
+          enabled: true,
+          autoChildren: true,
+        });
+        continue;
+      }
+      if (!isAllowedMemoryPath(rel, settings)) continue;
+      children.push({
+        id: sanitizeHubCardId(`${card.id || cleanFolder}-${rel}`),
+        title: entry.name,
+        description: summarizeFileAtPath(path.join(root, rel)),
+        path: rel,
+        enabled: true,
+      });
+    }
+  }
+  return materializeHubCardsForRoot(root, children, settings);
+}
+
+function summarizeFileAtPath(absPath) {
+  try {
+    const stats = fs.statSync(absPath);
+    if (!stats.isFile() || stats.size > MAX_FILE_BYTES) return "";
+    return summarizeContent(fs.readFileSync(absPath, "utf8"));
+  } catch {
+    return "";
+  }
 }
 
 function filterEnabledHubCards(cards = []) {
@@ -1245,11 +1786,24 @@ function normalizeMemoryWebappSettings(raw = {}, base = defaultMemoryWebappSetti
     allowedPaths: sanitizePathList(raw.allowedPaths ?? base.allowedPaths ?? ALLOWED_PREFIXES),
     watchAllow: sanitizePathList(raw.watchAllow ?? base.watchAllow),
     integrations: { hermes: Boolean(raw.integrations?.hermes ?? base.integrations?.hermes ?? false) },
+    startupContext: normalizeStartupContextSettings(raw.startupContext ?? base.startupContext),
     bestPractices: sanitizeTextList(raw.bestPractices ?? base.bestPractices ?? DOCUMENTATION_BEST_PRACTICES),
     markdownTemplates: sanitizeMarkdownTemplates(raw.markdownTemplates ?? base.markdownTemplates ?? DEFAULT_MARKDOWN_TEMPLATES),
     hubCards,
     customHubCards,
     hubSections,
+  };
+}
+
+function normalizeStartupContextSettings(value = {}) {
+  const rawFileNames = Array.isArray(value.fileNames) ? value.fileNames : DEFAULT_STARTUP_CONTEXT.fileNames;
+  const fileNames = [...new Set(rawFileNames
+    .map((item) => path.basename(String(item || "").trim()))
+    .filter((item) => item && !isBlockedPath(item) && isEditableTextFile(item))
+  )];
+  return {
+    enabled: Boolean(value.enabled),
+    fileNames: fileNames.length ? fileNames : [...DEFAULT_STARTUP_CONTEXT.fileNames],
   };
 }
 
@@ -1330,6 +1884,7 @@ function normalizeHubCardDefinition(card = {}, index = 0) {
     cards: children,
     enabled: card.enabled !== false,
   };
+  if (card.autoChildren) normalized.autoChildren = true;
   if (paths.length === 1) normalized.path = paths[0];
   return normalized;
 }
@@ -1343,6 +1898,7 @@ function stripHubCardRuntimeFields(card) {
   const paths = hubCardPaths(card);
   const base = { id: card.id, title: card.title, description: card.description };
   if ((card.cards || []).length) base.cards = card.cards;
+  if (card.autoChildren) base.autoChildren = true;
   return paths.length === 0 ? base : paths.length === 1 ? { ...base, path: paths[0] } : { ...base, paths };
 }
 
@@ -1403,17 +1959,42 @@ function riskScoreFor({ classification, issues, gitStatus }) {
 function readGitStatuses(root) {
   const statuses = new Map();
   try {
+    const rootPrefix = gitRepoPrefixForRoot(root);
     const output = execFileSync("git", ["status", "--porcelain=v1", "--untracked-files=all"], { cwd: root, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] });
     for (const line of output.split("\n")) {
       if (!line.trim()) continue;
       const status = line.slice(0, 2);
-      const rel = line.slice(3).replace(/^"|"$/g, "").replaceAll("\\", "/");
+      const rawRel = gitStatusPathFromPorcelainLine(line);
+      const rel = normalizeGitStatusPathForRoot(rawRel, rootPrefix);
       if (rel) statuses.set(rel, status);
     }
   } catch {
     // Git is optional for temp test roots and non-repo launches.
   }
   return statuses;
+}
+
+function gitRepoPrefixForRoot(root) {
+  try {
+    return normalizeRelPath(execFileSync("git", ["rev-parse", "--show-prefix"], { cwd: root, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).trim());
+  } catch {
+    return "";
+  }
+}
+
+function gitStatusPathFromPorcelainLine(line) {
+  const raw = line.slice(3).replace(/^"|"$/g, "").replaceAll("\\", "/");
+  if (!raw.includes(" -> ")) return raw;
+  return raw.split(" -> ").pop() || raw;
+}
+
+function normalizeGitStatusPathForRoot(relPath, rootPrefix = "") {
+  const normalized = normalizeRelPath(relPath);
+  const prefix = normalizeRelPath(rootPrefix);
+  if (!prefix) return normalized;
+  if (normalized === prefix.replace(/\/$/, "")) return "";
+  if (!normalized.startsWith(prefix)) return "";
+  return normalizeRelPath(normalized.slice(prefix.length));
 }
 
 export function createMemoryServer({ root = process.cwd(), port = DEFAULT_PORT } = {}) {
@@ -1438,6 +2019,15 @@ async function routeRequest(req, res, root) {
     sendJson(res, 200, { files: listMemoryFiles(root), root });
     return;
   }
+  if (req.method === "GET" && url.pathname === "/api/startup-context") {
+    sendJson(res, 200, { files: listStartupContextFiles(root).map(publicStartupContextFile), root });
+    return;
+  }
+  if (req.method === "GET" && url.pathname === "/api/startup-context/file") {
+    const order = url.searchParams.get("order") || "";
+    sendJson(res, 200, readStartupContextFile(root, order));
+    return;
+  }
   if (req.method === "GET" && url.pathname === "/api/settings") {
     const settings = readMemoryWebappSettings(root);
     sendJson(res, 200, { settings, hubCards: hubCardsForRoot(root, settings), hubSections: hubSectionsForRoot(root, settings), availableHubCards: settings.customHubCards });
@@ -1451,6 +2041,18 @@ async function routeRequest(req, res, root) {
   }
   if (req.method === "GET" && url.pathname === "/api/docqa") {
     sendJson(res, 200, buildDocQaReport(root));
+    return;
+  }
+  if (req.method === "GET" && url.pathname === "/api/graph") {
+    sendJson(res, 200, buildDocumentationGraph(root));
+    return;
+  }
+  if (req.method === "GET" && url.pathname === "/api/doctor") {
+    sendJson(res, 200, buildContextRoomDoctorReport(root));
+    return;
+  }
+  if (req.method === "GET" && url.pathname === "/api/brief") {
+    sendJson(res, 200, { brief: buildAgentBrief(root, { task: url.searchParams.get("task") || "", limit: Number(url.searchParams.get("limit") || 12) }) });
     return;
   }
   if (req.method === "POST" && url.pathname === "/api/docqa/review") {
@@ -1468,6 +2070,11 @@ async function routeRequest(req, res, root) {
     sendJson(res, 200, readFileDiff(root, relPath));
     return;
   }
+  if (req.method === "POST" && url.pathname === "/api/file/revert") {
+    const body = await readJsonBody(req);
+    sendJson(res, 200, revertMemoryFile(root, body.path));
+    return;
+  }
   if (req.method === "POST" && url.pathname === "/api/file") {
     const body = await readJsonBody(req);
     sendJson(res, 200, writeMemoryFile(root, body.path, body.content));
@@ -1475,7 +2082,7 @@ async function routeRequest(req, res, root) {
   }
   if (req.method === "POST" && url.pathname === "/api/markdown/create") {
     const body = await readJsonBody(req);
-    sendJson(res, 200, createMarkdownFile(root, { path: body.path, title: body.title, templateId: body.templateId }));
+    sendJson(res, 200, createMarkdownFile(root, { path: body.path, title: body.title, templateId: body.templateId, applyTemplate: body.applyTemplate, metadata: body.metadata }));
     return;
   }
   if (req.method === "POST" && url.pathname === "/api/folder/create") {
@@ -1505,17 +2112,31 @@ function normalizeRelPath(relPath) {
   return relPath.replaceAll("\\", "/").replace(/^\.\//, "").trim();
 }
 
+function displayPath(absPath) {
+  const home = process.env.HOME ? path.resolve(process.env.HOME) : "";
+  const resolved = path.resolve(absPath);
+  if (home && (resolved === home || resolved.startsWith(home + path.sep))) return "~/" + path.relative(home, resolved).replaceAll(path.sep, "/");
+  return resolved;
+}
+
 function isEditableTextFile(relPath) {
   return [".md", ".csv", ".txt", ".json", ".jsonl", ".yaml", ".yml", ".mjs", ".js", ".py"].includes(path.extname(relPath));
 }
 
 function validateEditableContent(relPath, content) {
+  if (hasUnresolvedConflictMarkers(content)) {
+    throw new Error(`Refusing to write unresolved conflict markers in ${relPath}`);
+  }
   if (path.extname(relPath) !== ".json") return;
   try {
     JSON.parse(content || "null");
   } catch (error) {
     throw new Error(`Invalid JSON in ${relPath}: ${error.message}`);
   }
+}
+
+function hasUnresolvedConflictMarkers(content) {
+  return /^(<<<<<<<|=======|>>>>>>>)/m.test(String(content || ""));
 }
 
 function walkTextFiles(dir, root, settings = defaultMemoryWebappSettings()) {
@@ -1565,6 +2186,16 @@ function isAllowedExternalPath(relPath) {
   if (!normalized || normalized.startsWith("../") || normalized.includes("/../") || path.isAbsolute(normalized)) return false;
   if (isBlockedPath(normalized)) return false;
   return Boolean(externalPrefixForPath(normalized));
+}
+
+function isAllowedExternalMemoryPath(relPath, settings = defaultMemoryWebappSettings()) {
+  const normalized = normalizeRelPath(relPath);
+  if (!resolveExternalPath(normalized)) return false;
+  if (normalized.startsWith("~/.hermes/")) {
+    return Boolean(settings.integrations?.hermes) && ALLOWED_EXTERNAL_PREFIXES.some((prefix) => normalized.startsWith(prefix));
+  }
+  const allowed = sanitizePathList(settings.allowedPaths || []);
+  return allowed.some((pattern) => pathMatchesSetting(normalized, pattern));
 }
 
 function externalPrefixForPath(relPath) {
@@ -1751,8 +2382,8 @@ export function renderAppHtml() {
     .sidebar-toggle:hover { transform: translateY(-1px); background: rgba(139,211,255,0.12); }
     .explorer-open { display: none; border: 1px solid rgba(139,211,255,0.28); border-radius: 14px; background: rgba(255,255,255,0.06); color: var(--text); width: 42px; height: 42px; cursor: pointer; align-items: center; justify-content: center; box-shadow: 0 0 28px rgba(139,211,255,0.12); transition: transform 160ms ease, background 160ms ease; }
     .explorer-open:hover { transform: translateY(-1px); background: rgba(139,211,255,0.12); }
-    .app.sidebar-collapsed .sidebar-copy, .app.sidebar-collapsed .workspace-dock, .app.sidebar-collapsed .search-row, .app.sidebar-collapsed .explorer-title, .app.sidebar-collapsed .tree, .app.sidebar-collapsed .hint { opacity: 0; pointer-events: none; transform: translateX(-10px); }
-    .sidebar-copy, .workspace-dock, .search-row, .explorer-title, .tree, .hint { transition: opacity 180ms ease, transform 180ms ease; }
+    .app.sidebar-collapsed .sidebar-copy, .app.sidebar-collapsed .workspace-dock, .app.sidebar-collapsed .search-row, .app.sidebar-collapsed .watch-filter-row, .app.sidebar-collapsed .selection-bar, .app.sidebar-collapsed .explorer-title, .app.sidebar-collapsed .tree, .app.sidebar-collapsed .hint { opacity: 0; pointer-events: none; transform: translateX(-10px); }
+    .sidebar-copy, .workspace-dock, .search-row, .watch-filter-row, .selection-bar, .explorer-title, .tree, .hint { transition: opacity 180ms ease, transform 180ms ease; }
     main { padding: 24px; display: grid; grid-template-rows: 1fr; gap: 18px; min-width: 0; min-height: 0; overflow: hidden; }
     h1 { font-size: 24px; margin: 0 0 6px; letter-spacing: -0.04em; }
     .subtitle { color: var(--muted); line-height: 1.35; font-size: 13px; }
@@ -1794,10 +2425,12 @@ export function renderAppHtml() {
     .explorer-context-actions.menu-actions { grid-template-columns: 1fr; }
     .explorer-context-actions.form-actions { grid-template-columns: 1fr 1fr; gap: 8px; }
     .explorer-context-menu .explorer-context-actions button { padding: 8px 10px; border-radius: 10px; font-size: 12px; line-height: 1.2; }
+    select option { color: #111827; background: #ffffff; }
+    select option:checked { color: #07101e; background: #93c5fd; }
     .empty-template-actions { display: grid; grid-template-columns: minmax(140px, 220px) auto; gap: 8px; align-items: center; }
     .empty-template-actions .file-template-select { min-width: 0; }
     .explorer-title { color: var(--accent); font-size: 11px; font-weight: 850; text-transform: uppercase; letter-spacing: 0.12em; margin: 10px 0 6px; }
-    .tree { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; font-size: 13px; line-height: 1.35; overflow: visible; padding-right: 4px; }
+    .tree { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; font-size: 13px; line-height: 1.35; overflow: visible; padding-right: 4px; min-height: 180px; }
     .tree-node { min-width: 0; }
     .tree-row { width: 100%; border: 1px solid transparent; border-radius: 8px; background: transparent; color: var(--text); text-align: left; padding: 5px 7px; cursor: pointer; display: flex; align-items: center; gap: 6px; min-width: 0; }
     .tree-row:hover { background: rgba(255,255,255,0.065); transform: translateX(2px); }
@@ -1857,8 +2490,28 @@ export function renderAppHtml() {
     .docqa-actions { display: flex; gap: 8px; flex-wrap: wrap; }
     .markdown-tools { padding: 16px 18px 18px; display: grid; gap: 16px; }
     .best-practice-list { margin: 0; padding-left: 20px; display: grid; gap: 7px; color: #d7e2f4; font-size: 13px; line-height: 1.45; }
-    .markdown-create { display: grid; grid-template-columns: 1fr 1fr auto auto; gap: 10px; align-items: end; }
+    .markdown-create { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 180px), 1fr)); gap: 10px; align-items: end; }
+    .markdown-create .settings-field.paths { grid-column: span 2; }
+    .markdown-create button { align-self: end; min-height: 42px; }
+    .new-doc-actions { grid-column: 1 / -1; display: flex; justify-content: flex-end; gap: 10px; flex-wrap: wrap; }
     .markdown-create .settings-field select { display: block; width: 100%; padding: 10px; border: 1px solid rgba(148,163,184,0.18); border-radius: 14px; background: rgba(255,255,255,0.045); color: var(--text); font: 12px/1.45 ui-monospace, SFMono-Regular, Menlo, monospace; }
+    .path-picker-field { grid-column: span 2; }
+    .path-picker { position: relative; display: grid; grid-template-columns: minmax(0, 1.2fr) minmax(0, 1fr); gap: 8px; padding: 10px; border: 1px solid rgba(139,211,255,0.18); border-radius: 16px; background: rgba(255,255,255,0.035); }
+    .path-picker-trigger { min-width: 0; min-height: 42px; border: 1px solid rgba(148,163,184,0.18); border-radius: 14px; padding: 10px 12px; background: rgba(255,255,255,0.045); color: var(--text); cursor: pointer; display: grid; grid-template-columns: 1fr auto; gap: 10px; align-items: center; text-align: left; }
+    .path-picker-trigger:hover, .path-picker-trigger[aria-expanded="true"] { border-color: rgba(139,211,255,0.42); background: rgba(139,211,255,0.08); }
+    .path-picker-trigger code { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: #edf5ff; font: 12px/1.45 ui-monospace, SFMono-Regular, Menlo, monospace; }
+    .path-picker-trigger span { color: var(--muted); font-size: 13px; }
+    .path-picker-menu { position: absolute; z-index: 70; top: calc(100% + 8px); left: 10px; width: min(620px, calc(100vw - 56px)); max-height: min(430px, 52vh); border: 1px solid rgba(139,211,255,0.26); border-radius: 16px; background: rgba(8,13,27,0.98); box-shadow: 0 24px 70px rgba(0,0,0,0.42); backdrop-filter: blur(20px); padding: 10px; display: grid; gap: 10px; }
+    .path-picker-menu[hidden] { display: none; }
+    .path-picker-search { width: 100%; padding: 10px 12px; border: 1px solid rgba(148,163,184,0.20); border-radius: 12px; background: rgba(255,255,255,0.055); color: var(--text); font: 12px/1.45 ui-monospace, SFMono-Regular, Menlo, monospace; }
+    .path-picker-options { display: grid; gap: 5px; max-height: min(330px, 40vh); overflow: auto; padding-right: 3px; }
+    .path-picker-option { width: 100%; min-width: 0; border: 1px solid rgba(148,163,184,0.14); border-radius: 10px; padding: 9px 10px; background: rgba(255,255,255,0.035); color: #dce8fb; cursor: pointer; display: grid; grid-template-columns: 1fr auto; gap: 10px; align-items: center; text-align: left; }
+    .path-picker-option:hover, .path-picker-option.active { border-color: rgba(139,211,255,0.45); background: rgba(139,211,255,0.10); }
+    .path-picker-option code { min-width: 0; color: var(--accent); font: 12px/1.35 ui-monospace, SFMono-Regular, Menlo, monospace; overflow-wrap: anywhere; }
+    .path-picker-option span { color: var(--muted); font-size: 10px; text-transform: uppercase; letter-spacing: 0.08em; white-space: nowrap; }
+    .path-picker-empty { color: var(--muted); padding: 10px; font-size: 13px; }
+    .path-picker-preview { grid-column: 1 / -1; display: flex; align-items: center; gap: 8px; min-width: 0; color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: 0.08em; }
+    .path-picker-preview code { min-width: 0; color: var(--accent); font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; text-transform: none; letter-spacing: 0; overflow-wrap: anywhere; }
     .settings-page { height: 100%; overflow: auto; padding: 24px; background: radial-gradient(circle at 20% 0%, rgba(182,156,255,0.14), transparent 28rem), rgba(3, 7, 18, 0.36); }
     .settings-page .settings-card { max-width: 1180px; margin: 0 auto; }
     .settings-card { box-shadow: var(--shadow); background: rgba(8,13,27,0.76); border: 1px solid var(--line); backdrop-filter: blur(18px); }
@@ -1899,16 +2552,33 @@ export function renderAppHtml() {
     .hub-section { display: grid; gap: 14px; padding-top: 18px; border-top: 1px solid rgba(139,211,255,0.24); }
     .hub-section:first-child { border-top: 0; padding-top: 0; }
     .hub-section-title { color: var(--muted); font-size: 12px; font-weight: 900; text-transform: uppercase; letter-spacing: 0.13em; }
-    .hub-section-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 260px), 1fr)); gap: 14px; }
-    .hub-folder-card { min-width: 0; border: 1px solid rgba(148,163,184,0.16); border-radius: 22px; padding: 18px; min-height: 132px; background: linear-gradient(145deg, rgba(139,211,255,0.10), rgba(182,156,255,0.06)); color: var(--text); text-align: left; cursor: pointer; display: grid; align-content: space-between; gap: 12px; box-shadow: 0 18px 54px rgba(0,0,0,0.24); overflow: hidden; }
+    .hub-section-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 260px), 1fr)); gap: 14px; align-items: start; }
+    .hub-folder-card { min-width: 0; border: 1px solid rgba(148,163,184,0.16); border-radius: 22px; padding: 0; min-height: 132px; background: linear-gradient(145deg, rgba(139,211,255,0.10), rgba(182,156,255,0.06)); color: var(--text); text-align: left; display: grid; gap: 0; box-shadow: 0 18px 54px rgba(0,0,0,0.24); overflow: hidden; }
     .hub-folder-card.navigation { background: linear-gradient(145deg, rgba(182,156,255,0.13), rgba(139,211,255,0.07)); }
+    .hub-folder-card.expanded { grid-column: 1 / -1; border-color: rgba(139,211,255,0.38); background: linear-gradient(145deg, rgba(139,211,255,0.13), rgba(182,156,255,0.08)); }
+    .hub-folder-card.current { border-color: rgba(139,211,255,0.54); }
     .hub-folder-card:hover { transform: translateY(-2px); border-color: rgba(139,211,255,0.42); background: linear-gradient(145deg, rgba(139,211,255,0.16), rgba(182,156,255,0.10)); }
+    .hub-folder-card-main { width: 100%; min-width: 0; min-height: 132px; border: 0; border-radius: 22px; padding: 18px; background: transparent; color: inherit; text-align: left; cursor: pointer; display: grid; align-content: space-between; gap: 12px; }
+    .hub-folder-card-main:focus-visible { outline: 2px solid rgba(139,211,255,0.74); outline-offset: -4px; }
+    .hub-folder-card.expanded > .hub-folder-card-main { min-height: 104px; }
+    .hub-folder-children { display: grid; gap: 12px; padding: 0 14px 14px; }
+    .hub-folder-children-head { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; padding: 13px 4px 0; border-top: 1px solid rgba(148,163,184,0.16); color: var(--muted); font-size: 12px; font-weight: 850; }
+    .hub-folder-children-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 230px), 1fr)); gap: 12px; }
+    .hub-folder-children .hub-folder-card { min-height: 112px; box-shadow: none; }
+    .hub-folder-children .hub-folder-card-main { min-height: 112px; padding: 14px; border-radius: 18px; }
     .hub-folder-card strong { display: block; min-width: 0; font-size: 20px; line-height: 1.05; letter-spacing: 0; overflow-wrap: anywhere; }
     .hub-folder-card span { min-width: 0; color: var(--muted); font-size: 13px; line-height: 1.35; overflow-wrap: anywhere; }
     .hub-folder-card code { min-width: 0; color: var(--accent); font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; line-height: 1.25; overflow-wrap: anywhere; white-space: normal; }
     .hub-folder-meta { min-width: 0; display: flex; justify-content: space-between; gap: 10px; align-items: end; color: #cbd7ec; font-size: 12px; text-transform: uppercase; letter-spacing: 0.08em; }
     .hub-folder-meta code { flex: 1 1 auto; }
     .hub-folder-meta span { flex: 0 0 auto; text-align: right; white-space: nowrap; }
+    .startup-context-panel { display: grid; gap: 10px; padding-top: 18px; border-top: 1px solid rgba(139,211,255,0.24); }
+    .startup-context-copy { color: var(--muted); font-size: 13px; line-height: 1.4; }
+    .startup-context-list { display: grid; gap: 8px; }
+    .startup-context-item { min-width: 0; border: 1px solid rgba(148,163,184,0.16); border-radius: 14px; padding: 12px 14px; background: rgba(255,255,255,0.04); color: var(--text); cursor: pointer; text-align: left; display: grid; grid-template-columns: minmax(120px, 0.28fr) minmax(0, 1fr); gap: 12px; align-items: center; }
+    .startup-context-item:hover { transform: translateY(-1px); border-color: rgba(139,211,255,0.42); background: rgba(139,211,255,0.09); }
+    .startup-context-item strong { min-width: 0; font-size: 13px; line-height: 1.25; overflow-wrap: anywhere; }
+    .startup-context-item span { min-width: 0; color: var(--muted); font: 12px/1.35 ui-monospace, SFMono-Regular, Menlo, monospace; overflow-wrap: anywhere; }
     .selection-bar { margin: 6px 0 8px; padding: 5px 6px 5px 10px; border: 1px solid rgba(139,211,255,0.18); border-radius: 999px; background: rgba(8,13,27,0.72); display: flex; gap: 8px; align-items: center; justify-content: space-between; box-shadow: 0 10px 28px rgba(0,0,0,0.18); }
     .selection-bar[hidden] { display: none; }
     .selection-summary { min-width: 0; color: #dce8fb; font-size: 11px; font-weight: 850; letter-spacing: 0.02em; white-space: nowrap; }
@@ -1982,12 +2652,74 @@ export function renderAppHtml() {
     .diff-raw-meta summary::-webkit-details-marker { display: none; }
     .diff-raw-meta pre { margin: 6px 0 0; padding: 8px 10px; border-radius: 10px; background: rgba(255,255,255,0.025); white-space: pre-wrap; }
     .diff-empty { padding: 18px; color: var(--muted); font: 14px/1.5 Inter, ui-sans-serif, system-ui, sans-serif; }
+    .conflict-panel { position: sticky; top: 0; z-index: 8; margin: 14px; border: 1px solid rgba(255,196,107,0.54); border-radius: 16px; background: linear-gradient(135deg, rgba(255,196,107,0.18), rgba(255,140,157,0.12)); box-shadow: 0 14px 44px rgba(0,0,0,0.24); padding: 14px; display: grid; gap: 12px; font-family: Inter, ui-sans-serif, system-ui, sans-serif; color: #f7efe1; }
+    .external-review-actions { align-items: center; flex-wrap: nowrap; }
+    .external-choice { min-height: 24px; padding: 4px 8px; border-radius: 999px; font-size: 11px; font-weight: 900; letter-spacing: 0; box-shadow: 0 6px 18px rgba(0,0,0,0.22); }
+    .external-choice.icon { width: 25px; min-height: 24px; padding: 0; display: inline-flex; align-items: center; justify-content: center; }
+    .external-change-stats { display: flex; gap: 6px; flex-wrap: wrap; color: rgba(226,236,255,0.82); font: 11px/1.2 ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; }
+    .external-change-stats span { border: 1px solid rgba(148,163,184,0.16); border-radius: 999px; padding: 3px 7px; background: rgba(2,6,23,0.24); }
+    .external-change-stats .add { color: #9cffbc; border-color: rgba(93,244,143,0.28); }
+    .external-change-stats .del { color: #ffb2bf; border-color: rgba(255,140,157,0.32); }
+    .external-change-stats .pending { color: #dbeafe; border-color: rgba(125,211,252,0.28); }
+    .external-review-doc { white-space: normal; background: rgba(3,7,18,0.16); }
+    .external-review-block { position: relative; min-width: 0; }
+    .external-review-block.change { display: block; position: relative; margin: 6px 0; padding: 2px 34px 2px 0; border-left: 2px solid rgba(125,211,252,0.46); border-radius: 0 10px 10px 0; background: linear-gradient(90deg, rgba(125,211,252,0.06), rgba(125,211,252,0.018) 72%, transparent); }
+    .external-review-block.resolved { color: rgba(226,236,255,0.86); margin: 4px 0; padding: 2px 78px 2px 0; border-left: 2px solid rgba(148,163,184,0.22); border-radius: 0 10px 10px 0; background: rgba(148,163,184,0.035); transition: min-height 180ms ease, background 220ms ease; }
+    .external-review-block.resolved.settling { overflow: hidden; transition: height 2s ease, min-height 2s ease, margin 2s ease, padding 2s ease, border-width 2s ease, background 220ms ease, border-color 220ms ease; }
+    .external-review-block.resolved.accept { border-left-color: rgba(93,244,143,0.46); background: rgba(48,215,111,0.06); }
+    .external-review-block.resolved.reject { border-left-color: rgba(255,140,157,0.42); background: rgba(255,86,117,0.055); }
+    .external-review-resolved-label { position: absolute; top: 5px; right: 7px; z-index: 1; border: 1px solid rgba(148,163,184,0.16); border-radius: 999px; padding: 2px 7px; background: rgba(8,13,27,0.78); color: rgba(226,236,255,0.72); font: 9px/1.35 Inter, ui-sans-serif, system-ui, sans-serif; font-weight: 900; text-transform: uppercase; letter-spacing: 0.08em; }
+    .external-review-block.resolved.accept .external-review-resolved-label { color: #b9ffd0; border-color: rgba(93,244,143,0.28); }
+    .external-review-block.resolved.reject .external-review-resolved-label { color: #ffc0c8; border-color: rgba(255,140,157,0.30); }
+    .external-review-placeholder { min-height: 24px; display: flex; align-items: center; padding: 2px 8px; color: rgba(226,236,255,0.62); font: 11px/1.5 Inter, ui-sans-serif, system-ui, sans-serif; font-weight: 800; }
+    .external-review-doc.settled .external-review-block.resolved { margin: 0; padding: 0; border-left-color: transparent; background: transparent; }
+    .external-review-doc.settled .external-review-block.resolved.accept, .external-review-doc.settled .external-review-block.resolved.reject { background: transparent; }
+    .external-review-doc.settled .external-review-resolved-label, .external-review-doc.settled .external-review-placeholder { display: none; }
+    .external-review-doc.settled .external-review-block.resolved.empty { min-height: 0; height: 0; border: 0; overflow: hidden; }
+    .external-review-lines { display: grid; gap: 1px; min-width: 0; }
+    .external-review-block-controls { position: absolute; top: 4px; right: 4px; z-index: 2; display: flex; gap: 4px; align-items: center; padding: 2px; border: 1px solid rgba(148,163,184,0.14); border-radius: 999px; background: rgba(8,13,27,0.86); opacity: 0.66; transition: opacity 140ms ease, transform 140ms ease, border-color 140ms ease; }
+    .external-review-block.change:hover .external-review-block-controls, .external-review-block.change:focus-within .external-review-block-controls { opacity: 1; border-color: rgba(139,211,255,0.26); transform: translateY(-1px); }
+    .external-review-line { display: grid; grid-template-columns: 28px minmax(0, 1fr); gap: 8px; padding: 1px 8px; border-radius: 5px; white-space: pre-wrap; overflow-wrap: anywhere; line-height: 1.58; }
+    .external-review-line .marker { color: rgba(226,236,255,0.58); user-select: none; }
+    .external-review-line.add { color: #d6ffe0; background: rgba(48,215,111,0.12); }
+    .external-review-line.add .marker { color: #8df0b4; }
+    .external-review-line.del { color: #ffd5dc; background: rgba(255,86,117,0.12); }
+    .external-review-line.del .marker { color: #ff9cac; }
+    .external-review-line.ctx { color: rgba(226,236,255,0.86); }
+    .external-review-block.resolved.empty { min-height: 32px; overflow: hidden; }
+    .conflict-panel strong { font-size: 15px; letter-spacing: 0; text-transform: none; }
+    .conflict-panel p { margin: 0; color: #d9c9a8; font-size: 13px; line-height: 1.45; }
+    .conflict-actions { display: flex; gap: 8px; flex-wrap: wrap; }
+    .conflict-compare { display: grid; gap: 12px; min-width: 0; }
+    .conflict-card { min-width: 0; border: 1px solid rgba(148,163,184,0.16); border-radius: 14px; background: rgba(3,7,18,0.34); overflow: hidden; }
+    .conflict-card-head { display: flex; justify-content: space-between; gap: 10px; align-items: center; padding: 8px 10px; border-bottom: 1px solid rgba(148,163,184,0.12); color: var(--muted); font-size: 11px; font-weight: 850; text-transform: uppercase; letter-spacing: 0.08em; }
+    .conflict-card-head small { color: rgba(226,236,255,0.58); font-size: 10px; font-weight: 800; letter-spacing: 0.04em; text-transform: none; }
+    .conflict-card-head .diff-line { display: inline; padding: 1px 5px; border-radius: 999px; }
+    .conflict-diff { max-height: min(42vh, 440px); overflow: auto; padding: 10px; font: 12px/1.46 ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; }
+    .conflict-diff-line { display: grid; grid-template-columns: 42px minmax(0, 1fr); gap: 8px; padding: 2px 8px; border-radius: 8px; white-space: pre-wrap; overflow-wrap: anywhere; }
+    .conflict-diff-line .marker { color: rgba(226,236,255,0.56); user-select: none; }
+    .conflict-diff-line.add { color: #ccffd9; background: rgba(48, 215, 111, 0.18); border-left: 3px solid rgba(93, 244, 143, 0.78); }
+    .conflict-diff-line.add .marker { color: #8df0b4; }
+    .conflict-diff-line.del { color: #ffd0d8; background: rgba(255, 86, 117, 0.18); border-left: 3px solid rgba(255, 140, 157, 0.78); }
+    .conflict-diff-line.del .marker { color: #ff9cac; }
+    .conflict-diff-line.ctx { color: rgba(226,236,255,0.82); border-left: 3px solid transparent; }
+    .conflict-diff-line.skip { color: rgba(148,163,184,0.72); background: rgba(148,163,184,0.07); border-left: 3px solid transparent; font-style: italic; }
+    .conflict-diff-line.skip .marker { color: rgba(148,163,184,0.62); }
+    .conflict-merge { display: grid; gap: 10px; padding: 10px; }
+    .conflict-merge textarea { display: block; width: 100%; min-height: min(42vh, 430px); resize: vertical; border: 1px solid rgba(148,163,184,0.18); border-radius: 12px; background: rgba(2,6,23,0.56); color: var(--text); outline: none; padding: 12px; font: 12px/1.48 ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; white-space: pre-wrap; overflow-wrap: anywhere; }
+    .conflict-merge-actions { display: flex; gap: 8px; flex-wrap: wrap; justify-content: flex-end; }
+    @media (max-width: 760px) { .external-review-actions { flex-wrap: wrap; justify-content: flex-start; } .external-review-block.change { padding-right: 0; } .external-review-block-controls { position: static; width: fit-content; margin: 4px 0 2px 8px; opacity: 1; } .external-review-line { grid-template-columns: 22px minmax(0, 1fr); } }
     .file-header-copy { min-width: 0; display: grid; gap: 5px; }
     .file-header-copy .diff-meta { white-space: normal; line-height: 1.35; }
     .file-actions { display: flex; gap: 8px; align-items: center; flex: 0 0 auto; }
     .file-action { border: 1px solid rgba(148,163,184,0.18); border-radius: 12px; padding: 9px 12px; background: rgba(255,255,255,0.06); color: var(--text); font-weight: 850; cursor: pointer; }
     .file-action:hover { transform: translateY(-1px); background: rgba(139,211,255,0.12); }
     .file-action.primary { color: #07101e; border: 0; background: linear-gradient(135deg, var(--accent), var(--accent-2)); }
+    .confirm-backdrop { position: fixed; inset: 0; z-index: 90; display: grid; place-items: center; padding: 18px; background: rgba(2,6,23,0.72); backdrop-filter: blur(14px); }
+    .confirm-dialog { width: min(420px, 100%); border: 1px solid rgba(148,163,184,0.24); border-radius: 18px; background: rgba(8,13,27,0.96); box-shadow: 0 22px 80px rgba(0,0,0,0.45); padding: 18px; color: var(--text); }
+    .confirm-dialog strong { display: block; font-size: 18px; line-height: 1.2; margin-bottom: 8px; }
+    .confirm-dialog p { margin: 0; color: var(--muted); font-size: 14px; line-height: 1.45; overflow-wrap: anywhere; }
+    .confirm-actions { display: flex; justify-content: flex-end; gap: 8px; flex-wrap: wrap; margin-top: 18px; }
     .diff-toggle { border: 1px solid rgba(139,211,255,0.24); border-radius: 14px; padding: 10px 13px; margin-bottom: 10px; background: rgba(139,211,255,0.08); color: var(--text); font-weight: 850; cursor: pointer; }
     .diff-toggle:hover { transform: translateY(-1px); background: rgba(139,211,255,0.14); }
     @media (max-width: 1280px) { .review-workspace { grid-template-columns: 1fr; } .diff-code, .doc-content { max-height: none; } }
@@ -2034,14 +2766,21 @@ export function renderAppHtml() {
       .review-item { padding: 11px; }
       .review-top { align-items: flex-start; }
       .settings-grid, .hub-card-editor-grid, .template-editor-grid, .markdown-create { grid-template-columns: 1fr; }
+      .markdown-create .settings-field.paths, .path-picker-field, .path-picker-preview, .new-doc-actions { grid-column: 1; }
+      .path-picker { grid-template-columns: 1fr; }
+      .path-picker-menu { left: 8px; right: 8px; width: auto; }
       .hub-folders { gap: 18px; }
-      .hub-folder-card { min-height: 116px; padding: 15px; border-radius: 18px; }
+      .hub-folder-card { min-height: 116px; border-radius: 18px; }
+      .hub-folder-card-main { min-height: 116px; padding: 15px; border-radius: 18px; }
+      .hub-folder-children { padding: 0 12px 12px; }
       .hub-folder-card strong { font-size: 18px; }
+      .startup-context-item { grid-template-columns: 1fr; gap: 5px; }
       textarea, .viewer { min-height: 100%; padding: 16px; font-size: 14px; line-height: 1.58; }
       .review-workspace { grid-template-columns: 1fr; gap: 12px; }
       .diff-code, .doc-content, .doc-editor { max-height: none; padding: 12px; font-size: 12px; }
       .diff-header, .file-panel header { padding: 12px; align-items: flex-start; }
       .file-actions { gap: 6px; flex-wrap: wrap; justify-content: flex-end; }
+      .conflict-compare { grid-template-columns: 1fr; }
       .file-action { padding: 8px 10px; }
       .planet-system { min-height: 620px; }
       .cosmos-home { min-height: 100%; padding: 16px; overflow: auto; }
@@ -2086,7 +2825,10 @@ export function renderAppHtml() {
       .review-summary-item { min-width: 0; }
       .review-item { padding: 10px; }
       .hub-folders { gap: 14px; margin-top: 12px; }
-      .hub-folder-card { min-height: 104px; padding: 14px; border-radius: 16px; }
+      .hub-folder-card { min-height: 104px; border-radius: 16px; }
+      .hub-folder-card-main { min-height: 104px; padding: 14px; border-radius: 16px; }
+      .hub-folder-children { padding: 0 10px 10px; gap: 10px; }
+      .hub-folder-children-grid { gap: 10px; }
       .hub-folder-card strong { font-size: 17px; }
       .hub-folder-card span { font-size: 12px; }
       .hub-breadcrumb { padding: 8px 10px; font-size: 11px; gap: 5px; }
@@ -2174,6 +2916,15 @@ export function renderAppHtml() {
               </header>
               <div id="markdownTools" class="markdown-tools"></div>
             </section>
+            <section class="docqa-panel">
+              <header>
+                <div>
+                  <h2>Context health</h2>
+                  <div class="muted">metadata, graph, links, startup context, and config checks</div>
+                </div>
+              </header>
+              <div id="contextHealth" class="markdown-tools"></div>
+            </section>
           </div>
           <div id="hubFolders" class="hub-folders"></div>
         </div>
@@ -2188,6 +2939,17 @@ export function renderAppHtml() {
             <div id="settingsPanel" class="settings-panel"></div>
           </section>
         </div>
+        <div id="newDocPage" class="settings-page" hidden>
+          <section class="docqa-panel settings-card">
+            <header>
+              <div>
+                <h2>New document</h2>
+                <div class="muted">choose the template and metadata before the file is created</div>
+              </div>
+            </header>
+            <div id="newDocPanel" class="settings-panel"></div>
+          </section>
+        </div>
         <div id="viewer" class="viewer"></div>
         <textarea id="editor" spellcheck="false"></textarea>
       </section>
@@ -2195,7 +2957,7 @@ export function renderAppHtml() {
   </div>
   <div id="explorerContextMenu" class="explorer-context-menu" hidden></div>
 <script>
-const state = { files: [], docqa: null, settings: null, settingsOpen: false, page: "hub", availableHubCards: [], hubFolders: [], hubSections: [], rootHubSections: [], activeHubCardId: null, selectedReview: null, selected: null, selectedDiff: null, diffCollapsed: false, saved: "", savedHash: null, dirty: false, mode: "view", homeView: "root", planetStack: ["root"], filePanel: false, history: [], historyIndex: -1, pathFilters: [], explorerWatchFilter: "all", selectedForDelete: new Set(), selectionRequest: 0, mobileSidebarTouched: false, expanded: new Set(["data", "automations", "integrations", "skills", "tools", "~", "~/.hermes", "~/.hermes/memories", "~/.hermes/skills"]) };
+const state = { files: [], startupContextFiles: [], selectedStartupContext: null, docqa: null, doctor: null, settings: null, settingsOpen: false, page: "hub", pendingMarkdown: null, availableHubCards: [], hubFolders: [], hubSections: [], rootHubSections: [], activeHubCardId: null, selectedReview: null, selected: null, selectedDiff: null, fileConflict: null, externalChange: null, conflictCompare: false, conflictMergeText: null, conflictMergeKey: "", conflictMergeMode: "auto", conflictCheckTimer: null, diffCollapsed: false, saved: "", savedHash: null, dirty: false, mode: "view", homeView: "root", planetStack: ["root"], filePanel: false, history: [], historyIndex: -1, pathFilters: [], explorerWatchFilter: "all", selectedForDelete: new Set(), selectionRequest: 0, mobileSidebarTouched: false, expanded: new Set(["data", "automations", "integrations", "skills", "tools", "~", "~/.hermes", "~/.hermes/memories", "~/.hermes/skills"]) };
 const MAIN_FILE_PATHS = new Set([
   "~/.hermes/memories/USER.md",
   "~/.hermes/memories/MEMORY.md",
@@ -2227,10 +2989,11 @@ const el = (id) => document.getElementById(id);
 
 async function api(path, options) {
   const attempts = options ? 1 : 3;
+  const requestOptions = options ? { cache: "no-store", ...options } : { cache: "no-store" };
   let lastError = null;
   for (let attempt = 1; attempt <= attempts; attempt += 1) {
     try {
-      const res = await fetch(path, options);
+      const res = await fetch(path, requestOptions);
       const json = await res.json();
       if (!res.ok) throw new Error(json.error || "request failed");
       return json;
@@ -2315,6 +3078,7 @@ function visibleFiles() {
   const filters = state.pathFilters || [];
   const generatedFilterQuery = folderFilterSearchQuery(filters).toLowerCase().trim();
   return state.files.filter((file) => {
+    if (file.startupContext) return false;
     const inScope = !filters.length || filters.some((filter) => pathMatchesFilter(file.path, filter));
     const matchesWatchFilter = explorerWatchFilterMatches(file.path, state.explorerWatchFilter, state.settings?.watchAllow || []);
     const haystack = (file.path + " " + file.label + " " + file.category).toLowerCase();
@@ -2417,11 +3181,6 @@ function parentDirectoryFromUiPath(relPath) {
   return parts.join("/");
 }
 
-function defaultMarkdownPathForDirectory(directory, title = "New document") {
-  const slug = slugifyUiId(title) || "new-document";
-  return (directory ? directory.replace(/\/$/, "") + "/" : "") + slug + ".md";
-}
-
 function defaultFolderPathForDirectory(directory, title = "New folder") {
   const slug = slugifyUiId(title) || "new-folder";
   return (directory ? directory.replace(/\/$/, "") + "/" : "") + slug;
@@ -2433,20 +3192,22 @@ function renderExplorerContextMenu(x, y) {
   if (!menu || !target || !state.settings) return;
   const directoryLabel = target.directory || "project root";
   const label = target.path || directoryLabel;
-  menu.innerHTML = '<div class="explorer-context-title"><span>Actions</span><code>' + escapeHtml(label) + '</code></div>' +
-    '<div class="explorer-context-actions menu-actions" data-context-action-list>' +
-      '<button class="secondary" type="button" data-context-watch>Watch</button>' +
+  const targetActions = target.path
+    ? '<button class="secondary" type="button" data-context-watch>Watch</button>' +
       '<button class="secondary" type="button" data-context-new-file>New file</button>' +
       '<button class="secondary" type="button" data-context-new-folder>New folder</button>' +
       '<button class="secondary" type="button" data-context-select>Select</button>' +
-      '<button class="secondary danger-action" type="button" data-context-delete>Delete</button>' +
+      '<button class="secondary danger-action" type="button" data-context-delete>Delete</button>'
+    : '<button class="secondary" type="button" data-context-new-file>New file</button>' +
+      '<button class="secondary" type="button" data-context-new-folder>New folder</button>';
+  menu.innerHTML = '<div class="explorer-context-title"><span>Actions</span><code>' + escapeHtml(label) + '</code></div>' +
+    '<div class="explorer-context-actions menu-actions" data-context-action-list>' +
+      targetActions +
     '</div>' +
     '<div class="explorer-context-form" data-context-new-file-form hidden>' +
       '<div class="explorer-context-title"><span>New file</span><code>' + escapeHtml(directoryLabel) + '</code></div>' +
       '<label class="explorer-context-label" for="contextMarkdownTitle">Name</label>' +
       '<input id="contextMarkdownTitle" placeholder="Document title" value="New document" />' +
-      '<label class="explorer-context-label" for="contextMarkdownPath">Path</label>' +
-      '<input id="contextMarkdownPath" data-auto-path="true" placeholder="path/to/file.md" value="' + escapeHtml(defaultMarkdownPathForDirectory(target.directory)) + '" />' +
       '<div class="explorer-context-actions form-actions"><button id="contextCancelMarkdown" class="secondary" type="button" title="Cancel" aria-label="Cancel">Cancel</button><button id="contextCreateMarkdown" class="primary" type="button">Create</button></div>' +
     '</div>' +
     '<div class="explorer-context-form" data-context-new-folder-form hidden>' +
@@ -2464,12 +3225,17 @@ function renderExplorerContextMenu(x, y) {
   document.querySelector("[data-context-new-folder]")?.addEventListener("click", showContextNewFolderForm);
   document.querySelector("[data-context-select]")?.addEventListener("click", selectExplorerContextTarget);
   document.querySelector("[data-context-delete]")?.addEventListener("click", () => deleteExplorerContextTarget().catch((error) => setStatus(error.message)));
-  el("contextMarkdownTitle")?.addEventListener("input", suggestContextMarkdownPath);
-  el("contextMarkdownPath")?.addEventListener("input", () => { el("contextMarkdownPath").dataset.autoPath = "false"; });
   el("contextCreateMarkdown")?.addEventListener("click", () => createMarkdownFromContextMenu().catch((error) => setStatus(error.message)));
   el("contextCancelMarkdown")?.addEventListener("click", hideExplorerContextMenu);
   el("contextCreateFolder")?.addEventListener("click", () => createFolderFromContextMenu().catch((error) => setStatus(error.message)));
   el("contextCancelFolder")?.addEventListener("click", hideExplorerContextMenu);
+}
+
+function openExplorerEmptyContextMenu(event) {
+  if (event.target.closest("#explorerContextMenu")) return;
+  if (event.target.closest("[data-file-path], [data-folder-path], [data-toggle-folder]")) return;
+  if (event.target.closest("button, input, textarea, select, a, .workspace-dock, .search-row, .watch-filter-row, .selection-bar, .sidebar-head")) return;
+  openExplorerContextMenu(event, { kind: "folder", path: "" });
 }
 
 function hideContextCreationForms() {
@@ -2513,13 +3279,6 @@ function clampContextMenuToViewport(menu) {
   });
 }
 
-function suggestContextMarkdownPath() {
-  const pathInput = el("contextMarkdownPath");
-  if (!pathInput || pathInput.dataset.autoPath === "false") return;
-  const title = el("contextMarkdownTitle")?.value || "New document";
-  pathInput.value = defaultMarkdownPathForDirectory(state.explorerContextTarget?.directory || "", title);
-}
-
 function hideExplorerContextMenu() {
   const menu = el("explorerContextMenu");
   if (menu) menu.hidden = true;
@@ -2561,20 +3320,20 @@ async function deleteExplorerContextTarget() {
 }
 
 async function createMarkdownFromContextMenu() {
-  const relPath = normalizeUiPath(el("contextMarkdownPath")?.value || "");
-  if (!relPath) throw new Error("New markdown path is required");
-  setStatus("creating markdown...");
-  const result = await api("/api/markdown/create", {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({ path: relPath }),
-  });
+  const title = el("contextMarkdownTitle")?.value.trim() || "New document";
+  const directory = state.explorerContextTarget?.directory || "";
+  const relPath = markdownPathFromName(directory, title);
+  if (!relPath) throw new Error("New markdown name is required");
   hideExplorerContextMenu();
-  const parent = parentDirectoryFromUiPath(result.path);
-  if (parent) state.expanded.add(parent);
-  await loadFiles();
-  await selectFile(result.path, { revealInExplorer: true });
-  setStatus("markdown file created");
+  showNewDocPage({ title, path: relPath, directory });
+  setStatus("new document setup");
+}
+
+function markdownPathFromName(directory, name) {
+  const cleanDirectory = normalizeUiPath(directory).replace(/\/$/, "");
+  const rawName = String(name || "").trim().replace(/\.md$/i, "");
+  const slug = slugifyUiId(rawName) || "new-document";
+  return (cleanDirectory ? cleanDirectory + "/" : "") + slug + ".md";
 }
 
 async function createFolderFromContextMenu() {
@@ -2667,6 +3426,7 @@ async function deletePaths(paths) {
   if (selected.includes(state.selected) || result.deleted.includes(state.selected)) {
     state.selected = null;
     state.selectedDiff = null;
+    resetExternalChangeState();
     state.savedHash = null;
     state.dirty = false;
   }
@@ -2819,14 +3579,16 @@ function iconForPath(filePath) {
 
 async function loadFiles() {
   setStatus("chargement...");
-  const [data, docqa, settingsData] = await Promise.all([api("/api/files"), api("/api/docqa"), api("/api/settings")]);
+  const [data, docqa, doctor, settingsData, startupData] = await Promise.all([api("/api/files"), api("/api/docqa"), api("/api/doctor"), api("/api/settings"), api("/api/startup-context")]);
   state.files = data.files;
+  state.startupContextFiles = startupData.files || [];
   state.docqa = docqa;
+  state.doctor = doctor;
   state.settings = settingsData.settings;
   state.availableHubCards = settingsData.availableHubCards || [];
   state.hubFolders = settingsData.hubCards || [];
   state.rootHubSections = settingsData.hubSections || [];
-  state.hubSections = hubSectionViewForCard(state.rootHubSections, state.activeHubCardId);
+  state.hubSections = state.rootHubSections;
   state.selectedReview = docqa.queue[0]?.path || null;
   renderFiles();
   if (!state.selected) showHome();
@@ -2835,14 +3597,19 @@ async function loadFiles() {
 
 async function selectFile(path, options = {}) {
   if (!path) return;
-  if (state.dirty && !confirm("You have unsaved changes. Change file?")) return;
+  if (state.selected && path !== state.selected && !options.forceReload && blockPendingExternalChange("before changing file")) return;
+  if (state.dirty && !options.forceReload && !confirm("You have unsaved changes. Change file?")) return;
 
   const requestId = ++state.selectionRequest;
   state.selected = path;
+  state.selectedStartupContext = null;
   state.page = "file";
   state.settingsOpen = false;
+  state.pendingMarkdown = null;
   if (state.docqa?.queue?.some((item) => item.path === path)) state.selectedReview = path;
   state.selectedDiff = null;
+  resetConflictState();
+  resetExternalChangeState();
   state.saved = "";
   state.savedHash = null;
   state.dirty = false;
@@ -2859,6 +3626,7 @@ async function selectFile(path, options = {}) {
   document.querySelector(".editor-shell").classList.add("file-open");
   el("home").hidden = true;
   el("settingsPage").hidden = true;
+  el("newDocPage").hidden = true;
   el("viewer").hidden = false;
   el("editor").hidden = true;
   el("editor").value = "";
@@ -2902,6 +3670,54 @@ function isCurrentSelection(requestId, path) {
   return state.selectionRequest === requestId && state.selected === path;
 }
 
+async function selectStartupContextFile(order) {
+  if (!order) return;
+  if (state.dirty && !confirm("You have unsaved changes. Change file?")) return;
+  const requestId = ++state.selectionRequest;
+  const selectedKey = "startup-context-" + order;
+  const pendingFile = (state.startupContextFiles || []).find((file) => String(file.startupContext.order) === String(order));
+  state.selected = selectedKey;
+  state.selectedStartupContext = pendingFile?.startupContext || { order, fileName: "Startup context", displayPath: "" };
+  state.selectedDiff = null;
+  resetExternalChangeState();
+  state.saved = "";
+  state.savedHash = null;
+  state.dirty = false;
+  state.page = "file";
+  state.settingsOpen = false;
+  state.pendingMarkdown = null;
+  collapseSidebarOnNarrow();
+  document.querySelector(".editor-shell").classList.remove("planet-file-open");
+  document.querySelector(".editor-shell").classList.add("file-open");
+  el("home").hidden = true;
+  el("settingsPage").hidden = true;
+  el("newDocPage").hidden = true;
+  el("viewer").hidden = false;
+  el("editor").hidden = true;
+  el("editor").value = "";
+  updateHeader();
+  updateHistoryButtons();
+  updateActionBanner();
+  updatePreview();
+  renderFiles();
+  renderViewer();
+  setStatus("opening startup context...");
+  try {
+    const data = await api("/api/startup-context/file?order=" + encodeURIComponent(order));
+    if (!isCurrentSelection(requestId, selectedKey)) return;
+    state.selectedStartupContext = data.startupContext;
+    state.saved = data.content;
+    state.savedHash = data.contentHash;
+    el("editor").value = data.content;
+    updateHeader();
+    updatePreview();
+    renderViewer();
+    setStatus("startup context open");
+  } catch (error) {
+    if (isCurrentSelection(requestId, selectedKey)) setStatus(error.message);
+  }
+}
+
 function scrollExplorerToPath(path) {
   const aside = document.querySelector("aside");
   const target = document.querySelector('[data-file-path="' + cssEscape(path) + '"]');
@@ -2912,6 +3728,7 @@ function scrollExplorerToPath(path) {
 function showHome() {
   state.page = "hub";
   state.settingsOpen = false;
+  state.pendingMarkdown = null;
   state.filePanel = false;
   state.dirty = false;
   el("title").textContent = "Doc QA Control Room";
@@ -2920,6 +3737,7 @@ function showHome() {
   el("meta").textContent = state.docqa ? "audit generated " + new Date(state.docqa.generatedAt).toLocaleTimeString("en-US") : "";
   el("home").hidden = false;
   el("settingsPage").hidden = true;
+  el("newDocPage").hidden = true;
   el("viewer").hidden = true;
   el("editor").hidden = true;
   el("save").disabled = true;
@@ -2941,6 +3759,7 @@ function renderDocQaDashboard() {
     selectFile(button.dataset.reviewPath, { revealInExplorer: !isNarrowLayout() }).catch((error) => setStatus(error.message));
   }));
   renderMarkdownTools();
+  renderContextHealth();
   renderHubFolders();
 }
 
@@ -2949,6 +3768,262 @@ function renderMarkdownTools() {
   if (!holder || !state.settings) return;
   const bestPractices = state.settings.bestPractices || [];
   holder.innerHTML = '<ol class="best-practice-list">' + bestPractices.map((item) => '<li>' + escapeHtml(item) + '</li>').join("") + '</ol>';
+}
+
+function renderContextHealth() {
+  const holder = el("contextHealth");
+  if (!holder || !state.doctor) return;
+  const summary = state.doctor.graph || {};
+  const issues = state.doctor.issues || [];
+  holder.innerHTML = '<div class="review-summary">' +
+    '<div class="review-summary-item"><strong>' + Number(summary.docs || 0).toLocaleString("en-US") + '</strong><span>docs</span></div>' +
+    '<div class="review-summary-item"><strong>' + Number(summary.missingMetadata || 0).toLocaleString("en-US") + '</strong><span>no metadata</span></div>' +
+    '<div class="review-summary-item"><strong>' + Number(summary.highOrCritical || 0).toLocaleString("en-US") + '</strong><span>high risk</span></div>' +
+  '</div>' +
+  '<div class="issue-list">' + (issues.length ? issues.slice(0, 10).map((issue) => '<div class="issue ' + escapeHtml(issue.severity) + '"><strong>[' + escapeHtml(issue.severity) + ']</strong> ' + escapeHtml((issue.path ? issue.path + ": " : "") + issue.message) + '</div>').join("") : '<div class="issue">Context health is clean.</div>') + '</div>';
+}
+
+function showNewDocPage({ title = "New document", path = "docs/new-document.md", directory = "" } = {}) {
+  if (blockPendingExternalChange("before creating a document")) return;
+  if (state.dirty && !confirm("You have unsaved changes. Create a new document?")) return;
+  state.page = "new-doc";
+  state.settingsOpen = false;
+  state.pendingMarkdown = { title, path, directory };
+  state.selected = null;
+  state.selectedStartupContext = null;
+  state.selectedDiff = null;
+  resetExternalChangeState();
+  state.savedHash = null;
+  state.dirty = false;
+  el("title").textContent = "New document";
+  el("path").textContent = path;
+  el("impact").textContent = "Configure the document before Context Room writes it to disk.";
+  el("meta").textContent = directory ? "folder: " + directory : "project root";
+  el("home").hidden = true;
+  el("settingsPage").hidden = true;
+  el("newDocPage").hidden = false;
+  el("viewer").hidden = true;
+  el("editor").hidden = true;
+  el("save").disabled = true;
+  document.querySelector(".editor-shell").classList.remove("planet-file-open", "file-open");
+  renderNewDocPanel();
+  updateHistoryButtons();
+  updateActionBanner();
+  collapseSidebarOnNarrow();
+}
+
+function renderNewDocPanel() {
+  const holder = el("newDocPanel");
+  if (!holder || !state.pendingMarkdown) return;
+  const pending = state.pendingMarkdown;
+  const canonical = slugifyUiId(pending.title).replaceAll("-", "_");
+  const initialPath = splitMarkdownPath(pending.path);
+  const initialFolder = initialPath.folder || pending.directory || "";
+  const initialFileName = initialPath.fileName || markdownFileNameFromName(pending.title);
+  const initialPreview = markdownPathFromParts(initialFolder, initialFileName);
+  holder.innerHTML = '<div class="markdown-create" data-structured-doc-form>' +
+    '<div class="settings-field"><label for="markdownCreateTitle">Title</label><input id="markdownCreateTitle" value="' + escapeHtml(pending.title) + '" /></div>' +
+    '<div class="settings-field path-picker-field"><label>Path</label><div class="path-picker" data-path-picker>' +
+      '<input id="markdownCreateFolder" type="hidden" value="' + escapeHtml(initialFolder) + '" />' +
+      '<button id="markdownCreateFolderButton" class="path-picker-trigger" type="button" aria-haspopup="listbox" aria-expanded="false" aria-controls="markdownCreateFolderMenu"><code id="markdownCreateFolderLabel">' + escapeHtml(pathFolderLabel(initialFolder)) + '</code><span>choose</span></button>' +
+      '<input id="markdownCreateFileName" aria-label="File name" data-auto-name="true" value="' + escapeHtml(initialFileName) + '" />' +
+      '<input id="markdownCreatePath" type="hidden" value="' + escapeHtml(initialPreview) + '" />' +
+      '<div id="markdownCreateFolderMenu" class="path-picker-menu" hidden><input id="markdownCreateFolderSearch" class="path-picker-search" placeholder="search folder..." /><div id="markdownCreateFolderOptions" class="path-picker-options" role="listbox" aria-label="Folder choices"></div></div>' +
+      '<div class="path-picker-preview"><span>final path</span><code id="markdownCreatePathPreview">' + escapeHtml(initialPreview) + '</code></div>' +
+    '</div></div>' +
+    '<div class="settings-field"><label for="markdownCreateTemplate">Template</label><select id="markdownCreateTemplate">' + renderTemplateOptions("context-golden") + '</select></div>' +
+    '<div class="settings-field"><label for="markdownCreateKind">Kind</label><select id="markdownCreateKind"><option value="canonical">canonical</option><option value="index">index</option><option value="agents">agents</option><option value="procedure">procedure</option><option value="decision">decision</option></select></div>' +
+    '<div class="settings-field"><label for="markdownCreateScope">Scope</label><input id="markdownCreateScope" value="project" /></div>' +
+    '<div class="settings-field"><label for="markdownCreateStatus">Status</label><select id="markdownCreateStatus"><option value="current">current</option><option value="draft">draft</option><option value="historical">historical</option><option value="superseded">superseded</option></select></div>' +
+    '<div class="settings-field"><label for="markdownCreateCanonical">Canonical for</label><input id="markdownCreateCanonical" value="' + escapeHtml(canonical) + '" placeholder="feature or system name" /></div>' +
+    '<div class="settings-field paths"><label for="markdownCreateSources">Sources</label><textarea id="markdownCreateSources" placeholder="one source path or URL per line"></textarea></div>' +
+    '<div class="new-doc-actions"><button id="cancelStructuredMarkdown" class="secondary" type="button">Cancel</button><button id="createStructuredMarkdown" class="primary" type="button">Create file</button></div>' +
+  '</div>';
+  el("markdownCreateTitle")?.addEventListener("input", suggestStructuredMarkdownPath);
+  el("markdownCreateFolderButton")?.addEventListener("click", () => togglePathPickerMenu());
+  el("markdownCreateFolderSearch")?.addEventListener("input", () => renderPathPickerOptions(el("markdownCreateFolderSearch")?.value || ""));
+  el("markdownCreateFolderSearch")?.addEventListener("keydown", (event) => {
+    if (event.key === "Escape") togglePathPickerMenu(false);
+  });
+  el("markdownCreateFileName")?.addEventListener("input", () => {
+    el("markdownCreateFileName").dataset.autoName = "false";
+    updateStructuredMarkdownPath();
+  });
+  el("markdownCreateFileName")?.addEventListener("blur", normalizeStructuredFileName);
+  el("markdownCreateTemplate")?.addEventListener("change", syncStructuredTemplateKind);
+  el("cancelStructuredMarkdown")?.addEventListener("click", () => goHub());
+  el("createStructuredMarkdown")?.addEventListener("click", () => createStructuredMarkdownFromWizard().catch((error) => setStatus(error.message)));
+  renderPathPickerOptions();
+  updateStructuredMarkdownPath();
+}
+
+function suggestStructuredMarkdownPath() {
+  const title = el("markdownCreateTitle")?.value || "New document";
+  const fileName = el("markdownCreateFileName");
+  if (fileName && fileName.dataset.autoName !== "false") fileName.value = markdownFileNameFromName(title);
+  updateStructuredMarkdownPath();
+  const canonical = el("markdownCreateCanonical");
+  if (canonical && !canonical.value.trim()) canonical.value = slugifyUiId(title).replaceAll("-", "_");
+}
+
+function markdownFolderOptions(selectedFolder = "") {
+  const folders = new Set([""]);
+  const addFolder = (folderPath) => {
+    const clean = normalizeUiPath(folderPath).replace(/\/$/, "");
+    if (!clean || clean.startsWith("~")) {
+      if (!clean) folders.add("");
+      return;
+    }
+    folders.add(clean);
+    for (const parent of parentFolders(clean)) folders.add(parent);
+  };
+  addFolder(selectedFolder);
+  addFolder(state.pendingMarkdown?.directory || "");
+  for (const item of state.files || []) {
+    const folder = parentDirectoryFromUiPath(item.path || "");
+    if (folder) addFolder(folder);
+  }
+  for (const configured of [...(state.settings?.allowedPaths || []), ...(state.settings?.watchAllow || [])]) {
+    const clean = normalizeUiPath(configured);
+    if (clean.endsWith("/")) addFolder(clean);
+  }
+  return [...folders]
+    .sort((a, b) => (a === "" ? -1 : b === "" ? 1 : a.localeCompare(b)))
+    .map((value) => ({ value, label: value ? value + "/" : "project root" }));
+}
+
+function pathFolderLabel(folder = "") {
+  return folder ? normalizeUiPath(folder).replace(/\/$/, "") + "/" : "project root";
+}
+
+function togglePathPickerMenu(forceOpen) {
+  const menu = el("markdownCreateFolderMenu");
+  const button = el("markdownCreateFolderButton");
+  if (!menu || !button) return;
+  const open = typeof forceOpen === "boolean" ? forceOpen : menu.hidden;
+  menu.hidden = !open;
+  button.setAttribute("aria-expanded", open ? "true" : "false");
+  if (open) {
+    const search = el("markdownCreateFolderSearch");
+    if (search) {
+      search.value = "";
+      renderPathPickerOptions();
+      search.focus();
+    }
+  }
+}
+
+function renderPathPickerOptions(query = "") {
+  const holder = el("markdownCreateFolderOptions");
+  if (!holder) return;
+  const selected = normalizeUiPath(el("markdownCreateFolder")?.value || "").replace(/\/$/, "");
+  const cleanQuery = String(query || "").toLowerCase().trim();
+  const options = markdownFolderOptions(selected).filter((folder) => {
+    if (!cleanQuery) return true;
+    return folder.label.toLowerCase().includes(cleanQuery) || folder.value.toLowerCase().includes(cleanQuery);
+  });
+  holder.innerHTML = options.length
+    ? options.slice(0, 80).map((folder) =>
+      '<button class="path-picker-option ' + (folder.value === selected ? 'active' : '') + '" type="button" role="option" aria-selected="' + (folder.value === selected ? 'true' : 'false') + '" data-path-folder="' + escapeHtml(folder.value) + '">' +
+        '<code>' + escapeHtml(folder.label) + '</code><span>' + (folder.value === selected ? 'current' : 'select') + '</span>' +
+      '</button>'
+    ).join("")
+    : '<div class="path-picker-empty">No folder matches this search.</div>';
+  holder.querySelectorAll("[data-path-folder]").forEach((button) => button.addEventListener("click", () => setStructuredFolder(button.dataset.pathFolder || "")));
+}
+
+function setStructuredFolder(folder) {
+  const clean = normalizeUiPath(folder).replace(/\/$/, "");
+  const input = el("markdownCreateFolder");
+  const label = el("markdownCreateFolderLabel");
+  if (input) input.value = clean;
+  if (label) label.textContent = pathFolderLabel(clean);
+  togglePathPickerMenu(false);
+  updateStructuredMarkdownPath();
+}
+
+function splitMarkdownPath(relPath = "") {
+  const normalized = normalizeUiPath(relPath);
+  const parts = normalized.split("/").filter(Boolean);
+  const fileName = parts.pop() || "";
+  return { folder: parts.join("/"), fileName };
+}
+
+function markdownFileNameFromName(name) {
+  const raw = String(name || "").trim().replace(/\.md$/i, "");
+  const slug = slugifyUiId(raw) || "new-document";
+  return slug + ".md";
+}
+
+function markdownPathFromParts(folder, fileName) {
+  const cleanFolder = normalizeUiPath(folder).replace(/\/$/, "");
+  const cleanFileName = markdownFileNameFromName(fileName);
+  return (cleanFolder ? cleanFolder + "/" : "") + cleanFileName;
+}
+
+function updateStructuredMarkdownPath() {
+  const folder = el("markdownCreateFolder")?.value || "";
+  const fileName = el("markdownCreateFileName")?.value || el("markdownCreateTitle")?.value || "New document";
+  const relPath = markdownPathFromParts(folder, fileName);
+  const pathInput = el("markdownCreatePath");
+  const preview = el("markdownCreatePathPreview");
+  if (pathInput) pathInput.value = relPath;
+  if (preview) preview.textContent = relPath;
+  if (state.pendingMarkdown) {
+    state.pendingMarkdown.path = relPath;
+    state.pendingMarkdown.directory = folder;
+  }
+  if (state.page === "new-doc") {
+    el("path").textContent = relPath;
+    el("meta").textContent = folder ? "folder: " + folder : "project root";
+  }
+  return relPath;
+}
+
+function normalizeStructuredFileName() {
+  const input = el("markdownCreateFileName");
+  if (!input) return;
+  input.value = splitMarkdownPath(markdownPathFromParts("", input.value)).fileName;
+  updateStructuredMarkdownPath();
+}
+
+function syncStructuredTemplateKind() {
+  const templateId = el("markdownCreateTemplate")?.value || "context-golden";
+  const kindByTemplate = { agents: "agents", "docs-index": "index", "context-golden": "canonical", procedure: "procedure", "decision-record": "decision" };
+  const kind = kindByTemplate[templateId];
+  if (kind && el("markdownCreateKind")) el("markdownCreateKind").value = kind;
+}
+
+async function createStructuredMarkdownFromWizard() {
+  const title = el("markdownCreateTitle")?.value.trim() || "New document";
+  const relPath = normalizeUiPath(updateStructuredMarkdownPath() || el("markdownCreatePath")?.value || "");
+  if (!relPath) throw new Error("New markdown path is required");
+  const metadata = {
+    kind: el("markdownCreateKind")?.value || "canonical",
+    scope: el("markdownCreateScope")?.value.trim() || "project",
+    status: el("markdownCreateStatus")?.value || "current",
+    canonical_for: el("markdownCreateCanonical")?.value.trim() || "",
+    last_verified: new Date().toISOString().slice(0, 10),
+    sources: linesFromTextarea("markdownCreateSources"),
+  };
+  setStatus("creating structured doc...");
+  const result = await api("/api/markdown/create", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      path: relPath,
+      title,
+      templateId: el("markdownCreateTemplate")?.value || "context-golden",
+      applyTemplate: true,
+      metadata,
+    }),
+  });
+  const parent = parentDirectoryFromUiPath(result.path);
+  if (parent) state.expanded.add(parent);
+  state.pendingMarkdown = null;
+  await loadFiles();
+  await selectFile(result.path, { revealInExplorer: true });
+  setStatus("structured doc created");
 }
 
 function visibleMarkdownTemplates(templates = []) {
@@ -2988,12 +4063,12 @@ function renderReviewItem(item) {
   '</button>';
 }
 
-function renderFileActionButtons({ hasReviewItem = false, dirty = false, canApplyTemplate = false } = {}) {
+function renderFileActionButtons({ hasReviewItem = false, dirty = false, canApplyTemplate = false, blockedByConflict = false } = {}) {
   return '<div class="file-actions">' +
     (canApplyTemplate ? '<div class="empty-template-actions"><select class="file-template-select" data-empty-template-select aria-label="Template">' + renderTemplateOptions() + '</select><button class="file-action" type="button" data-apply-template>Use template</button></div>' : '') +
     (hasReviewItem ? '<button class="file-action" type="button" data-file-verify>Mark verified</button>' : '') +
     '<button class="file-action danger-action" type="button" data-file-delete>Delete</button>' +
-    '<button class="file-action primary" type="button" data-file-save ' + (!dirty ? 'disabled' : '') + '>Save</button>' +
+    '<button class="file-action primary" type="button" data-file-save ' + (!dirty || blockedByConflict ? 'disabled' : '') + (blockedByConflict ? ' title="Resolve the disk change before saving"' : '') + '>Save</button>' +
   '</div>';
 }
 
@@ -3006,11 +4081,14 @@ function renderSettingsPanel() {
   if (!holder || !state.settings) return;
   const watchAllow = (state.settings.watchAllow || []).join("\n");
   const bestPractices = (state.settings.bestPractices || []).join("\n");
+  const startupContext = state.settings.startupContext || { enabled: false, fileNames: ["AGENTS.md", "CLAUDE.md"] };
+  const startupFileNames = (startupContext.fileNames || []).join("\n");
   const markdownTemplates = state.settings.markdownTemplates || [];
   const sections = state.settings.hubSections?.length ? state.settings.hubSections : [{ id: "main", title: "Main", cards: state.settings.customHubCards || state.availableHubCards || [] }];
   holder.innerHTML = '<div class="settings-grid">' +
     '<div class="settings-field"><label for="watchAllow">Watched folders/files</label><textarea id="watchAllow" placeholder="one path per line · empty = nothing to review">' + escapeHtml(watchAllow) + '</textarea></div>' +
     '<div class="settings-field"><label for="bestPractices">Docs best practices</label><textarea id="bestPractices" placeholder="one practice per line">' + escapeHtml(bestPractices) + '</textarea></div>' +
+    '<div class="settings-field"><label class="template-enabled-toggle" for="startupContextEnabled"><input id="startupContextEnabled" type="checkbox" ' + (startupContext.enabled ? 'checked' : '') + ' /> Startup context scanner</label><textarea id="startupContextFileNames" placeholder="one filename per line">' + escapeHtml(startupFileNames) + '</textarea></div>' +
   '</div>' +
   '<div><div class="settings-title">Markdown templates</div><div class="hub-card-options" id="markdownTemplateEditors">' +
     markdownTemplates.map(renderMarkdownTemplateEditor).join("") +
@@ -3061,7 +4139,7 @@ function renderHubSectionEditor(section) {
 function renderHubCardEditor(card, depth = 0) {
   const paths = (card.paths || [card.path]).filter(Boolean).join("\n");
   return '<div class="hub-card-editor ' + (depth ? 'nested' : '') + '" data-hub-card-editor data-card-id="' + escapeHtml(card.id || "") + '">' +
-    '<div class="hub-card-editor-head"><label class="hub-card-editor-title"><input type="checkbox" data-card-enabled ' + (card.enabled !== false ? 'checked' : '') + ' /> active</label><div class="docqa-actions"><button class="selection-action" type="button" data-add-child-card title="add a child card">+</button><button class="selection-action danger-action" type="button" data-remove-hub-card title="remove this card">×</button></div></div>' +
+    '<div class="hub-card-editor-head"><label class="hub-card-editor-title"><input type="checkbox" data-card-enabled ' + (card.enabled !== false ? 'checked' : '') + ' /> active</label><label class="hub-card-editor-title"><input type="checkbox" data-card-auto-children ' + (card.autoChildren ? 'checked' : '') + ' /> auto subcards</label><div class="docqa-actions"><button class="selection-action" type="button" data-add-child-card title="add a child card">+</button><button class="selection-action danger-action" type="button" data-remove-hub-card title="remove this card">×</button></div></div>' +
     '<div class="hub-card-editor-grid">' +
       '<div class="settings-field"><label>Name</label><input data-card-title value="' + escapeHtml(card.title || "") + '" placeholder="Card name" /></div>' +
       '<div class="settings-field"><label>Description</label><input data-card-description value="' + escapeHtml(card.description || "") + '" placeholder="Short description" /></div>' +
@@ -3096,6 +4174,10 @@ function addHubCardEditor(holder) {
 async function saveSettings() {
   const watchAllow = linesFromTextarea("watchAllow");
   const bestPractices = linesFromTextarea("bestPractices");
+  const startupContext = {
+    enabled: Boolean(el("startupContextEnabled")?.checked),
+    fileNames: linesFromTextarea("startupContextFileNames"),
+  };
   const markdownTemplates = collectMarkdownTemplateEditors();
   const hubSections = collectHubSectionEditors();
   const allCards = flattenUiCards(hubSections.flatMap((section) => section.cards));
@@ -3104,14 +4186,17 @@ async function saveSettings() {
   const result = await api("/api/settings", {
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify({ settings: { watchAllow, bestPractices, markdownTemplates, hubCards, hubSections } }),
+    body: JSON.stringify({ settings: { watchAllow, bestPractices, startupContext, markdownTemplates, hubCards, hubSections } }),
   });
   state.settings = result.settings;
   state.availableHubCards = result.availableHubCards || state.availableHubCards;
   state.hubFolders = result.hubCards || [];
   state.rootHubSections = result.hubSections || [];
-  state.hubSections = hubSectionViewForCard(state.rootHubSections, state.activeHubCardId);
-  state.docqa = await api("/api/docqa");
+  state.hubSections = state.rootHubSections;
+  state.startupContextFiles = (await api("/api/startup-context")).files || [];
+  const [docqa, doctor] = await Promise.all([api("/api/docqa"), api("/api/doctor")]);
+  state.docqa = docqa;
+  state.doctor = doctor;
   state.selectedReview = state.docqa.queue[0]?.path || null;
   if (state.page === "settings") renderSettingsPanel();
   else renderDocQaDashboard();
@@ -3147,8 +4232,9 @@ function collectHubCardEditors(container) {
     const description = row.querySelector(":scope > .hub-card-editor-grid [data-card-description]")?.value.trim() || "";
     const paths = (row.querySelector(":scope > .hub-card-editor-grid [data-card-paths]")?.value || "").split(/\r?\n/).map((line) => normalizeUiPath(line)).filter(Boolean);
     const enabled = row.querySelector(":scope > .hub-card-editor-head [data-card-enabled]")?.checked !== false;
+    const autoChildren = row.querySelector(":scope > .hub-card-editor-head [data-card-auto-children]")?.checked === true;
     const cards = collectHubCardEditors(row.querySelector(":scope > [data-card-children]"));
-    return { id, title, description, paths, cards, enabled };
+    return { id, title, description, paths, cards, autoChildren, enabled };
   }).filter((card) => card.title);
 }
 
@@ -3178,7 +4264,9 @@ async function updateWatchSelection(path, action) {
   state.settings = result.settings;
   state.availableHubCards = result.availableHubCards || state.availableHubCards;
   state.hubFolders = result.hubCards || state.hubFolders;
-  state.docqa = await api("/api/docqa");
+  const [docqa, doctor] = await Promise.all([api("/api/docqa"), api("/api/doctor")]);
+  state.docqa = docqa;
+  state.doctor = doctor;
   state.selectedReview = state.docqa.queue.find((item) => item.path === state.selectedReview)?.path || state.docqa.queue[0]?.path || null;
   renderFiles();
   if (state.page === "settings") renderSettingsPanel();
@@ -3200,7 +4288,9 @@ async function addSelectedToWatch() {
   state.settings = result.settings;
   state.availableHubCards = result.availableHubCards || state.availableHubCards;
   state.hubFolders = result.hubCards || state.hubFolders;
-  state.docqa = await api("/api/docqa");
+  const [docqa, doctor] = await Promise.all([api("/api/docqa"), api("/api/doctor")]);
+  state.docqa = docqa;
+  state.doctor = doctor;
   state.selectedReview = state.docqa.queue.find((item) => item.path === state.selectedReview)?.path || state.docqa.queue[0]?.path || null;
   state.selectedForDelete.clear();
   renderFiles();
@@ -3223,7 +4313,9 @@ async function removeSelectedFromWatch() {
   state.settings = result.settings;
   state.availableHubCards = result.availableHubCards || state.availableHubCards;
   state.hubFolders = result.hubCards || state.hubFolders;
-  state.docqa = await api("/api/docqa");
+  const [docqa, doctor] = await Promise.all([api("/api/docqa"), api("/api/doctor")]);
+  state.docqa = docqa;
+  state.doctor = doctor;
   state.selectedReview = state.docqa.queue.find((item) => item.path === state.selectedReview)?.path || state.docqa.queue[0]?.path || null;
   state.selectedForDelete.clear();
   renderFiles();
@@ -3241,11 +4333,14 @@ function normalizeUiPath(value) {
 }
 
 function showSettingsPage() {
+  if (blockPendingExternalChange("before opening settings")) return;
   if (state.dirty && !confirm("You have unsaved changes. Open settings?")) return;
   state.page = "settings";
   state.settingsOpen = true;
+  state.pendingMarkdown = null;
   state.selected = null;
   state.selectedDiff = null;
+  resetExternalChangeState();
   state.savedHash = null;
   state.dirty = false;
   el("title").textContent = "Settings";
@@ -3254,6 +4349,7 @@ function showSettingsPage() {
   el("meta").textContent = "settings open";
   el("home").hidden = true;
   el("settingsPage").hidden = false;
+  el("newDocPage").hidden = true;
   el("viewer").hidden = true;
   el("editor").hidden = true;
   el("save").disabled = true;
@@ -3280,12 +4376,14 @@ function updateActionBanner() {
 function renderHubFolders() {
   const holder = el("hubFolders");
   if (!holder) return;
-  const sections = state.hubSections?.length ? state.hubSections : [{ id: "main", title: "Main", cards: state.hubFolders || [] }];
-  holder.innerHTML = renderHubBreadcrumb() + sections.map((section) => '<section class="hub-section"><div class="hub-section-title">' + escapeHtml(section.title || "Section") + '</div><div class="hub-section-grid">' + (section.cards || []).map(renderHubFolderCard).join("") + '</div></section>').join("");
+  const sections = state.rootHubSections?.length ? state.rootHubSections : state.hubSections?.length ? state.hubSections : [{ id: "main", title: "Main", cards: state.hubFolders || [] }];
+  const activeIds = activeHubCardIds(sections);
+  holder.innerHTML = sections.map((section) => '<section class="hub-section"><div class="hub-section-title">' + escapeHtml(section.title || "Section") + '</div><div class="hub-section-grid">' + (section.cards || []).map((card) => renderHubFolderCard(card, activeIds)).join("") + '</div></section>').join("") + renderStartupContextPanel();
   document.querySelectorAll("[data-hub-file]").forEach((button) => button.addEventListener("click", () => selectFile(button.dataset.hubFile).catch((error) => setStatus(error.message))));
   document.querySelectorAll("[data-hub-folders]").forEach((button) => button.addEventListener("click", () => filterFolders(button.dataset.hubFolders.split('|'))));
   document.querySelectorAll("[data-hub-card-children]").forEach((button) => button.addEventListener("click", () => openHubChildren(button.dataset.hubCardChildren)));
   document.querySelectorAll("[data-hub-crumb]").forEach((button) => button.addEventListener("click", () => openHubPath(button.dataset.hubCrumb || null)));
+  document.querySelectorAll("[data-startup-order]").forEach((button) => button.addEventListener("click", () => selectStartupContextFile(button.dataset.startupOrder).catch((error) => setStatus(error.message))));
 }
 
 function renderHubBreadcrumb() {
@@ -3298,21 +4396,50 @@ function renderHubBreadcrumb() {
   }).join("") + '</nav>';
 }
 
-function renderHubFolderCard(folder) {
+function activeHubCardIds(sections = state.rootHubSections || state.hubSections || []) {
+  return new Set(hubBreadcrumbForCard(sections, state.activeHubCardId).map((crumb) => crumb.id).filter(Boolean));
+}
+
+function renderHubFolderCard(folder, activeIds = activeHubCardIds()) {
   const children = folder.cards || [];
   const paths = folderPaths(folder);
   const directFilePath = hubCardDirectFilePath(paths, children);
-  const count = countFolderFiles(paths) + children.reduce((sum, child) => sum + countFolderFiles(folderPaths(child)), 0);
+  const ownCount = children.length && folder.autoChildren ? 0 : countFolderFiles(paths);
+  const count = ownCount + children.reduce((sum, child) => sum + countFolderFiles(folderPaths(child)), 0);
   const meta = children.length ? children.length + ' child card' + (children.length > 1 ? 's' : '') : (paths.length > 1 ? paths.length + ' sources' : paths[0]);
+  const expanded = children.length && activeIds.has(folder.id);
+  const current = state.activeHubCardId === folder.id;
   const data = children.length
     ? ' data-hub-card-children="' + escapeHtml(folder.id) + '"'
     : directFilePath
       ? ' data-hub-file="' + escapeHtml(directFilePath) + '"'
       : ' data-hub-folders="' + escapeHtml(paths.join('|')) + '"';
-  return '<button class="hub-folder-card ' + (children.length ? 'navigation' : '') + '" type="button"' + data + '>' +
-    '<div><strong>' + escapeHtml(folder.title) + '</strong><span>' + escapeHtml(folder.description) + '</span></div>' +
-    '<div class="hub-folder-meta"><code>' + escapeHtml(meta || "navigation") + '</code><span>' + count + ' file' + (count > 1 ? 's' : '') + '</span></div>' +
-  '</button>';
+  return '<article class="hub-folder-card ' + (children.length ? 'navigation ' : '') + (expanded ? 'expanded ' : '') + (current ? 'current' : '') + '">' +
+    '<button class="hub-folder-card-main" type="button"' + data + '>' +
+      '<div><strong>' + escapeHtml(folder.title) + '</strong><span>' + escapeHtml(folder.description) + '</span></div>' +
+      '<div class="hub-folder-meta"><code>' + escapeHtml(meta || "navigation") + '</code><span>' + count + ' file' + (count > 1 ? 's' : '') + '</span></div>' +
+    '</button>' +
+    (expanded ? renderHubFolderChildren(folder, activeIds) : '') +
+  '</article>';
+}
+
+function renderHubFolderChildren(folder, activeIds) {
+  const crumbs = hubBreadcrumbForCard(state.rootHubSections || state.hubSections || [], folder.id);
+  const crumbText = crumbs.slice(1).map((crumb) => crumb.title).join(" / ") || folder.title;
+  return '<div class="hub-folder-children">' +
+    '<div class="hub-folder-children-head"><span>' + escapeHtml(crumbText) + '</span><span>' + (folder.cards || []).length + ' subcard' + ((folder.cards || []).length > 1 ? 's' : '') + '</span></div>' +
+    '<div class="hub-folder-children-grid">' + (folder.cards || []).map((child) => renderHubFolderCard(child, activeIds)).join("") + '</div>' +
+  '</div>';
+}
+
+function renderStartupContextPanel() {
+  if (!state.settings?.startupContext?.enabled) return "";
+  const files = (state.startupContextFiles || []).sort((a, b) => (a.startupContext.order || 0) - (b.startupContext.order || 0));
+  const fileNames = (state.settings.startupContext.fileNames || []).join(", ");
+  const body = files.length
+    ? '<div class="startup-context-list">' + files.map((file) => '<button class="startup-context-item" type="button" data-startup-order="' + escapeHtml(file.startupContext.order) + '"><strong>' + escapeHtml(file.startupContext.order + ". " + file.startupContext.fileName) + '</strong><span>' + escapeHtml(file.startupContext.displayPath) + '</span></button>').join("") + '</div>'
+    : '<div class="issue">No startup context files found for: ' + escapeHtml(fileNames || "AGENTS.md, CLAUDE.md") + '</div>';
+  return '<section class="startup-context-panel"><div class="hub-section-title">Startup context</div><div class="startup-context-copy">Agent instruction files found from the filesystem root down to this Context Room root.</div>' + body + '</section>';
 }
 
 function hubCardDirectFilePath(paths = [], children = []) {
@@ -3323,14 +4450,14 @@ function hubCardDirectFilePath(paths = [], children = []) {
 }
 
 function openHubChildren(cardId) {
-  openHubPath(cardId);
-  setStatus("child cards open");
+  const nextId = state.activeHubCardId === cardId ? null : cardId;
+  openHubPath(nextId);
+  setStatus(nextId ? "child cards open" : "child cards closed");
 }
 
 function openHubPath(cardId = null) {
-  const nextSections = hubSectionViewForCard(state.rootHubSections || state.hubSections || [], cardId);
   state.activeHubCardId = cardId || null;
-  state.hubSections = nextSections;
+  state.hubSections = state.rootHubSections || state.hubSections;
   renderHubFolders();
   setStatus(cardId ? "hub path" : "hub");
 }
@@ -3574,25 +4701,35 @@ async function goHistory(delta) {
 }
 
 function goHub() {
+  if (blockPendingExternalChange("before returning to hub")) return;
   if (state.dirty && !confirm("You have unsaved changes. Return to hub?")) return;
   collapseSidebarOnNarrow();
   state.selected = null;
+  state.selectedStartupContext = null;
   state.selectedDiff = null;
+  resetConflictState();
+  resetExternalChangeState();
   state.savedHash = null;
   state.dirty = false;
+  state.pendingMarkdown = null;
   state.activeHubCardId = null;
   state.hubSections = state.rootHubSections;
   showHome();
 }
 
 function updateHeader() {
-  const file = state.files.find((item) => item.path === state.selected) || { label: state.selected, path: state.selected };
+  const file = state.selectedStartupContext
+    ? { label: state.selectedStartupContext.fileName, path: state.selectedStartupContext.displayPath }
+    : state.files.find((item) => item.path === state.selected) || { label: state.selected, path: state.selected };
   el("title").textContent = file.label || file.path;
-  el("path").textContent = "";
+  el("path").textContent = state.selectedStartupContext ? file.path : "";
   el("impact").textContent = "";
-  el("save").disabled = !state.dirty || !state.selected;
+  const conflict = activeFileConflict();
+  const externalChange = activeExternalChange();
+  const blockedByDiskChange = Boolean(conflict || externalChange);
+  el("save").disabled = Boolean(state.selectedStartupContext) || blockedByDiskChange || !state.dirty || !state.selected;
   const headerSave = document.querySelector("[data-file-save]");
-  if (headerSave) headerSave.disabled = !state.dirty || !state.selected;
+  if (headerSave) headerSave.disabled = Boolean(state.selectedStartupContext) || blockedByDiskChange || !state.dirty || !state.selected;
   updateActionBanner();
 }
 
@@ -3609,11 +4746,12 @@ function updatePreview() {
   el("meta").textContent = text.length.toLocaleString("en-US") + " characters · " + lines.toLocaleString("en-US") + " lines" + (state.dirty ? " · modified" : "");
 }
 
-function setMode() {
-  state.mode = "edit";
-  el("viewer").style.display = "block";
-  el("editor").style.display = "none";
-  if (state.selected) renderViewer();
+function setMode(mode = "view") {
+  state.mode = mode === "edit" ? "edit" : "view";
+  const hasSelectedFile = Boolean(state.selected || state.selectedStartupContext);
+  el("viewer").style.display = hasSelectedFile && state.mode === "view" ? "block" : "";
+  el("editor").style.display = hasSelectedFile && state.mode === "edit" ? "block" : "none";
+  if (hasSelectedFile && state.mode === "view") renderViewer();
 }
 
 async function applyTemplateToCurrentFile() {
@@ -3640,30 +4778,637 @@ function pathTitleFromUiPath(relPath) {
 function renderViewer() {
   const text = el("editor").value;
   const diff = state.selectedDiff || { changed: false, additions: 0, deletions: 0, patch: "", available: false };
-  const file = state.files.find((item) => item.path === state.selected) || { label: state.selected, path: state.selected };
-  const hasDiff = diff.available !== false && diff.changed;
+  const readOnlyStartup = Boolean(state.selectedStartupContext);
+  const conflict = activeFileConflict();
+  const externalChange = activeExternalChange();
+  const file = readOnlyStartup
+    ? { label: state.selectedStartupContext.fileName, path: state.selectedStartupContext.displayPath }
+    : state.files.find((item) => item.path === state.selected) || { label: state.selected, path: state.selected };
+  const hasDiff = !readOnlyStartup && diff.available !== false && diff.changed;
   const diffMarkup = hasDiff ? renderDiffPanel(diff) : "";
   const showDiffButton = hasDiff && state.diffCollapsed ? '<button class="diff-toggle" type="button" data-show-diff>Show Git diff</button>' : "";
-  const canApplyTemplate = Boolean(state.selected?.endsWith(".md") && !text.trim());
+  const canApplyTemplate = Boolean(!readOnlyStartup && state.selected?.endsWith(".md") && !text.trim());
+  const actionsMarkup = readOnlyStartup
+    ? ""
+    : externalChange && !conflict
+      ? renderExternalReviewActions(externalChange)
+      : renderFileActionButtons({ hasReviewItem: selectedFileNeedsReview(), dirty: state.dirty, canApplyTemplate, blockedByConflict: Boolean(conflict || externalChange) });
+  const conflictMarkup = conflict ? renderConflictPanel(conflict, text) : "";
+  const editorMarkup = !conflict && externalChange
+    ? renderExternalReviewDocument(state.saved || "", externalChange.diskContent || "")
+    : '<textarea id="docEditor" class="doc-editor" spellcheck="false" ' + (readOnlyStartup ? 'readonly' : '') + '>' + escapeHtml(text) + '</textarea>';
   el("viewer").innerHTML = '<div class="review-workspace ' + (!hasDiff || state.diffCollapsed ? 'no-diff' : '') + '">' +
     (state.diffCollapsed ? "" : diffMarkup) +
-    '<section class="file-panel">' + showDiffButton + '<header><div class="file-header-copy"><strong>' + escapeHtml(file.label || "Document") + '</strong></div>' + renderFileActionButtons({ hasReviewItem: selectedFileNeedsReview(), dirty: state.dirty, canApplyTemplate }) + '</header><textarea id="docEditor" class="doc-editor" spellcheck="false">' + escapeHtml(text) + '</textarea></section></div>';
-  document.querySelector("[data-hide-diff]")?.addEventListener("click", () => { state.diffCollapsed = true; renderViewer(); });
-  document.querySelector("[data-show-diff]")?.addEventListener("click", () => { state.diffCollapsed = false; renderViewer(); });
-  document.querySelector("[data-file-save]")?.addEventListener("click", () => saveCurrent().catch((error) => setStatus(error.message)));
-  document.querySelector("[data-file-verify]")?.addEventListener("click", () => verifyCurrentFile().catch((error) => setStatus(error.message)));
-  document.querySelector("[data-file-delete]")?.addEventListener("click", () => deletePaths([state.selected]).catch((error) => setStatus(error.message)));
-  document.querySelector("[data-apply-template]")?.addEventListener("click", () => applyTemplateToCurrentFile().catch((error) => setStatus(error.message)));
+    '<section class="file-panel">' + showDiffButton + '<header><div class="file-header-copy"><strong>' + escapeHtml(file.label || "Document") + '</strong>' + (readOnlyStartup ? '<span class="muted">' + escapeHtml(file.path) + '</span>' : '') + '</div>' + actionsMarkup + '</header>' + conflictMarkup + editorMarkup + '</section></div>';
+  document.querySelector("[data-hide-diff]")?.addEventListener("click", (event) => {
+    event.preventDefault();
+    setDiffCollapsed(true);
+  });
+  document.querySelector("[data-show-diff]")?.addEventListener("click", (event) => {
+    event.preventDefault();
+    setDiffCollapsed(false);
+  });
+  document.querySelector("[data-revert-diff]")?.addEventListener("click", () => promptRevertCurrentDiff());
+  document.querySelector("[data-apply-external-change]")?.addEventListener("click", () => applyExternalChange().catch((error) => setStatus(error.message)));
+  document.querySelector("[data-reject-external-change]")?.addEventListener("click", () => promptRejectExternalChange());
+  wireExternalReviewDecisionButtons();
+  document.querySelector("[data-conflict-compare]")?.addEventListener("click", () => toggleConflictCompare());
+  document.querySelector("[data-conflict-reload]")?.addEventListener("click", () => promptReloadConflictFromDisk());
+  document.querySelector("[data-conflict-keep]")?.addEventListener("click", () => promptKeepConflictEdits());
+  document.querySelector("[data-conflict-merge-editor]")?.addEventListener("input", (event) => {
+    state.conflictMergeText = event.target.value;
+    state.conflictMergeMode = "manual";
+  });
+  document.querySelectorAll("[data-conflict-merge-source]").forEach((button) => button.addEventListener("click", (event) => promptSaveConflictSource(event.currentTarget.dataset.conflictMergeSource)));
+  wireFileActionButtons();
   const docEditor = el("docEditor");
-  if (docEditor) {
+  if (docEditor && !readOnlyStartup) {
     docEditor.addEventListener("input", () => {
       el("editor").value = docEditor.value;
       state.dirty = docEditor.value !== state.saved;
       updateHeader();
       updatePreview();
+      updateConflictCompareLive(docEditor.value);
+      scheduleConflictCheck();
     });
   }
   syncWorkspaceScroll();
+}
+
+function wireFileActionButtons(root = document) {
+  root.querySelector("[data-file-save]")?.addEventListener("click", () => saveCurrent().catch((error) => setStatus(error.message)));
+  root.querySelector("[data-file-verify]")?.addEventListener("click", () => verifyCurrentFile().catch((error) => setStatus(error.message)));
+  root.querySelector("[data-file-delete]")?.addEventListener("click", () => deletePaths([state.selected]).catch((error) => setStatus(error.message)));
+  root.querySelector("[data-apply-template]")?.addEventListener("click", () => applyTemplateToCurrentFile().catch((error) => setStatus(error.message)));
+}
+
+function setDiffCollapsed(collapsed) {
+  const viewState = captureEditorViewState();
+  state.diffCollapsed = Boolean(collapsed);
+  renderViewer();
+  restoreEditorViewState(viewState);
+}
+
+function wireExternalReviewDecisionButtons(root = document) {
+  root.querySelectorAll("[data-external-block-decision]").forEach((button) => button.addEventListener("click", (event) => {
+    event.preventDefault();
+    event.stopPropagation();
+    chooseExternalReviewBlock(event.currentTarget.dataset.externalBlockDecision, event.currentTarget.dataset.externalBlockId).catch((error) => setStatus(error.message));
+  }));
+}
+
+function renderExternalReviewActions(change) {
+  const beforeText = state.saved || "";
+  const afterText = change.diskContent || "";
+  const blocks = buildExternalReviewBlocks(beforeText, afterText, change.reviewDecisions || {});
+  const summary = summarizeExternalReviewBlocks(blocks);
+  return '<div class="file-actions external-review-actions" aria-label="Review disk change">' +
+    '<div class="external-change-stats" title="' + escapeHtml(change.path || "This file") + ' changed on disk"><span class="pending">' + summary.pending + ' left</span><span class="add">+' + summary.additions + '</span><span class="del">-' + summary.deletions + '</span></div>' +
+  '</div>';
+}
+
+function renderExternalReviewDocument(beforeText, afterText) {
+  const change = activeExternalChange();
+  const blocks = buildExternalReviewBlocks(beforeText, afterText, change?.reviewDecisions || {});
+  if (!blocks.some((block) => block.kind === "change")) return '<div class="doc-editor external-review-doc"><div class="diff-empty">No textual difference.</div></div>';
+  return '<div class="doc-editor external-review-doc" role="document" aria-label="Document with disk changes highlighted">' +
+    blocks.map((block) => renderExternalReviewBlock(block)).join("") +
+  '</div>';
+}
+
+function renderExternalReviewBlock(block) {
+  if (block.kind !== "change") {
+    return '<div class="external-review-block context">' + block.rows.map((row) => renderExternalReviewLine(row)).join("") + '</div>';
+  }
+  if (block.decision) {
+    const rows = externalReviewRowsForDecision(block);
+    const decisionLabel = block.decision === "accept" ? "accepted" : "rejected";
+    const body = rows.length ? rows.map((row) => renderExternalReviewLine(row)).join("") : '<div class="external-review-placeholder">Change ' + escapeHtml(decisionLabel) + '</div>';
+    return '<div class="external-review-block context resolved ' + escapeHtml(block.decision) + (rows.length ? '' : ' empty') + '" data-external-review-block="' + escapeHtml(block.id) + '">' +
+      '<span class="external-review-resolved-label">' + escapeHtml(decisionLabel) + '</span>' +
+      body +
+    '</div>';
+  }
+  const decisionClass = block.decision || "pending";
+  return '<div class="external-review-block change ' + decisionClass + '" data-external-review-block="' + escapeHtml(block.id) + '">' +
+    '<div class="external-review-lines">' + block.rows.map((row) => renderExternalReviewLine(row)).join("") + '</div>' +
+    '<div class="external-review-block-controls" aria-label="Review this change">' +
+      '<button class="file-action primary external-choice icon" type="button" data-external-block-decision="accept" data-external-block-id="' + escapeHtml(block.id) + '" title="Accept this change">OK</button>' +
+      '<button class="file-action danger-action external-choice icon" type="button" data-external-block-decision="reject" data-external-block-id="' + escapeHtml(block.id) + '" title="Reject this change">x</button>' +
+    '</div>' +
+  '</div>';
+}
+
+function renderExternalReviewLine(row) {
+  const marker = row.type === "add" ? "+" : row.type === "del" ? "-" : " ";
+  return '<div class="external-review-line ' + row.type + '"><span class="marker">' + escapeHtml(marker) + '</span><span>' + escapeHtml(row.line || " ") + '</span></div>';
+}
+
+function externalReviewRowsForDecision(block) {
+  if (block.decision === "accept") return block.rows.filter((row) => row.type !== "del").map((row) => ({ type: "ctx", line: row.line }));
+  if (block.decision === "reject") return block.rows.filter((row) => row.type !== "add").map((row) => ({ type: "ctx", line: row.line }));
+  return block.rows;
+}
+
+function buildExternalReviewBlocks(beforeText, afterText, decisions = {}) {
+  const rows = buildSimpleTextDiffRows(beforeText, afterText);
+  const blocks = [];
+  let current = null;
+  let changeIndex = 0;
+  for (const row of rows) {
+    const kind = row.type === "add" || row.type === "del" ? "change" : "context";
+    if (!current || current.kind !== kind) {
+      const id = kind === "change" ? "change-" + changeIndex++ : "context-" + blocks.length;
+      current = { id, kind, rows: [], decision: kind === "change" ? decisions[id] || null : null };
+      blocks.push(current);
+    }
+    current.rows.push(row);
+  }
+  return blocks;
+}
+
+function summarizeExternalReviewBlocks(blocks) {
+  return blocks.reduce((summary, block) => {
+    if (block.kind === "change" && !block.decision) summary.pending += 1;
+    for (const row of block.rows) {
+      if (row.type === "add") summary.additions += 1;
+      if (row.type === "del") summary.deletions += 1;
+    }
+    return summary;
+  }, { pending: 0, additions: 0, deletions: 0 });
+}
+
+async function chooseExternalReviewBlock(decision, blockId) {
+  const change = activeExternalChange();
+  if (!change || !blockId || (decision !== "accept" && decision !== "reject")) return;
+  const viewState = captureEditorViewState({ anchorBlockId: blockId });
+  change.reviewDecisions = { ...(change.reviewDecisions || {}), [blockId]: decision };
+  const blocks = buildExternalReviewBlocks(state.saved || "", change.diskContent || "", change.reviewDecisions);
+  const pending = blocks.filter((block) => block.kind === "change" && !block.decision);
+  const updatedInPlace = updateExternalReviewBlockInPlace(blocks, blockId, viewState);
+  if (!updatedInPlace) renderViewer();
+  restoreEditorViewState(viewState);
+  updateHeader();
+  updatePreview();
+  if (pending.length) {
+    setStatus(pending.length + " change" + (pending.length > 1 ? "s" : "") + " left to review");
+    return;
+  }
+  setStatus("saving reviewed change...");
+  if (updatedInPlace) await waitForInlineReviewTransition();
+  await saveExternalReviewDecision(blocks, viewState);
+}
+
+function updateExternalReviewBlockInPlace(blocks, blockId, viewState) {
+  const block = blocks.find((item) => item.id === blockId);
+  const current = externalReviewBlockElement(blockId);
+  if (!block || !current) return false;
+  const previousHeight = current.getBoundingClientRect().height;
+  current.outerHTML = renderExternalReviewBlock(block);
+  const next = externalReviewBlockElement(blockId);
+  if (next) {
+    if (block.decision && previousHeight > 0) next.style.minHeight = Math.ceil(previousHeight) + "px";
+    wireExternalReviewDecisionButtons(next);
+  }
+  const actions = document.querySelector(".external-review-actions");
+  const change = activeExternalChange();
+  if (actions && change) actions.outerHTML = renderExternalReviewActions(change);
+  return true;
+}
+
+function waitForInlineReviewTransition() {
+  return new Promise((resolve) => window.setTimeout(resolve, 260));
+}
+
+function externalReviewTextAnchor(blocks, blockId, mergedText) {
+  if (!blockId) return null;
+  const finalLines = splitMergeLines(mergedText).lines;
+  let lineIndex = 0;
+  for (const block of blocks) {
+    const rows = block.kind === "context" ? block.rows : externalReviewRowsForDecision(block);
+    if (block.id === blockId) {
+      const safeLineIndex = Math.max(0, Math.min(lineIndex, Math.max(0, finalLines.length - 1)));
+      const anchorRow = rows.find((row) => String(row.line || "").trim()) || rows[0] || null;
+      return {
+        lineIndex: safeLineIndex,
+        textOffset: textOffsetForLineIndex(finalLines, safeLineIndex),
+        lineText: anchorRow?.line || finalLines[safeLineIndex] || "",
+      };
+    }
+    lineIndex += rows.length;
+  }
+  return null;
+}
+
+async function saveExternalReviewDecision(blocks, viewState) {
+  const change = activeExternalChange();
+  if (!change || state.selectedStartupContext || state.selected !== change.path) return;
+  const merged = computeExternalReviewContent(blocks, state.saved || "", change.diskContent || "");
+  viewState.textAnchor = externalReviewTextAnchor(blocks, viewState.anchorBlockId, merged);
+  setStatus("saving reviewed changes...");
+  const result = await api("/api/file", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ path: change.path, content: merged }),
+  });
+  resetConflictState();
+  resetExternalChangeState();
+  // Returning from inline review should keep the reader in the document, not open the Git diff panel.
+  state.diffCollapsed = true;
+  state.saved = merged;
+  state.savedHash = result.contentHash;
+  state.dirty = false;
+  el("editor").value = merged;
+  const docEditor = el("docEditor");
+  if (docEditor) docEditor.value = merged;
+  await loadFiles();
+  if (state.selected === change.path) {
+    state.selectedDiff = await api("/api/file/diff?path=" + encodeURIComponent(change.path));
+    if (!finishExternalReviewPanelInPlace(viewState)) {
+      renderViewer();
+      restoreEditorViewState(viewState);
+    }
+    updateHeader();
+    updatePreview();
+    setStatus(result.backupPath ? "review applied · backup created" : "review applied");
+  }
+}
+
+function finishExternalReviewPanelInPlace(viewState) {
+  if (!document.querySelector(".external-review-doc")) return false;
+  const actions = document.querySelector(".external-review-actions");
+  if (!actions) return false;
+  actions.outerHTML = renderFileActionButtons({
+    hasReviewItem: selectedFileNeedsReview(),
+    dirty: false,
+    canApplyTemplate: false,
+    blockedByConflict: false,
+  });
+  const header = document.querySelector(".file-panel header");
+  if (header) wireFileActionButtons(header);
+  window.setTimeout(() => settleFinishedExternalReview(viewState), 520);
+  return true;
+}
+
+function settleFinishedExternalReview(viewState) {
+  const doc = document.querySelector(".external-review-doc");
+  if (!doc || doc.classList.contains("settled")) return;
+  const blocks = [...doc.querySelectorAll(".external-review-block.resolved")];
+  for (const block of blocks) {
+    const startHeight = Math.ceil(block.getBoundingClientRect().height);
+    block.classList.add("settling");
+    block.style.height = startHeight + "px";
+    block.style.minHeight = startHeight + "px";
+    block.style.overflow = "hidden";
+  }
+  void doc.offsetHeight;
+  doc.classList.add("settled");
+  for (const block of blocks) {
+    const targetHeight = block.classList.contains("empty") ? 0 : Math.ceil(block.scrollHeight);
+    block.style.height = targetHeight + "px";
+    block.style.minHeight = targetHeight + "px";
+  }
+  restoreEditorViewState(viewState);
+  window.setTimeout(() => {
+    for (const block of blocks) {
+      block.classList.remove("settling");
+      block.style.height = "";
+      block.style.minHeight = "";
+      block.style.overflow = "";
+    }
+    restoreEditorViewState(viewState);
+  }, 2050);
+}
+
+function computeExternalReviewContent(blocks, beforeText, afterText) {
+  if (blocks.every((block) => block.kind !== "change" || block.decision === "accept")) return afterText;
+  if (blocks.every((block) => block.kind !== "change" || block.decision === "reject")) return beforeText;
+  const lines = [];
+  for (const block of blocks) {
+    if (block.kind === "context") {
+      lines.push(...block.rows.map((row) => row.line));
+      continue;
+    }
+    lines.push(...externalReviewRowsForDecision(block).map((row) => row.line));
+  }
+  return joinMergeLines(lines, splitMergeLines(afterText).trailingNewline);
+}
+
+function renderConflictPanel(conflict, editorText) {
+  const compare = state.conflictCompare ? renderConflictCompare(conflict, editorText) : "";
+  return '<section class="conflict-panel">' +
+    '<div><strong>File changed on disk</strong><p>This editor has unsaved changes, but the file was also changed outside Context Room. Normal save is blocked until you choose which version wins.</p></div>' +
+    '<div class="conflict-actions">' +
+      '<button class="file-action" type="button" data-conflict-compare>' + (state.conflictCompare ? "Hide compare" : "Compare / merge") + '</button>' +
+      '<button class="file-action" type="button" data-conflict-reload>Reload from disk</button>' +
+      '<button class="file-action danger-action" type="button" data-conflict-keep>Keep my edits</button>' +
+    '</div>' +
+    compare +
+  '</section>';
+}
+
+function renderConflictCompare(conflict, editorText) {
+  const mergeText = ensureConflictMergeText(conflict, editorText);
+  return '<div class="conflict-compare">' +
+    '<div class="conflict-card"><div class="conflict-card-head"><span>Disk vs your editor</span><small><span class="diff-line del">- disk</span> <span class="diff-line add">+ editor</span></small></div>' + renderConflictDiff(conflict.diskContent || "", editorText || "") + '</div>' +
+    '<div class="conflict-card"><div class="conflict-card-head"><span>Merged result</span><small>edit, then choose a version to save</small></div><div class="conflict-merge">' +
+      '<textarea data-conflict-merge-editor spellcheck="false">' + escapeHtml(mergeText) + '</textarea>' +
+      '<div class="conflict-merge-actions">' +
+        '<button class="file-action" type="button" data-conflict-merge-source="editor">Use editor</button>' +
+        '<button class="file-action" type="button" data-conflict-merge-source="disk">Use disk</button>' +
+        '<button class="file-action primary" type="button" data-conflict-merge-source="both">Use both</button>' +
+      '</div>' +
+    '</div></div>' +
+  '</div>';
+}
+
+function renderConflictDiff(diskText, editorText) {
+  const rows = compactConflictDiffRows(buildSimpleTextDiffRows(diskText, editorText));
+  if (!rows.some((row) => row.type === "add" || row.type === "del")) return '<div class="diff-empty">No textual difference.</div>';
+  return '<div class="conflict-diff" data-conflict-diff-root>' + rows.map((row) => {
+    const marker = row.type === "add" ? "+ editor" : row.type === "del" ? "- disk" : row.type === "skip" ? "..." : " ";
+    return '<div class="conflict-diff-line ' + row.type + '"><span class="marker">' + escapeHtml(marker) + '</span><span>' + escapeHtml(row.line || " ") + '</span></div>';
+  }).join("") + '</div>';
+}
+
+function compactConflictDiffRows(rows, contextSize = 3) {
+  const changedIndexes = rows
+    .map((row, index) => (row.type === "add" || row.type === "del" ? index : -1))
+    .filter((index) => index >= 0);
+  if (!changedIndexes.length) return rows;
+  const keep = new Set();
+  for (const index of changedIndexes) {
+    const from = Math.max(0, index - contextSize);
+    const to = Math.min(rows.length - 1, index + contextSize);
+    for (let cursor = from; cursor <= to; cursor += 1) keep.add(cursor);
+  }
+  const keptIndexes = [...keep].sort((a, b) => a - b);
+  const compact = [];
+  let previous = -1;
+  for (const index of keptIndexes) {
+    const skipped = index - previous - 1;
+    if (skipped > 0) compact.push({ type: "skip", line: skipped + " unchanged line" + (skipped > 1 ? "s" : "") });
+    compact.push(rows[index]);
+    previous = index;
+  }
+  const trailing = rows.length - previous - 1;
+  if (trailing > 0) compact.push({ type: "skip", line: trailing + " unchanged line" + (trailing > 1 ? "s" : "") });
+  return compact;
+}
+
+function buildSimpleTextDiffRows(leftText, rightText) {
+  const left = splitMergeLines(leftText).lines;
+  const right = splitMergeLines(rightText).lines;
+  const cellCount = (left.length + 1) * (right.length + 1);
+  if (cellCount <= 700000) return buildLcsTextDiffRows(left, right);
+  return buildPrefixSuffixTextDiffRows(left, right);
+}
+
+function buildLcsTextDiffRows(left, right) {
+  const dp = Array.from({ length: left.length + 1 }, () => new Uint32Array(right.length + 1));
+  for (let i = left.length - 1; i >= 0; i -= 1) {
+    for (let j = right.length - 1; j >= 0; j -= 1) {
+      dp[i][j] = left[i] === right[j] ? dp[i + 1][j + 1] + 1 : Math.max(dp[i + 1][j], dp[i][j + 1]);
+    }
+  }
+  const rows = [];
+  let i = 0;
+  let j = 0;
+  while (i < left.length && j < right.length) {
+    if (left[i] === right[j]) {
+      rows.push({ type: "ctx", line: left[i] });
+      i += 1;
+      j += 1;
+    } else if (dp[i + 1][j] >= dp[i][j + 1]) {
+      rows.push({ type: "del", line: left[i] });
+      i += 1;
+    } else {
+      rows.push({ type: "add", line: right[j] });
+      j += 1;
+    }
+  }
+  while (i < left.length) {
+    rows.push({ type: "del", line: left[i] });
+    i += 1;
+  }
+  while (j < right.length) {
+    rows.push({ type: "add", line: right[j] });
+    j += 1;
+  }
+  return rows;
+}
+
+function buildPrefixSuffixTextDiffRows(left, right) {
+  let prefix = 0;
+  while (prefix < left.length && prefix < right.length && left[prefix] === right[prefix]) prefix += 1;
+  let leftEnd = left.length;
+  let rightEnd = right.length;
+  while (leftEnd > prefix && rightEnd > prefix && left[leftEnd - 1] === right[rightEnd - 1]) {
+    leftEnd -= 1;
+    rightEnd -= 1;
+  }
+  const rows = [];
+  for (const line of left.slice(0, prefix)) rows.push({ type: "ctx", line });
+  for (const line of left.slice(prefix, leftEnd)) rows.push({ type: "del", line });
+  for (const line of right.slice(prefix, rightEnd)) rows.push({ type: "add", line });
+  for (const line of left.slice(leftEnd)) rows.push({ type: "ctx", line });
+  return rows;
+}
+
+function ensureConflictMergeText(conflict, editorText) {
+  const key = conflictMergeKey(conflict, editorText);
+  if (state.conflictMergeText === null || (state.conflictMergeKey !== key && state.conflictMergeMode !== "manual")) {
+    state.conflictMergeKey = key;
+    state.conflictMergeText = buildConflictMergeTextForMode(conflict, editorText || "");
+  }
+  return state.conflictMergeText;
+}
+
+function buildConflictMergeTextForMode(conflict, editorText) {
+  if (state.conflictMergeMode === "editor") return editorText || "";
+  if (state.conflictMergeMode === "disk") return conflict.diskContent || "";
+  return buildDefaultMergeText(state.saved, editorText || "", conflict.diskContent || "");
+}
+
+function updateConflictCompareLive(editorText) {
+  const conflict = activeFileConflict();
+  if (!conflict || !state.conflictCompare) return;
+  const diffRoot = document.querySelector("[data-conflict-diff-root]");
+  if (diffRoot) {
+    const scrollTop = diffRoot.scrollTop;
+    diffRoot.outerHTML = renderConflictDiff(conflict.diskContent || "", editorText || "");
+    const nextDiffRoot = document.querySelector("[data-conflict-diff-root]");
+    if (nextDiffRoot) nextDiffRoot.scrollTop = Math.min(scrollTop, Math.max(0, nextDiffRoot.scrollHeight - nextDiffRoot.clientHeight));
+  }
+  if (state.conflictMergeMode === "manual") return;
+  const mergeEditor = document.querySelector("[data-conflict-merge-editor]");
+  if (!mergeEditor) return;
+  const nextMergeText = buildConflictMergeTextForMode(conflict, editorText || "");
+  const wasFocused = document.activeElement === mergeEditor;
+  const selectionStart = mergeEditor.selectionStart;
+  const selectionEnd = mergeEditor.selectionEnd;
+  state.conflictMergeText = nextMergeText;
+  state.conflictMergeKey = conflictMergeKey(conflict, editorText || "");
+  mergeEditor.value = nextMergeText;
+  if (wasFocused && typeof selectionStart === "number" && typeof selectionEnd === "number") {
+    const nextStart = Math.min(selectionStart, mergeEditor.value.length);
+    const nextEnd = Math.min(selectionEnd, mergeEditor.value.length);
+    mergeEditor.setSelectionRange(nextStart, nextEnd);
+  }
+}
+
+function conflictMergeKey(conflict, editorText) {
+  return [conflict.path || "", conflict.diskHash || "", lightweightTextHash(state.saved || ""), lightweightTextHash(editorText || "")].join("|");
+}
+
+function lightweightTextHash(value) {
+  const text = String(value || "");
+  let hash = 2166136261;
+  for (let index = 0; index < text.length; index += 1) {
+    hash ^= text.charCodeAt(index);
+    hash = Math.imul(hash, 16777619);
+  }
+  return text.length + ":" + (hash >>> 0).toString(36);
+}
+
+function splitMergeLines(text) {
+  const value = String(text || "");
+  if (!value) return { lines: [], trailingNewline: false };
+  const trailingNewline = value.endsWith("\n");
+  const lines = value.split("\n");
+  if (trailingNewline) lines.pop();
+  return { lines, trailingNewline };
+}
+
+function joinMergeLines(lines, trailingNewline = false) {
+  const text = lines.join("\n");
+  return text + (trailingNewline && (text || lines.length) ? "\n" : "");
+}
+
+function textOffsetForLineIndex(lines, lineIndex) {
+  const safeIndex = Math.max(0, Math.min(Number(lineIndex) || 0, lines.length));
+  let offset = 0;
+  for (let index = 0; index < safeIndex; index += 1) offset += String(lines[index] || "").length + 1;
+  return offset;
+}
+
+function changedLineRange(baseLines, nextLines) {
+  let start = 0;
+  while (start < baseLines.length && start < nextLines.length && baseLines[start] === nextLines[start]) start += 1;
+  let baseEnd = baseLines.length;
+  let nextEnd = nextLines.length;
+  while (baseEnd > start && nextEnd > start && baseLines[baseEnd - 1] === nextLines[nextEnd - 1]) {
+    baseEnd -= 1;
+    nextEnd -= 1;
+  }
+  return {
+    start,
+    baseEnd,
+    nextEnd,
+    replacement: nextLines.slice(start, nextEnd),
+    changed: start !== baseEnd || start !== nextEnd,
+  };
+}
+
+function buildDefaultMergeText(baseText, editorText, diskText) {
+  if (editorText === diskText) return editorText;
+  if (baseText === editorText) return diskText;
+  if (baseText === diskText) return editorText;
+  const base = splitMergeLines(baseText);
+  const editor = splitMergeLines(editorText);
+  const disk = splitMergeLines(diskText);
+  const editorChange = changedLineRange(base.lines, editor.lines);
+  const diskChange = changedLineRange(base.lines, disk.lines);
+  if (!editorChange.changed) return diskText;
+  if (!diskChange.changed) return editorText;
+  if (editorChange.baseEnd < diskChange.start || diskChange.baseEnd < editorChange.start) {
+    const merged = base.lines.slice();
+    const edits = [
+      { ...editorChange, source: "editor" },
+      { ...diskChange, source: "disk" },
+    ].sort((a, b) => b.start - a.start);
+    for (const edit of edits) merged.splice(edit.start, edit.baseEnd - edit.start, ...edit.replacement);
+    return joinMergeLines(merged, editor.trailingNewline || disk.trailingNewline || base.trailingNewline);
+  }
+  if (editorChange.replacement.join("\n") === diskChange.replacement.join("\n")) {
+    const merged = base.lines.slice();
+    merged.splice(editorChange.start, editorChange.baseEnd - editorChange.start, ...editorChange.replacement);
+    return joinMergeLines(merged, editor.trailingNewline || disk.trailingNewline || base.trailingNewline);
+  }
+  const start = Math.min(editorChange.start, diskChange.start);
+  const end = Math.max(editorChange.baseEnd, diskChange.baseEnd);
+  const merged = [
+    ...base.lines.slice(0, start),
+    "<<<<<<< your unsaved editor",
+    ...editor.lines.slice(editorChange.start, editorChange.nextEnd),
+    "=======",
+    ...disk.lines.slice(diskChange.start, diskChange.nextEnd),
+    ">>>>>>> current disk version",
+    ...base.lines.slice(end),
+  ];
+  return joinMergeLines(merged, editor.trailingNewline || disk.trailingNewline || base.trailingNewline);
+}
+
+function conflictResolutionContent(source) {
+  const conflict = activeFileConflict();
+  if (!conflict) return { content: "", label: "merged result", title: "Save merged result" };
+  const editorText = el("docEditor")?.value || el("editor").value || "";
+  if (source === "editor") return { content: editorText, label: "your editor version", title: "Save editor version" };
+  if (source === "disk") return { content: conflict.diskContent || "", label: "the disk version", title: "Save disk version" };
+  const mergeEditor = document.querySelector("[data-conflict-merge-editor]");
+  const content = state.conflictMergeMode === "manual" && mergeEditor
+    ? mergeEditor.value
+    : buildDefaultMergeText(state.saved, editorText, conflict.diskContent || "");
+  return { content, label: "the merged result", title: "Save merged result" };
+}
+
+function hasConflictMarkers(content) {
+  return /^(<<<<<<<|=======|>>>>>>>)/m.test(content);
+}
+
+function promptSaveConflictSource(source) {
+  const conflict = activeFileConflict();
+  if (!conflict) return;
+  const normalizedSource = source === "editor" || source === "disk" || source === "both" ? source : "both";
+  if (normalizedSource === "disk") {
+    showConfirmDialog({
+      title: "Reload disk version",
+      body: "Discard your unsaved editor changes and reload the current disk version for " + conflict.path + "? Nothing will be written.",
+      confirmLabel: "Reload",
+      onConfirm: () => reloadConflictFromDisk(conflict.path).catch((error) => setStatus(error.message)),
+    });
+    return;
+  }
+  const resolution = conflictResolutionContent(normalizedSource);
+  state.conflictMergeMode = normalizedSource;
+  state.conflictMergeText = resolution.content;
+  state.conflictMergeKey = conflictMergeKey(conflict, el("docEditor")?.value || el("editor").value || "");
+  const mergeEditor = document.querySelector("[data-conflict-merge-editor]");
+  if (mergeEditor) mergeEditor.value = resolution.content;
+  if (normalizedSource === "both" && hasConflictMarkers(resolution.content)) {
+    state.conflictMergeMode = "manual";
+    if (!state.conflictCompare) {
+      state.conflictCompare = true;
+      renderViewer();
+    }
+    setStatus("manual merge required · edit Merged result, then click Use both again");
+    return;
+  }
+  if (hasConflictMarkers(resolution.content)) {
+    state.conflictMergeMode = "manual";
+    if (!state.conflictCompare) {
+      state.conflictCompare = true;
+      renderViewer();
+    }
+    setStatus("unresolved conflict markers · remove them before saving");
+    return;
+  }
+  showConfirmDialog({
+    title: resolution.title,
+    body: "Save " + resolution.label + " for " + conflict.path + "? Context Room will create a backup of the current disk version first.",
+    confirmLabel: "Save",
+    onConfirm: () => saveConflictMerge(resolution.content).catch((error) => setStatus(error.message)),
+  });
 }
 
 function syncWorkspaceScroll() {
@@ -3690,7 +5435,7 @@ function renderDiffPanel(diff) {
   const reviewLines = lines.filter((line) => !isGitDiffMetadataLine(line));
   const rawMeta = gitMeta.length ? '<details class="diff-raw-meta"><summary title="Raw Git metadata">⋯</summary><pre>' + gitMeta.map(escapeHtml).join("\n") + '</pre></details>' : "";
   const body = rawMeta + '<pre class="diff-code">' + reviewLines.map(renderDiffLine).join("") + '</pre>';
-  return '<section class="diff-panel"><div class="diff-header"><strong>Git diff</strong><div class="file-actions"><span class="diff-meta">' + escapeHtml(meta) + '</span><button class="file-action" type="button" data-hide-diff>Hide</button></div></div>' + body + '</section>';
+  return '<section class="diff-panel"><div class="diff-header"><strong>Git diff</strong><div class="file-actions"><span class="diff-meta">' + escapeHtml(meta) + '</span><button class="file-action danger-action" type="button" data-revert-diff>Revert</button><button class="file-action" type="button" data-hide-diff>Hide</button></div></div>' + body + '</section>';
 }
 
 function isGitDiffMetadataLine(line) {
@@ -3731,9 +5476,287 @@ function buildPathTargets() {
   return [...targets.values()].sort((a, b) => b.display.length - a.display.length);
 }
 
-async function saveCurrent() {
+function promptRevertCurrentDiff() {
+  if (!state.selected || !state.selectedDiff?.changed || state.diffCollapsed) return;
+  const path = state.selected;
+  const body = state.dirty
+    ? "Discard the Git diff and your unsaved editor changes for " + state.selected + "? This cannot be undone."
+    : "Discard the Git diff for " + state.selected + "? This cannot be undone.";
+  showConfirmDialog({
+    title: "Revert Git diff",
+    body,
+    confirmLabel: "Revert",
+    onConfirm: () => revertCurrentDiff(path).catch((error) => setStatus(error.message)),
+  });
+}
+
+function showConfirmDialog({ title, body, confirmLabel = "Confirm", onConfirm }) {
+  document.querySelector(".confirm-backdrop")?.remove();
+  const backdrop = document.createElement("div");
+  backdrop.className = "confirm-backdrop";
+  backdrop.innerHTML = '<section class="confirm-dialog" role="dialog" aria-modal="true" aria-label="' + escapeHtml(title) + '">' +
+    '<strong>' + escapeHtml(title) + '</strong>' +
+    '<p>' + escapeHtml(body) + '</p>' +
+    '<div class="confirm-actions"><button class="file-action" type="button" data-confirm-cancel>Cancel</button><button class="file-action danger-action" type="button" data-confirm-accept>' + escapeHtml(confirmLabel) + '</button></div>' +
+  '</section>';
+  const close = () => {
+    backdrop.remove();
+    document.removeEventListener("keydown", onKeydown);
+  };
+  const onKeydown = (event) => {
+    if (event.key === "Escape") close();
+  };
+  backdrop.addEventListener("click", (event) => {
+    if (event.target === backdrop) close();
+  });
+  backdrop.querySelector("[data-confirm-cancel]").addEventListener("click", close);
+  backdrop.querySelector("[data-confirm-accept]").addEventListener("click", () => {
+    close();
+    onConfirm?.();
+  });
+  document.addEventListener("keydown", onKeydown);
+  document.body.appendChild(backdrop);
+}
+
+async function revertCurrentDiff(path = state.selected) {
+  if (state.selectedStartupContext) return;
+  if (!path || state.selected !== path || !state.selectedDiff?.changed || state.diffCollapsed) return;
+  setStatus("reverting diff...");
+  const result = await api("/api/file/revert", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ path }),
+  });
+  state.dirty = false;
+  await loadFiles();
+  const stillExists = state.files.some((item) => item.path === path);
+  if (result.deleted || !stillExists) {
+    goHub();
+    setStatus("diff reverted · file removed");
+    return;
+  }
+  await selectFile(path, { pushHistory: false, revealInExplorer: false });
+  setStatus(result.reverted ? "diff reverted" : "no diff to revert");
+}
+
+function activeFileConflict() {
+  return state.fileConflict && state.fileConflict.path === state.selected ? state.fileConflict : null;
+}
+
+function activeExternalChange() {
+  return state.externalChange && state.externalChange.path === state.selected ? state.externalChange : null;
+}
+
+function resetConflictState() {
+  state.fileConflict = null;
+  state.conflictCompare = false;
+  state.conflictMergeText = null;
+  state.conflictMergeKey = "";
+  state.conflictMergeMode = "auto";
+}
+
+function resetExternalChangeState() {
+  state.externalChange = null;
+}
+
+function blockPendingExternalChange(action = "before leaving") {
+  if (!activeExternalChange()) return false;
+  setStatus("file changed on disk · apply or reject " + action);
+  renderViewer();
+  updateHeader();
+  return true;
+}
+
+function scheduleConflictCheck() {
+  if (!state.selected || state.selectedStartupContext || !state.dirty) return;
+  window.clearTimeout(state.conflictCheckTimer);
+  state.conflictCheckTimer = window.setTimeout(() => checkSelectedFileConflict().catch((error) => setStatus(error.message)), 250);
+}
+
+async function checkSelectedFileConflict() {
+  if (!state.selected || state.selectedStartupContext || !state.dirty) return false;
+  const path = state.selected;
+  const [data, diff] = await Promise.all([
+    api("/api/file?path=" + encodeURIComponent(path)),
+    api("/api/file/diff?path=" + encodeURIComponent(path)),
+  ]);
+  if (state.selected !== path || !state.dirty) return false;
+  if (data.contentHash === state.savedHash) {
+    if (activeFileConflict() || activeExternalChange()) {
+      resetConflictState();
+      resetExternalChangeState();
+      renderViewer();
+      updateHeader();
+      updatePreview();
+    }
+    return false;
+  }
+  const existingConflict = activeFileConflict();
+  if (existingConflict && existingConflict.diskHash === data.contentHash && existingConflict.diskContent === data.content) {
+    state.selectedDiff = diff;
+    updateHeader();
+    updatePreview();
+    setStatus("file changed on disk · resolve conflict before saving");
+    return true;
+  }
+  state.fileConflict = {
+    path,
+    diskContent: data.content,
+    diskHash: data.contentHash,
+    diskUpdatedAt: data.updatedAt || "",
+  };
+  state.conflictMergeText = null;
+  state.conflictMergeKey = "";
+  state.conflictMergeMode = "auto";
+  state.selectedDiff = diff;
+  renderViewer();
+  updateHeader();
+  updatePreview();
+  setStatus("file changed on disk · resolve conflict before saving");
+  return true;
+}
+
+async function applyExternalChange() {
+  const change = activeExternalChange();
+  if (!change || state.selectedStartupContext || state.selected !== change.path) return;
+  if (state.dirty && activeEditor().value !== state.saved && !confirm("Discard your unsaved editor changes and apply the disk version?")) return;
+  const viewState = captureEditorViewState();
+  resetConflictState();
+  resetExternalChangeState();
+  state.saved = change.diskContent;
+  state.savedHash = change.diskHash;
+  state.dirty = false;
+  el("editor").value = change.diskContent;
+  const docEditor = el("docEditor");
+  if (docEditor) docEditor.value = change.diskContent;
+  await loadFiles();
+  if (state.selected === change.path) {
+    state.selectedDiff = await api("/api/file/diff?path=" + encodeURIComponent(change.path));
+    renderViewer();
+    restoreEditorViewState(viewState);
+    updateHeader();
+    updatePreview();
+    setStatus("disk change applied");
+  }
+}
+
+function promptRejectExternalChange() {
+  const change = activeExternalChange();
+  if (!change) return;
+  const unsavedNote = state.dirty && activeEditor().value !== state.saved ? " Any unsaved editor edits will be discarded." : "";
+  showConfirmDialog({
+    title: "Reject disk change",
+    body: "Restore the version Context Room was showing before the disk change for " + change.path + "? A backup of the current disk version will be created." + unsavedNote,
+    confirmLabel: "Reject change",
+    onConfirm: () => rejectExternalChange(change.path).catch((error) => setStatus(error.message)),
+  });
+}
+
+async function rejectExternalChange(path) {
+  const change = activeExternalChange();
+  if (!change || state.selectedStartupContext || state.selected !== path) return;
+  setStatus("rejecting disk change...");
+  const viewState = captureEditorViewState();
+  const result = await api("/api/file", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ path, content: state.saved }),
+  });
+  resetConflictState();
+  resetExternalChangeState();
+  state.savedHash = result.contentHash;
+  state.dirty = false;
+  el("editor").value = state.saved;
+  const docEditor = el("docEditor");
+  if (docEditor) docEditor.value = state.saved;
+  await loadFiles();
+  if (state.selected === path) {
+    state.selectedDiff = await api("/api/file/diff?path=" + encodeURIComponent(path));
+    renderViewer();
+    restoreEditorViewState(viewState);
+    updateHeader();
+    updatePreview();
+    setStatus(result.backupPath ? "disk change rejected · backup created" : "disk change rejected");
+  }
+}
+
+function toggleConflictCompare() {
+  if (!activeFileConflict()) return;
+  state.conflictCompare = !state.conflictCompare;
+  renderViewer();
+}
+
+function promptReloadConflictFromDisk() {
+  const conflict = activeFileConflict();
+  if (!conflict) return;
+  showConfirmDialog({
+    title: "Reload from disk",
+    body: "Discard your unsaved editor changes and load the current disk version for " + conflict.path + "?",
+    confirmLabel: "Reload",
+    onConfirm: () => reloadConflictFromDisk(conflict.path).catch((error) => setStatus(error.message)),
+  });
+}
+
+async function reloadConflictFromDisk(path) {
+  if (!activeFileConflict() || state.selected !== path) return;
+  resetConflictState();
+  state.dirty = false;
+  await selectFile(path, { pushHistory: false, revealInExplorer: false, forceReload: true });
+  setStatus("reloaded from disk");
+}
+
+function promptKeepConflictEdits() {
+  const conflict = activeFileConflict();
+  if (!conflict) return;
+  showConfirmDialog({
+    title: "Keep my edits",
+    body: "Overwrite the current disk version with your editor buffer for " + conflict.path + "? Context Room will create a backup of the disk version first.",
+    confirmLabel: "Keep my edits",
+    onConfirm: () => saveCurrent({ forceConflict: true }).catch((error) => setStatus(error.message)),
+  });
+}
+
+async function saveConflictMerge(merged) {
+  const conflict = activeFileConflict();
+  if (!conflict) return;
+  if (hasConflictMarkers(merged)) {
+    state.conflictCompare = true;
+    state.conflictMergeMode = "manual";
+    state.conflictMergeText = merged;
+    renderViewer();
+    setStatus("save blocked · unresolved conflict markers");
+    return;
+  }
+  el("editor").value = merged;
+  const docEditor = el("docEditor");
+  if (docEditor) docEditor.value = merged;
+  state.dirty = true;
+  await saveCurrent({ forceConflict: true });
+}
+
+async function saveCurrent(options = {}) {
+  if (state.selectedStartupContext) {
+    setStatus("startup context is read-only");
+    return;
+  }
   if (!state.selected) return;
+  const conflict = activeFileConflict();
+  if (conflict && !options.forceConflict) {
+    state.conflictCompare = true;
+    renderViewer();
+    updateHeader();
+    setStatus("file changed on disk · choose reload or keep my edits");
+    return;
+  }
+  const externalChange = activeExternalChange();
+  if (externalChange && !options.forceExternalChange) {
+    renderViewer();
+    updateHeader();
+    setStatus("file changed on disk · apply or reject before saving");
+    return;
+  }
   setStatus("saving...");
+  const viewState = captureEditorViewState();
   const content = activeEditor().value;
   const result = await api("/api/file", {
     method: "POST",
@@ -3743,8 +5766,11 @@ async function saveCurrent() {
   state.saved = content;
   state.savedHash = result.contentHash;
   state.dirty = false;
+  resetConflictState();
+  resetExternalChangeState();
   await loadFiles();
   renderViewer();
+  restoreEditorViewState(viewState);
   setStatus(result.backupPath ? "saved · backup created" : "saved");
   updateHeader();
 }
@@ -3752,15 +5778,17 @@ async function saveCurrent() {
 async function refreshFromDisk() {
   const previousSelected = state.selected;
   try {
-    const [filesData, docqa, settingsData] = await Promise.all([api("/api/files"), api("/api/docqa"), api("/api/settings")]);
+    const [filesData, docqa, doctor, settingsData, startupData] = await Promise.all([api("/api/files"), api("/api/docqa"), api("/api/doctor"), api("/api/settings"), api("/api/startup-context")]);
     state.files = filesData.files;
+    state.startupContextFiles = startupData.files || [];
     state.docqa = docqa;
+    state.doctor = doctor;
     if (!state.settingsOpen) {
       state.settings = settingsData.settings;
       state.availableHubCards = settingsData.availableHubCards || [];
       state.hubFolders = settingsData.hubCards || [];
       state.rootHubSections = settingsData.hubSections || [];
-      state.hubSections = hubSectionViewForCard(state.rootHubSections, state.activeHubCardId);
+      state.hubSections = state.rootHubSections;
     }
     renderFiles();
     if (state.settingsOpen) {
@@ -3770,25 +5798,48 @@ async function refreshFromDisk() {
     if (!state.selected) renderDocQaDashboard();
     else updateHeader();
 
-    if (!previousSelected || previousSelected !== state.selected) return;
+    if (!previousSelected || previousSelected !== state.selected || state.selectedStartupContext) return;
     const [data, diff] = await Promise.all([
       api("/api/file?path=" + encodeURIComponent(previousSelected)),
       api("/api/file/diff?path=" + encodeURIComponent(previousSelected)),
     ]);
-    if (data.contentHash === state.savedHash) return;
     if (state.dirty) {
-      state.selectedDiff = diff;
-      setStatus("changed elsewhere · reload blocked by your edits");
+      await checkSelectedFileConflict();
       return;
     }
-    state.saved = data.content;
-    state.savedHash = data.contentHash;
+    if (data.contentHash === state.savedHash) {
+      if (activeExternalChange()) {
+        resetExternalChangeState();
+        state.selectedDiff = diff;
+        renderViewer();
+        updateHeader();
+        updatePreview();
+      }
+      return;
+    }
+    const existingExternalChange = activeExternalChange();
+    if (existingExternalChange && existingExternalChange.diskHash === data.contentHash && existingExternalChange.diskContent === data.content) {
+      state.selectedDiff = diff;
+      updateHeader();
+      updatePreview();
+      return;
+    }
+    const viewState = captureEditorViewState();
+    resetConflictState();
+    state.externalChange = {
+      path: previousSelected,
+      diskContent: data.content,
+      diskHash: data.contentHash,
+      diskUpdatedAt: data.updatedAt || "",
+      reviewDecisions: {},
+    };
     state.selectedDiff = diff;
-    el("editor").value = data.content;
+    state.diffCollapsed = true;
     renderViewer();
+    restoreEditorViewState(viewState);
     updateHeader();
     updatePreview();
-    setStatus("reloaded from disk");
+    setStatus("file changed on disk · review before applying");
   } catch (error) {
     setStatus(error.message);
   }
@@ -3796,6 +5847,149 @@ async function refreshFromDisk() {
 
 function setStatus(text) { el("status").textContent = text; }
 function activeEditor() { return el("docEditor") || el("editor"); }
+function isScrollableY(element) {
+  if (!element) return false;
+  const style = window.getComputedStyle(element);
+  return /(auto|scroll|overlay)/.test(style.overflowY) && element.scrollHeight > element.clientHeight + 1;
+}
+function activeDocumentScrollTarget() {
+  const documentSurface = document.querySelector(".external-review-doc") || el("docEditor");
+  if (isScrollableY(documentSurface)) return documentSurface;
+  if (isScrollableY(el("viewer"))) return el("viewer");
+  return documentSurface || el("viewer");
+}
+function externalReviewBlockElement(blockId) {
+  if (!blockId) return null;
+  return document.querySelector('[data-external-review-block="' + cssEscape(blockId) + '"]');
+}
+function scrollableParentForElement(element) {
+  let current = element?.parentElement;
+  while (current && current !== document.body) {
+    const style = window.getComputedStyle(current);
+    if (/(auto|scroll|overlay)/.test(style.overflowY) && current.scrollHeight > current.clientHeight) return current;
+    current = current.parentElement;
+  }
+  return activeDocumentScrollTarget() || el("viewer");
+}
+function shiftScrollForElement(element, delta) {
+  if (!element || Math.abs(delta) < 0.5) return;
+  const scroller = scrollableParentForElement(element);
+  if (scroller && scroller !== document.body && scroller !== document.documentElement) scroller.scrollTop += delta;
+  else window.scrollBy(0, delta);
+}
+function isSaveShortcut(event) {
+  return (event.ctrlKey || event.metaKey) && !event.altKey && !event.shiftKey && String(event.key || "").toLowerCase() === "s";
+}
+function handleSaveShortcut(event) {
+  if (!isSaveShortcut(event)) return false;
+  if (state.page !== "file" || !state.selected || state.selectedStartupContext) return false;
+  event.preventDefault();
+  if (activeExternalChange()) {
+    setStatus("file changed on disk · apply or reject before saving");
+    renderViewer();
+    updateHeader();
+    return true;
+  }
+  if (!state.dirty) {
+    setStatus("no changes to save");
+    return true;
+  }
+  saveCurrent().catch((error) => setStatus(error.message));
+  return true;
+}
+function captureEditorViewState(options = {}) {
+  const editor = activeEditor();
+  const viewer = el("viewer");
+  const documentScrollTarget = activeDocumentScrollTarget();
+  const anchor = externalReviewBlockElement(options.anchorBlockId);
+  return {
+    path: state.selected,
+    editorId: editor?.id || "",
+    anchorBlockId: options.anchorBlockId || "",
+    anchorTop: anchor ? anchor.getBoundingClientRect().top : null,
+    documentScrollTarget: documentScrollTarget?.classList?.contains("external-review-doc") ? "external-review-doc" : documentScrollTarget?.id || "",
+    documentScrollTop: documentScrollTarget?.scrollTop || 0,
+    documentScrollLeft: documentScrollTarget?.scrollLeft || 0,
+    editorScrollTop: editor?.scrollTop || 0,
+    editorScrollLeft: editor?.scrollLeft || 0,
+    viewerScrollTop: viewer?.scrollTop || 0,
+    viewerScrollLeft: viewer?.scrollLeft || 0,
+    windowScrollX: window.scrollX || 0,
+    windowScrollY: window.scrollY || 0,
+    selectionStart: typeof editor?.selectionStart === "number" ? editor.selectionStart : null,
+    selectionEnd: typeof editor?.selectionEnd === "number" ? editor.selectionEnd : null,
+    focused: document.activeElement === editor,
+  };
+}
+function restoreEditorViewState(snapshot) {
+  if (!snapshot || snapshot.path !== state.selected) return;
+  const apply = () => {
+    const editor = snapshot.textAnchor ? (el("docEditor") || activeEditor()) : (snapshot.editorId ? el(snapshot.editorId) : activeEditor());
+    const viewer = el("viewer");
+    const documentScrollTarget = (snapshot.documentScrollTarget === "external-review-doc"
+      ? document.querySelector(".external-review-doc")
+      : snapshot.documentScrollTarget === "docEditor"
+        ? el("docEditor")
+        : null) || activeDocumentScrollTarget();
+    if (documentScrollTarget) {
+      documentScrollTarget.scrollTop = snapshot.documentScrollTop || 0;
+      documentScrollTarget.scrollLeft = snapshot.documentScrollLeft || 0;
+    }
+    if (viewer) {
+      viewer.scrollTop = snapshot.viewerScrollTop || 0;
+      viewer.scrollLeft = snapshot.viewerScrollLeft || 0;
+    }
+    window.scrollTo(snapshot.windowScrollX || 0, snapshot.windowScrollY || 0);
+    const anchor = externalReviewBlockElement(snapshot.anchorBlockId);
+    if (anchor && typeof snapshot.anchorTop === "number") shiftScrollForElement(anchor, anchor.getBoundingClientRect().top - snapshot.anchorTop);
+    if (!editor) return;
+    const restoredTextAnchor = scrollEditorToTextAnchor(editor, snapshot);
+    if (!restoredTextAnchor) editor.scrollTop = snapshot.editorScrollTop || 0;
+    editor.scrollLeft = snapshot.editorScrollLeft || 0;
+    if (!restoredTextAnchor && typeof snapshot.selectionStart === "number" && typeof snapshot.selectionEnd === "number" && typeof editor.setSelectionRange === "function") {
+      const start = Math.min(snapshot.selectionStart, editor.value.length);
+      const end = Math.min(snapshot.selectionEnd, editor.value.length);
+      editor.setSelectionRange(start, end);
+    }
+    if (snapshot.focused) {
+      try { editor.focus({ preventScroll: true }); }
+      catch { editor.focus(); }
+    }
+  };
+  apply();
+  window.requestAnimationFrame(() => {
+    apply();
+    window.requestAnimationFrame(apply);
+  });
+  window.setTimeout(apply, 0);
+}
+
+function scrollEditorToTextAnchor(editor, snapshot) {
+  const anchor = snapshot?.textAnchor;
+  if (!editor || !anchor || typeof editor.value !== "string") return false;
+  const value = editor.value;
+  let offset = Math.max(0, Math.min(Number(anchor.textOffset) || 0, value.length));
+  const lineText = String(anchor.lineText || "");
+  if (lineText) {
+    const searchStart = Math.max(0, offset - 2000);
+    const found = value.indexOf(lineText, searchStart);
+    if (found >= 0 && found <= offset + 2000) offset = found;
+  }
+  const lineIndex = value.slice(0, offset).split("\n").length - 1;
+  const style = window.getComputedStyle(editor);
+  const fontSize = Number.parseFloat(style.fontSize) || 15;
+  const lineHeight = Number.parseFloat(style.lineHeight) || fontSize * 1.7;
+  const rect = editor.getBoundingClientRect();
+  const desiredTop = typeof snapshot.anchorTop === "number"
+    ? Math.max(24, Math.min(editor.clientHeight * 0.68, snapshot.anchorTop - rect.top))
+    : editor.clientHeight * 0.36;
+  editor.scrollTop = Math.max(0, lineIndex * lineHeight - desiredTop);
+  if (typeof editor.setSelectionRange === "function") {
+    const caret = Math.max(0, Math.min(offset, value.length));
+    editor.setSelectionRange(caret, caret);
+  }
+  return true;
+}
 function escapeHtml(value) { return String(value).replace(/[&<>"]/g, (ch) => ({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;"}[ch])); }
 function escapeRegExp(value) { return String(value).replace(/[-/\\^$*+?.()|[\]{}]/g, "\\$&"); }
 function cssEscape(value) { return window.CSS && CSS.escape ? CSS.escape(value) : String(value).replace(/(["\\])/g, "\\$1"); }
@@ -3809,13 +6003,23 @@ el("editor").addEventListener("input", () => {
 el("search").addEventListener("input", () => { state.pathFilters = []; expandSearchMatches(); renderFiles(); });
 el("clearSearch").addEventListener("click", () => clearExplorerFilter());
 document.querySelectorAll("[data-watch-filter]").forEach((button) => button.addEventListener("click", () => setExplorerWatchFilter(button.dataset.watchFilter)));
+document.querySelector("aside")?.addEventListener("contextmenu", openExplorerEmptyContextMenu);
 document.addEventListener("click", (event) => {
   const menu = el("explorerContextMenu");
   if (!menu || menu.hidden || menu.contains(event.target)) return;
   hideExplorerContextMenu();
 });
+document.addEventListener("click", (event) => {
+  const picker = document.querySelector("[data-path-picker]");
+  if (!picker || picker.contains(event.target)) return;
+  togglePathPickerMenu(false);
+});
 document.addEventListener("keydown", (event) => {
-  if (event.key === "Escape") hideExplorerContextMenu();
+  if (handleSaveShortcut(event)) return;
+  if (event.key === "Escape") {
+    hideExplorerContextMenu();
+    togglePathPickerMenu(false);
+  }
 });
 el("sidebarToggle").addEventListener("click", () => {
   state.mobileSidebarTouched = true;
@@ -3845,7 +6049,12 @@ el("unwatchSelected").addEventListener("click", () => removeSelectedFromWatch().
 el("clearSelection").addEventListener("click", () => clearDeleteSelection());
 el("deleteSelected").addEventListener("click", () => deletePaths([...state.selectedForDelete]).catch((error) => setStatus(error.message)));
 el("save").addEventListener("click", () => saveCurrent().catch((error) => setStatus(error.message)));
-el("reload").addEventListener("click", () => selectFile(state.selected, { pushHistory: false, fromPlanet: state.filePanel }).catch((error) => setStatus(error.message)));
+el("reload").addEventListener("click", () => {
+  if (blockPendingExternalChange("before reloading")) return;
+  if (state.dirty && !confirm("Discard unsaved editor changes and reload this file from disk?")) return;
+  state.dirty = false;
+  selectFile(state.selected, { pushHistory: false, fromPlanet: state.filePanel, forceReload: true }).catch((error) => setStatus(error.message));
+});
 window.addEventListener("beforeunload", (event) => {
   if (!state.dirty) return;
   event.preventDefault();

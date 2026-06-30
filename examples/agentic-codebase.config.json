@@ -19,6 +19,10 @@
   "integrations": {
     "hermes": false
   },
+  "startupContext": {
+    "enabled": true,
+    "fileNames": ["AGENTS.md", "CLAUDE.md"]
+  },
   "hubSections": [
     {
       "id": "main",
@@ -35,6 +39,7 @@
           "title": "Docs",
           "path": "docs/",
           "description": "Project documentation.",
+          "autoChildren": true,
           "cards": [
             { "id": "architecture", "title": "Architecture", "path": "docs/architecture/" },
             { "id": "decisions", "title": "Decisions", "path": "docs/decisions/" }

@@ -4,7 +4,7 @@ Documentation control room for the era of AI agent loops.
 
 AI agents can now loop on tasks for hours and days to create the biggest projects. In that world, the highest-leverage part of a project is no longer the source code. It is the documentation that tells agents what the project is, how it works, what matters, what are the features, all the details of the features it needs, and which reusable skills or procedures should guide future work.
 
-Context Room is built around one belief: if you maintain excellent documentation, you can build the bests AI-native projects.
+Context Room is built around one belief: if you maintain excellent documentation, you can build the best AI-native projects.
 
 It gives any repository a local browser UI to manage, navigate, and verify the docs and skills that keep agents aligned.
 
@@ -18,6 +18,9 @@ Context Room helps you:
 - see what an agent changed in watched docs;
 - review those changes with Git-backed diffs;
 - verify that documentation updates are correct;
+- map docs to metadata, source files, startup instructions, and hub cards;
+- run health checks for stale docs, broken references, missing metadata, and duplicate canonical docs;
+- generate a deterministic task brief from local docs, without calling an LLM;
 - keep the review state local to the project;
 - let an AI agent install and configure the documentation map for you.
 
@@ -41,11 +44,12 @@ The goal is not to replace your editor or Git workflow. The goal is to make docu
 
 ## Install
 
-From npm once published:
+From npm:
 
 ```bash
-npx context-room init
-npx context-room start
+npm install -D context-room
+npx context-room init --title "My Project"
+npx context-room start --root . --port 4317
 ```
 
 From this repo checkout:
@@ -83,6 +87,10 @@ Minimal config:
   "title": "My Project",
   "allowedPaths": ["docs/", "skills/", "README.md", "AGENTS.md"],
   "watchAllow": ["docs/", "skills/", "AGENTS.md"],
+  "startupContext": {
+    "enabled": true,
+    "fileNames": ["AGENTS.md", "CLAUDE.md"]
+  },
   "hubSections": [
     {
       "id": "main",
@@ -92,6 +100,7 @@ Minimal config:
           "id": "docs",
           "title": "Docs",
           "path": "docs/",
+          "autoChildren": true,
           "cards": [
             { "id": "architecture", "title": "Architecture", "path": "docs/architecture/" },
             { "id": "decisions", "title": "Decisions", "path": "docs/decisions/" }
@@ -117,17 +126,50 @@ Minimal config:
 
 `watchAllow` controls the review queue. A watched folder includes changed tracked files and new untracked files inside it.
 
+`startupContext` optionally lists agent instruction filenames such as `AGENTS.md` and `CLAUDE.md` from the filesystem root down to the Context Room root. These files are shown read-only and do not pollute the explorer.
+
+`autoChildren: true` on a folder card tells Context Room to infer sub-cards from the folder's immediate files and subfolders.
+
+## Documentation metadata
+
+New structured docs include lightweight frontmatter:
+
+```md
+---
+context_room:
+  kind: canonical
+  scope: website
+  status: current
+  canonical_for: billing
+  last_verified: 2026-06-26
+  sources: [src/billing.ts, docs/pricing.md]
+---
+```
+
+Supported `kind` values: `agents`, `index`, `canonical`, `procedure`, `decision`.
+
+Supported `status` values: `current`, `draft`, `historical`, `superseded`.
+
+This metadata powers `doctor`, the context graph, strict guard mode, and deterministic briefs. Existing Markdown without metadata still works, but watched or hub-visible docs will be reported as weaker context.
+
 ## CLI
 
 ```bash
 context-room init [--title "My Project"] [--allow docs/,skills/,README.md,AGENTS.md] [--watch docs/,skills/]
 context-room start [--root .] [--port 4317]
-context-room doctor [--root .]
-context-room guard [--root .]
+context-room doctor [--root .] [--strict]
+context-room guard [--root .] [--profile review-only|strict|advisory]
+context-room brief [--root .] [--task "change billing onboarding"] [--limit 12]
 context-room install-hook [--root .]
 ```
 
-`guard` exits with a non-zero status when watched documentation has changed but has not been marked verified in Context Room. `install-hook` wires that guard into `.git/hooks/pre-commit`, so commits are blocked until the watched docs review queue is clear.
+`doctor` prints config, graph, metadata, link, startup-context, and hub health.
+
+`guard` defaults to `review-only`: it exits with a non-zero status when watched documentation has changed but has not been marked verified in Context Room. `strict` also blocks on high-impact health issues. `advisory` reports issues but exits zero.
+
+`brief` is deterministic and local. It ranks docs from startup context, metadata, hub visibility, watched status, and task keywords. It does not call an LLM.
+
+`install-hook` wires the review-only guard into `.git/hooks/pre-commit`, so commits are blocked until the watched docs review queue is clear.
 
 ## Agent setup prompt
 
