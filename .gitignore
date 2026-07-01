@@ -1,5 +1,8 @@
 node_modules/
 npm-debug.log*
 .context-room/review-state.json
+.context-room/session-state.json
+.context-room/agent-command.json
+.context-room/agent-annotations.json
 .context-room/backups/
 .DS_Store

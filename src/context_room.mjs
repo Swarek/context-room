@@ -17,11 +17,24 @@ export const CONFIG_DIR = ".context-room";
 export const CONFIG_FILE = `${CONFIG_DIR}/config.json`;
 const CONFIG_SCHEMA_URL = "https://raw.githubusercontent.com/Swarek/context-room/main/schemas/config.schema.json";
 const DOCQA_REVIEW_STATE = `${CONFIG_DIR}/review-state.json`;
+const COLLAB_SESSION_STATE = `${CONFIG_DIR}/session-state.json`;
+const COLLAB_AGENT_COMMAND = `${CONFIG_DIR}/agent-command.json`;
+const COLLAB_AGENT_ANNOTATIONS = `${CONFIG_DIR}/agent-annotations.json`;
 const MEMORY_WEBAPP_SETTINGS = CONFIG_FILE;
 const HERMES_CRON_JOBS_FILE = "~/.hermes/cron/jobs.json";
 const HERMES_CRON_JOBS_FOLDER = "~/.hermes/cron/jobs/";
 const HERMES_CRON_MD_FOLDER = "~/.hermes/cron/jobs-md/";
 const DEFAULT_STARTUP_CONTEXT = { enabled: false, fileNames: ["AGENTS.md", "CLAUDE.md"] };
+const DEFAULT_STARTUP_SKILLS = { enabled: true, folderNames: [".codex/skills", ".agents/skills", "skills"] };
+export const FILE_THEME_OPTIONS = [
+  { id: "context-room", label: "Context Room", description: "Default dark theme" },
+  { id: "vscode-dark", label: "VS Code Dark", description: "Quiet editor contrast" },
+  { id: "github-dark", label: "GitHub Dark", description: "Clear docs contrast" },
+  { id: "dracula", label: "Dracula", description: "High color structure" },
+  { id: "solarized-dark", label: "Solarized Dark", description: "Soft long-read palette" },
+  { id: "light-plus", label: "Light Plus", description: "Bright document surface" },
+];
+const DEFAULT_FILE_THEME = "context-room";
 export const DOCUMENTATION_BEST_PRACTICES = [
   "One file, one clear scope: name what this document is responsible for and what belongs elsewhere.",
   "Start with the goal, then the few durable facts that change decisions.",
@@ -433,14 +446,14 @@ export function listStartupContextFiles(root = process.cwd(), settings = readMem
         fileName: item.fileName,
         absolutePath: item.abs,
         displayPath: displayPath(item.abs),
+        kind: "startup-context",
       },
     };
   });
 }
 
 export function readStartupContextFile(root = process.cwd(), order = 0, settings = readMemoryWebappSettings(root)) {
-  const normalizedOrder = Number(order);
-  const found = listStartupContextFiles(root, settings).find((file) => file.startupContext.order === normalizedOrder);
+  const found = resolveStartupContextFile(root, order, settings);
   if (!found) throw new Error(`Startup context file not found: ${order}`);
   const abs = found.startupContext.absolutePath;
   const stats = fs.statSync(abs);
@@ -459,6 +472,140 @@ export function readStartupContextFile(root = process.cwd(), order = 0, settings
   };
 }
 
+export function writeStartupContextFile(root = process.cwd(), order = 0, content = "", settings = readMemoryWebappSettings(root)) {
+  const found = resolveStartupContextFile(root, order, settings);
+  if (!found) throw new Error(`Startup context file not found: ${order}`);
+  return writeAbsoluteStartupFile(found.startupContext.absolutePath, content, publicStartupContextFile(found).startupContext);
+}
+
+export function listStartupSkillFolders(root = process.cwd(), settings = readMemoryWebappSettings(root)) {
+  const config = normalizeStartupSkillSettings(settings.startupSkills);
+  if (!config.enabled) return [];
+  const resolvedRoot = path.resolve(root);
+  const dirs = ancestorDirsForRoot(resolvedRoot);
+  const found = [];
+  const seen = new Set();
+  for (const dir of dirs) {
+    for (const folderName of config.folderNames) {
+      const abs = path.join(dir, folderName);
+      if (seen.has(abs) || !fs.existsSync(abs) || !fs.statSync(abs).isDirectory()) continue;
+      seen.add(abs);
+      const skills = fs.readdirSync(abs, { withFileTypes: true })
+        .filter((entry) => entry.isDirectory() && !entry.name.startsWith(".") && fs.existsSync(path.join(abs, entry.name, "SKILL.md")))
+        .map((entry) => entry.name)
+        .sort((a, b) => a.localeCompare(b, "fr"));
+      const looseFiles = fs.readdirSync(abs, { withFileTypes: true })
+        .filter((entry) => entry.isFile() && entry.name.endsWith(".md") && entry.name !== "README.md")
+        .map((entry) => entry.name.replace(/\.md$/i, ""))
+        .sort((a, b) => a.localeCompare(b, "fr"));
+      found.push({ abs, dir, folderName, skills: [...new Set([...skills, ...looseFiles])] });
+    }
+  }
+  return found.map((item, index) => ({
+    order: index + 1,
+    folderName: item.folderName,
+    absolutePath: item.abs,
+    displayPath: displayPath(item.abs),
+    skillCount: item.skills.length,
+    skills: item.skills.slice(0, 60),
+  }));
+}
+
+export function readStartupSkillFile(root = process.cwd(), folderOrder = 0, skillName = "", settings = readMemoryWebappSettings(root)) {
+  const { folder, requestedName, abs } = resolveStartupSkillFile(root, folderOrder, skillName, settings);
+  const stats = fs.statSync(abs);
+  if (stats.size > MAX_FILE_BYTES) throw new Error(`File too large for context room: ${displayPath(abs)}`);
+  const content = fs.readFileSync(abs, "utf8");
+  const fileName = path.basename(abs) === "SKILL.md" ? `${requestedName}/SKILL.md` : path.basename(abs);
+  return {
+    label: path.basename(abs),
+    path: displayPath(abs),
+    content,
+    exists: true,
+    updatedAt: stats.mtime.toISOString(),
+    chars: content.length,
+    contentHash: hashContent(content),
+    startupContext: {
+      order: `${folder.order}:${requestedName}`,
+      fileName,
+      displayPath: displayPath(abs),
+      kind: "startup-skill",
+      folder: folder.displayPath,
+      skillName: requestedName,
+    },
+  };
+}
+
+export function writeStartupSkillFile(root = process.cwd(), folderOrder = 0, skillName = "", content = "", settings = readMemoryWebappSettings(root)) {
+  const { folder, requestedName, abs } = resolveStartupSkillFile(root, folderOrder, skillName, settings);
+  const fileName = path.basename(abs) === "SKILL.md" ? `${requestedName}/SKILL.md` : path.basename(abs);
+  return writeAbsoluteStartupFile(abs, content, {
+    order: `${folder.order}:${requestedName}`,
+    fileName,
+    displayPath: displayPath(abs),
+    kind: "startup-skill",
+    folder: folder.displayPath,
+    skillName: requestedName,
+  });
+}
+
+function resolveStartupContextFile(root, order, settings = readMemoryWebappSettings(root)) {
+  const normalizedOrder = Number(order);
+  return listStartupContextFiles(root, settings).find((file) => file.startupContext.order === normalizedOrder);
+}
+
+function resolveStartupSkillFile(root, folderOrder, skillName, settings = readMemoryWebappSettings(root)) {
+  const normalizedOrder = Number(folderOrder);
+  const requestedName = path.basename(String(skillName || "").trim());
+  const folder = listStartupSkillFolders(root, settings).find((item) => item.order === normalizedOrder);
+  if (!folder || !requestedName || !folder.skills.includes(requestedName)) throw new Error(`Startup skill not found: ${skillName}`);
+  const folderAbs = path.resolve(folder.absolutePath);
+  const candidates = [
+    path.join(folderAbs, requestedName, "SKILL.md"),
+    path.join(folderAbs, `${requestedName}.md`),
+  ];
+  const abs = candidates.find((candidate) => {
+    const resolved = path.resolve(candidate);
+    return (resolved === folderAbs || resolved.startsWith(`${folderAbs}${path.sep}`)) && fs.existsSync(resolved) && fs.statSync(resolved).isFile();
+  });
+  if (!abs) throw new Error(`Startup skill file not found: ${skillName}`);
+  return { folder, requestedName, abs };
+}
+
+function writeAbsoluteStartupFile(absPath, content, startupContext) {
+  if (typeof content !== "string") throw new Error("Content must be a string");
+  if (Buffer.byteLength(content, "utf8") > MAX_FILE_BYTES) {
+    throw new Error("Content is too large for the local context room");
+  }
+  const abs = path.resolve(absPath);
+  if (!fs.existsSync(abs) || !fs.statSync(abs).isFile()) throw new Error(`Startup file not found: ${displayPath(abs)}`);
+  validateEditableContent(startupContext.fileName || path.basename(abs), content);
+  fs.writeFileSync(abs, content, "utf8");
+  const stats = fs.statSync(abs);
+  return {
+    label: path.basename(abs),
+    path: displayPath(abs),
+    exists: true,
+    backupPath: null,
+    bytes: stats.size,
+    chars: content.length,
+    updatedAt: stats.mtime.toISOString(),
+    contentHash: hashContent(content),
+    startupContext,
+  };
+}
+
+function ancestorDirsForRoot(root) {
+  const dirs = [];
+  let current = path.resolve(root);
+  while (current && current !== path.dirname(current)) {
+    dirs.push(current);
+    current = path.dirname(current);
+  }
+  dirs.push(path.parse(path.resolve(root)).root);
+  return [...new Set(dirs)].reverse();
+}
+
 function publicStartupContextFile(file) {
   return {
     label: file.label,
@@ -468,6 +615,7 @@ function publicStartupContextFile(file) {
       order: file.startupContext.order,
       fileName: file.startupContext.fileName,
       displayPath: file.startupContext.displayPath,
+      kind: "startup-context",
     },
   };
 }
@@ -754,9 +902,16 @@ export function readDocReviewState(root = process.cwd()) {
 export function writeDocReviewDecision(root, relPath, { status, note = "" } = {}) {
   const normalized = normalizeRelPath(relPath);
   const allowedStatuses = new Set(["verified", "needs_changes", "snoozed"]);
-  if (!allowedStatuses.has(status)) throw new Error(`Invalid review status: ${status}`);
-  const file = readMemoryFile(root, normalized);
   const state = readDocReviewState(root);
+  const file = readMemoryFile(root, normalized);
+  if (status === "unverified") {
+    delete state.reviews[normalized];
+    const statePath = path.join(root, DOCQA_REVIEW_STATE);
+    fs.mkdirSync(path.dirname(statePath), { recursive: true });
+    fs.writeFileSync(statePath, JSON.stringify(state, null, 2) + "\n", "utf8");
+    return { path: normalized, status: "unverified", note: "", reviewedAt: new Date().toISOString(), contentHash: hashContent(file.content) };
+  }
+  if (!allowedStatuses.has(status)) throw new Error(`Invalid review status: ${status}`);
   const decision = {
     status,
     note: String(note || "").slice(0, 500),
@@ -768,6 +923,236 @@ export function writeDocReviewDecision(root, relPath, { status, note = "" } = {}
   fs.mkdirSync(path.dirname(statePath), { recursive: true });
   fs.writeFileSync(statePath, JSON.stringify(state, null, 2) + "\n", "utf8");
   return { path: normalized, ...decision };
+}
+
+export function readCollaborationSessionState(root = process.cwd()) {
+  const statePath = path.join(root, COLLAB_SESSION_STATE);
+  const fallback = defaultCollaborationSessionState(root);
+  if (!fs.existsSync(statePath)) return fallback;
+  try {
+    const sanitized = sanitizeCollaborationSessionState(JSON.parse(fs.readFileSync(statePath, "utf8")));
+    return { ...fallback, ...Object.fromEntries(Object.entries(sanitized).filter(([, value]) => value !== undefined)) };
+  } catch {
+    return fallback;
+  }
+}
+
+export function writeCollaborationSessionState(root = process.cwd(), next = {}) {
+  const state = { ...sanitizeCollaborationSessionState(next), root: path.resolve(root) };
+  const statePath = path.join(root, COLLAB_SESSION_STATE);
+  fs.mkdirSync(path.dirname(statePath), { recursive: true });
+  fs.writeFileSync(statePath, JSON.stringify(state, null, 2) + "\n", "utf8");
+  return state;
+}
+
+export function readAgentCommand(root = process.cwd()) {
+  const commandPath = path.join(root, COLLAB_AGENT_COMMAND);
+  if (!fs.existsSync(commandPath)) return { command: null };
+  try {
+    const command = sanitizeAgentCommand(root, JSON.parse(fs.readFileSync(commandPath, "utf8")));
+    return { command };
+  } catch {
+    return { command: null };
+  }
+}
+
+export function writeAgentCommand(root = process.cwd(), next = {}) {
+  const command = sanitizeAgentCommand(root, {
+    ...next,
+    id: next.id || "cmd-" + Date.now().toString(36) + "-" + Math.random().toString(36).slice(2, 8),
+    createdAt: next.createdAt || new Date().toISOString(),
+    source: next.source || "agent",
+  });
+  const commandPath = path.join(root, COLLAB_AGENT_COMMAND);
+  fs.mkdirSync(path.dirname(commandPath), { recursive: true });
+  fs.writeFileSync(commandPath, JSON.stringify(command, null, 2) + "\n", "utf8");
+  return command;
+}
+
+export function readAgentAnnotations(root = process.cwd(), relPath = "") {
+  const annotationPath = path.join(root, COLLAB_AGENT_ANNOTATIONS);
+  const state = readJsonFile(annotationPath, { version: 1, annotations: [] });
+  const annotations = Array.isArray(state.annotations) ? state.annotations.map(sanitizeAgentAnnotation).filter(Boolean) : [];
+  const normalized = normalizeRelPath(String(relPath || ""));
+  return {
+    version: 1,
+    annotations: normalized ? annotations.filter((item) => item.path === normalized) : annotations,
+  };
+}
+
+export function appendAgentAnnotation(root = process.cwd(), next = {}) {
+  const annotation = sanitizeAgentAnnotation({
+    ...next,
+    id: next.id || "ann-" + Date.now().toString(36) + "-" + Math.random().toString(36).slice(2, 8),
+    createdAt: next.createdAt || new Date().toISOString(),
+    source: next.source || "agent",
+    resolved: false,
+  });
+  if (!annotation) throw new Error("Invalid annotation");
+  const settings = readMemoryWebappSettings(root);
+  if (!isAllowedMemoryPath(annotation.path, settings)) throw new Error(`Path not allowed in context room: ${annotation.path}`);
+  const annotationPath = path.join(root, COLLAB_AGENT_ANNOTATIONS);
+  const state = readJsonFile(annotationPath, { version: 1, annotations: [] });
+  const annotations = Array.isArray(state.annotations) ? state.annotations.map(sanitizeAgentAnnotation).filter(Boolean) : [];
+  annotations.push(annotation);
+  fs.mkdirSync(path.dirname(annotationPath), { recursive: true });
+  fs.writeFileSync(annotationPath, JSON.stringify({ version: 1, annotations }, null, 2) + "\n", "utf8");
+  return annotation;
+}
+
+export function resolveAgentAnnotation(root = process.cwd(), { id = "", path: relPath = "" } = {}) {
+  const annotationPath = path.join(root, COLLAB_AGENT_ANNOTATIONS);
+  const state = readJsonFile(annotationPath, { version: 1, annotations: [] });
+  const normalizedPath = normalizeRelPath(String(relPath || ""));
+  const annotations = Array.isArray(state.annotations) ? state.annotations.map(sanitizeAgentAnnotation).filter(Boolean) : [];
+  let resolved = null;
+  const nextAnnotations = annotations.map((annotation) => {
+    if (annotation.id !== id || (normalizedPath && annotation.path !== normalizedPath)) return annotation;
+    resolved = { ...annotation, resolved: true, resolvedAt: new Date().toISOString() };
+    return resolved;
+  });
+  if (!resolved) throw new Error(`Annotation not found: ${id}`);
+  fs.mkdirSync(path.dirname(annotationPath), { recursive: true });
+  fs.writeFileSync(annotationPath, JSON.stringify({ version: 1, annotations: nextAnnotations }, null, 2) + "\n", "utf8");
+  return resolved;
+}
+
+export function buildAgentReviewQueue(root = process.cwd()) {
+  const report = buildDocQaReport(root);
+  return {
+    generatedAt: report.generatedAt,
+    summary: report.summary,
+    queue: report.queue.map((item) => ({
+      path: item.path,
+      label: item.label,
+      gitStatus: item.gitStatus,
+      riskScore: item.riskScore,
+      issues: item.issues,
+      review: item.review || null,
+    })),
+    note: "Read-only queue. Human verification must happen in the Context Room webapp.",
+  };
+}
+
+function defaultCollaborationSessionState(root) {
+  return {
+    version: 1,
+    root: path.resolve(root),
+    updatedAt: null,
+    source: "context-room",
+    page: "unknown",
+    view: "unknown",
+    openFile: null,
+    selectedPath: null,
+    visibleHeading: null,
+    scrollPercent: 0,
+    pendingMiniDiffs: 0,
+    gitDiffOpen: false,
+    diffCollapsed: true,
+    explorerFilter: "all",
+    pathFilters: [],
+    selectedReview: null,
+    dirty: false,
+    mode: "view",
+    status: "No active webapp session state has been published yet.",
+  };
+}
+
+function sanitizeCollaborationSessionState(next = {}) {
+  return {
+    version: 1,
+    root: shortString(next.root, 1000) || undefined,
+    updatedAt: next.updatedAt || new Date().toISOString(),
+    source: shortString(next.source, 80) || "webapp",
+    page: shortString(next.page, 40) || "unknown",
+    view: shortString(next.view || next.page, 40) || "unknown",
+    openFile: nullablePath(next.openFile),
+    selectedPath: nullablePath(next.selectedPath),
+    visibleHeading: nullableString(next.visibleHeading, 240),
+    scrollPercent: clampNumber(next.scrollPercent, 0, 100),
+    pendingMiniDiffs: Math.max(0, Math.floor(Number(next.pendingMiniDiffs) || 0)),
+    gitDiffOpen: Boolean(next.gitDiffOpen),
+    diffCollapsed: next.diffCollapsed !== false,
+    explorerFilter: ["all", "watched", "unwatched"].includes(next.explorerFilter) ? next.explorerFilter : "all",
+    pathFilters: Array.isArray(next.pathFilters) ? next.pathFilters.map(nullablePath).filter(Boolean).slice(0, 20) : [],
+    selectedReview: nullablePath(next.selectedReview),
+    dirty: Boolean(next.dirty),
+    mode: next.mode === "edit" ? "edit" : "view",
+    status: nullableString(next.status, 300),
+  };
+}
+
+function sanitizeAgentCommand(root, next = {}) {
+  const action = ["navigate", "open", "scroll", "highlight"].includes(next.action) ? next.action : "navigate";
+  const view = ["hub", "settings", "file", "diff"].includes(next.view) ? next.view : (next.path ? "file" : "hub");
+  const normalizedPath = nullablePath(next.path);
+  if (normalizedPath) {
+    const settings = readMemoryWebappSettings(root);
+    if (!isAllowedMemoryPath(normalizedPath, settings)) throw new Error(`Path not allowed in context room: ${normalizedPath}`);
+  }
+  const targetType = ["heading", "text", "percent"].includes(next.targetType || next.target?.type) ? (next.targetType || next.target?.type) : "";
+  const targetValue = next.targetValue ?? next.target?.value ?? "";
+  return {
+    version: 1,
+    id: shortString(next.id, 120) || "cmd-" + Date.now().toString(36),
+    source: shortString(next.source, 80) || "agent",
+    createdAt: next.createdAt || new Date().toISOString(),
+    action,
+    view,
+    path: normalizedPath,
+    target: targetType ? { type: targetType, value: targetType === "percent" ? clampNumber(targetValue, 0, 100) : shortString(targetValue, 500) } : null,
+    highlight: next.highlight !== false,
+    message: nullableString(next.message, 300),
+  };
+}
+
+function sanitizeAgentAnnotation(next = {}) {
+  const normalizedPath = nullablePath(next.path);
+  const note = shortString(next.note, 1000);
+  if (!normalizedPath || !note) return null;
+  const targetType = ["heading", "text", "file"].includes(next.targetType) ? next.targetType : (next.target ? "text" : "file");
+  return {
+    version: 1,
+    id: shortString(next.id, 120) || "ann-" + Date.now().toString(36),
+    source: shortString(next.source, 80) || "agent",
+    createdAt: next.createdAt || new Date().toISOString(),
+    path: normalizedPath,
+    targetType,
+    target: nullableString(next.target, 500),
+    note,
+    resolved: Boolean(next.resolved),
+    resolvedAt: next.resolvedAt || null,
+  };
+}
+
+function readJsonFile(absPath, fallback) {
+  if (!fs.existsSync(absPath)) return fallback;
+  try {
+    return JSON.parse(fs.readFileSync(absPath, "utf8"));
+  } catch {
+    return fallback;
+  }
+}
+
+function nullablePath(value) {
+  const normalized = normalizeRelPath(String(value || ""));
+  if (!normalized || normalized.startsWith("../") || normalized.includes("/../") || path.isAbsolute(normalized)) return null;
+  return shortString(normalized, 1000);
+}
+
+function nullableString(value, max = 500) {
+  const text = shortString(value, max);
+  return text || null;
+}
+
+function shortString(value, max = 500) {
+  return String(value ?? "").replace(/\u0000/g, "").trim().slice(0, max);
+}
+
+function clampNumber(value, min, max) {
+  const number = Number(value);
+  if (!Number.isFinite(number)) return min;
+  return Math.max(min, Math.min(max, number));
 }
 
 function currentReviewFor(reviews, relPath, content) {
@@ -1328,6 +1713,7 @@ export function buildContextRoomDoctorReport(root = process.cwd()) {
       watchAllow: settings.watchAllow.length,
       hubSections: settings.hubSections.length,
       markdownTemplates: settings.markdownTemplates.length,
+      appearance: settings.appearance,
       startupContext: settings.startupContext,
     },
     docqa: docqa.summary,
@@ -1555,7 +1941,9 @@ export function createDefaultProjectConfig({ title = "Context Room", allowedPath
     allowedPaths: sanitizePathList(allowedPaths),
     watchAllow: sanitizePathList(watchAllow),
     integrations: { hermes: false },
+    appearance: { fileTheme: DEFAULT_FILE_THEME, autoOpenGitDiff: true },
     startupContext: { ...DEFAULT_STARTUP_CONTEXT },
+    startupSkills: { ...DEFAULT_STARTUP_SKILLS },
     bestPractices: [...DOCUMENTATION_BEST_PRACTICES],
     markdownTemplates: DEFAULT_MARKDOWN_TEMPLATES.map(normalizeMarkdownTemplate).filter(Boolean),
     hubCards: { ...DEFAULT_HUB_CARD_VISIBILITY },
@@ -1575,7 +1963,49 @@ export function initializeContextRoomProject(root = process.cwd(), options = {})
   const watchAllow = options.watchAllow?.length ? options.watchAllow : existing.watchAllow?.length ? existing.watchAllow : [];
   const config = normalizeMemoryWebappSettings({ ...createDefaultProjectConfig({ title, allowedPaths, watchAllow }), ...existing, title, allowedPaths, watchAllow });
   const saved = writeMemoryWebappSettings(root, config);
+  ensureRuntimeGitExcludes(root);
   return { config: saved, configPath: path.join(root, MEMORY_WEBAPP_SETTINGS) };
+}
+
+export function ensureRuntimeGitExcludes(root = process.cwd()) {
+  const excludePath = gitInfoExcludePath(root);
+  if (!excludePath) return { updated: false, path: null };
+  const prefix = gitRootRelativePrefix(root);
+  const entries = [
+    ".context-room/review-state.json",
+    ".context-room/session-state.json",
+    ".context-room/agent-command.json",
+    ".context-room/agent-annotations.json",
+    ".context-room/memory-webapp-backups/",
+  ].map((entry) => prefix + entry);
+  const marker = "# Context Room runtime state";
+  const existing = fs.existsSync(excludePath) ? fs.readFileSync(excludePath, "utf8") : "";
+  const missing = entries.filter((entry) => !existing.split(/\r?\n/).includes(entry));
+  if (!missing.length) return { updated: false, path: excludePath };
+  fs.mkdirSync(path.dirname(excludePath), { recursive: true });
+  const newlinePrefix = existing.endsWith("\n") || !existing ? "" : "\n";
+  const markerLine = existing.includes(marker) ? "" : marker + "\n";
+  fs.appendFileSync(excludePath, newlinePrefix + markerLine + missing.join("\n") + "\n", "utf8");
+  return { updated: true, path: excludePath, entries: missing };
+}
+
+function gitInfoExcludePath(root) {
+  try {
+    const excludePath = execFileSync("git", ["rev-parse", "--path-format=absolute", "--git-path", "info/exclude"], { cwd: root, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).trim();
+    return excludePath || null;
+  } catch {
+    return null;
+  }
+}
+
+function gitRootRelativePrefix(root) {
+  try {
+    const topLevel = execFileSync("git", ["rev-parse", "--show-toplevel"], { cwd: root, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).trim();
+    const rel = normalizeRelPath(path.relative(topLevel, path.resolve(root)));
+    return rel && rel !== "." ? rel.replace(/\/$/, "") + "/" : "";
+  } catch {
+    return "";
+  }
 }
 
 function inferAllowedPathsForRoot(root) {
@@ -1786,12 +2216,23 @@ function normalizeMemoryWebappSettings(raw = {}, base = defaultMemoryWebappSetti
     allowedPaths: sanitizePathList(raw.allowedPaths ?? base.allowedPaths ?? ALLOWED_PREFIXES),
     watchAllow: sanitizePathList(raw.watchAllow ?? base.watchAllow),
     integrations: { hermes: Boolean(raw.integrations?.hermes ?? base.integrations?.hermes ?? false) },
+    appearance: normalizeAppearanceSettings(raw.appearance ?? base.appearance),
     startupContext: normalizeStartupContextSettings(raw.startupContext ?? base.startupContext),
+    startupSkills: normalizeStartupSkillSettings(raw.startupSkills ?? base.startupSkills),
     bestPractices: sanitizeTextList(raw.bestPractices ?? base.bestPractices ?? DOCUMENTATION_BEST_PRACTICES),
     markdownTemplates: sanitizeMarkdownTemplates(raw.markdownTemplates ?? base.markdownTemplates ?? DEFAULT_MARKDOWN_TEMPLATES),
     hubCards,
     customHubCards,
     hubSections,
+  };
+}
+
+function normalizeAppearanceSettings(value = {}) {
+  const allowed = new Set(FILE_THEME_OPTIONS.map((theme) => theme.id));
+  const fileTheme = String(value.fileTheme || DEFAULT_FILE_THEME).trim();
+  return {
+    fileTheme: allowed.has(fileTheme) ? fileTheme : DEFAULT_FILE_THEME,
+    autoOpenGitDiff: value.autoOpenGitDiff !== false,
   };
 }
 
@@ -1804,6 +2245,18 @@ function normalizeStartupContextSettings(value = {}) {
   return {
     enabled: Boolean(value.enabled),
     fileNames: fileNames.length ? fileNames : [...DEFAULT_STARTUP_CONTEXT.fileNames],
+  };
+}
+
+function normalizeStartupSkillSettings(value = {}) {
+  const rawFolderNames = Array.isArray(value.folderNames) ? value.folderNames : DEFAULT_STARTUP_SKILLS.folderNames;
+  const folderNames = [...new Set(rawFolderNames
+    .map((item) => normalizeRelPath(String(item || "")).replace(/\/$/, ""))
+    .filter((item) => item && !item.startsWith("../") && !item.includes("/../") && !path.isAbsolute(item) && !isBlockedPath(item))
+  )];
+  return {
+    enabled: value.enabled !== false,
+    folderNames: folderNames.length ? folderNames : [...DEFAULT_STARTUP_SKILLS.folderNames],
   };
 }
 
@@ -2023,9 +2476,29 @@ async function routeRequest(req, res, root) {
     sendJson(res, 200, { files: listStartupContextFiles(root).map(publicStartupContextFile), root });
     return;
   }
+  if (req.method === "GET" && url.pathname === "/api/startup-skills") {
+    sendJson(res, 200, { folders: listStartupSkillFolders(root), root });
+    return;
+  }
+  if (req.method === "GET" && url.pathname === "/api/startup-skills/file") {
+    const folder = url.searchParams.get("folder") || "";
+    const skill = url.searchParams.get("skill") || "";
+    sendJson(res, 200, readStartupSkillFile(root, folder, skill));
+    return;
+  }
+  if (req.method === "POST" && url.pathname === "/api/startup-skills/file") {
+    const body = await readJsonBody(req);
+    sendJson(res, 200, writeStartupSkillFile(root, body.folder, body.skill, body.content));
+    return;
+  }
   if (req.method === "GET" && url.pathname === "/api/startup-context/file") {
     const order = url.searchParams.get("order") || "";
     sendJson(res, 200, readStartupContextFile(root, order));
+    return;
+  }
+  if (req.method === "POST" && url.pathname === "/api/startup-context/file") {
+    const body = await readJsonBody(req);
+    sendJson(res, 200, writeStartupContextFile(root, body.order, body.content));
     return;
   }
   if (req.method === "GET" && url.pathname === "/api/settings") {
@@ -2053,6 +2526,42 @@ async function routeRequest(req, res, root) {
   }
   if (req.method === "GET" && url.pathname === "/api/brief") {
     sendJson(res, 200, { brief: buildAgentBrief(root, { task: url.searchParams.get("task") || "", limit: Number(url.searchParams.get("limit") || 12) }) });
+    return;
+  }
+  if (req.method === "GET" && (url.pathname === "/api/session-state" || url.pathname === "/api/agent/state")) {
+    sendJson(res, 200, readCollaborationSessionState(root));
+    return;
+  }
+  if (req.method === "POST" && url.pathname === "/api/session-state") {
+    const body = await readJsonBody(req);
+    sendJson(res, 200, writeCollaborationSessionState(root, body));
+    return;
+  }
+  if (req.method === "GET" && url.pathname === "/api/agent/review-queue") {
+    sendJson(res, 200, buildAgentReviewQueue(root));
+    return;
+  }
+  if (req.method === "GET" && url.pathname === "/api/agent/command") {
+    sendJson(res, 200, readAgentCommand(root));
+    return;
+  }
+  if (req.method === "POST" && url.pathname === "/api/agent/command") {
+    const body = await readJsonBody(req);
+    sendJson(res, 200, { command: writeAgentCommand(root, body) });
+    return;
+  }
+  if (req.method === "GET" && url.pathname === "/api/agent/annotations") {
+    sendJson(res, 200, readAgentAnnotations(root, url.searchParams.get("path") || ""));
+    return;
+  }
+  if (req.method === "POST" && url.pathname === "/api/agent/annotations") {
+    const body = await readJsonBody(req);
+    sendJson(res, 200, { annotation: appendAgentAnnotation(root, body) });
+    return;
+  }
+  if (req.method === "POST" && url.pathname === "/api/agent/annotations/resolve") {
+    const body = await readJsonBody(req);
+    sendJson(res, 200, { annotation: resolveAgentAnnotation(root, { id: body.id, path: body.path }) });
     return;
   }
   if (req.method === "POST" && url.pathname === "/api/docqa/review") {
@@ -2320,10 +2829,10 @@ function sendHtml(res, body) {
   res.end(body);
 }
 
-export function renderFileActionButtons({ hasReviewItem = false, dirty = false } = {}) {
+export function renderFileActionButtons({ reviewAction = null, dirty = false, deletable = true } = {}) {
   return '<div class="file-actions">' +
-    (hasReviewItem ? '<button class="file-action" type="button" data-file-verify>Mark verified</button>' : '') +
-    '<button class="file-action danger-action" type="button" data-file-delete>Delete</button>' +
+    (reviewAction ? '<button class="file-action" type="button" data-file-review-decision="' + escapeHtmlServer(reviewAction.status) + '">' + escapeHtmlServer(reviewAction.label) + '</button>' : '') +
+    (deletable ? '<button class="file-action danger-action" type="button" data-file-delete>Delete</button>' : '') +
     '<button class="file-action primary" type="button" data-file-save ' + (!dirty ? 'disabled' : '') + '>Save</button>' +
   '</div>';
 }
@@ -2337,7 +2846,7 @@ export function renderReviewSummary(summary = {}) {
 
 export function renderAppHtml() {
   return String.raw`<!doctype html>
-<html lang="en">
+<html lang="en" data-file-theme="${DEFAULT_FILE_THEME}">
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
@@ -2355,28 +2864,266 @@ export function renderAppHtml() {
       --accent-2: #b69cff;
       --good: #8df0b4;
       --danger: #ff8c9d;
+      --on-accent: #07101e;
       --shadow: 0 24px 80px rgba(0, 0, 0, 0.38);
+      --body-glow-1: rgba(139, 211, 255, 0.22);
+      --body-glow-2: rgba(182, 156, 255, 0.18);
+      --body-glow-3: rgba(139,211,255,0.16);
+      --body-glow-4: rgba(182,156,255,0.12);
+      --star-dot: rgba(255,255,255,0.42);
+      --star-opacity: 0.16;
+      --surface-wash: rgba(3, 7, 18, 0.36);
+      --surface-sidebar: rgba(8, 13, 27, 0.72);
+      --surface-floating: rgba(8,13,27,0.96);
+      --surface-floating-soft: rgba(8,13,27,0.82);
+      --surface-card: rgba(255,255,255,0.045);
+      --surface-card-hover: rgba(139,211,255,0.08);
+      --surface-reader: rgba(3, 7, 18, 0.42);
+      --label-strong: #dce8fb;
+      --file-panel-bg: rgba(8,13,27,0.72);
+      --file-header-bg: rgba(8,13,27,0.36);
+      --file-bg: rgba(3,7,18,0.16);
+      --file-fg: #eef4ff;
+      --file-muted: #98a6bd;
+      --file-line: rgba(148,163,184,0.16);
+      --file-h1: #8bd3ff;
+      --file-h2: #b69cff;
+      --file-h3: #8df0b4;
+      --file-h4: #ffd48f;
+      --file-code: #f8c37a;
+      --file-quote: #aab8cd;
+      --file-list: #8bd3ff;
+      --file-marker: #64748b;
+      --file-hr: rgba(139,211,255,0.35);
       font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+    :root[data-file-theme="vscode-dark"] {
+      color-scheme: dark;
+      --bg: #1e1e1e;
+      --panel: rgba(37,37,38,0.88);
+      --panel-strong: rgba(45,45,48,0.96);
+      --line: rgba(204,204,204,0.16);
+      --text: #d4d4d4;
+      --muted: #9a9a9a;
+      --accent: #569cd6;
+      --accent-2: #4ec9b0;
+      --good: #6a9955;
+      --danger: #f48771;
+      --shadow: 0 24px 80px rgba(0,0,0,0.46);
+      --body-glow-1: rgba(86,156,214,0.16);
+      --body-glow-2: rgba(78,201,176,0.12);
+      --body-glow-3: rgba(86,156,214,0.10);
+      --body-glow-4: rgba(197,134,192,0.10);
+      --surface-wash: rgba(30,30,30,0.48);
+      --surface-sidebar: rgba(30,30,30,0.82);
+      --surface-floating: rgba(37,37,38,0.98);
+      --surface-floating-soft: rgba(37,37,38,0.88);
+      --surface-card: rgba(255,255,255,0.04);
+      --surface-card-hover: rgba(86,156,214,0.10);
+      --surface-reader: rgba(30,30,30,0.50);
+      --label-strong: #d4d4d4;
+      --file-panel-bg: #1e1e1e;
+      --file-header-bg: #252526;
+      --file-bg: #1e1e1e;
+      --file-fg: #d4d4d4;
+      --file-muted: #858585;
+      --file-line: rgba(204,204,204,0.16);
+      --file-h1: #4ec9b0;
+      --file-h2: #569cd6;
+      --file-h3: #c586c0;
+      --file-h4: #dcdcaa;
+      --file-code: #ce9178;
+      --file-quote: #6a9955;
+      --file-list: #9cdcfe;
+      --file-marker: #808080;
+      --file-hr: rgba(86,156,214,0.38);
+    }
+    :root[data-file-theme="github-dark"] {
+      color-scheme: dark;
+      --bg: #0d1117;
+      --panel: rgba(22,27,34,0.88);
+      --panel-strong: rgba(33,38,45,0.96);
+      --line: rgba(139,148,158,0.22);
+      --text: #c9d1d9;
+      --muted: #8b949e;
+      --accent: #79c0ff;
+      --accent-2: #d2a8ff;
+      --good: #7ee787;
+      --danger: #ff7b72;
+      --shadow: 0 24px 80px rgba(0,0,0,0.48);
+      --body-glow-1: rgba(121,192,255,0.15);
+      --body-glow-2: rgba(210,168,255,0.12);
+      --body-glow-3: rgba(121,192,255,0.10);
+      --body-glow-4: rgba(126,231,135,0.08);
+      --surface-wash: rgba(13,17,23,0.52);
+      --surface-sidebar: rgba(13,17,23,0.84);
+      --surface-floating: rgba(22,27,34,0.98);
+      --surface-floating-soft: rgba(22,27,34,0.90);
+      --surface-card: rgba(255,255,255,0.04);
+      --surface-card-hover: rgba(121,192,255,0.09);
+      --surface-reader: rgba(13,17,23,0.54);
+      --label-strong: #c9d1d9;
+      --file-panel-bg: #0d1117;
+      --file-header-bg: #161b22;
+      --file-bg: #0d1117;
+      --file-fg: #c9d1d9;
+      --file-muted: #8b949e;
+      --file-line: rgba(139,148,158,0.22);
+      --file-h1: #79c0ff;
+      --file-h2: #a5d6ff;
+      --file-h3: #ffa657;
+      --file-h4: #7ee787;
+      --file-code: #d2a8ff;
+      --file-quote: #8b949e;
+      --file-list: #7ee787;
+      --file-marker: #6e7681;
+      --file-hr: rgba(121,192,255,0.34);
+    }
+    :root[data-file-theme="dracula"] {
+      color-scheme: dark;
+      --bg: #282a36;
+      --panel: rgba(40,42,54,0.88);
+      --panel-strong: rgba(52,55,70,0.96);
+      --line: rgba(248,248,242,0.14);
+      --text: #f8f8f2;
+      --muted: #b8bfdc;
+      --accent: #ff79c6;
+      --accent-2: #bd93f9;
+      --good: #50fa7b;
+      --danger: #ff5555;
+      --shadow: 0 24px 80px rgba(0,0,0,0.42);
+      --body-glow-1: rgba(255,121,198,0.16);
+      --body-glow-2: rgba(189,147,249,0.16);
+      --body-glow-3: rgba(139,233,253,0.10);
+      --body-glow-4: rgba(80,250,123,0.08);
+      --surface-wash: rgba(40,42,54,0.52);
+      --surface-sidebar: rgba(40,42,54,0.84);
+      --surface-floating: rgba(52,55,70,0.98);
+      --surface-floating-soft: rgba(52,55,70,0.88);
+      --surface-card: rgba(248,248,242,0.045);
+      --surface-card-hover: rgba(189,147,249,0.10);
+      --surface-reader: rgba(40,42,54,0.50);
+      --label-strong: #f8f8f2;
+      --file-panel-bg: #282a36;
+      --file-header-bg: #343746;
+      --file-bg: #282a36;
+      --file-fg: #f8f8f2;
+      --file-muted: #b8bfdc;
+      --file-line: rgba(248,248,242,0.14);
+      --file-h1: #ff79c6;
+      --file-h2: #bd93f9;
+      --file-h3: #50fa7b;
+      --file-h4: #8be9fd;
+      --file-code: #f1fa8c;
+      --file-quote: #6272a4;
+      --file-list: #8be9fd;
+      --file-marker: #6272a4;
+      --file-hr: rgba(189,147,249,0.38);
+    }
+    :root[data-file-theme="solarized-dark"] {
+      color-scheme: dark;
+      --bg: #002b36;
+      --panel: rgba(7,54,66,0.88);
+      --panel-strong: rgba(7,54,66,0.98);
+      --line: rgba(131,148,150,0.22);
+      --text: #93a1a1;
+      --muted: #839496;
+      --accent: #268bd2;
+      --accent-2: #2aa198;
+      --good: #859900;
+      --danger: #dc322f;
+      --shadow: 0 24px 80px rgba(0,0,0,0.42);
+      --body-glow-1: rgba(38,139,210,0.14);
+      --body-glow-2: rgba(42,161,152,0.12);
+      --body-glow-3: rgba(181,137,0,0.08);
+      --body-glow-4: rgba(133,153,0,0.08);
+      --surface-wash: rgba(0,43,54,0.50);
+      --surface-sidebar: rgba(0,43,54,0.86);
+      --surface-floating: rgba(7,54,66,0.98);
+      --surface-floating-soft: rgba(7,54,66,0.90);
+      --surface-card: rgba(253,246,227,0.045);
+      --surface-card-hover: rgba(38,139,210,0.10);
+      --surface-reader: rgba(0,43,54,0.52);
+      --label-strong: #eee8d5;
+      --file-panel-bg: #002b36;
+      --file-header-bg: #073642;
+      --file-bg: #002b36;
+      --file-fg: #93a1a1;
+      --file-muted: #839496;
+      --file-line: rgba(131,148,150,0.22);
+      --file-h1: #b58900;
+      --file-h2: #268bd2;
+      --file-h3: #2aa198;
+      --file-h4: #859900;
+      --file-code: #cb4b16;
+      --file-quote: #657b83;
+      --file-list: #2aa198;
+      --file-marker: #586e75;
+      --file-hr: rgba(38,139,210,0.34);
+    }
+    :root[data-file-theme="light-plus"] {
+      color-scheme: light;
+      --bg: #f6f8fa;
+      --panel: rgba(255,255,255,0.90);
+      --panel-strong: rgba(255,255,255,0.98);
+      --line: rgba(27,31,36,0.14);
+      --text: #24292f;
+      --muted: #57606a;
+      --accent: #0550ae;
+      --accent-2: #8250df;
+      --good: #116329;
+      --danger: #cf222e;
+      --on-accent: #ffffff;
+      --shadow: 0 24px 70px rgba(31,35,40,0.16);
+      --body-glow-1: rgba(5,80,174,0.13);
+      --body-glow-2: rgba(130,80,223,0.11);
+      --body-glow-3: rgba(5,80,174,0.08);
+      --body-glow-4: rgba(17,99,41,0.07);
+      --star-dot: rgba(36,41,47,0.26);
+      --star-opacity: 0.10;
+      --surface-wash: rgba(255,255,255,0.58);
+      --surface-sidebar: rgba(255,255,255,0.86);
+      --surface-floating: rgba(255,255,255,0.98);
+      --surface-floating-soft: rgba(255,255,255,0.90);
+      --surface-card: rgba(27,31,36,0.045);
+      --surface-card-hover: rgba(5,80,174,0.08);
+      --surface-reader: rgba(255,255,255,0.70);
+      --label-strong: #24292f;
+      --file-panel-bg: #ffffff;
+      --file-header-bg: #f6f8fa;
+      --file-bg: #ffffff;
+      --file-fg: #24292f;
+      --file-muted: #57606a;
+      --file-line: rgba(27,31,36,0.14);
+      --file-h1: #0550ae;
+      --file-h2: #8250df;
+      --file-h3: #116329;
+      --file-h4: #953800;
+      --file-code: #a40e26;
+      --file-quote: #57606a;
+      --file-list: #0550ae;
+      --file-marker: #6e7781;
+      --file-hr: rgba(5,80,174,0.22);
     }
     * { box-sizing: border-box; }
     body {
       margin: 0;
       min-height: 100vh;
       background:
-        radial-gradient(circle at top left, rgba(139, 211, 255, 0.22), transparent 30rem),
-        radial-gradient(circle at 80% 20%, rgba(182, 156, 255, 0.18), transparent 28rem),
+        radial-gradient(circle at top left, var(--body-glow-1), transparent 30rem),
+        radial-gradient(circle at 80% 20%, var(--body-glow-2), transparent 28rem),
         var(--bg);
       color: var(--text);
       overflow: hidden;
     }
     body::before, body::after { content: ""; position: fixed; inset: 0; pointer-events: none; z-index: 0; }
-    body::before { background-image: radial-gradient(circle, rgba(255,255,255,0.42) 0 1px, transparent 1.6px); background-size: 86px 86px; opacity: 0.16; animation: starDrift 38s linear infinite; }
-    body::after { background: radial-gradient(circle at 65% 48%, rgba(139,211,255,0.16), transparent 22rem), radial-gradient(circle at 30% 74%, rgba(182,156,255,0.12), transparent 26rem); animation: nebulaPulse 12s ease-in-out infinite alternate; }
+    body::before { background-image: radial-gradient(circle, var(--star-dot) 0 1px, transparent 1.6px); background-size: 86px 86px; opacity: var(--star-opacity); animation: starDrift 38s linear infinite; }
+    body::after { background: radial-gradient(circle at 65% 48%, var(--body-glow-3), transparent 22rem), radial-gradient(circle at 30% 74%, var(--body-glow-4), transparent 26rem); animation: nebulaPulse 12s ease-in-out infinite alternate; }
     .app { position: relative; z-index: 1; display: grid; grid-template-columns: 390px 1fr; height: 100vh; min-height: 0; overflow: hidden; transition: grid-template-columns 260ms ease; }
     .app.sidebar-collapsed { grid-template-columns: 76px 1fr; }
-    aside { border-right: 1px solid var(--line); padding: 14px 18px; background: rgba(8, 13, 27, 0.72); backdrop-filter: blur(22px); height: 100vh; min-height: 0; overflow: auto; display: block; transition: padding 260ms ease, background 260ms ease; }
+    aside { border-right: 1px solid var(--line); padding: 14px 18px; background: var(--surface-sidebar); backdrop-filter: blur(22px); height: 100vh; min-height: 0; overflow: auto; display: block; transition: padding 260ms ease, background 260ms ease; }
     .app.sidebar-collapsed aside { padding: 14px 10px; overflow: visible; }
-    .app.sidebar-collapsed .sidebar-toggle { position: fixed; left: 16px; top: 16px; z-index: 20; background: rgba(12,20,38,0.96); }
+    .app.sidebar-collapsed .sidebar-toggle { position: fixed; left: 16px; top: 16px; z-index: 20; background: var(--surface-floating); }
     .sidebar-head { display: grid; grid-template-columns: 1fr auto; gap: 10px; align-items: start; }
     .sidebar-toggle { border: 1px solid rgba(139,211,255,0.28); border-radius: 14px; background: rgba(255,255,255,0.06); color: var(--text); width: 42px; height: 42px; cursor: pointer; box-shadow: 0 0 28px rgba(139,211,255,0.12); transition: transform 160ms ease, background 160ms ease; }
     .sidebar-toggle:hover { transform: translateY(-1px); background: rgba(139,211,255,0.12); }
@@ -2388,17 +3135,17 @@ export function renderAppHtml() {
     h1 { font-size: 24px; margin: 0 0 6px; letter-spacing: -0.04em; }
     .subtitle { color: var(--muted); line-height: 1.35; font-size: 13px; }
     .launch-map { display: grid; grid-template-columns: repeat(3, 1fr); gap: 6px; margin: 10px 0; }
-    .launch-card { border: 1px solid var(--line); border-radius: 12px; padding: 8px; background: rgba(255,255,255,0.045); min-width: 0; transition: transform 180ms ease, border-color 180ms ease, background 180ms ease; }
-    .launch-card:hover { transform: translateY(-2px); border-color: rgba(139,211,255,0.38); background: rgba(139,211,255,0.08); }
+    .launch-card { border: 1px solid var(--line); border-radius: 12px; padding: 8px; background: var(--surface-card); min-width: 0; transition: transform 180ms ease, border-color 180ms ease, background 180ms ease; }
+    .launch-card:hover { transform: translateY(-2px); border-color: color-mix(in srgb, var(--accent) 38%, transparent); background: var(--surface-card-hover); }
     .launch-card.hot { border-color: rgba(141, 240, 180, 0.42); background: rgba(141, 240, 180, 0.08); }
     .launch-card strong { display: block; font-size: 11px; line-height: 1.2; }
     .launch-card span { display: none; }
     .quick-files { display: grid; gap: 5px; margin: 6px 0 10px; overflow: visible; padding-right: 4px; }
     .quick-group { display: grid; gap: 4px; }
     .quick-group-title { color: var(--muted); font-size: 10px; font-weight: 850; text-transform: uppercase; letter-spacing: 0.1em; margin: 6px 0 2px; }
-    .quick-file { width: 100%; border: 1px solid rgba(148,163,184,0.16); border-radius: 9px; background: rgba(255,255,255,0.035); color: var(--text); text-align: left; padding: 6px 8px; cursor: pointer; display: grid; gap: 1px; }
-    .quick-file:hover { background: rgba(139,211,255,0.08); border-color: rgba(139,211,255,0.28); transform: translateX(2px); }
-    .quick-file.active { background: rgba(139,211,255,0.14); border-color: rgba(139,211,255,0.56); }
+    .quick-file { width: 100%; border: 1px solid color-mix(in srgb, var(--line) 88%, transparent); border-radius: 9px; background: var(--surface-card); color: var(--text); text-align: left; padding: 6px 8px; cursor: pointer; display: grid; gap: 1px; }
+    .quick-file:hover { background: var(--surface-card-hover); border-color: color-mix(in srgb, var(--accent) 28%, transparent); transform: translateX(2px); }
+    .quick-file.active { background: color-mix(in srgb, var(--accent) 14%, transparent); border-color: color-mix(in srgb, var(--accent) 56%, transparent); }
     .quick-file strong { font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
     .quick-file span { color: var(--muted); font-size: 11px; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
     .search-row { display: grid; grid-template-columns: 1fr auto; gap: 8px; align-items: center; margin: 10px 0 10px; }
@@ -2408,12 +3155,12 @@ export function renderAppHtml() {
     .clear-search { border: 1px solid var(--line); border-radius: 14px; padding: 12px 13px; background: rgba(255,255,255,0.055); color: var(--muted); cursor: pointer; }
     .clear-search:hover { color: var(--text); background: rgba(255,255,255,0.085); }
     .watch-filter-row { display: flex; gap: 4px; margin: -3px 0 6px; align-items: center; }
-    .watch-filter { border: 1px solid rgba(148,163,184,0.16); border-radius: 999px; padding: 4px 7px; background: rgba(255,255,255,0.035); color: var(--muted); cursor: pointer; font-size: 10px; font-weight: 850; line-height: 1; }
-    .watch-filter:hover { color: var(--text); background: rgba(139,211,255,0.08); }
-    .watch-filter.active { color: #07101e; border-color: transparent; background: linear-gradient(135deg, var(--accent), var(--accent-2)); }
-    .explorer-context-menu { position: fixed; z-index: 80; width: min(245px, calc(100vw - 24px)); border: 1px solid rgba(139,211,255,0.24); border-radius: 14px; background: rgba(8,13,27,0.96); box-shadow: 0 18px 48px rgba(0,0,0,0.38); backdrop-filter: blur(20px); padding: 8px; display: grid; gap: 7px; }
+    .watch-filter { border: 1px solid color-mix(in srgb, var(--line) 88%, transparent); border-radius: 999px; padding: 4px 7px; background: var(--surface-card); color: var(--muted); cursor: pointer; font-size: 10px; font-weight: 850; line-height: 1; }
+    .watch-filter:hover { color: var(--text); background: var(--surface-card-hover); }
+    .watch-filter.active { color: var(--on-accent); border-color: transparent; background: linear-gradient(135deg, var(--accent), var(--accent-2)); }
+    .explorer-context-menu { position: fixed; z-index: 80; width: min(245px, calc(100vw - 24px)); border: 1px solid color-mix(in srgb, var(--accent) 24%, transparent); border-radius: 14px; background: var(--surface-floating); box-shadow: 0 18px 48px rgba(0,0,0,0.38); backdrop-filter: blur(20px); padding: 8px; display: grid; gap: 7px; }
     .explorer-context-menu[hidden] { display: none; }
-    .explorer-context-title { display: grid; gap: 2px; color: #dce8fb; font-size: 11px; font-weight: 900; padding: 2px 4px; }
+    .explorer-context-title { display: grid; gap: 2px; color: var(--label-strong); font-size: 11px; font-weight: 900; padding: 2px 4px; }
     .explorer-context-title code { color: var(--accent); font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 10px; font-weight: 700; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
     .explorer-context-form { display: grid; gap: 7px; }
     .explorer-context-form[hidden] { display: none; }
@@ -2450,114 +3197,115 @@ export function renderAppHtml() {
     .actions { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; justify-content: flex-end; }
     .history-nav { display: flex; gap: 6px; }
     .history-nav button { min-width: 42px; padding-left: 12px; padding-right: 12px; }
-    button.primary, button.secondary { border: 0; border-radius: 14px; padding: 12px 16px; color: #07101e; background: linear-gradient(135deg, var(--accent), var(--accent-2)); font-weight: 850; cursor: pointer; transition: transform 160ms ease, filter 160ms ease, background 160ms ease; }
+    button.primary, button.secondary { border: 0; border-radius: 14px; padding: 12px 16px; color: var(--on-accent); background: linear-gradient(135deg, var(--accent), var(--accent-2)); font-weight: 850; cursor: pointer; transition: transform 160ms ease, filter 160ms ease, background 160ms ease; }
     button.primary:hover, button.secondary:hover { transform: translateY(-1px); filter: brightness(1.08); }
     button.secondary { background: rgba(255,255,255,0.08); color: var(--text); border: 1px solid var(--line); }
     button:disabled { opacity: 0.45; cursor: not-allowed; }
     .status { color: var(--muted); font-size: 13px; min-width: 150px; text-align: right; }
     .editor-shell { min-height: 0; overflow: hidden; position: relative; }
-    .workspace-dock { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; margin: 0 0 12px; padding: 7px; border: 1px solid rgba(148,163,184,0.18); border-radius: 18px; background: rgba(8,13,27,0.82); backdrop-filter: blur(18px); box-shadow: 0 16px 48px rgba(0,0,0,0.22); }
+    .workspace-dock { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; margin: 0 0 12px; padding: 7px; border: 1px solid var(--line); border-radius: 18px; background: var(--surface-floating-soft); backdrop-filter: blur(18px); box-shadow: 0 16px 48px rgba(0,0,0,0.22); }
     .dock-button { border: 1px solid rgba(148,163,184,0.22); border-radius: 12px; background: rgba(255,255,255,0.06); color: var(--text); padding: 9px 11px; font-weight: 850; cursor: pointer; }
     .dock-button:hover { transform: translateY(-1px); background: rgba(139,211,255,0.12); }
-    .dock-button.primary { color: #07101e; border: 0; background: linear-gradient(135deg, var(--accent), var(--accent-2)); }
+    .dock-button.primary { color: var(--on-accent); border: 0; background: linear-gradient(135deg, var(--accent), var(--accent-2)); }
     .dock-status { display: none; }
-    .docqa-home { height: 100%; padding: 24px; overflow: auto; position: relative; background: radial-gradient(circle at 18% 0%, rgba(139,211,255,0.12), transparent 28rem), rgba(3, 7, 18, 0.36); scroll-padding-bottom: 28px; }
+    .docqa-home { height: 100%; padding: 24px; overflow: auto; position: relative; background: radial-gradient(circle at 18% 0%, var(--body-glow-3), transparent 28rem), var(--surface-wash); scroll-padding-bottom: 28px; }
     .docqa-grid { display: grid; grid-template-columns: 1fr; gap: 18px; align-items: start; }
-    .docqa-panel { border: 1px solid var(--line); border-radius: 22px; background: rgba(8, 13, 27, 0.72); box-shadow: var(--shadow); overflow: hidden; }
+    .docqa-panel { border: 1px solid var(--line); border-radius: 22px; background: var(--panel); box-shadow: var(--shadow); overflow: hidden; }
     .docqa-panel header { padding: 18px 20px; border-bottom: 1px solid var(--line); display: flex; justify-content: space-between; gap: 12px; align-items: baseline; }
     .docqa-panel h2 { margin: 0; font-size: 18px; letter-spacing: -0.03em; }
     .docqa-panel .muted { color: var(--muted); font-size: 12px; }
     .review-summary { display: flex; gap: 10px; align-items: stretch; flex-wrap: wrap; }
-    .review-summary-item { min-width: 118px; border: 1px solid rgba(148,163,184,0.16); border-radius: 16px; background: rgba(255,255,255,0.045); padding: 10px 12px; }
+    .review-summary-item { min-width: 118px; border: 1px solid color-mix(in srgb, var(--line) 88%, transparent); border-radius: 16px; background: var(--surface-card); padding: 10px 12px; }
     .review-summary-item strong { display: block; font-size: 24px; line-height: 1; }
     .review-summary-item span { display: block; color: var(--muted); font-size: 10px; text-transform: uppercase; letter-spacing: 0.1em; margin-top: 6px; }
     .review-list { display: grid; gap: 8px; padding: 12px; max-height: clamp(220px, 34vh, 360px); overflow: auto; overscroll-behavior-y: auto; scrollbar-gutter: stable; }
-    .review-item { border: 1px solid rgba(148,163,184,0.16); border-radius: 16px; background: rgba(255,255,255,0.04); color: var(--text); text-align: left; padding: 13px; cursor: pointer; display: grid; gap: 8px; }
-    .review-item:hover, .review-item.active { border-color: rgba(139,211,255,0.42); background: rgba(139,211,255,0.08); transform: translateX(2px); }
+    .review-item { border: 1px solid color-mix(in srgb, var(--line) 88%, transparent); border-radius: 16px; background: var(--surface-card); color: var(--text); text-align: left; padding: 13px; cursor: pointer; display: grid; gap: 8px; }
+    .review-item:hover, .review-item.active { border-color: color-mix(in srgb, var(--accent) 42%, transparent); background: var(--surface-card-hover); transform: translateX(2px); }
     .review-top { display: flex; justify-content: space-between; gap: 12px; align-items: center; }
     .review-title { font-weight: 850; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
     .review-path { color: var(--muted); font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
     .chips { display: flex; flex-wrap: wrap; gap: 6px; }
-    .chip { border: 1px solid rgba(148,163,184,0.18); border-radius: 999px; padding: 4px 8px; color: #dce8fb; background: rgba(255,255,255,0.045); font-size: 10px; font-weight: 800; text-transform: uppercase; letter-spacing: 0.08em; }
+    .chip { border: 1px solid var(--line); border-radius: 999px; padding: 4px 8px; color: var(--label-strong); background: var(--surface-card); font-size: 10px; font-weight: 800; text-transform: uppercase; letter-spacing: 0.08em; }
     .chip.critical { border-color: rgba(255,140,157,0.58); color: #ffc0c8; background: rgba(255,140,157,0.10); }
     .chip.high { border-color: rgba(255,196,107,0.55); color: #ffd79c; background: rgba(255,196,107,0.10); }
     .inspector-body { padding: 16px 18px; display: grid; gap: 14px; }
     .inspector-path { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; color: var(--accent); overflow-wrap: anywhere; }
     .issue-list { display: grid; gap: 8px; }
-    .issue { border-left: 3px solid rgba(139,211,255,0.5); padding: 8px 10px; background: rgba(255,255,255,0.035); border-radius: 10px; color: #d7e2f4; font-size: 13px; }
+    .issue { border-left: 3px solid color-mix(in srgb, var(--accent) 50%, transparent); padding: 8px 10px; background: var(--surface-card); border-radius: 10px; color: var(--text); font-size: 13px; }
     .issue.critical { border-left-color: var(--danger); }
     .issue.high { border-left-color: #ffc46b; }
     .docqa-actions { display: flex; gap: 8px; flex-wrap: wrap; }
     .markdown-tools { padding: 16px 18px 18px; display: grid; gap: 16px; }
-    .best-practice-list { margin: 0; padding-left: 20px; display: grid; gap: 7px; color: #d7e2f4; font-size: 13px; line-height: 1.45; }
+    .best-practice-list { margin: 0; padding-left: 20px; display: grid; gap: 7px; color: var(--text); font-size: 13px; line-height: 1.45; }
     .markdown-create { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 180px), 1fr)); gap: 10px; align-items: end; }
     .markdown-create .settings-field.paths { grid-column: span 2; }
     .markdown-create button { align-self: end; min-height: 42px; }
     .new-doc-actions { grid-column: 1 / -1; display: flex; justify-content: flex-end; gap: 10px; flex-wrap: wrap; }
     .markdown-create .settings-field select { display: block; width: 100%; padding: 10px; border: 1px solid rgba(148,163,184,0.18); border-radius: 14px; background: rgba(255,255,255,0.045); color: var(--text); font: 12px/1.45 ui-monospace, SFMono-Regular, Menlo, monospace; }
     .path-picker-field { grid-column: span 2; }
-    .path-picker { position: relative; display: grid; grid-template-columns: minmax(0, 1.2fr) minmax(0, 1fr); gap: 8px; padding: 10px; border: 1px solid rgba(139,211,255,0.18); border-radius: 16px; background: rgba(255,255,255,0.035); }
-    .path-picker-trigger { min-width: 0; min-height: 42px; border: 1px solid rgba(148,163,184,0.18); border-radius: 14px; padding: 10px 12px; background: rgba(255,255,255,0.045); color: var(--text); cursor: pointer; display: grid; grid-template-columns: 1fr auto; gap: 10px; align-items: center; text-align: left; }
-    .path-picker-trigger:hover, .path-picker-trigger[aria-expanded="true"] { border-color: rgba(139,211,255,0.42); background: rgba(139,211,255,0.08); }
-    .path-picker-trigger code { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: #edf5ff; font: 12px/1.45 ui-monospace, SFMono-Regular, Menlo, monospace; }
+    .path-picker { position: relative; display: grid; grid-template-columns: minmax(0, 1.2fr) minmax(0, 1fr); gap: 8px; padding: 10px; border: 1px solid color-mix(in srgb, var(--accent) 18%, transparent); border-radius: 16px; background: var(--surface-card); }
+    .path-picker-trigger { min-width: 0; min-height: 42px; border: 1px solid var(--line); border-radius: 14px; padding: 10px 12px; background: var(--surface-card); color: var(--text); cursor: pointer; display: grid; grid-template-columns: 1fr auto; gap: 10px; align-items: center; text-align: left; }
+    .path-picker-trigger:hover, .path-picker-trigger[aria-expanded="true"] { border-color: color-mix(in srgb, var(--accent) 42%, transparent); background: var(--surface-card-hover); }
+    .path-picker-trigger code { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text); font: 12px/1.45 ui-monospace, SFMono-Regular, Menlo, monospace; }
     .path-picker-trigger span { color: var(--muted); font-size: 13px; }
-    .path-picker-menu { position: absolute; z-index: 70; top: calc(100% + 8px); left: 10px; width: min(620px, calc(100vw - 56px)); max-height: min(430px, 52vh); border: 1px solid rgba(139,211,255,0.26); border-radius: 16px; background: rgba(8,13,27,0.98); box-shadow: 0 24px 70px rgba(0,0,0,0.42); backdrop-filter: blur(20px); padding: 10px; display: grid; gap: 10px; }
+    .path-picker-menu { position: absolute; z-index: 70; top: calc(100% + 8px); left: 10px; width: min(620px, calc(100vw - 56px)); max-height: min(430px, 52vh); border: 1px solid color-mix(in srgb, var(--accent) 26%, transparent); border-radius: 16px; background: var(--surface-floating); box-shadow: 0 24px 70px rgba(0,0,0,0.42); backdrop-filter: blur(20px); padding: 10px; display: grid; gap: 10px; }
     .path-picker-menu[hidden] { display: none; }
     .path-picker-search { width: 100%; padding: 10px 12px; border: 1px solid rgba(148,163,184,0.20); border-radius: 12px; background: rgba(255,255,255,0.055); color: var(--text); font: 12px/1.45 ui-monospace, SFMono-Regular, Menlo, monospace; }
     .path-picker-options { display: grid; gap: 5px; max-height: min(330px, 40vh); overflow: auto; padding-right: 3px; }
-    .path-picker-option { width: 100%; min-width: 0; border: 1px solid rgba(148,163,184,0.14); border-radius: 10px; padding: 9px 10px; background: rgba(255,255,255,0.035); color: #dce8fb; cursor: pointer; display: grid; grid-template-columns: 1fr auto; gap: 10px; align-items: center; text-align: left; }
-    .path-picker-option:hover, .path-picker-option.active { border-color: rgba(139,211,255,0.45); background: rgba(139,211,255,0.10); }
+    .path-picker-option { width: 100%; min-width: 0; border: 1px solid color-mix(in srgb, var(--line) 84%, transparent); border-radius: 10px; padding: 9px 10px; background: var(--surface-card); color: var(--label-strong); cursor: pointer; display: grid; grid-template-columns: 1fr auto; gap: 10px; align-items: center; text-align: left; }
+    .path-picker-option:hover, .path-picker-option.active { border-color: color-mix(in srgb, var(--accent) 45%, transparent); background: var(--surface-card-hover); }
     .path-picker-option code { min-width: 0; color: var(--accent); font: 12px/1.35 ui-monospace, SFMono-Regular, Menlo, monospace; overflow-wrap: anywhere; }
     .path-picker-option span { color: var(--muted); font-size: 10px; text-transform: uppercase; letter-spacing: 0.08em; white-space: nowrap; }
     .path-picker-empty { color: var(--muted); padding: 10px; font-size: 13px; }
     .path-picker-preview { grid-column: 1 / -1; display: flex; align-items: center; gap: 8px; min-width: 0; color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: 0.08em; }
     .path-picker-preview code { min-width: 0; color: var(--accent); font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; text-transform: none; letter-spacing: 0; overflow-wrap: anywhere; }
-    .settings-page { height: 100%; overflow: auto; padding: 24px; background: radial-gradient(circle at 20% 0%, rgba(182,156,255,0.14), transparent 28rem), rgba(3, 7, 18, 0.36); }
+    .settings-page { height: 100%; overflow: auto; padding: 24px; background: radial-gradient(circle at 20% 0%, var(--body-glow-4), transparent 28rem), var(--surface-wash); }
     .settings-page .settings-card { max-width: 1180px; margin: 0 auto; }
-    .settings-card { box-shadow: var(--shadow); background: rgba(8,13,27,0.76); border: 1px solid var(--line); backdrop-filter: blur(18px); }
+    .settings-card { box-shadow: var(--shadow); background: var(--panel); border: 1px solid var(--line); backdrop-filter: blur(18px); }
     .settings-card header { padding: 18px 20px; border-bottom: 1px solid var(--line); align-items: center; gap: 10px; }
     .settings-card h2 { font-size: 22px; letter-spacing: -0.04em; }
     .settings-panel { padding: 20px; display: grid; gap: 18px; }
     .settings-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
     .settings-field { display: grid; gap: 6px; }
     .settings-field label, .settings-title { color: var(--muted); font-size: 11px; font-weight: 850; text-transform: uppercase; letter-spacing: 0.09em; }
-    .settings-field textarea, .settings-field input { display: block; width: 100%; padding: 10px; border: 1px solid rgba(148,163,184,0.18); border-radius: 14px; background: rgba(255,255,255,0.045); color: var(--text); font: 12px/1.45 ui-monospace, SFMono-Regular, Menlo, monospace; }
+    .settings-field textarea, .settings-field input, .settings-field select { display: block; width: 100%; padding: 10px; border: 1px solid var(--line); border-radius: 14px; background: var(--surface-card); color: var(--text); font: 12px/1.45 ui-monospace, SFMono-Regular, Menlo, monospace; }
     .settings-field textarea { min-height: 88px; height: 88px; resize: vertical; }
     .hub-card-options { display: grid; gap: 12px; }
-    .hub-card-option { display: flex; align-items: center; gap: 6px; border: 1px solid rgba(148,163,184,0.18); border-radius: 999px; padding: 7px 10px; color: #dce8fb; background: rgba(255,255,255,0.04); font-size: 12px; }
+    .hub-card-option { display: flex; align-items: center; gap: 6px; border: 1px solid var(--line); border-radius: 999px; padding: 7px 10px; color: var(--label-strong); background: var(--surface-card); font-size: 12px; }
     .hub-section-editor { display: grid; gap: 10px; padding-top: 12px; border-top: 1px solid rgba(139,211,255,0.24); }
     .hub-section-editor:first-child { padding-top: 0; border-top: 0; }
     .hub-section-editor-head { display: grid; grid-template-columns: 1fr auto auto; gap: 8px; align-items: end; }
-    .hub-card-editor { display: grid; gap: 10px; padding: 12px; border: 1px solid rgba(148,163,184,0.16); border-radius: 18px; background: rgba(255,255,255,0.035); }
+    .hub-card-editor { display: grid; gap: 10px; padding: 12px; border: 1px solid color-mix(in srgb, var(--line) 86%, transparent); border-radius: 18px; background: var(--surface-card); }
     .hub-card-editor.nested { margin-left: 18px; border-left-color: rgba(139,211,255,0.42); }
     .hub-card-children { display: grid; gap: 8px; padding-left: 8px; border-left: 1px solid rgba(139,211,255,0.20); }
     .hub-card-editor-head { display: flex; justify-content: space-between; gap: 10px; align-items: center; }
-    .hub-card-editor-title { display: flex; gap: 8px; align-items: center; color: #dce8fb; font-size: 12px; font-weight: 850; }
+    .hub-card-editor-title { display: flex; gap: 8px; align-items: center; color: var(--label-strong); font-size: 12px; font-weight: 850; }
     .hub-card-editor-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
     .hub-card-editor .paths { grid-column: 1 / -1; }
-    .template-editor { display: grid; gap: 10px; padding: 12px; border: 1px solid rgba(148,163,184,0.16); border-radius: 18px; background: rgba(255,255,255,0.035); }
-    .template-editor-head { display: flex; justify-content: space-between; gap: 10px; align-items: center; color: #dce8fb; font-size: 12px; font-weight: 850; }
-    .template-enabled-toggle { display: inline-flex; gap: 8px; align-items: center; color: #dce8fb; font-size: 12px; font-weight: 850; }
+    .template-editor { display: grid; gap: 10px; padding: 12px; border: 1px solid color-mix(in srgb, var(--line) 86%, transparent); border-radius: 18px; background: var(--surface-card); }
+    .template-editor-head { display: flex; justify-content: space-between; gap: 10px; align-items: center; color: var(--label-strong); font-size: 12px; font-weight: 850; }
+    .template-enabled-toggle { display: inline-flex; gap: 8px; align-items: center; color: var(--label-strong); font-size: 12px; font-weight: 850; }
     .template-enabled-toggle input { width: auto; accent-color: var(--accent); }
+    .settings-help { margin: -2px 0 0; color: var(--muted); font-size: 12px; line-height: 1.45; }
     .template-editor-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
     .template-editor .template-body { grid-column: 1 / -1; }
     .template-editor .template-body textarea { min-height: 220px; height: 220px; }
     .settings-footer { display: flex; justify-content: space-between; gap: 12px; align-items: center; color: var(--muted); font-size: 12px; }
     .hub-folders { margin-top: 16px; display: grid; gap: 26px; }
-    .hub-breadcrumb { display: flex; flex-wrap: wrap; align-items: center; gap: 7px; margin-bottom: -6px; padding: 10px 12px; border: 1px solid rgba(139,211,255,0.18); border-radius: 18px; background: rgba(8,13,27,0.58); color: var(--muted); font-size: 12px; font-weight: 800; }
-    .hub-crumb { border: 1px solid rgba(148,163,184,0.18); border-radius: 999px; padding: 7px 10px; background: rgba(255,255,255,0.04); color: #dce8fb; cursor: pointer; font-weight: 850; }
-    .hub-crumb:hover { color: #07101e; background: linear-gradient(135deg, var(--accent), var(--accent-2)); transform: translateY(-1px); }
+    .hub-breadcrumb { display: flex; flex-wrap: wrap; align-items: center; gap: 7px; margin-bottom: -6px; padding: 10px 12px; border: 1px solid color-mix(in srgb, var(--accent) 18%, transparent); border-radius: 18px; background: var(--surface-floating-soft); color: var(--muted); font-size: 12px; font-weight: 800; }
+    .hub-crumb { border: 1px solid var(--line); border-radius: 999px; padding: 7px 10px; background: var(--surface-card); color: var(--label-strong); cursor: pointer; font-weight: 850; }
+    .hub-crumb:hover { color: var(--on-accent); background: linear-gradient(135deg, var(--accent), var(--accent-2)); transform: translateY(-1px); }
     .hub-crumb.current { pointer-events: none; color: var(--accent); background: rgba(139,211,255,0.10); }
     .hub-crumb-separator { color: rgba(148,163,184,0.52); }
     .hub-section { display: grid; gap: 14px; padding-top: 18px; border-top: 1px solid rgba(139,211,255,0.24); }
     .hub-section:first-child { border-top: 0; padding-top: 0; }
     .hub-section-title { color: var(--muted); font-size: 12px; font-weight: 900; text-transform: uppercase; letter-spacing: 0.13em; }
     .hub-section-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 260px), 1fr)); gap: 14px; align-items: start; }
-    .hub-folder-card { min-width: 0; border: 1px solid rgba(148,163,184,0.16); border-radius: 22px; padding: 0; min-height: 132px; background: linear-gradient(145deg, rgba(139,211,255,0.10), rgba(182,156,255,0.06)); color: var(--text); text-align: left; display: grid; gap: 0; box-shadow: 0 18px 54px rgba(0,0,0,0.24); overflow: hidden; }
-    .hub-folder-card.navigation { background: linear-gradient(145deg, rgba(182,156,255,0.13), rgba(139,211,255,0.07)); }
-    .hub-folder-card.expanded { grid-column: 1 / -1; border-color: rgba(139,211,255,0.38); background: linear-gradient(145deg, rgba(139,211,255,0.13), rgba(182,156,255,0.08)); }
-    .hub-folder-card.current { border-color: rgba(139,211,255,0.54); }
-    .hub-folder-card:hover { transform: translateY(-2px); border-color: rgba(139,211,255,0.42); background: linear-gradient(145deg, rgba(139,211,255,0.16), rgba(182,156,255,0.10)); }
+    .hub-folder-card { min-width: 0; border: 1px solid color-mix(in srgb, var(--line) 88%, transparent); border-radius: 22px; padding: 0; min-height: 132px; background: linear-gradient(145deg, color-mix(in srgb, var(--accent) 10%, var(--surface-card)), color-mix(in srgb, var(--accent-2) 6%, var(--surface-card))); color: var(--text); text-align: left; display: grid; gap: 0; box-shadow: 0 18px 54px rgba(0,0,0,0.24); overflow: hidden; }
+    .hub-folder-card.navigation { background: linear-gradient(145deg, color-mix(in srgb, var(--accent-2) 13%, var(--surface-card)), color-mix(in srgb, var(--accent) 7%, var(--surface-card))); }
+    .hub-folder-card.expanded { grid-column: 1 / -1; border-color: color-mix(in srgb, var(--accent) 38%, transparent); background: linear-gradient(145deg, color-mix(in srgb, var(--accent) 13%, var(--surface-card)), color-mix(in srgb, var(--accent-2) 8%, var(--surface-card))); }
+    .hub-folder-card.current { border-color: color-mix(in srgb, var(--accent) 54%, transparent); }
+    .hub-folder-card:hover { transform: translateY(-2px); border-color: color-mix(in srgb, var(--accent) 42%, transparent); background: linear-gradient(145deg, color-mix(in srgb, var(--accent) 16%, var(--surface-card)), color-mix(in srgb, var(--accent-2) 10%, var(--surface-card))); }
     .hub-folder-card-main { width: 100%; min-width: 0; min-height: 132px; border: 0; border-radius: 22px; padding: 18px; background: transparent; color: inherit; text-align: left; cursor: pointer; display: grid; align-content: space-between; gap: 12px; }
     .hub-folder-card-main:focus-visible { outline: 2px solid rgba(139,211,255,0.74); outline-offset: -4px; }
     .hub-folder-card.expanded > .hub-folder-card-main { min-height: 104px; }
@@ -2569,19 +3317,31 @@ export function renderAppHtml() {
     .hub-folder-card strong { display: block; min-width: 0; font-size: 20px; line-height: 1.05; letter-spacing: 0; overflow-wrap: anywhere; }
     .hub-folder-card span { min-width: 0; color: var(--muted); font-size: 13px; line-height: 1.35; overflow-wrap: anywhere; }
     .hub-folder-card code { min-width: 0; color: var(--accent); font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; line-height: 1.25; overflow-wrap: anywhere; white-space: normal; }
-    .hub-folder-meta { min-width: 0; display: flex; justify-content: space-between; gap: 10px; align-items: end; color: #cbd7ec; font-size: 12px; text-transform: uppercase; letter-spacing: 0.08em; }
+    .hub-folder-meta { min-width: 0; display: flex; justify-content: space-between; gap: 10px; align-items: end; color: var(--label-strong); font-size: 12px; text-transform: uppercase; letter-spacing: 0.08em; }
     .hub-folder-meta code { flex: 1 1 auto; }
     .hub-folder-meta span { flex: 0 0 auto; text-align: right; white-space: nowrap; }
     .startup-context-panel { display: grid; gap: 10px; padding-top: 18px; border-top: 1px solid rgba(139,211,255,0.24); }
     .startup-context-copy { color: var(--muted); font-size: 13px; line-height: 1.4; }
     .startup-context-list { display: grid; gap: 8px; }
-    .startup-context-item { min-width: 0; border: 1px solid rgba(148,163,184,0.16); border-radius: 14px; padding: 12px 14px; background: rgba(255,255,255,0.04); color: var(--text); cursor: pointer; text-align: left; display: grid; grid-template-columns: minmax(120px, 0.28fr) minmax(0, 1fr); gap: 12px; align-items: center; }
-    .startup-context-item:hover { transform: translateY(-1px); border-color: rgba(139,211,255,0.42); background: rgba(139,211,255,0.09); }
+    .startup-context-item { min-width: 0; border: 1px solid color-mix(in srgb, var(--line) 88%, transparent); border-radius: 14px; padding: 12px 14px; background: var(--surface-card); color: var(--text); cursor: pointer; text-align: left; display: grid; grid-template-columns: minmax(120px, 0.28fr) minmax(0, 1fr); gap: 12px; align-items: center; }
+    .startup-context-item:hover { transform: translateY(-1px); border-color: color-mix(in srgb, var(--accent) 42%, transparent); background: var(--surface-card-hover); }
+    .startup-context-item.readonly { cursor: default; }
+    .startup-context-item.readonly:hover { transform: none; border-color: color-mix(in srgb, var(--line) 88%, transparent); background: var(--surface-card); }
     .startup-context-item strong { min-width: 0; font-size: 13px; line-height: 1.25; overflow-wrap: anywhere; }
     .startup-context-item span { min-width: 0; color: var(--muted); font: 12px/1.35 ui-monospace, SFMono-Regular, Menlo, monospace; overflow-wrap: anywhere; }
-    .selection-bar { margin: 6px 0 8px; padding: 5px 6px 5px 10px; border: 1px solid rgba(139,211,255,0.18); border-radius: 999px; background: rgba(8,13,27,0.72); display: flex; gap: 8px; align-items: center; justify-content: space-between; box-shadow: 0 10px 28px rgba(0,0,0,0.18); }
+    .startup-skill-names { min-width: 0; display: grid; gap: 4px; }
+    .startup-skill-names code { min-width: 0; color: var(--muted); font: 12px/1.35 ui-monospace, SFMono-Regular, Menlo, monospace; overflow-wrap: anywhere; }
+    .startup-skill-names em { color: var(--muted); font-style: normal; font-size: 12px; line-height: 1.4; overflow-wrap: anywhere; }
+    .startup-skill-buttons { min-width: 0; display: flex; flex-wrap: wrap; gap: 6px; }
+    .startup-skill-button { border: 1px solid rgba(139,211,255,0.24); border-radius: 999px; padding: 5px 8px; background: rgba(139,211,255,0.08); color: var(--text); cursor: pointer; font: 11px/1.2 ui-monospace, SFMono-Regular, Menlo, monospace; overflow-wrap: anywhere; }
+    .startup-skill-button:hover { border-color: rgba(139,211,255,0.5); background: rgba(139,211,255,0.14); }
+    .launch-card, .review-item, .hub-folder-card, .startup-context-item, .card, .conflict-card { position: relative; isolation: isolate; overflow: hidden; --spotlight-x: 50%; --spotlight-y: 50%; }
+    .launch-card::before, .review-item::before, .hub-folder-card::before, .startup-context-item::before, .card::before, .conflict-card::before { content: ""; position: absolute; inset: 0; z-index: 0; border-radius: inherit; pointer-events: none; background: radial-gradient(360px circle at var(--spotlight-x) var(--spotlight-y), rgba(139,211,255,0.18), rgba(182,156,255,0.08) 30%, transparent 62%); opacity: 0; transition: opacity 180ms ease; }
+    .launch-card.spotlight-active::before, .launch-card:focus-within::before, .review-item.spotlight-active::before, .review-item:focus-within::before, .hub-folder-card.spotlight-active::before, .hub-folder-card:focus-within::before, .startup-context-item.spotlight-active::before, .startup-context-item:focus-within::before, .card.spotlight-active::before, .card:focus-within::before, .conflict-card.spotlight-active::before, .conflict-card:focus-within::before { opacity: 1; }
+    .launch-card > *, .review-item > *, .hub-folder-card > *, .startup-context-item > *, .card > *, .conflict-card > * { position: relative; z-index: 1; }
+    .selection-bar { margin: 6px 0 8px; padding: 5px 6px 5px 10px; border: 1px solid color-mix(in srgb, var(--accent) 18%, transparent); border-radius: 999px; background: var(--surface-floating-soft); display: flex; gap: 8px; align-items: center; justify-content: space-between; box-shadow: 0 10px 28px rgba(0,0,0,0.18); }
     .selection-bar[hidden] { display: none; }
-    .selection-summary { min-width: 0; color: #dce8fb; font-size: 11px; font-weight: 850; letter-spacing: 0.02em; white-space: nowrap; }
+    .selection-summary { min-width: 0; color: var(--label-strong); font-size: 11px; font-weight: 850; letter-spacing: 0.02em; white-space: nowrap; }
     .selection-actions { display: flex; gap: 4px; align-items: center; }
     .selection-action { width: 28px; height: 28px; padding: 0; border: 1px solid rgba(148,163,184,0.18); border-radius: 999px; background: rgba(255,255,255,0.045); color: var(--muted); font-size: 13px; line-height: 1; cursor: pointer; display: grid; place-items: center; }
     .selection-action:hover { color: var(--text); background: rgba(139,211,255,0.10); transform: translateY(-1px); }
@@ -2595,9 +3355,9 @@ export function renderAppHtml() {
 
     .danger-action { border-color: rgba(255,140,157,0.38) !important; color: #ffc0c8 !important; }
     @media (max-width: 860px) { .settings-card { position: static; width: 100%; max-height: none; margin-bottom: 12px; } }
-    .cosmos-home { height: 100%; min-height: calc(100vh - 168px); padding: 34px; overflow: hidden; background: radial-gradient(circle at 50% 38%, rgba(139,211,255,0.13), transparent 24rem), rgba(3, 7, 18, 0.36); transition: padding-right 320ms ease; }
+    .cosmos-home { height: 100%; min-height: calc(100vh - 168px); padding: 34px; overflow: hidden; background: radial-gradient(circle at 50% 38%, var(--body-glow-3), transparent 24rem), var(--surface-wash); transition: padding-right 320ms ease; }
     .editor-shell.planet-file-open .cosmos-home { padding-right: min(46vw, 660px); }
-    .planet-stage { position: relative; height: 100%; min-height: calc(100vh - 236px); border-radius: 28px; overflow: hidden; display: grid; place-items: center; background: radial-gradient(circle at 50% 50%, rgba(182,156,255,0.10), transparent 22rem); }
+    .planet-stage { position: relative; height: 100%; min-height: calc(100vh - 236px); border-radius: 28px; overflow: hidden; display: grid; place-items: center; background: radial-gradient(circle at 50% 50%, var(--body-glow-4), transparent 22rem); }
     .planet-stage::before, .planet-stage::after { content: ""; position: absolute; border: 1px solid rgba(139,211,255,0.13); border-radius: 50%; pointer-events: none; }
     .planet-stage::before { width: min(72vw, 920px); height: min(72vw, 920px); animation: orbitSpin 46s linear infinite; }
     .planet-stage::after { width: min(46vw, 620px); height: min(46vw, 620px); border-color: rgba(182,156,255,0.16); animation: orbitSpin 34s linear reverse infinite; }
@@ -2630,18 +3390,36 @@ export function renderAppHtml() {
     @keyframes planetFloat { from { translate: 0 -8px; } to { translate: 0 12px; } }
     @keyframes planetZoom { from { transform: translate(-50%, -50%) scale(0.35); opacity: 0; } to { transform: translate(-50%, -50%) scale(1); opacity: 1; } }
     @keyframes satelliteIn { from { opacity: 0; transform: translate(-50%, -50%) scale(0.25); } to { opacity: 1; transform: translate(-50%, -50%) scale(1); } }
-    textarea, .viewer { width: 100%; height: 100%; min-height: calc(100vh - 48px); border: 0; outline: none; padding: 34px; background: rgba(3, 7, 18, 0.42); color: var(--text); font: 18px/1.72 ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; }
+    textarea, .viewer { width: 100%; height: 100%; min-height: calc(100vh - 48px); border: 0; outline: none; padding: 34px; background: var(--surface-reader); color: var(--text); font: 18px/1.72 ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; }
     textarea { resize: none; display: none; }
     .viewer { white-space: pre-wrap; overflow: auto; }
     .review-workspace { display: grid; grid-template-columns: minmax(320px, 0.92fr) minmax(420px, 1.08fr); gap: 18px; min-height: 100%; }
     .review-workspace.no-diff { grid-template-columns: 1fr; }
-    .diff-panel, .file-panel { border: 1px solid rgba(148,163,184,0.16); border-radius: 22px; background: rgba(8,13,27,0.72); overflow: hidden; min-width: 0; }
-    .diff-header, .file-panel header { padding: 15px 17px; border-bottom: 1px solid rgba(148,163,184,0.14); display: flex; justify-content: space-between; gap: 10px; align-items: center; color: #e8f1ff; font-family: Inter, ui-sans-serif, system-ui, sans-serif; }
+    .diff-panel, .file-panel { border: 1px solid var(--line); border-radius: 22px; background: var(--panel); overflow: hidden; min-width: 0; }
+    .file-panel { border-color: var(--file-line); background: var(--file-panel-bg); }
+    .diff-header, .file-panel header { padding: 15px 17px; border-bottom: 1px solid var(--line); display: flex; justify-content: space-between; gap: 10px; align-items: center; color: var(--label-strong); font-family: Inter, ui-sans-serif, system-ui, sans-serif; }
+    .file-panel header { border-bottom-color: var(--file-line); background: var(--file-header-bg); color: var(--file-fg); }
     .diff-header strong, .file-panel strong { font-size: 13px; letter-spacing: 0.08em; text-transform: uppercase; }
     .diff-meta { color: var(--muted); font-size: 12px; white-space: nowrap; }
     .diff-code, .doc-content, .doc-editor { margin: 0; padding: 18px; white-space: pre-wrap; overflow: auto; max-height: calc(100vh - 162px); font: 13px/1.55 ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; }
     .doc-content { font-size: 15px; line-height: 1.7; }
-    .doc-editor { display: block; width: 100%; min-height: calc(100vh - 162px); border: 0; border-radius: 0; resize: none; background: rgba(3,7,18,0.16); color: var(--text); outline: none; font-size: 15px; line-height: 1.7; }
+    .doc-editor { display: block; width: 100%; min-height: calc(100vh - 162px); border: 0; border-radius: 0; resize: none; background: var(--file-bg); color: var(--file-fg); outline: none; font-size: 15px; line-height: 1.7; caret-color: var(--file-h1); }
+    .doc-editor::selection, .markdown-view ::selection { background: color-mix(in srgb, var(--file-h2) 32%, transparent); }
+    .markdown-view { white-space: normal; }
+    .markdown-line { min-height: 1.7em; white-space: pre-wrap; overflow-wrap: anywhere; color: var(--file-fg); }
+    .markdown-line.blank { min-height: 1.15em; }
+    .markdown-line.h1, .markdown-line.h2, .markdown-line.h3, .markdown-line.h4 { margin: 0.42em 0 0.18em; font-weight: 900; letter-spacing: 0; }
+    .markdown-line.h1 { color: var(--file-h1); font-size: 1.28em; padding-bottom: 0.22em; border-bottom: 1px solid var(--file-hr); }
+    .markdown-line.h2 { color: var(--file-h2); font-size: 1.16em; }
+    .markdown-line.h3 { color: var(--file-h3); font-size: 1.06em; }
+    .markdown-line.h4 { color: var(--file-h4); }
+    .markdown-line.list { color: var(--file-fg); padding-left: 0.8em; }
+    .markdown-line.list .markdown-marker { color: var(--file-list); font-weight: 900; }
+    .markdown-line.quote { color: var(--file-quote); border-left: 2px solid var(--file-quote); padding-left: 0.8em; opacity: 0.9; }
+    .markdown-line.code, .markdown-line.fence { color: var(--file-code); background: color-mix(in srgb, var(--file-code) 10%, transparent); }
+    .markdown-line.frontmatter, .markdown-line.hr { color: var(--file-marker); }
+    .markdown-inline-code { color: var(--file-code); background: color-mix(in srgb, var(--file-code) 12%, transparent); border-radius: 4px; padding: 0 3px; }
+    .agent-focus-pulse.markdown-line { border-radius: 8px; }
     .diff-line { display: block; padding: 1px 8px; border-radius: 6px; }
     .diff-line.add { color: #b9ffd0; background: rgba(141,240,180,0.08); }
     .diff-line.del { color: #ffc0c8; background: rgba(255,140,157,0.08); }
@@ -2656,28 +3434,25 @@ export function renderAppHtml() {
     .external-review-actions { align-items: center; flex-wrap: nowrap; }
     .external-choice { min-height: 24px; padding: 4px 8px; border-radius: 999px; font-size: 11px; font-weight: 900; letter-spacing: 0; box-shadow: 0 6px 18px rgba(0,0,0,0.22); }
     .external-choice.icon { width: 25px; min-height: 24px; padding: 0; display: inline-flex; align-items: center; justify-content: center; }
+    .external-choice.bulk { min-height: 28px; padding: 5px 9px; font-size: 10px; }
     .external-change-stats { display: flex; gap: 6px; flex-wrap: wrap; color: rgba(226,236,255,0.82); font: 11px/1.2 ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; }
     .external-change-stats span { border: 1px solid rgba(148,163,184,0.16); border-radius: 999px; padding: 3px 7px; background: rgba(2,6,23,0.24); }
     .external-change-stats .add { color: #9cffbc; border-color: rgba(93,244,143,0.28); }
     .external-change-stats .del { color: #ffb2bf; border-color: rgba(255,140,157,0.32); }
     .external-change-stats .pending { color: #dbeafe; border-color: rgba(125,211,252,0.28); }
-    .external-review-doc { white-space: normal; background: rgba(3,7,18,0.16); }
+    .external-review-doc { white-space: normal; background: var(--file-bg); }
     .external-review-block { position: relative; min-width: 0; }
     .external-review-block.change { display: block; position: relative; margin: 6px 0; padding: 2px 34px 2px 0; border-left: 2px solid rgba(125,211,252,0.46); border-radius: 0 10px 10px 0; background: linear-gradient(90deg, rgba(125,211,252,0.06), rgba(125,211,252,0.018) 72%, transparent); }
+    .external-review-block.attention { outline: 2px solid rgba(139,211,255,0.82); outline-offset: 2px; animation: externalReviewAttention 1.4s ease; }
     .external-review-block.resolved { color: rgba(226,236,255,0.86); margin: 4px 0; padding: 2px 78px 2px 0; border-left: 2px solid rgba(148,163,184,0.22); border-radius: 0 10px 10px 0; background: rgba(148,163,184,0.035); transition: min-height 180ms ease, background 220ms ease; }
     .external-review-block.resolved.settling { overflow: hidden; transition: height 2s ease, min-height 2s ease, margin 2s ease, padding 2s ease, border-width 2s ease, background 220ms ease, border-color 220ms ease; }
     .external-review-block.resolved.accept { border-left-color: rgba(93,244,143,0.46); background: rgba(48,215,111,0.06); }
     .external-review-block.resolved.reject { border-left-color: rgba(255,140,157,0.42); background: rgba(255,86,117,0.055); }
-    .external-review-resolved-label { position: absolute; top: 5px; right: 7px; z-index: 1; border: 1px solid rgba(148,163,184,0.16); border-radius: 999px; padding: 2px 7px; background: rgba(8,13,27,0.78); color: rgba(226,236,255,0.72); font: 9px/1.35 Inter, ui-sans-serif, system-ui, sans-serif; font-weight: 900; text-transform: uppercase; letter-spacing: 0.08em; }
-    .external-review-block.resolved.accept .external-review-resolved-label { color: #b9ffd0; border-color: rgba(93,244,143,0.28); }
-    .external-review-block.resolved.reject .external-review-resolved-label { color: #ffc0c8; border-color: rgba(255,140,157,0.30); }
-    .external-review-placeholder { min-height: 24px; display: flex; align-items: center; padding: 2px 8px; color: rgba(226,236,255,0.62); font: 11px/1.5 Inter, ui-sans-serif, system-ui, sans-serif; font-weight: 800; }
-    .external-review-doc.settled .external-review-block.resolved { margin: 0; padding: 0; border-left-color: transparent; background: transparent; }
-    .external-review-doc.settled .external-review-block.resolved.accept, .external-review-doc.settled .external-review-block.resolved.reject { background: transparent; }
-    .external-review-doc.settled .external-review-resolved-label, .external-review-doc.settled .external-review-placeholder { display: none; }
-    .external-review-doc.settled .external-review-block.resolved.empty { min-height: 0; height: 0; border: 0; overflow: hidden; }
+    .external-review-doc.settled .external-review-block.resolved, .external-review-block.resolved.settled { margin: 0; padding: 0; border-left-color: transparent; background: transparent; }
+    .external-review-doc.settled .external-review-block.resolved.accept, .external-review-doc.settled .external-review-block.resolved.reject, .external-review-block.resolved.settled.accept, .external-review-block.resolved.settled.reject { background: transparent; }
+    .external-review-doc.settled .external-review-block.resolved.empty, .external-review-block.resolved.settled.empty { min-height: 0; height: 0; border: 0; overflow: hidden; }
     .external-review-lines { display: grid; gap: 1px; min-width: 0; }
-    .external-review-block-controls { position: absolute; top: 4px; right: 4px; z-index: 2; display: flex; gap: 4px; align-items: center; padding: 2px; border: 1px solid rgba(148,163,184,0.14); border-radius: 999px; background: rgba(8,13,27,0.86); opacity: 0.66; transition: opacity 140ms ease, transform 140ms ease, border-color 140ms ease; }
+    .external-review-block-controls { position: absolute; top: 4px; right: 4px; z-index: 2; display: flex; gap: 4px; align-items: center; padding: 2px; border: 1px solid var(--line); border-radius: 999px; background: var(--surface-floating-soft); opacity: 0.66; transition: opacity 140ms ease, transform 140ms ease, border-color 140ms ease; }
     .external-review-block.change:hover .external-review-block-controls, .external-review-block.change:focus-within .external-review-block-controls { opacity: 1; border-color: rgba(139,211,255,0.26); transform: translateY(-1px); }
     .external-review-line { display: grid; grid-template-columns: 28px minmax(0, 1fr); gap: 8px; padding: 1px 8px; border-radius: 5px; white-space: pre-wrap; overflow-wrap: anywhere; line-height: 1.58; }
     .external-review-line .marker { color: rgba(226,236,255,0.58); user-select: none; }
@@ -2687,11 +3462,22 @@ export function renderAppHtml() {
     .external-review-line.del .marker { color: #ff9cac; }
     .external-review-line.ctx { color: rgba(226,236,255,0.86); }
     .external-review-block.resolved.empty { min-height: 32px; overflow: hidden; }
+    .agent-annotations { display: grid; gap: 7px; padding: 10px 14px 0; }
+    .agent-annotation { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 10px; align-items: center; border-left: 2px solid rgba(182,156,255,0.62); border-radius: 0 10px 10px 0; background: rgba(182,156,255,0.075); padding: 8px 10px; color: rgba(226,236,255,0.9); font: 12px/1.4 Inter, ui-sans-serif, system-ui, sans-serif; }
+    .agent-annotation strong { display: block; color: #f2edff; font-size: 11px; text-transform: uppercase; letter-spacing: 0.08em; margin-bottom: 3px; }
+    .agent-annotation code { color: var(--accent-2); font: 11px/1.3 ui-monospace, SFMono-Regular, Menlo, monospace; overflow-wrap: anywhere; }
+    .agent-annotation-actions { display: flex; gap: 5px; align-items: center; }
+    .agent-toast { position: fixed; right: 18px; bottom: 18px; z-index: 60; max-width: min(420px, calc(100vw - 36px)); border: 1px solid rgba(139,211,255,0.34); border-radius: 18px; background: rgba(13,22,42,0.96); box-shadow: var(--shadow); padding: 12px; color: var(--text); font: 13px/1.4 Inter, ui-sans-serif, system-ui, sans-serif; }
+    .agent-toast strong { display: block; margin-bottom: 4px; }
+    .agent-toast-actions { display: flex; gap: 7px; justify-content: flex-end; margin-top: 10px; }
+    .agent-focus-pulse { animation: agentFocusPulse 1.5s ease; }
+    @keyframes externalReviewAttention { 0%, 100% { box-shadow: 0 0 0 rgba(139,211,255,0); } 28% { box-shadow: 0 0 0 6px rgba(139,211,255,0.16); } 56% { box-shadow: 0 0 0 2px rgba(139,211,255,0.08); } }
+    @keyframes agentFocusPulse { 0%, 100% { box-shadow: 0 0 0 rgba(182,156,255,0); } 25% { box-shadow: 0 0 0 5px rgba(182,156,255,0.16), inset 0 0 0 1px rgba(182,156,255,0.34); } 60% { box-shadow: 0 0 0 2px rgba(182,156,255,0.1), inset 0 0 0 1px rgba(182,156,255,0.2); } }
     .conflict-panel strong { font-size: 15px; letter-spacing: 0; text-transform: none; }
     .conflict-panel p { margin: 0; color: #d9c9a8; font-size: 13px; line-height: 1.45; }
     .conflict-actions { display: flex; gap: 8px; flex-wrap: wrap; }
     .conflict-compare { display: grid; gap: 12px; min-width: 0; }
-    .conflict-card { min-width: 0; border: 1px solid rgba(148,163,184,0.16); border-radius: 14px; background: rgba(3,7,18,0.34); overflow: hidden; }
+    .conflict-card { min-width: 0; border: 1px solid var(--line); border-radius: 14px; background: var(--surface-card); overflow: hidden; }
     .conflict-card-head { display: flex; justify-content: space-between; gap: 10px; align-items: center; padding: 8px 10px; border-bottom: 1px solid rgba(148,163,184,0.12); color: var(--muted); font-size: 11px; font-weight: 850; text-transform: uppercase; letter-spacing: 0.08em; }
     .conflict-card-head small { color: rgba(226,236,255,0.58); font-size: 10px; font-weight: 800; letter-spacing: 0.04em; text-transform: none; }
     .conflict-card-head .diff-line { display: inline; padding: 1px 5px; border-radius: 999px; }
@@ -2714,9 +3500,9 @@ export function renderAppHtml() {
     .file-actions { display: flex; gap: 8px; align-items: center; flex: 0 0 auto; }
     .file-action { border: 1px solid rgba(148,163,184,0.18); border-radius: 12px; padding: 9px 12px; background: rgba(255,255,255,0.06); color: var(--text); font-weight: 850; cursor: pointer; }
     .file-action:hover { transform: translateY(-1px); background: rgba(139,211,255,0.12); }
-    .file-action.primary { color: #07101e; border: 0; background: linear-gradient(135deg, var(--accent), var(--accent-2)); }
+    .file-action.primary { color: var(--on-accent); border: 0; background: linear-gradient(135deg, var(--accent), var(--accent-2)); }
     .confirm-backdrop { position: fixed; inset: 0; z-index: 90; display: grid; place-items: center; padding: 18px; background: rgba(2,6,23,0.72); backdrop-filter: blur(14px); }
-    .confirm-dialog { width: min(420px, 100%); border: 1px solid rgba(148,163,184,0.24); border-radius: 18px; background: rgba(8,13,27,0.96); box-shadow: 0 22px 80px rgba(0,0,0,0.45); padding: 18px; color: var(--text); }
+    .confirm-dialog { width: min(420px, 100%); border: 1px solid var(--line); border-radius: 18px; background: var(--surface-floating); box-shadow: 0 22px 80px rgba(0,0,0,0.45); padding: 18px; color: var(--text); }
     .confirm-dialog strong { display: block; font-size: 18px; line-height: 1.2; margin-bottom: 8px; }
     .confirm-dialog p { margin: 0; color: var(--muted); font-size: 14px; line-height: 1.45; overflow-wrap: anywhere; }
     .confirm-actions { display: flex; justify-content: flex-end; gap: 8px; flex-wrap: wrap; margin-top: 18px; }
@@ -2727,7 +3513,7 @@ export function renderAppHtml() {
     .viewer a.path-link:hover { color: #ffffff; border-bottom-color: #ffffff; }
     .mode-toggle { display: flex; border: 1px solid var(--line); border-radius: 14px; overflow: hidden; }
     .mode-toggle button { border: 0; background: transparent; color: var(--muted); padding: 11px 13px; font-weight: 850; cursor: pointer; }
-    .mode-toggle button.active { color: #07101e; background: linear-gradient(135deg, var(--accent), var(--accent-2)); }
+    .mode-toggle button.active { color: var(--on-accent); background: linear-gradient(135deg, var(--accent), var(--accent-2)); }
     .cards { display: none; grid-template-columns: repeat(3, 1fr); gap: 10px; margin: 18px 0; }
     .card { padding: 12px; border-radius: 16px; border: 1px solid var(--line); background: rgba(255,255,255,0.045); }
     .card strong { display: block; font-size: 18px; margin-bottom: 3px; }
@@ -2796,7 +3582,7 @@ export function renderAppHtml() {
       .app, .app.sidebar-collapsed { grid-template-columns: 1fr; grid-template-rows: 1fr; height: 100dvh; padding: 54px 0 0; overflow: hidden; }
       .explorer-open { display: inline-flex; position: fixed; top: 8px; right: 8px; z-index: 35; width: 38px; height: 38px; border-radius: 12px; }
       .app.explorer-expanded .explorer-open { display: none; }
-      .workspace-dock, .app.sidebar-collapsed .workspace-dock { position: fixed; top: 0; left: 0; right: 0; z-index: 33; width: 100%; height: 54px; margin: 0; padding: 7px 52px 7px 8px; gap: 5px; border: 0; border-bottom: 1px solid var(--line); border-radius: 0; background: rgba(8,13,27,0.94); backdrop-filter: blur(18px); box-shadow: 0 8px 24px rgba(0,0,0,0.32); flex-wrap: nowrap; overflow-x: auto; scrollbar-width: none; opacity: 1; pointer-events: auto; transform: none; }
+      .workspace-dock, .app.sidebar-collapsed .workspace-dock { position: fixed; top: 0; left: 0; right: 0; z-index: 33; width: 100%; height: 54px; margin: 0; padding: 7px 52px 7px 8px; gap: 5px; border: 0; border-bottom: 1px solid var(--line); border-radius: 0; background: var(--surface-floating); backdrop-filter: blur(18px); box-shadow: 0 8px 24px rgba(0,0,0,0.32); flex-wrap: nowrap; overflow-x: auto; scrollbar-width: none; opacity: 1; pointer-events: auto; transform: none; }
       .app.sidebar-collapsed .workspace-dock { width: 100%; padding: 7px 52px 7px 8px; margin: 0; opacity: 1; }
       .app.explorer-expanded .workspace-dock { display: none; }
       .workspace-dock::-webkit-scrollbar { display: none; }
@@ -2933,7 +3719,7 @@ export function renderAppHtml() {
             <header>
               <div>
                 <h2>Settings</h2>
-                <div class="muted">watch scope, sections, and hub cards</div>
+                <div class="muted">watch scope, themes, sections, and hub cards</div>
               </div>
             </header>
             <div id="settingsPanel" class="settings-panel"></div>
@@ -2956,8 +3742,11 @@ export function renderAppHtml() {
     </main>
   </div>
   <div id="explorerContextMenu" class="explorer-context-menu" hidden></div>
+  <div id="agentToast" class="agent-toast" hidden></div>
 <script>
-const state = { files: [], startupContextFiles: [], selectedStartupContext: null, docqa: null, doctor: null, settings: null, settingsOpen: false, page: "hub", pendingMarkdown: null, availableHubCards: [], hubFolders: [], hubSections: [], rootHubSections: [], activeHubCardId: null, selectedReview: null, selected: null, selectedDiff: null, fileConflict: null, externalChange: null, conflictCompare: false, conflictMergeText: null, conflictMergeKey: "", conflictMergeMode: "auto", conflictCheckTimer: null, diffCollapsed: false, saved: "", savedHash: null, dirty: false, mode: "view", homeView: "root", planetStack: ["root"], filePanel: false, history: [], historyIndex: -1, pathFilters: [], explorerWatchFilter: "all", selectedForDelete: new Set(), selectionRequest: 0, mobileSidebarTouched: false, expanded: new Set(["data", "automations", "integrations", "skills", "tools", "~", "~/.hermes", "~/.hermes/memories", "~/.hermes/skills"]) };
+const state = { files: [], startupContextFiles: [], startupSkillFolders: [], selectedStartupContext: null, docqa: null, doctor: null, settings: null, settingsOpen: false, page: "hub", pendingMarkdown: null, availableHubCards: [], hubFolders: [], hubSections: [], rootHubSections: [], activeHubCardId: null, selectedReview: null, reviewModePath: null, reviewModeStatus: null, selected: null, selectedDiff: null, fileConflict: null, externalChange: null, conflictCompare: false, conflictMergeText: null, conflictMergeKey: "", conflictMergeMode: "auto", conflictCheckTimer: null, diffCollapsed: false, saved: "", savedHash: null, dirty: false, mode: "view", homeView: "root", planetStack: ["root"], filePanel: false, history: [], historyIndex: -1, pathFilters: [], explorerWatchFilter: "all", selectedForDelete: new Set(), selectionRequest: 0, mobileSidebarTouched: false, sessionStateTimer: null, agentCommandTimer: null, lastAgentCommandId: "", pendingAgentCommand: null, agentAnnotations: {}, userActiveAt: 0, expanded: new Set(["data", "automations", "integrations", "skills", "tools", "~", "~/.hermes", "~/.hermes/memories", "~/.hermes/skills"]) };
+const FILE_THEMES = ${JSON.stringify(FILE_THEME_OPTIONS)};
+const DEFAULT_FILE_THEME = "${DEFAULT_FILE_THEME}";
 const MAIN_FILE_PATHS = new Set([
   "~/.hermes/memories/USER.md",
   "~/.hermes/memories/MEMORY.md",
@@ -3005,6 +3794,327 @@ async function api(path, options) {
     }
   }
   throw lastError || new Error("request failed");
+}
+
+function currentFileThemeId() {
+  const wanted = state.settings?.appearance?.fileTheme || DEFAULT_FILE_THEME;
+  return FILE_THEMES.some((theme) => theme.id === wanted) ? wanted : DEFAULT_FILE_THEME;
+}
+
+function applyFileTheme() {
+  document.documentElement.dataset.fileTheme = currentFileThemeId();
+  document.documentElement.dataset.appTheme = currentFileThemeId();
+}
+
+function autoOpenGitDiffEnabled() {
+  return state.settings?.appearance?.autoOpenGitDiff !== false;
+}
+
+function collapsedByGitDiffPreference(diff) {
+  return !(diff?.available !== false && diff?.changed && autoOpenGitDiffEnabled());
+}
+
+function renderFileThemeOptions(selected = currentFileThemeId()) {
+  return FILE_THEMES.map((theme) =>
+    '<option value="' + escapeHtml(theme.id) + '" ' + (theme.id === selected ? 'selected' : '') + '>' +
+      escapeHtml(theme.label + " - " + theme.description) +
+    '</option>'
+  ).join("");
+}
+
+function scheduleSessionStatePush() {
+  window.clearTimeout(state.sessionStateTimer);
+  state.sessionStateTimer = window.setTimeout(() => publishSessionState().catch(() => {}), 280);
+}
+
+async function publishSessionState() {
+  await api("/api/session-state", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(buildSessionStatePayload()),
+  });
+}
+
+function buildSessionStatePayload() {
+  const externalChange = activeExternalChange();
+  const blocks = externalChange ? buildExternalReviewBlocks(state.saved || "", externalChange.diskContent || "", externalChange.reviewDecisions || {}) : [];
+  const pendingMiniDiffs = blocks.filter((block) => block.kind === "change" && !block.decision).length;
+  return {
+    source: "webapp",
+    page: state.page,
+    view: state.page,
+    openFile: state.selectedStartupContext ? state.selectedStartupContext.displayPath : state.selected,
+    selectedPath: state.selected,
+    visibleHeading: currentVisibleHeading(),
+    scrollPercent: currentScrollPercent(),
+    pendingMiniDiffs,
+    gitDiffOpen: Boolean(state.selectedDiff?.changed && !state.diffCollapsed),
+    diffCollapsed: Boolean(state.diffCollapsed),
+    explorerFilter: state.explorerWatchFilter,
+    pathFilters: state.pathFilters || [],
+    selectedReview: state.selectedReview,
+    dirty: Boolean(state.dirty),
+    mode: state.mode,
+    status: el("status")?.textContent || "",
+  };
+}
+
+function currentScrollPercent() {
+  const scroller = activeDocumentScrollTarget();
+  if (!scroller) return 0;
+  const max = Math.max(0, scroller.scrollHeight - scroller.clientHeight);
+  if (!max) return 0;
+  return Math.round((scroller.scrollTop / max) * 100);
+}
+
+function currentVisibleHeading() {
+  if (state.page !== "file") return null;
+  const renderedHeading = currentMarkdownViewHeading();
+  if (renderedHeading) return renderedHeading;
+  const editor = activeEditor();
+  const text = editor?.value || state.saved || "";
+  if (!text) return null;
+  const lineIndex = activeEditorCaretLineIndex(editor) ?? approximateVisibleLineIndex();
+  const lines = text.split("\n");
+  for (let index = Math.min(lineIndex, lines.length - 1); index >= 0; index -= 1) {
+    const match = lines[index].match(/^\s{0,3}(#{1,6})\s+(.+?)\s*#*\s*$/);
+    if (match) return match[1] + " " + match[2].trim();
+  }
+  return null;
+}
+
+function currentMarkdownViewHeading() {
+  const reader = visibleMarkdownReader();
+  if (!reader) return null;
+  const headings = [...reader.querySelectorAll("[data-heading-text]")];
+  if (!headings.length) return null;
+  const readerTop = reader.getBoundingClientRect().top;
+  let current = null;
+  for (const heading of headings) {
+    if (heading.getBoundingClientRect().top <= readerTop + 80) current = heading;
+    else break;
+  }
+  current = current || headings.find((heading) => heading.getBoundingClientRect().top >= readerTop);
+  if (!current) return null;
+  return (current.dataset.headingMarker || "#") + " " + (current.dataset.headingText || "").trim();
+}
+
+function visibleMarkdownReader() {
+  const reader = el("docReader");
+  if (!reader || reader.hidden) return null;
+  const style = window.getComputedStyle(reader);
+  if (style.display === "none" || style.visibility === "hidden") return null;
+  return reader;
+}
+
+function activeEditorCaretLineIndex(editor) {
+  if (!editor || document.activeElement !== editor || typeof editor.selectionStart !== "number" || typeof editor.value !== "string") return null;
+  return editor.value.slice(0, Math.max(0, Math.min(editor.selectionStart, editor.value.length))).split("\n").length - 1;
+}
+
+function approximateVisibleLineIndex() {
+  const editor = activeEditor();
+  const scroller = activeDocumentScrollTarget();
+  const target = editor || scroller;
+  if (!target) return 0;
+  const style = window.getComputedStyle(target);
+  const fontSize = Number.parseFloat(style.fontSize) || 14;
+  const lineHeight = Number.parseFloat(style.lineHeight) || fontSize * 1.6;
+  return Math.max(0, Math.floor((scroller?.scrollTop || target.scrollTop || 0) / Math.max(1, lineHeight)));
+}
+
+function startAgentCommandPolling() {
+  if (state.agentCommandTimer) window.clearInterval(state.agentCommandTimer);
+  state.agentCommandTimer = window.setInterval(() => pollAgentCommand().catch(() => {}), 1500);
+  pollAgentCommand().catch(() => {});
+}
+
+async function pollAgentCommand() {
+  const data = await api("/api/agent/command");
+  const command = data.command;
+  if (!command?.id || command.id === state.lastAgentCommandId) return;
+  state.lastAgentCommandId = command.id;
+  handleAgentCommand(command).catch((error) => setStatus(error.message));
+}
+
+async function handleAgentCommand(command) {
+  if (shouldDeferAgentCommand(command)) {
+    showAgentCommandToast(command);
+    return;
+  }
+  await executeAgentCommand(command);
+}
+
+function shouldDeferAgentCommand(command) {
+  if (!command) return false;
+  if (state.dirty || activeExternalChange() || activeFileConflict()) return true;
+  return Date.now() - (state.userActiveAt || 0) < 1200 && command.path && command.path !== state.selected;
+}
+
+function showAgentCommandToast(command) {
+  state.pendingAgentCommand = command;
+  const toast = el("agentToast");
+  if (!toast) return;
+  const label = command.path || command.view || "Context Room";
+  toast.innerHTML = '<strong>Agent wants to navigate</strong><div>Open <code>' + escapeHtml(label) + '</code> without losing your current place?</div><div class="agent-toast-actions"><button class="file-action" type="button" data-agent-toast-dismiss>Later</button><button class="file-action primary" type="button" data-agent-toast-go>Go</button></div>';
+  toast.hidden = false;
+  toast.querySelector("[data-agent-toast-dismiss]")?.addEventListener("click", hideAgentToast);
+  toast.querySelector("[data-agent-toast-go]")?.addEventListener("click", () => {
+    const pending = state.pendingAgentCommand;
+    hideAgentToast();
+    if (pending) executeAgentCommand(pending).catch((error) => setStatus(error.message));
+  });
+}
+
+function hideAgentToast() {
+  state.pendingAgentCommand = null;
+  const toast = el("agentToast");
+  if (toast) toast.hidden = true;
+}
+
+async function executeAgentCommand(command) {
+  hideAgentToast();
+  const view = command.view || (command.path ? "file" : "hub");
+  if (view === "settings") {
+    showSettingsPage();
+  } else if (view === "hub" && !command.path) {
+    goHub();
+  } else if (command.path) {
+    await selectFile(command.path, { revealInExplorer: true, pushHistory: true });
+    if (view === "diff" && state.selected === command.path) {
+      state.selectedDiff = await api("/api/file/diff?path=" + encodeURIComponent(command.path)).catch(() => state.selectedDiff);
+      if (state.selectedDiff?.changed) setDiffCollapsed(false);
+    }
+  }
+  window.setTimeout(() => applyAgentScrollTarget(command), 120);
+  setStatus("agent navigated context room");
+  scheduleSessionStatePush();
+}
+
+function applyAgentScrollTarget(command) {
+  const target = command?.target || null;
+  if (!target) {
+    if (command?.highlight !== false) pulseAgentFocus(visibleMarkdownReader() || activeEditor() || el("viewer"));
+    return;
+  }
+  if (target.type === "percent") {
+    const scroller = activeDocumentScrollTarget();
+    if (scroller) scroller.scrollTop = Math.max(0, scroller.scrollHeight - scroller.clientHeight) * (Number(target.value) / 100);
+    pulseAgentFocus(scroller);
+    scheduleSessionStatePush();
+    return;
+  }
+  const found = scrollToEditorNeedle(String(target.value || ""), target.type);
+  if (!found) setStatus("agent target not found");
+  scheduleSessionStatePush();
+}
+
+function scrollToEditorNeedle(needle, type = "text") {
+  if (scrollMarkdownViewToNeedle(needle, type)) return true;
+  const editor = activeEditor();
+  if (!editor || !needle) return false;
+  const value = editor.value || "";
+  const offset = type === "heading" ? findHeadingOffset(value, needle) : value.toLowerCase().indexOf(needle.toLowerCase());
+  if (offset < 0) return false;
+  const lineIndex = value.slice(0, offset).split("\n").length - 1;
+  const style = window.getComputedStyle(editor);
+  const fontSize = Number.parseFloat(style.fontSize) || 14;
+  const lineHeight = Number.parseFloat(style.lineHeight) || fontSize * 1.6;
+  editor.scrollTop = Math.max(0, lineIndex * lineHeight - editor.clientHeight * 0.34);
+  if (typeof editor.setSelectionRange === "function") {
+    editor.setSelectionRange(offset, Math.min(value.length, offset + needle.length));
+    try { editor.focus({ preventScroll: true }); }
+    catch { editor.focus(); }
+  }
+  pulseAgentFocus(editor);
+  return true;
+}
+
+function scrollMarkdownViewToNeedle(needle, type = "text") {
+  const reader = visibleMarkdownReader();
+  if (!reader || !needle) return false;
+  const wanted = String(needle || "").trim();
+  if (!wanted) return false;
+  const normalizedWanted = normalizeHeadingText(wanted);
+  const lines = [...reader.querySelectorAll(".markdown-line")];
+  const target = type === "heading"
+    ? lines.find((line) => line.dataset.headingText && (normalizeHeadingText(line.dataset.headingText) === normalizedWanted || normalizeHeadingText((line.dataset.headingMarker || "") + " " + line.dataset.headingText) === normalizedWanted))
+    : lines.find((line) => line.textContent.toLowerCase().includes(wanted.toLowerCase()));
+  if (!target) return false;
+  reader.scrollTop = Math.max(0, target.offsetTop - reader.clientHeight * 0.34);
+  pulseAgentFocus(target);
+  return true;
+}
+
+function findHeadingOffset(value, heading) {
+  const wanted = normalizeHeadingText(heading);
+  const pattern = /^\s{0,3}#{1,6}\s+(.+?)\s*#*\s*$/gm;
+  let match;
+  while ((match = pattern.exec(value))) {
+    if (normalizeHeadingText(match[1]) === wanted || normalizeHeadingText(match[0]) === wanted) return match.index;
+  }
+  return value.toLowerCase().indexOf(String(heading || "").toLowerCase());
+}
+
+function normalizeHeadingText(value) {
+  return String(value || "").replace(/^#+\s*/, "").replace(/\s*#+$/, "").trim().toLowerCase();
+}
+
+function pulseAgentFocus(target) {
+  if (!target?.classList) return;
+  target.classList.remove("agent-focus-pulse");
+  void target.offsetWidth;
+  target.classList.add("agent-focus-pulse");
+  window.setTimeout(() => target.classList.remove("agent-focus-pulse"), 1600);
+}
+
+async function loadAnnotationsForPath(path) {
+  if (!path) return;
+  const data = await api("/api/agent/annotations?path=" + encodeURIComponent(path));
+  state.agentAnnotations[path] = data.annotations || [];
+}
+
+function unresolvedAnnotationsForSelectedFile() {
+  if (!state.selected) return [];
+  return (state.agentAnnotations[state.selected] || []).filter((annotation) => !annotation.resolved);
+}
+
+function renderAgentAnnotations(path) {
+  const annotations = (state.agentAnnotations[path] || []).filter((annotation) => !annotation.resolved);
+  if (!annotations.length) return "";
+  return '<div class="agent-annotations" aria-label="Agent annotations">' + annotations.map((annotation) =>
+    '<div class="agent-annotation" data-agent-annotation="' + escapeHtml(annotation.id) + '">' +
+      '<div><strong>Agent note</strong><div>' + escapeHtml(annotation.note) + '</div>' + (annotation.target ? '<code>' + escapeHtml(annotation.target) + '</code>' : '') + '</div>' +
+      '<div class="agent-annotation-actions"><button class="file-action" type="button" data-agent-annotation-goto="' + escapeHtml(annotation.id) + '">Go</button><button class="file-action" type="button" data-agent-annotation-resolve="' + escapeHtml(annotation.id) + '">Resolve</button></div>' +
+    '</div>'
+  ).join("") + '</div>';
+}
+
+function wireAgentAnnotationButtons(root = document) {
+  root.querySelectorAll("[data-agent-annotation-goto]").forEach((button) => button.addEventListener("click", () => {
+    const annotation = unresolvedAnnotationsForSelectedFile().find((item) => item.id === button.dataset.agentAnnotationGoto);
+    if (!annotation) return;
+    if (annotation.target) scrollToEditorNeedle(annotation.target, annotation.targetType || "text");
+    else pulseAgentFocus(visibleMarkdownReader() || activeEditor() || el("viewer"));
+  }));
+  root.querySelectorAll("[data-agent-annotation-resolve]").forEach((button) => button.addEventListener("click", () => resolveAnnotation(button.dataset.agentAnnotationResolve).catch((error) => setStatus(error.message))));
+}
+
+async function resolveAnnotation(id) {
+  if (!id || !state.selected) return;
+  await api("/api/agent/annotations/resolve", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ id, path: state.selected }),
+  });
+  await loadAnnotationsForPath(state.selected);
+  renderViewer();
+  setStatus("annotation resolved");
+}
+
+function markUserActive() {
+  state.userActiveAt = Date.now();
+  scheduleSessionStatePush();
 }
 
 function renderStats(files) {
@@ -3096,6 +4206,7 @@ function setExplorerWatchFilter(filter) {
   if (state.explorerWatchFilter !== "all") expandExplorerFilterResults();
   renderFiles();
   setStatus(state.explorerWatchFilter === "all" ? "showing all docs" : "showing " + state.explorerWatchFilter + " docs");
+  scheduleSessionStatePush();
 }
 
 function expandExplorerFilterResults() {
@@ -3512,6 +4623,7 @@ function filterFolders(folderPaths) {
   const target = document.querySelector('[data-folder-path="' + cssEscape(cleans[0] || "") + '"]');
   if (aside && target) aside.scrollTop += target.getBoundingClientRect().top - aside.getBoundingClientRect().top - 16;
   setStatus(cleans.length > 1 ? "folders filtered" : "folder filtered");
+  scheduleSessionStatePush();
 }
 
 function folderFilterSearchQuery(folderPaths = []) {
@@ -3532,6 +4644,7 @@ function clearExplorerFilter() {
   el("search").value = "";
   renderFiles();
   setStatus("explorateur complet");
+  scheduleSessionStatePush();
 }
 
 function pathMatchesFilter(filePath, filterPath) {
@@ -3579,12 +4692,14 @@ function iconForPath(filePath) {
 
 async function loadFiles() {
   setStatus("chargement...");
-  const [data, docqa, doctor, settingsData, startupData] = await Promise.all([api("/api/files"), api("/api/docqa"), api("/api/doctor"), api("/api/settings"), api("/api/startup-context")]);
+  const [data, docqa, doctor, settingsData, startupData, startupSkillsData] = await Promise.all([api("/api/files"), api("/api/docqa"), api("/api/doctor"), api("/api/settings"), api("/api/startup-context"), api("/api/startup-skills")]);
   state.files = data.files;
   state.startupContextFiles = startupData.files || [];
+  state.startupSkillFolders = startupSkillsData.folders || [];
   state.docqa = docqa;
   state.doctor = doctor;
   state.settings = settingsData.settings;
+  applyFileTheme();
   state.availableHubCards = settingsData.availableHubCards || [];
   state.hubFolders = settingsData.hubCards || [];
   state.rootHubSections = settingsData.hubSections || [];
@@ -3593,6 +4708,7 @@ async function loadFiles() {
   renderFiles();
   if (!state.selected) showHome();
   setStatus("ready");
+  scheduleSessionStatePush();
 }
 
 async function selectFile(path, options = {}) {
@@ -3603,6 +4719,8 @@ async function selectFile(path, options = {}) {
   const requestId = ++state.selectionRequest;
   state.selected = path;
   state.selectedStartupContext = null;
+  state.reviewModePath = options.reviewMode ? path : null;
+  state.reviewModeStatus = options.reviewMode ? reviewStatusForPath(path) : null;
   state.page = "file";
   state.settingsOpen = false;
   state.pendingMarkdown = null;
@@ -3613,7 +4731,9 @@ async function selectFile(path, options = {}) {
   state.saved = "";
   state.savedHash = null;
   state.dirty = false;
+  state.mode = "edit";
   state.filePanel = false;
+  state.diffCollapsed = !autoOpenGitDiffEnabled();
   if (options.revealInExplorer) {
     state.pathFilters = [];
     el("search").value = "";
@@ -3645,6 +4765,7 @@ async function selectFile(path, options = {}) {
     state.saved = data.content;
     state.savedHash = data.contentHash;
     el("editor").value = data.content;
+    await loadAnnotationsForPath(path).catch(() => {});
     if (options.pushHistory !== false) pushHistory(path);
     updateHeader();
     updateHistoryButtons();
@@ -3656,6 +4777,7 @@ async function selectFile(path, options = {}) {
       .then((diff) => {
         if (!isCurrentSelection(requestId, path)) return;
         state.selectedDiff = diff;
+        state.diffCollapsed = collapsedByGitDiffPreference(diff);
         renderViewer();
       })
       .catch((error) => {
@@ -3678,11 +4800,14 @@ async function selectStartupContextFile(order) {
   const pendingFile = (state.startupContextFiles || []).find((file) => String(file.startupContext.order) === String(order));
   state.selected = selectedKey;
   state.selectedStartupContext = pendingFile?.startupContext || { order, fileName: "Startup context", displayPath: "" };
+  state.reviewModePath = null;
+  state.reviewModeStatus = null;
   state.selectedDiff = null;
   resetExternalChangeState();
   state.saved = "";
   state.savedHash = null;
   state.dirty = false;
+  state.mode = "edit";
   state.page = "file";
   state.settingsOpen = false;
   state.pendingMarkdown = null;
@@ -3713,6 +4838,58 @@ async function selectStartupContextFile(order) {
     updatePreview();
     renderViewer();
     setStatus("startup context open");
+    scheduleSessionStatePush();
+  } catch (error) {
+    if (isCurrentSelection(requestId, selectedKey)) setStatus(error.message);
+  }
+}
+
+async function selectStartupSkillFile(folderOrder, skillName) {
+  if (!folderOrder || !skillName) return;
+  if (state.dirty && !confirm("You have unsaved changes. Change file?")) return;
+  const requestId = ++state.selectionRequest;
+  const selectedKey = "startup-skill-" + folderOrder + "-" + skillName;
+  state.selected = selectedKey;
+  state.selectedStartupContext = { order: folderOrder + ":" + skillName, fileName: skillName + "/SKILL.md", displayPath: "Startup skill" };
+  state.reviewModePath = null;
+  state.reviewModeStatus = null;
+  state.selectedDiff = null;
+  resetExternalChangeState();
+  state.saved = "";
+  state.savedHash = null;
+  state.dirty = false;
+  state.mode = "edit";
+  state.page = "file";
+  state.settingsOpen = false;
+  state.pendingMarkdown = null;
+  collapseSidebarOnNarrow();
+  document.querySelector(".editor-shell").classList.remove("planet-file-open");
+  document.querySelector(".editor-shell").classList.add("file-open");
+  el("home").hidden = true;
+  el("settingsPage").hidden = true;
+  el("newDocPage").hidden = true;
+  el("viewer").hidden = false;
+  el("editor").hidden = true;
+  el("editor").value = "";
+  updateHeader();
+  updateHistoryButtons();
+  updateActionBanner();
+  updatePreview();
+  renderFiles();
+  renderViewer();
+  setStatus("opening startup skill...");
+  try {
+    const data = await api("/api/startup-skills/file?folder=" + encodeURIComponent(folderOrder) + "&skill=" + encodeURIComponent(skillName));
+    if (!isCurrentSelection(requestId, selectedKey)) return;
+    state.selectedStartupContext = data.startupContext;
+    state.saved = data.content;
+    state.savedHash = data.contentHash;
+    el("editor").value = data.content;
+    updateHeader();
+    updatePreview();
+    renderViewer();
+    setStatus("startup skill open");
+    scheduleSessionStatePush();
   } catch (error) {
     if (isCurrentSelection(requestId, selectedKey)) setStatus(error.message);
   }
@@ -3746,6 +4923,7 @@ function showHome() {
   updateHistoryButtons();
   updateActionBanner();
   renderHubFolders();
+  scheduleSessionStatePush();
 }
 
 function renderDocQaDashboard() {
@@ -3756,7 +4934,7 @@ function renderDocQaDashboard() {
   const queue = report.queue.length ? report.queue : [];
   el("reviewQueue").innerHTML = queue.length ? queue.map(renderReviewItem).join("") : '<div class="issue">No watched files changed or created in the current worktree.</div>';
   document.querySelectorAll("[data-review-path]").forEach((button) => button.addEventListener("click", () => {
-    selectFile(button.dataset.reviewPath, { revealInExplorer: !isNarrowLayout() }).catch((error) => setStatus(error.message));
+    selectFile(button.dataset.reviewPath, { revealInExplorer: !isNarrowLayout(), reviewMode: true }).catch((error) => setStatus(error.message));
   }));
   renderMarkdownTools();
   renderContextHealth();
@@ -3810,6 +4988,7 @@ function showNewDocPage({ title = "New document", path = "docs/new-document.md",
   updateHistoryButtons();
   updateActionBanner();
   collapseSidebarOnNarrow();
+  scheduleSessionStatePush();
 }
 
 function renderNewDocPanel() {
@@ -4063,17 +5242,24 @@ function renderReviewItem(item) {
   '</button>';
 }
 
-function renderFileActionButtons({ hasReviewItem = false, dirty = false, canApplyTemplate = false, blockedByConflict = false } = {}) {
+function renderFileActionButtons({ reviewAction = null, dirty = false, canApplyTemplate = false, blockedByConflict = false, deletable = true } = {}) {
   return '<div class="file-actions">' +
     (canApplyTemplate ? '<div class="empty-template-actions"><select class="file-template-select" data-empty-template-select aria-label="Template">' + renderTemplateOptions() + '</select><button class="file-action" type="button" data-apply-template>Use template</button></div>' : '') +
-    (hasReviewItem ? '<button class="file-action" type="button" data-file-verify>Mark verified</button>' : '') +
-    '<button class="file-action danger-action" type="button" data-file-delete>Delete</button>' +
+    (reviewAction ? '<button class="file-action" type="button" data-file-review-decision="' + escapeHtml(reviewAction.status) + '">' + escapeHtml(reviewAction.label) + '</button>' : '') +
+    (deletable ? '<button class="file-action danger-action" type="button" data-file-delete>Delete</button>' : '') +
     '<button class="file-action primary" type="button" data-file-save ' + (!dirty || blockedByConflict ? 'disabled' : '') + (blockedByConflict ? ' title="Resolve the disk change before saving"' : '') + '>Save</button>' +
   '</div>';
 }
 
-function selectedFileNeedsReview() {
-  return Boolean(state.selected && state.docqa?.queue?.some((item) => item.path === state.selected));
+function reviewStatusForPath(path) {
+  const item = state.docqa?.queue?.find((entry) => entry.path === path);
+  return item?.review?.current ? item.review.status || null : null;
+}
+
+function reviewActionForSelectedFile() {
+  if (!state.selected || state.reviewModePath !== state.selected) return null;
+  if (state.reviewModeStatus === "verified") return { status: "unverified", label: "Mark unverified" };
+  return { status: "verified", label: "Mark verified" };
 }
 
 function renderSettingsPanel() {
@@ -4083,12 +5269,18 @@ function renderSettingsPanel() {
   const bestPractices = (state.settings.bestPractices || []).join("\n");
   const startupContext = state.settings.startupContext || { enabled: false, fileNames: ["AGENTS.md", "CLAUDE.md"] };
   const startupFileNames = (startupContext.fileNames || []).join("\n");
+  const startupSkills = state.settings.startupSkills || { enabled: true, folderNames: [".codex/skills", ".agents/skills", "skills"] };
+  const startupSkillFolderNames = (startupSkills.folderNames || []).join("\n");
+  const appearance = state.settings.appearance || { fileTheme: DEFAULT_FILE_THEME, autoOpenGitDiff: true };
   const markdownTemplates = state.settings.markdownTemplates || [];
   const sections = state.settings.hubSections?.length ? state.settings.hubSections : [{ id: "main", title: "Main", cards: state.settings.customHubCards || state.availableHubCards || [] }];
   holder.innerHTML = '<div class="settings-grid">' +
     '<div class="settings-field"><label for="watchAllow">Watched folders/files</label><textarea id="watchAllow" placeholder="one path per line · empty = nothing to review">' + escapeHtml(watchAllow) + '</textarea></div>' +
     '<div class="settings-field"><label for="bestPractices">Docs best practices</label><textarea id="bestPractices" placeholder="one practice per line">' + escapeHtml(bestPractices) + '</textarea></div>' +
     '<div class="settings-field"><label class="template-enabled-toggle" for="startupContextEnabled"><input id="startupContextEnabled" type="checkbox" ' + (startupContext.enabled ? 'checked' : '') + ' /> Startup context scanner</label><textarea id="startupContextFileNames" placeholder="one filename per line">' + escapeHtml(startupFileNames) + '</textarea></div>' +
+    '<div class="settings-field"><label class="template-enabled-toggle" for="startupSkillsEnabled"><input id="startupSkillsEnabled" type="checkbox" ' + (startupSkills.enabled !== false ? 'checked' : '') + ' /> Startup skills scanner</label><textarea id="startupSkillFolderNames" placeholder="one folder path per line">' + escapeHtml(startupSkillFolderNames) + '</textarea></div>' +
+    '<div class="settings-field"><label for="fileTheme">App theme</label><select id="fileTheme">' + renderFileThemeOptions(appearance.fileTheme) + '</select></div>' +
+    '<div class="settings-field"><label class="template-enabled-toggle" for="autoOpenGitDiff"><input id="autoOpenGitDiff" type="checkbox" ' + (appearance.autoOpenGitDiff !== false ? 'checked' : '') + ' /> Auto-open Git diff</label><p class="settings-help">When enabled, files with a Git diff open with the diff visible. When disabled, use the Show Git diff button manually.</p></div>' +
   '</div>' +
   '<div><div class="settings-title">Markdown templates</div><div class="hub-card-options" id="markdownTemplateEditors">' +
     markdownTemplates.map(renderMarkdownTemplateEditor).join("") +
@@ -4178,6 +5370,14 @@ async function saveSettings() {
     enabled: Boolean(el("startupContextEnabled")?.checked),
     fileNames: linesFromTextarea("startupContextFileNames"),
   };
+  const startupSkills = {
+    enabled: Boolean(el("startupSkillsEnabled")?.checked),
+    folderNames: linesFromTextarea("startupSkillFolderNames"),
+  };
+  const appearance = {
+    fileTheme: el("fileTheme")?.value || DEFAULT_FILE_THEME,
+    autoOpenGitDiff: el("autoOpenGitDiff")?.checked !== false,
+  };
   const markdownTemplates = collectMarkdownTemplateEditors();
   const hubSections = collectHubSectionEditors();
   const allCards = flattenUiCards(hubSections.flatMap((section) => section.cards));
@@ -4186,14 +5386,16 @@ async function saveSettings() {
   const result = await api("/api/settings", {
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify({ settings: { watchAllow, bestPractices, startupContext, markdownTemplates, hubCards, hubSections } }),
+    body: JSON.stringify({ settings: { watchAllow, bestPractices, startupContext, startupSkills, appearance, markdownTemplates, hubCards, hubSections } }),
   });
   state.settings = result.settings;
+  applyFileTheme();
   state.availableHubCards = result.availableHubCards || state.availableHubCards;
   state.hubFolders = result.hubCards || [];
   state.rootHubSections = result.hubSections || [];
   state.hubSections = state.rootHubSections;
   state.startupContextFiles = (await api("/api/startup-context")).files || [];
+  state.startupSkillFolders = (await api("/api/startup-skills")).folders || [];
   const [docqa, doctor] = await Promise.all([api("/api/docqa"), api("/api/doctor")]);
   state.docqa = docqa;
   state.doctor = doctor;
@@ -4201,6 +5403,7 @@ async function saveSettings() {
   if (state.page === "settings") renderSettingsPanel();
   else renderDocQaDashboard();
   setStatus("settings saved");
+  scheduleSessionStatePush();
 }
 
 function collectMarkdownTemplateEditors() {
@@ -4262,6 +5465,7 @@ async function updateWatchSelection(path, action) {
     body: JSON.stringify({ settings: { ...current, watchAllow } }),
   });
   state.settings = result.settings;
+  applyFileTheme();
   state.availableHubCards = result.availableHubCards || state.availableHubCards;
   state.hubFolders = result.hubCards || state.hubFolders;
   const [docqa, doctor] = await Promise.all([api("/api/docqa"), api("/api/doctor")]);
@@ -4286,6 +5490,7 @@ async function addSelectedToWatch() {
     body: JSON.stringify({ settings: { ...current, watchAllow } }),
   });
   state.settings = result.settings;
+  applyFileTheme();
   state.availableHubCards = result.availableHubCards || state.availableHubCards;
   state.hubFolders = result.hubCards || state.hubFolders;
   const [docqa, doctor] = await Promise.all([api("/api/docqa"), api("/api/doctor")]);
@@ -4311,6 +5516,7 @@ async function removeSelectedFromWatch() {
     body: JSON.stringify({ settings: { ...current, watchAllow } }),
   });
   state.settings = result.settings;
+  applyFileTheme();
   state.availableHubCards = result.availableHubCards || state.availableHubCards;
   state.hubFolders = result.hubCards || state.hubFolders;
   const [docqa, doctor] = await Promise.all([api("/api/docqa"), api("/api/doctor")]);
@@ -4339,6 +5545,8 @@ function showSettingsPage() {
   state.settingsOpen = true;
   state.pendingMarkdown = null;
   state.selected = null;
+  state.reviewModePath = null;
+  state.reviewModeStatus = null;
   state.selectedDiff = null;
   resetExternalChangeState();
   state.savedHash = null;
@@ -4358,6 +5566,7 @@ function showSettingsPage() {
   updateHistoryButtons();
   updateActionBanner();
   setStatus("settings");
+  scheduleSessionStatePush();
 }
 
 function handleHubAction() {
@@ -4378,12 +5587,13 @@ function renderHubFolders() {
   if (!holder) return;
   const sections = state.rootHubSections?.length ? state.rootHubSections : state.hubSections?.length ? state.hubSections : [{ id: "main", title: "Main", cards: state.hubFolders || [] }];
   const activeIds = activeHubCardIds(sections);
-  holder.innerHTML = sections.map((section) => '<section class="hub-section"><div class="hub-section-title">' + escapeHtml(section.title || "Section") + '</div><div class="hub-section-grid">' + (section.cards || []).map((card) => renderHubFolderCard(card, activeIds)).join("") + '</div></section>').join("") + renderStartupContextPanel();
+  holder.innerHTML = sections.map((section) => '<section class="hub-section"><div class="hub-section-title">' + escapeHtml(section.title || "Section") + '</div><div class="hub-section-grid">' + (section.cards || []).map((card) => renderHubFolderCard(card, activeIds)).join("") + '</div></section>').join("") + renderStartupContextPanel() + renderStartupSkillsPanel();
   document.querySelectorAll("[data-hub-file]").forEach((button) => button.addEventListener("click", () => selectFile(button.dataset.hubFile).catch((error) => setStatus(error.message))));
   document.querySelectorAll("[data-hub-folders]").forEach((button) => button.addEventListener("click", () => filterFolders(button.dataset.hubFolders.split('|'))));
   document.querySelectorAll("[data-hub-card-children]").forEach((button) => button.addEventListener("click", () => openHubChildren(button.dataset.hubCardChildren)));
   document.querySelectorAll("[data-hub-crumb]").forEach((button) => button.addEventListener("click", () => openHubPath(button.dataset.hubCrumb || null)));
   document.querySelectorAll("[data-startup-order]").forEach((button) => button.addEventListener("click", () => selectStartupContextFile(button.dataset.startupOrder).catch((error) => setStatus(error.message))));
+  document.querySelectorAll("[data-startup-skill-name]").forEach((button) => button.addEventListener("click", () => selectStartupSkillFile(button.dataset.startupSkillFolder, button.dataset.startupSkillName).catch((error) => setStatus(error.message))));
 }
 
 function renderHubBreadcrumb() {
@@ -4440,6 +5650,23 @@ function renderStartupContextPanel() {
     ? '<div class="startup-context-list">' + files.map((file) => '<button class="startup-context-item" type="button" data-startup-order="' + escapeHtml(file.startupContext.order) + '"><strong>' + escapeHtml(file.startupContext.order + ". " + file.startupContext.fileName) + '</strong><span>' + escapeHtml(file.startupContext.displayPath) + '</span></button>').join("") + '</div>'
     : '<div class="issue">No startup context files found for: ' + escapeHtml(fileNames || "AGENTS.md, CLAUDE.md") + '</div>';
   return '<section class="startup-context-panel"><div class="hub-section-title">Startup context</div><div class="startup-context-copy">Agent instruction files found from the filesystem root down to this Context Room root.</div>' + body + '</section>';
+}
+
+function renderStartupSkillsPanel() {
+  if (state.settings?.startupSkills?.enabled === false) return "";
+  const folders = (state.startupSkillFolders || []).sort((a, b) => (a.order || 0) - (b.order || 0));
+  if (!folders.length) return "";
+  const body = '<div class="startup-context-list">' + folders.map((folder) => {
+    const names = (folder.skills || []).slice(0, 60);
+    const buttons = names.length
+      ? '<div class="startup-skill-buttons">' + names.map((name) => '<button class="startup-skill-button" type="button" data-startup-skill-folder="' + escapeHtml(folder.order) + '" data-startup-skill-name="' + escapeHtml(name) + '">' + escapeHtml(name) + '</button>').join("") + '</div>'
+      : '<em>No SKILL.md folders found here</em>';
+    return '<div class="startup-context-item readonly">' +
+      '<strong>' + escapeHtml((folder.order || "?") + ". " + (folder.skillCount || 0) + " skills") + '</strong>' +
+      '<div class="startup-skill-names"><code>' + escapeHtml(folder.displayPath || folder.folderName || "skills") + '</code>' + buttons + '</div>' +
+    '</div>';
+  }).join("") + '</div>';
+  return '<section class="startup-context-panel"><div class="hub-section-title">Startup skills</div><div class="startup-context-copy">Skill folders found from the filesystem root down to this Context Room root.</div>' + body + '</section>';
 }
 
 function hubCardDirectFilePath(paths = [], children = []) {
@@ -4521,26 +5748,31 @@ function countFolderFiles(folderPaths) {
 
 
 async function applyReviewDecision(path, status) {
-  const note = status === "verified" ? "verified from Doc QA Control Room" : "needs changes from Doc QA Control Room";
-  const nextPath = status === "verified" ? nextReviewPath(state.docqa?.queue || [], path) : null;
-  setStatus(status === "verified" ? "validating..." : "marking...");
+  if (!path) return;
+  const normalizedStatus = status === "unverified" ? "unverified" : status === "verified" ? "verified" : "needs_changes";
+  const note = normalizedStatus === "verified"
+    ? "verified from Context Room review queue"
+    : normalizedStatus === "unverified"
+      ? "verification removed from Context Room review queue"
+      : "needs changes from Context Room review queue";
+  setStatus(normalizedStatus === "verified" ? "validating..." : normalizedStatus === "unverified" ? "marking unverified..." : "marking...");
   await api("/api/docqa/review", {
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify({ path, status, note }),
+    body: JSON.stringify({ path, status: normalizedStatus, note }),
   });
   const docqa = await api("/api/docqa");
   state.docqa = docqa;
-  const nextAvailablePath = nextPath && docqa.queue.some((item) => item.path === nextPath) ? nextPath : docqa.queue[0]?.path || null;
-  state.selectedReview = docqa.queue.find((item) => item.path === path)?.path || nextAvailablePath;
-  if (status === "verified" && nextAvailablePath) {
-    await selectFile(nextAvailablePath, { revealInExplorer: true });
-    setStatus("file verified · next opened");
-  } else if (state.selected) {
-    setStatus(status === "verified" ? "file verified" : "needs changes");
+  if (state.reviewModePath === path) state.reviewModeStatus = normalizedStatus === "verified" ? "verified" : null;
+  state.selectedReview = docqa.queue.find((item) => item.path === path)?.path || docqa.queue[0]?.path || null;
+  if (state.selected === path) {
+    renderViewer();
+    updateHeader();
+    updatePreview();
+    setStatus(normalizedStatus === "verified" ? "file verified" : normalizedStatus === "unverified" ? "file marked unverified" : "needs changes");
   } else {
     renderDocQaDashboard();
-    setStatus(status === "verified" ? "verified" : "needs changes");
+    setStatus(normalizedStatus === "verified" ? "verified" : normalizedStatus === "unverified" ? "unverified" : "needs changes");
   }
 }
 
@@ -4555,6 +5787,7 @@ function nextReviewPath(queue = [], currentPath = null) {
 
 async function verifyCurrentFile() {
   if (!state.selected) return;
+  if (state.reviewModePath !== state.selected) return;
   if (state.dirty && !confirm("This file has unsaved changes. Mark verified without saving?")) return;
   await applyReviewDecision(state.selected, "verified");
 }
@@ -4658,8 +5891,8 @@ async function selectPlanetFile(path) {
   state.filePanel = true;
   document.querySelector(".editor-shell").classList.add("planet-file-open");
   el("home").hidden = false;
-  el("viewer").hidden = state.mode !== "view";
-  el("editor").hidden = state.mode !== "edit";
+  el("viewer").hidden = false;
+  el("editor").hidden = true;
   renderPlanetSystem();
 }
 
@@ -4696,6 +5929,7 @@ function updateHistoryButtons() {
 async function goHistory(delta) {
   const nextIndex = state.historyIndex + delta;
   if (nextIndex < 0 || nextIndex >= state.history.length) return;
+  if (blockPendingExternalChange(delta < 0 ? "before going back" : "before going forward")) return;
   state.historyIndex = nextIndex;
   await selectFile(state.history[state.historyIndex], { pushHistory: false });
 }
@@ -4706,6 +5940,8 @@ function goHub() {
   collapseSidebarOnNarrow();
   state.selected = null;
   state.selectedStartupContext = null;
+  state.reviewModePath = null;
+  state.reviewModeStatus = null;
   state.selectedDiff = null;
   resetConflictState();
   resetExternalChangeState();
@@ -4718,18 +5954,19 @@ function goHub() {
 }
 
 function updateHeader() {
-  const file = state.selectedStartupContext
+  const isStartupFile = Boolean(state.selectedStartupContext);
+  const file = isStartupFile
     ? { label: state.selectedStartupContext.fileName, path: state.selectedStartupContext.displayPath }
     : state.files.find((item) => item.path === state.selected) || { label: state.selected, path: state.selected };
   el("title").textContent = file.label || file.path;
-  el("path").textContent = state.selectedStartupContext ? file.path : "";
+  el("path").textContent = isStartupFile ? file.path : "";
   el("impact").textContent = "";
   const conflict = activeFileConflict();
   const externalChange = activeExternalChange();
   const blockedByDiskChange = Boolean(conflict || externalChange);
-  el("save").disabled = Boolean(state.selectedStartupContext) || blockedByDiskChange || !state.dirty || !state.selected;
+  el("save").disabled = blockedByDiskChange || !state.dirty || !state.selected;
   const headerSave = document.querySelector("[data-file-save]");
-  if (headerSave) headerSave.disabled = Boolean(state.selectedStartupContext) || blockedByDiskChange || !state.dirty || !state.selected;
+  if (headerSave) headerSave.disabled = blockedByDiskChange || !state.dirty || !state.selected;
   updateActionBanner();
 }
 
@@ -4747,11 +5984,15 @@ function updatePreview() {
 }
 
 function setMode(mode = "view") {
+  const viewState = captureEditorViewState();
   state.mode = mode === "edit" ? "edit" : "view";
   const hasSelectedFile = Boolean(state.selected || state.selectedStartupContext);
-  el("viewer").style.display = hasSelectedFile && state.mode === "view" ? "block" : "";
-  el("editor").style.display = hasSelectedFile && state.mode === "edit" ? "block" : "none";
-  if (hasSelectedFile && state.mode === "view") renderViewer();
+  el("viewer").style.display = hasSelectedFile ? "block" : "";
+  el("editor").style.display = "none";
+  if (hasSelectedFile) {
+    renderViewer();
+    restoreEditorViewState(viewState);
+  }
 }
 
 async function applyTemplateToCurrentFile() {
@@ -4778,28 +6019,29 @@ function pathTitleFromUiPath(relPath) {
 function renderViewer() {
   const text = el("editor").value;
   const diff = state.selectedDiff || { changed: false, additions: 0, deletions: 0, patch: "", available: false };
-  const readOnlyStartup = Boolean(state.selectedStartupContext);
+  const isStartupFile = Boolean(state.selectedStartupContext);
   const conflict = activeFileConflict();
   const externalChange = activeExternalChange();
-  const file = readOnlyStartup
+  const file = isStartupFile
     ? { label: state.selectedStartupContext.fileName, path: state.selectedStartupContext.displayPath }
     : state.files.find((item) => item.path === state.selected) || { label: state.selected, path: state.selected };
-  const hasDiff = !readOnlyStartup && diff.available !== false && diff.changed;
+  const hasDiff = !isStartupFile && diff.available !== false && diff.changed;
   const diffMarkup = hasDiff ? renderDiffPanel(diff) : "";
   const showDiffButton = hasDiff && state.diffCollapsed ? '<button class="diff-toggle" type="button" data-show-diff>Show Git diff</button>' : "";
-  const canApplyTemplate = Boolean(!readOnlyStartup && state.selected?.endsWith(".md") && !text.trim());
-  const actionsMarkup = readOnlyStartup
-    ? ""
-    : externalChange && !conflict
+  const canApplyTemplate = Boolean(!isStartupFile && state.selected?.endsWith(".md") && !text.trim());
+  const actionsMarkup = externalChange && !conflict
       ? renderExternalReviewActions(externalChange)
-      : renderFileActionButtons({ hasReviewItem: selectedFileNeedsReview(), dirty: state.dirty, canApplyTemplate, blockedByConflict: Boolean(conflict || externalChange) });
+      : renderFileActionButtons({ reviewAction: isStartupFile ? null : reviewActionForSelectedFile(), dirty: state.dirty, canApplyTemplate, blockedByConflict: Boolean(conflict || externalChange), deletable: !isStartupFile });
   const conflictMarkup = conflict ? renderConflictPanel(conflict, text) : "";
   const editorMarkup = !conflict && externalChange
     ? renderExternalReviewDocument(state.saved || "", externalChange.diskContent || "")
-    : '<textarea id="docEditor" class="doc-editor" spellcheck="false" ' + (readOnlyStartup ? 'readonly' : '') + '>' + escapeHtml(text) + '</textarea>';
+    : state.mode === "edit"
+      ? '<textarea id="docEditor" class="doc-editor" spellcheck="false">' + escapeHtml(text) + '</textarea>'
+      : renderMarkdownLineView(text);
+  const annotationMarkup = !isStartupFile && !conflict ? renderAgentAnnotations(state.selected) : "";
   el("viewer").innerHTML = '<div class="review-workspace ' + (!hasDiff || state.diffCollapsed ? 'no-diff' : '') + '">' +
     (state.diffCollapsed ? "" : diffMarkup) +
-    '<section class="file-panel">' + showDiffButton + '<header><div class="file-header-copy"><strong>' + escapeHtml(file.label || "Document") + '</strong>' + (readOnlyStartup ? '<span class="muted">' + escapeHtml(file.path) + '</span>' : '') + '</div>' + actionsMarkup + '</header>' + conflictMarkup + editorMarkup + '</section></div>';
+    '<section class="file-panel">' + showDiffButton + '<header><div class="file-header-copy"><strong>' + escapeHtml(file.label || "Document") + '</strong>' + (isStartupFile ? '<span class="muted">' + escapeHtml(file.path) + '</span>' : '') + '</div>' + actionsMarkup + '</header>' + conflictMarkup + annotationMarkup + editorMarkup + '</section></div>';
   document.querySelector("[data-hide-diff]")?.addEventListener("click", (event) => {
     event.preventDefault();
     setDiffCollapsed(true);
@@ -4812,6 +6054,8 @@ function renderViewer() {
   document.querySelector("[data-apply-external-change]")?.addEventListener("click", () => applyExternalChange().catch((error) => setStatus(error.message)));
   document.querySelector("[data-reject-external-change]")?.addEventListener("click", () => promptRejectExternalChange());
   wireExternalReviewDecisionButtons();
+  wireExternalReviewAllButtons();
+  wireAgentAnnotationButtons();
   document.querySelector("[data-conflict-compare]")?.addEventListener("click", () => toggleConflictCompare());
   document.querySelector("[data-conflict-reload]")?.addEventListener("click", () => promptReloadConflictFromDisk());
   document.querySelector("[data-conflict-keep]")?.addEventListener("click", () => promptKeepConflictEdits());
@@ -4822,7 +6066,7 @@ function renderViewer() {
   document.querySelectorAll("[data-conflict-merge-source]").forEach((button) => button.addEventListener("click", (event) => promptSaveConflictSource(event.currentTarget.dataset.conflictMergeSource)));
   wireFileActionButtons();
   const docEditor = el("docEditor");
-  if (docEditor && !readOnlyStartup) {
+  if (docEditor) {
     docEditor.addEventListener("input", () => {
       el("editor").value = docEditor.value;
       state.dirty = docEditor.value !== state.saved;
@@ -4830,14 +6074,57 @@ function renderViewer() {
       updatePreview();
       updateConflictCompareLive(docEditor.value);
       scheduleConflictCheck();
+      scheduleSessionStatePush();
     });
   }
   syncWorkspaceScroll();
+  scheduleSessionStatePush();
+}
+
+function renderMarkdownLineView(text, options = {}) {
+  let inFence = false;
+  const lines = String(text || "").split("\n");
+  return '<div id="docReader" class="doc-editor markdown-view" role="document" tabindex="0" aria-label="' + (options.readOnly ? "Read-only document" : "Document preview") + '">' +
+    lines.map((line, index) => {
+      const startsFence = /^\s*(\`\`\`|~~~)/.test(line);
+      const rendered = renderMarkdownLine(line, index, { inFence: inFence || startsFence });
+      if (startsFence) inFence = !inFence;
+      return rendered;
+    }).join("") +
+  '</div>';
+}
+
+function renderMarkdownLine(line, index, options = {}) {
+  const raw = String(line || "");
+  const trimmed = raw.trim();
+  const attrs = ' data-line-index="' + index + '"';
+  if (!raw) return '<div class="markdown-line blank"' + attrs + '>&nbsp;</div>';
+  const heading = raw.match(/^(\s{0,3})(#{1,6})\s+(.+?)\s*#*\s*$/);
+  if (heading && !options.inFence) {
+    const level = Math.min(4, heading[2].length);
+    const text = heading[3].trim();
+    return '<div class="markdown-line h' + level + '"' + attrs + ' data-heading-marker="' + escapeHtml(heading[2]) + '" data-heading-text="' + escapeHtml(text) + '">' + renderMarkdownInline(raw) + '</div>';
+  }
+  if (options.inFence) return '<div class="markdown-line ' + (/^\s*(\`\`\`|~~~)/.test(raw) ? "fence" : "code") + '"' + attrs + '>' + escapeHtml(raw || " ") + '</div>';
+  if (/^\s*[-*_]{3,}\s*$/.test(raw)) return '<div class="markdown-line hr"' + attrs + '>' + escapeHtml(raw) + '</div>';
+  if (trimmed === "---" || trimmed === "...") return '<div class="markdown-line frontmatter"' + attrs + '>' + escapeHtml(raw) + '</div>';
+  const quote = raw.match(/^(\s*>+\s?)(.*)$/);
+  if (quote) return '<div class="markdown-line quote"' + attrs + '><span class="markdown-marker">' + escapeHtml(quote[1]) + '</span>' + renderMarkdownInline(quote[2]) + '</div>';
+  const list = raw.match(/^(\s*(?:[-*+]|\d+[.)])\s+)(.*)$/);
+  if (list) return '<div class="markdown-line list"' + attrs + '><span class="markdown-marker">' + escapeHtml(list[1]) + '</span>' + renderMarkdownInline(list[2]) + '</div>';
+  return '<div class="markdown-line body"' + attrs + '>' + renderMarkdownInline(raw) + '</div>';
+}
+
+function renderMarkdownInline(value) {
+  return String(value || "").split(/(\`[^\`\n]+\`)/g).map((part) => {
+    if (/^\`[^\`\n]+\`$/.test(part)) return '<span class="markdown-inline-code">' + escapeHtml(part) + '</span>';
+    return escapeHtml(part);
+  }).join("");
 }
 
 function wireFileActionButtons(root = document) {
+  root.querySelector("[data-file-review-decision]")?.addEventListener("click", (event) => applyReviewDecision(state.selected, event.currentTarget.dataset.fileReviewDecision).catch((error) => setStatus(error.message)));
   root.querySelector("[data-file-save]")?.addEventListener("click", () => saveCurrent().catch((error) => setStatus(error.message)));
-  root.querySelector("[data-file-verify]")?.addEventListener("click", () => verifyCurrentFile().catch((error) => setStatus(error.message)));
   root.querySelector("[data-file-delete]")?.addEventListener("click", () => deletePaths([state.selected]).catch((error) => setStatus(error.message)));
   root.querySelector("[data-apply-template]")?.addEventListener("click", () => applyTemplateToCurrentFile().catch((error) => setStatus(error.message)));
 }
@@ -4857,13 +6144,26 @@ function wireExternalReviewDecisionButtons(root = document) {
   }));
 }
 
+function wireExternalReviewAllButtons(root = document) {
+  root.querySelectorAll("[data-external-review-all]").forEach((button) => button.addEventListener("click", (event) => {
+    event.preventDefault();
+    event.stopPropagation();
+    chooseAllExternalReviewBlocks(event.currentTarget.dataset.externalReviewAll).catch((error) => setStatus(error.message));
+  }));
+}
+
 function renderExternalReviewActions(change) {
   const beforeText = state.saved || "";
   const afterText = change.diskContent || "";
   const blocks = buildExternalReviewBlocks(beforeText, afterText, change.reviewDecisions || {});
   const summary = summarizeExternalReviewBlocks(blocks);
+  const bulkActions = summary.pending > 1 || summary.pendingLines > 1
+    ? '<button class="file-action primary external-choice bulk" type="button" data-external-review-all="accept">Accept all</button>' +
+      '<button class="file-action danger-action external-choice bulk" type="button" data-external-review-all="reject">Reject all</button>'
+    : "";
   return '<div class="file-actions external-review-actions" aria-label="Review disk change">' +
     '<div class="external-change-stats" title="' + escapeHtml(change.path || "This file") + ' changed on disk"><span class="pending">' + summary.pending + ' left</span><span class="add">+' + summary.additions + '</span><span class="del">-' + summary.deletions + '</span></div>' +
+    bulkActions +
   '</div>';
 }
 
@@ -4882,11 +6182,8 @@ function renderExternalReviewBlock(block) {
   }
   if (block.decision) {
     const rows = externalReviewRowsForDecision(block);
-    const decisionLabel = block.decision === "accept" ? "accepted" : "rejected";
-    const body = rows.length ? rows.map((row) => renderExternalReviewLine(row)).join("") : '<div class="external-review-placeholder">Change ' + escapeHtml(decisionLabel) + '</div>';
     return '<div class="external-review-block context resolved ' + escapeHtml(block.decision) + (rows.length ? '' : ' empty') + '" data-external-review-block="' + escapeHtml(block.id) + '">' +
-      '<span class="external-review-resolved-label">' + escapeHtml(decisionLabel) + '</span>' +
-      body +
+      rows.map((row) => renderExternalReviewLine(row)).join("") +
     '</div>';
   }
   const decisionClass = block.decision || "pending";
@@ -4929,13 +6226,15 @@ function buildExternalReviewBlocks(beforeText, afterText, decisions = {}) {
 
 function summarizeExternalReviewBlocks(blocks) {
   return blocks.reduce((summary, block) => {
-    if (block.kind === "change" && !block.decision) summary.pending += 1;
+    const pendingBlock = block.kind === "change" && !block.decision;
+    if (pendingBlock) summary.pending += 1;
     for (const row of block.rows) {
       if (row.type === "add") summary.additions += 1;
       if (row.type === "del") summary.deletions += 1;
+      if (pendingBlock && (row.type === "add" || row.type === "del")) summary.pendingLines += 1;
     }
     return summary;
-  }, { pending: 0, additions: 0, deletions: 0 });
+  }, { pending: 0, pendingLines: 0, additions: 0, deletions: 0 });
 }
 
 async function chooseExternalReviewBlock(decision, blockId) {
@@ -4947,14 +6246,36 @@ async function chooseExternalReviewBlock(decision, blockId) {
   const pending = blocks.filter((block) => block.kind === "change" && !block.decision);
   const updatedInPlace = updateExternalReviewBlockInPlace(blocks, blockId, viewState);
   if (!updatedInPlace) renderViewer();
-  restoreEditorViewState(viewState);
   updateHeader();
   updatePreview();
+  if (updatedInPlace) settleExternalReviewBlocks([blockId], viewState, { restoreScroll: false });
   if (pending.length) {
     setStatus(pending.length + " change" + (pending.length > 1 ? "s" : "") + " left to review");
     return;
   }
   setStatus("saving reviewed change...");
+  if (updatedInPlace) await waitForInlineReviewTransition();
+  await saveExternalReviewDecision(blocks, viewState);
+}
+
+async function chooseAllExternalReviewBlocks(decision) {
+  const change = activeExternalChange();
+  if (!change || (decision !== "accept" && decision !== "reject")) return;
+  const currentBlocks = buildExternalReviewBlocks(state.saved || "", change.diskContent || "", change.reviewDecisions || {});
+  const pendingBlocks = currentBlocks.filter((block) => block.kind === "change" && !block.decision);
+  if (!pendingBlocks.length) return;
+  const anchorBlockId = closestExternalReviewChangeBlockId() || pendingBlocks[0].id;
+  const viewState = captureEditorViewState({ anchorBlockId });
+  const nextDecisions = { ...(change.reviewDecisions || {}) };
+  for (const block of pendingBlocks) nextDecisions[block.id] = decision;
+  change.reviewDecisions = nextDecisions;
+  const blocks = buildExternalReviewBlocks(state.saved || "", change.diskContent || "", change.reviewDecisions);
+  const updatedInPlace = updateExternalReviewDocumentInPlace(blocks);
+  if (!updatedInPlace) renderViewer();
+  restoreEditorViewState(viewState);
+  updateHeader();
+  updatePreview();
+  setStatus("saving reviewed changes...");
   if (updatedInPlace) await waitForInlineReviewTransition();
   await saveExternalReviewDecision(blocks, viewState);
 }
@@ -4972,7 +6293,31 @@ function updateExternalReviewBlockInPlace(blocks, blockId, viewState) {
   }
   const actions = document.querySelector(".external-review-actions");
   const change = activeExternalChange();
-  if (actions && change) actions.outerHTML = renderExternalReviewActions(change);
+  if (actions && change) {
+    actions.outerHTML = renderExternalReviewActions(change);
+    wireExternalReviewAllButtons(document.querySelector(".external-review-actions") || document);
+  }
+  return true;
+}
+
+function updateExternalReviewDocumentInPlace(blocks) {
+  const doc = document.querySelector(".external-review-doc");
+  if (!doc) return false;
+  const previousHeights = new Map([...doc.querySelectorAll("[data-external-review-block]")].map((element) => [element.dataset.externalReviewBlock, element.getBoundingClientRect().height]));
+  doc.innerHTML = blocks.map((block) => renderExternalReviewBlock(block)).join("");
+  for (const block of blocks) {
+    if (block.kind !== "change" || !block.decision) continue;
+    const element = externalReviewBlockElement(block.id);
+    const previousHeight = previousHeights.get(block.id) || 0;
+    if (element && previousHeight > 0) element.style.minHeight = Math.ceil(previousHeight) + "px";
+  }
+  wireExternalReviewDecisionButtons(doc);
+  const actions = document.querySelector(".external-review-actions");
+  const change = activeExternalChange();
+  if (actions && change) {
+    actions.outerHTML = renderExternalReviewActions(change);
+    wireExternalReviewAllButtons(document.querySelector(".external-review-actions") || document);
+  }
   return true;
 }
 
@@ -5002,15 +6347,11 @@ function externalReviewTextAnchor(blocks, blockId, mergedText) {
 
 async function saveExternalReviewDecision(blocks, viewState) {
   const change = activeExternalChange();
-  if (!change || state.selectedStartupContext || state.selected !== change.path) return;
+  if (!change || state.selected !== change.path) return;
   const merged = computeExternalReviewContent(blocks, state.saved || "", change.diskContent || "");
   viewState.textAnchor = externalReviewTextAnchor(blocks, viewState.anchorBlockId, merged);
   setStatus("saving reviewed changes...");
-  const result = await api("/api/file", {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({ path: change.path, content: merged }),
-  });
+  const result = await writeSelectedDiskFile(merged, change.path);
   resetConflictState();
   resetExternalChangeState();
   // Returning from inline review should keep the reader in the document, not open the Git diff panel.
@@ -5023,7 +6364,7 @@ async function saveExternalReviewDecision(blocks, viewState) {
   if (docEditor) docEditor.value = merged;
   await loadFiles();
   if (state.selected === change.path) {
-    state.selectedDiff = await api("/api/file/diff?path=" + encodeURIComponent(change.path));
+    state.selectedDiff = await readSelectedDiff(change.path);
     if (!finishExternalReviewPanelInPlace(viewState)) {
       renderViewer();
       restoreEditorViewState(viewState);
@@ -5039,7 +6380,7 @@ function finishExternalReviewPanelInPlace(viewState) {
   const actions = document.querySelector(".external-review-actions");
   if (!actions) return false;
   actions.outerHTML = renderFileActionButtons({
-    hasReviewItem: selectedFileNeedsReview(),
+    reviewAction: reviewActionForSelectedFile(),
     dirty: false,
     canApplyTemplate: false,
     blockedByConflict: false,
@@ -5053,7 +6394,16 @@ function finishExternalReviewPanelInPlace(viewState) {
 function settleFinishedExternalReview(viewState) {
   const doc = document.querySelector(".external-review-doc");
   if (!doc || doc.classList.contains("settled")) return;
-  const blocks = [...doc.querySelectorAll(".external-review-block.resolved")];
+  doc.classList.add("settled");
+  settleExternalReviewBlocks([...doc.querySelectorAll(".external-review-block.resolved")], viewState);
+}
+
+function settleExternalReviewBlocks(blocksOrIds, viewState, options = {}) {
+  const restoreScroll = options.restoreScroll !== false;
+  const blocks = blocksOrIds
+    .map((item) => typeof item === "string" ? externalReviewBlockElement(item) : item)
+    .filter((block) => block?.classList?.contains("resolved") && !block.classList.contains("settling") && !block.classList.contains("settled"));
+  if (!blocks.length) return;
   for (const block of blocks) {
     const startHeight = Math.ceil(block.getBoundingClientRect().height);
     block.classList.add("settling");
@@ -5061,14 +6411,14 @@ function settleFinishedExternalReview(viewState) {
     block.style.minHeight = startHeight + "px";
     block.style.overflow = "hidden";
   }
-  void doc.offsetHeight;
-  doc.classList.add("settled");
+  void blocks[0].offsetHeight;
   for (const block of blocks) {
+    block.classList.add("settled");
     const targetHeight = block.classList.contains("empty") ? 0 : Math.ceil(block.scrollHeight);
     block.style.height = targetHeight + "px";
     block.style.minHeight = targetHeight + "px";
   }
-  restoreEditorViewState(viewState);
+  if (restoreScroll) restoreEditorViewState(viewState);
   window.setTimeout(() => {
     for (const block of blocks) {
       block.classList.remove("settling");
@@ -5076,7 +6426,7 @@ function settleFinishedExternalReview(viewState) {
       block.style.minHeight = "";
       block.style.overflow = "";
     }
-    restoreEditorViewState(viewState);
+    if (restoreScroll) restoreEditorViewState(viewState);
   }, 2050);
 }
 
@@ -5547,6 +6897,54 @@ function activeExternalChange() {
   return state.externalChange && state.externalChange.path === state.selected ? state.externalChange : null;
 }
 
+function startupSelectionRequest() {
+  const startup = state.selectedStartupContext;
+  if (!startup) return null;
+  if (startup.kind === "startup-skill" || startup.skillName) {
+    return {
+      type: "startup-skill",
+      folder: String(startup.order || "").split(":")[0],
+      skill: startup.skillName || String(startup.order || "").split(":").slice(1).join(":"),
+    };
+  }
+  return { type: "startup-context", order: startup.order };
+}
+
+async function readSelectedDiskFile(path = state.selected) {
+  const startup = startupSelectionRequest();
+  if (startup?.type === "startup-context") return api("/api/startup-context/file?order=" + encodeURIComponent(startup.order));
+  if (startup?.type === "startup-skill") return api("/api/startup-skills/file?folder=" + encodeURIComponent(startup.folder) + "&skill=" + encodeURIComponent(startup.skill));
+  return api("/api/file?path=" + encodeURIComponent(path));
+}
+
+async function readSelectedDiff(path = state.selected) {
+  if (state.selectedStartupContext) return { path, available: false, changed: false, additions: 0, deletions: 0, patch: "" };
+  return api("/api/file/diff?path=" + encodeURIComponent(path));
+}
+
+async function writeSelectedDiskFile(content, path = state.selected) {
+  const startup = startupSelectionRequest();
+  if (startup?.type === "startup-context") {
+    return api("/api/startup-context/file", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ order: startup.order, content }),
+    });
+  }
+  if (startup?.type === "startup-skill") {
+    return api("/api/startup-skills/file", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ folder: startup.folder, skill: startup.skill, content }),
+    });
+  }
+  return api("/api/file", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ path, content }),
+  });
+}
+
 function resetConflictState() {
   state.fileConflict = null;
   state.conflictCompare = false;
@@ -5561,24 +6959,68 @@ function resetExternalChangeState() {
 
 function blockPendingExternalChange(action = "before leaving") {
   if (!activeExternalChange()) return false;
-  setStatus("file changed on disk · apply or reject " + action);
-  renderViewer();
+  const targetBlockId = closestExternalReviewChangeBlockId();
+  setStatus("file changed on disk · review the highlighted change " + action);
+  if (state.mode !== "view") setMode("view");
+  else renderViewer();
   updateHeader();
+  const focus = () => focusExternalReviewChange(targetBlockId) || focusNearestExternalReviewChange();
+  if (!focus()) window.requestAnimationFrame(focus);
+  return true;
+}
+
+function externalReviewChangeElements() {
+  return [...document.querySelectorAll(".external-review-block.change[data-external-review-block]")];
+}
+
+function closestExternalReviewChangeElement() {
+  const changes = externalReviewChangeElements();
+  if (!changes.length) return null;
+  const scroller = activeDocumentScrollTarget();
+  const rect = scroller?.getBoundingClientRect?.();
+  const centerY = rect ? rect.top + rect.height / 2 : window.innerHeight / 2;
+  return changes.reduce((closest, element) => {
+    const elementRect = element.getBoundingClientRect();
+    const distance = Math.abs(elementRect.top + elementRect.height / 2 - centerY);
+    return !closest || distance < closest.distance ? { element, distance } : closest;
+  }, null)?.element || null;
+}
+
+function closestExternalReviewChangeBlockId() {
+  return closestExternalReviewChangeElement()?.dataset.externalReviewBlock || "";
+}
+
+function focusNearestExternalReviewChange() {
+  return focusExternalReviewChange(closestExternalReviewChangeBlockId());
+}
+
+function focusExternalReviewChange(blockId) {
+  let target = blockId ? externalReviewBlockElement(blockId) : closestExternalReviewChangeElement();
+  if (!target && activeExternalChange()) {
+    renderViewer();
+    target = blockId ? externalReviewBlockElement(blockId) : closestExternalReviewChangeElement();
+  }
+  if (!target) return false;
+  target.classList.remove("attention");
+  void target.offsetWidth;
+  target.classList.add("attention");
+  target.scrollIntoView({ behavior: "smooth", block: "center", inline: "nearest" });
+  window.setTimeout(() => target.classList.remove("attention"), 1500);
   return true;
 }
 
 function scheduleConflictCheck() {
-  if (!state.selected || state.selectedStartupContext || !state.dirty) return;
+  if (!state.selected || !state.dirty) return;
   window.clearTimeout(state.conflictCheckTimer);
   state.conflictCheckTimer = window.setTimeout(() => checkSelectedFileConflict().catch((error) => setStatus(error.message)), 250);
 }
 
 async function checkSelectedFileConflict() {
-  if (!state.selected || state.selectedStartupContext || !state.dirty) return false;
+  if (!state.selected || !state.dirty) return false;
   const path = state.selected;
   const [data, diff] = await Promise.all([
-    api("/api/file?path=" + encodeURIComponent(path)),
-    api("/api/file/diff?path=" + encodeURIComponent(path)),
+    readSelectedDiskFile(path),
+    readSelectedDiff(path),
   ]);
   if (state.selected !== path || !state.dirty) return false;
   if (data.contentHash === state.savedHash) {
@@ -5618,7 +7060,7 @@ async function checkSelectedFileConflict() {
 
 async function applyExternalChange() {
   const change = activeExternalChange();
-  if (!change || state.selectedStartupContext || state.selected !== change.path) return;
+  if (!change || state.selected !== change.path) return;
   if (state.dirty && activeEditor().value !== state.saved && !confirm("Discard your unsaved editor changes and apply the disk version?")) return;
   const viewState = captureEditorViewState();
   resetConflictState();
@@ -5631,7 +7073,7 @@ async function applyExternalChange() {
   if (docEditor) docEditor.value = change.diskContent;
   await loadFiles();
   if (state.selected === change.path) {
-    state.selectedDiff = await api("/api/file/diff?path=" + encodeURIComponent(change.path));
+    state.selectedDiff = await readSelectedDiff(change.path);
     renderViewer();
     restoreEditorViewState(viewState);
     updateHeader();
@@ -5654,14 +7096,10 @@ function promptRejectExternalChange() {
 
 async function rejectExternalChange(path) {
   const change = activeExternalChange();
-  if (!change || state.selectedStartupContext || state.selected !== path) return;
+  if (!change || state.selected !== path) return;
   setStatus("rejecting disk change...");
   const viewState = captureEditorViewState();
-  const result = await api("/api/file", {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({ path, content: state.saved }),
-  });
+  const result = await writeSelectedDiskFile(state.saved, path);
   resetConflictState();
   resetExternalChangeState();
   state.savedHash = result.contentHash;
@@ -5671,7 +7109,7 @@ async function rejectExternalChange(path) {
   if (docEditor) docEditor.value = state.saved;
   await loadFiles();
   if (state.selected === path) {
-    state.selectedDiff = await api("/api/file/diff?path=" + encodeURIComponent(path));
+    state.selectedDiff = await readSelectedDiff(path);
     renderViewer();
     restoreEditorViewState(viewState);
     updateHeader();
@@ -5735,10 +7173,6 @@ async function saveConflictMerge(merged) {
 }
 
 async function saveCurrent(options = {}) {
-  if (state.selectedStartupContext) {
-    setStatus("startup context is read-only");
-    return;
-  }
   if (!state.selected) return;
   const conflict = activeFileConflict();
   if (conflict && !options.forceConflict) {
@@ -5758,13 +7192,10 @@ async function saveCurrent(options = {}) {
   setStatus("saving...");
   const viewState = captureEditorViewState();
   const content = activeEditor().value;
-  const result = await api("/api/file", {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({ path: state.selected, content }),
-  });
+  const result = await writeSelectedDiskFile(content);
   state.saved = content;
   state.savedHash = result.contentHash;
+  if (result.startupContext) state.selectedStartupContext = result.startupContext;
   state.dirty = false;
   resetConflictState();
   resetExternalChangeState();
@@ -5778,13 +7209,15 @@ async function saveCurrent(options = {}) {
 async function refreshFromDisk() {
   const previousSelected = state.selected;
   try {
-    const [filesData, docqa, doctor, settingsData, startupData] = await Promise.all([api("/api/files"), api("/api/docqa"), api("/api/doctor"), api("/api/settings"), api("/api/startup-context")]);
+    const [filesData, docqa, doctor, settingsData, startupData, startupSkillsData] = await Promise.all([api("/api/files"), api("/api/docqa"), api("/api/doctor"), api("/api/settings"), api("/api/startup-context"), api("/api/startup-skills")]);
     state.files = filesData.files;
     state.startupContextFiles = startupData.files || [];
+    state.startupSkillFolders = startupSkillsData.folders || [];
     state.docqa = docqa;
     state.doctor = doctor;
     if (!state.settingsOpen) {
       state.settings = settingsData.settings;
+      applyFileTheme();
       state.availableHubCards = settingsData.availableHubCards || [];
       state.hubFolders = settingsData.hubCards || [];
       state.rootHubSections = settingsData.hubSections || [];
@@ -5798,10 +7231,10 @@ async function refreshFromDisk() {
     if (!state.selected) renderDocQaDashboard();
     else updateHeader();
 
-    if (!previousSelected || previousSelected !== state.selected || state.selectedStartupContext) return;
+    if (!previousSelected || previousSelected !== state.selected) return;
     const [data, diff] = await Promise.all([
-      api("/api/file?path=" + encodeURIComponent(previousSelected)),
-      api("/api/file/diff?path=" + encodeURIComponent(previousSelected)),
+      readSelectedDiskFile(previousSelected),
+      readSelectedDiff(previousSelected),
     ]);
     if (state.dirty) {
       await checkSelectedFileConflict();
@@ -5853,7 +7286,7 @@ function isScrollableY(element) {
   return /(auto|scroll|overlay)/.test(style.overflowY) && element.scrollHeight > element.clientHeight + 1;
 }
 function activeDocumentScrollTarget() {
-  const documentSurface = document.querySelector(".external-review-doc") || el("docEditor");
+  const documentSurface = document.querySelector(".external-review-doc") || el("docEditor") || el("docReader");
   if (isScrollableY(documentSurface)) return documentSurface;
   if (isScrollableY(el("viewer"))) return el("viewer");
   return documentSurface || el("viewer");
@@ -5882,7 +7315,7 @@ function isSaveShortcut(event) {
 }
 function handleSaveShortcut(event) {
   if (!isSaveShortcut(event)) return false;
-  if (state.page !== "file" || !state.selected || state.selectedStartupContext) return false;
+  if (state.page !== "file" || !state.selected) return false;
   event.preventDefault();
   if (activeExternalChange()) {
     setStatus("file changed on disk · apply or reject before saving");
@@ -5930,6 +7363,8 @@ function restoreEditorViewState(snapshot) {
       ? document.querySelector(".external-review-doc")
       : snapshot.documentScrollTarget === "docEditor"
         ? el("docEditor")
+        : snapshot.documentScrollTarget === "docReader"
+          ? el("docReader")
         : null) || activeDocumentScrollTarget();
     if (documentScrollTarget) {
       documentScrollTarget.scrollTop = snapshot.documentScrollTop || 0;
@@ -5994,13 +7429,52 @@ function escapeHtml(value) { return String(value).replace(/[&<>"]/g, (ch) => ({"
 function escapeRegExp(value) { return String(value).replace(/[-/\\^$*+?.()|[\]{}]/g, "\\$&"); }
 function cssEscape(value) { return window.CSS && CSS.escape ? CSS.escape(value) : String(value).replace(/(["\\])/g, "\\$1"); }
 
+const SPOTLIGHT_CARD_SELECTOR = ".launch-card, .review-item, .hub-folder-card, .startup-context-item, .card, .conflict-card";
+let spotlightCard = null;
+let spotlightPointer = null;
+let spotlightFrame = 0;
+function clearCardSpotlight() {
+  if (spotlightCard) spotlightCard.classList.remove("spotlight-active");
+  spotlightCard = null;
+}
+function setCardSpotlight(card, x, y) {
+  if (spotlightCard && spotlightCard !== card) spotlightCard.classList.remove("spotlight-active");
+  spotlightCard = card;
+  if (!card) return;
+  const rect = card.getBoundingClientRect();
+  card.classList.add("spotlight-active");
+  card.style.setProperty("--spotlight-x", Math.round(x - rect.left) + "px");
+  card.style.setProperty("--spotlight-y", Math.round(y - rect.top) + "px");
+}
+function updateCardSpotlightAt(x, y) {
+  if (x < 0 || y < 0 || x > window.innerWidth || y > window.innerHeight) {
+    clearCardSpotlight();
+    return;
+  }
+  const element = document.elementFromPoint(x, y);
+  const card = element instanceof Element ? element.closest(SPOTLIGHT_CARD_SELECTOR) : null;
+  setCardSpotlight(card, x, y);
+}
+function updateCardSpotlight(event) {
+  spotlightPointer = { x: event.clientX, y: event.clientY };
+  updateCardSpotlightAt(spotlightPointer.x, spotlightPointer.y);
+}
+function refreshCardSpotlightAfterScroll() {
+  if (!spotlightPointer || spotlightFrame) return;
+  spotlightFrame = window.requestAnimationFrame(() => {
+    spotlightFrame = 0;
+    updateCardSpotlightAt(spotlightPointer.x, spotlightPointer.y);
+  });
+}
+
 el("editor").addEventListener("input", () => {
+  markUserActive();
   state.dirty = el("editor").value !== state.saved;
   updateHeader();
   updatePreview();
   if (state.mode === "view") renderViewer();
 });
-el("search").addEventListener("input", () => { state.pathFilters = []; expandSearchMatches(); renderFiles(); });
+el("search").addEventListener("input", () => { markUserActive(); state.pathFilters = []; expandSearchMatches(); renderFiles(); scheduleSessionStatePush(); });
 el("clearSearch").addEventListener("click", () => clearExplorerFilter());
 document.querySelectorAll("[data-watch-filter]").forEach((button) => button.addEventListener("click", () => setExplorerWatchFilter(button.dataset.watchFilter)));
 document.querySelector("aside")?.addEventListener("contextmenu", openExplorerEmptyContextMenu);
@@ -6014,7 +7488,23 @@ document.addEventListener("click", (event) => {
   if (!picker || picker.contains(event.target)) return;
   togglePathPickerMenu(false);
 });
+document.addEventListener("pointermove", updateCardSpotlight, { passive: true });
+document.addEventListener("pointerleave", () => {
+  spotlightPointer = null;
+  clearCardSpotlight();
+}, { passive: true });
+document.addEventListener("pointercancel", () => {
+  spotlightPointer = null;
+  clearCardSpotlight();
+}, { passive: true });
+document.addEventListener("scroll", refreshCardSpotlightAfterScroll, { capture: true, passive: true });
+window.addEventListener("resize", refreshCardSpotlightAfterScroll, { passive: true });
+window.addEventListener("blur", () => {
+  spotlightPointer = null;
+  clearCardSpotlight();
+});
 document.addEventListener("keydown", (event) => {
+  markUserActive();
   if (handleSaveShortcut(event)) return;
   if (event.key === "Escape") {
     hideExplorerContextMenu();
@@ -6056,13 +7546,17 @@ el("reload").addEventListener("click", () => {
   selectFile(state.selected, { pushHistory: false, fromPlanet: state.filePanel, forceReload: true }).catch((error) => setStatus(error.message));
 });
 window.addEventListener("beforeunload", (event) => {
-  if (!state.dirty) return;
+  if (!state.dirty && !activeExternalChange()) return;
+  if (activeExternalChange()) focusNearestExternalReviewChange();
   event.preventDefault();
   event.returnValue = "";
 });
+document.addEventListener("pointerdown", markUserActive, { passive: true });
+document.addEventListener("scroll", scheduleSessionStatePush, { capture: true, passive: true });
 syncResponsiveSidebar({ force: true });
 window.addEventListener("resize", () => syncResponsiveSidebar());
 setMode("view");
+startAgentCommandPolling();
 loadFiles().catch((error) => setStatus(error.message));
 window.setInterval(() => refreshFromDisk(), 2200);
 </script>

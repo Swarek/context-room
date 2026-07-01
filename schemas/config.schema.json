@@ -54,6 +54,38 @@
         }
       }
     },
+    "startupSkills": {
+      "type": "object",
+      "description": "Optional scanner for skill folders above the Context Room root. These folders are shown read-only and never added to the explorer.",
+      "additionalProperties": true,
+      "properties": {
+        "enabled": { "type": "boolean", "default": true },
+        "folderNames": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 },
+          "uniqueItems": true,
+          "default": [".codex/skills", ".agents/skills", "skills"]
+        }
+      }
+    },
+    "appearance": {
+      "type": "object",
+      "description": "Visual preferences for the Context Room webapp.",
+      "additionalProperties": true,
+      "properties": {
+        "fileTheme": {
+          "type": "string",
+          "description": "Theme used for file reading and editing surfaces.",
+          "enum": ["context-room", "vscode-dark", "github-dark", "dracula", "solarized-dark", "light-plus"],
+          "default": "context-room"
+        },
+        "autoOpenGitDiff": {
+          "type": "boolean",
+          "description": "When true, files with a Git diff open with the diff panel visible. When false, the diff stays collapsed until the user opens it manually.",
+          "default": true
+        }
+      }
+    },
     "hubCards": {
       "type": "object",
       "description": "Legacy card visibility map. Prefer hubSections for new setups.",

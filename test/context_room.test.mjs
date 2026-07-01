@@ -10,8 +10,11 @@ import {
   CONFIG_DIR,
   CONFIG_FILE,
   DEFAULT_MARKDOWN_TEMPLATES,
+  FILE_THEME_OPTIONS,
+  appendAgentAnnotation,
   applyMarkdownTemplateToFile,
   buildAgentBrief,
+  buildAgentReviewQueue,
   buildContextRoomDoctorReport,
   buildDocQaReport,
   buildDocumentationGraph,
@@ -19,19 +22,29 @@ import {
   createMarkdownFile,
   createDefaultProjectConfig,
   deleteMemoryPaths,
+  ensureRuntimeGitExcludes,
   hubSectionsForRoot,
   initializeContextRoomProject,
   isAllowedMemoryPath,
   listMemoryFiles,
   listStartupContextFiles,
+  listStartupSkillFolders,
   parseDocMetadata,
+  readAgentAnnotations,
+  readAgentCommand,
+  readCollaborationSessionState,
   readFileDiff,
   readMemoryWebappSettings,
   readStartupContextFile,
+  readStartupSkillFile,
   renderAppHtml,
   renderExplorerContextMenuMarkup,
   renderTemplateOptionsMarkup,
   revertMemoryFile,
+  writeStartupContextFile,
+  writeStartupSkillFile,
+  writeAgentCommand,
+  writeCollaborationSessionState,
   writeDocReviewDecision,
 } from "../src/context_room.mjs";
 
@@ -65,6 +78,9 @@ test("default config is project-agnostic and supports cards, nested cards, allow
   assert.equal(config.title, "Demo Project");
   assert.match(config.$schema, /schemas\/config\.schema\.json$/);
   assert.deepEqual(config.watchAllow, []);
+  assert.equal(config.appearance.fileTheme, "context-room");
+  assert.equal(config.appearance.autoOpenGitDiff, true);
+  assert.ok(FILE_THEME_OPTIONS.some((theme) => theme.id === config.appearance.fileTheme));
   assert.ok(config.allowedPaths.includes("docs/"));
   assert.ok(config.allowedPaths.includes("src/"));
   assert.ok(config.hubSections[0].cards.some((card) => card.id === "docs"));
@@ -86,6 +102,7 @@ test("init writes a reusable project config without LifeOS-specific paths", () =
   assert.match(saved.$schema, /schemas\/config\.schema\.json$/);
   assert.ok(saved.allowedPaths.includes("docs/"));
   assert.ok(saved.allowedPaths.includes("src/"));
+  assert.equal(saved.appearance.autoOpenGitDiff, true);
   assert.equal(JSON.stringify(saved).includes("Life OS"), false);
   assert.equal(JSON.stringify(saved).includes(".lifeos"), false);
 });
@@ -99,6 +116,19 @@ test("allowed paths are driven by project config", () => {
   assert.equal(isAllowedMemoryPath("README.md", settings), true);
   assert.equal(isAllowedMemoryPath("src/private.js", settings), false);
   assert.equal(isAllowedMemoryPath("../secret.md", settings), false);
+});
+
+test("appearance settings preserve manual Git diff opening preference", () => {
+  const root = makeRoot();
+  initializeContextRoomProject(root, { allowedPaths: ["docs/"] });
+  const configPath = path.join(root, CONFIG_FILE);
+  const config = JSON.parse(fs.readFileSync(configPath, "utf8"));
+  config.appearance = { ...config.appearance, autoOpenGitDiff: false };
+  fs.writeFileSync(configPath, JSON.stringify(config, null, 2) + "\n");
+
+  const settings = readMemoryWebappSettings(root);
+  assert.equal(settings.appearance.fileTheme, "context-room");
+  assert.equal(settings.appearance.autoOpenGitDiff, false);
 });
 
 test("file listing follows project config and does not inject Hermes/LifeOS files by default", () => {
@@ -136,20 +166,67 @@ test("startup context scanner lists configured agent files from ancestors to roo
   const files = listStartupContextFiles(root);
   const memoryFiles = listMemoryFiles(root);
   const opened = readStartupContextFile(root, 2);
+  const written = writeStartupContextFile(root, 2, "# Updated Claude\n");
 
   assert.deepEqual(files.map((file) => file.startupContext.fileName), ["AGENTS.md", "CLAUDE.md", "AGENTS.md"]);
   assert.deepEqual(files.map((file) => file.startupContext.order), [1, 2, 3]);
   assert.equal(files[0].category, "0 · startup context");
   assert.match(files[0].startupContext.displayPath, /AGENTS\.md$/);
+  assert.equal(files[0].startupContext.kind, "startup-context");
   assert.equal(memoryFiles.some((file) => file.startupContext), false);
   assert.equal(opened.content, "# Parent Claude\n");
   assert.equal(opened.startupContext.fileName, "CLAUDE.md");
+  assert.equal(written.contentHash, readStartupContextFile(root, 2).contentHash);
+  assert.equal(fs.readFileSync(path.join(parent, "CLAUDE.md"), "utf8"), "# Updated Claude\n");
+});
+
+test("startup skills scanner lists configured skill folders from ancestors to root", () => {
+  const base = makeRoot();
+  const parent = path.join(base, "parent");
+  const root = path.join(parent, "project");
+  fs.mkdirSync(path.join(base, ".codex", "skills", "global-skill"), { recursive: true });
+  fs.mkdirSync(path.join(parent, ".agents", "skills", "parent-skill"), { recursive: true });
+  fs.mkdirSync(path.join(root, ".codex", "skills", "project-skill"), { recursive: true });
+  fs.writeFileSync(path.join(base, ".codex", "skills", "global-skill", "SKILL.md"), "# Global\n");
+  fs.writeFileSync(path.join(parent, ".agents", "skills", "parent-skill", "SKILL.md"), "# Parent\n");
+  fs.writeFileSync(path.join(root, ".codex", "skills", "project-skill", "SKILL.md"), "# Project\n");
+  initializeContextRoomProject(root, {
+    allowedPaths: ["docs/"],
+    watchAllow: [],
+  });
+  const configPath = path.join(root, CONFIG_FILE);
+  const config = JSON.parse(fs.readFileSync(configPath, "utf8"));
+  config.startupSkills = { enabled: true, folderNames: [".codex/skills", ".agents/skills"] };
+  fs.writeFileSync(configPath, JSON.stringify(config, null, 2) + "\n");
+
+  const folders = listStartupSkillFolders(root);
+  const opened = readStartupSkillFile(root, 2, "parent-skill");
+  const written = writeStartupSkillFile(root, 2, "parent-skill", "# Parent Updated\n");
+
+  assert.deepEqual(folders.map((folder) => folder.folderName), [".codex/skills", ".agents/skills", ".codex/skills"]);
+  assert.deepEqual(folders.map((folder) => folder.order), [1, 2, 3]);
+  assert.deepEqual(folders.map((folder) => folder.skills), [["global-skill"], ["parent-skill"], ["project-skill"]]);
+  assert.match(folders[0].displayPath, /\.codex\/skills$/);
+  assert.equal(opened.content, "# Parent\n");
+  assert.equal(opened.startupContext.kind, "startup-skill");
+  assert.equal(opened.startupContext.skillName, "parent-skill");
+  assert.match(opened.startupContext.displayPath, /parent-skill\/SKILL\.md$/);
+  assert.equal(written.contentHash, readStartupSkillFile(root, 2, "parent-skill").contentHash);
+  assert.equal(fs.readFileSync(path.join(parent, ".agents", "skills", "parent-skill", "SKILL.md"), "utf8"), "# Parent Updated\n");
 });
 
 test("startup context virtual files stay out of the explorer tree", () => {
   const html = renderAppHtml();
 
   assert.match(html, /api\("\/api\/startup-context"\)/);
+  assert.match(html, /api\("\/api\/startup-skills"\)/);
+  assert.match(html, /api\("\/api\/startup-skills\/file\?folder="/);
+  assert.match(html, /function renderStartupSkillsPanel\(\)/);
+  assert.match(html, /function selectStartupSkillFile\(folderOrder, skillName\)/);
+  assert.match(html, /Startup skills/);
+  assert.match(html, /startupSkillFolders: \[\]/);
+  assert.match(html, /data-startup-skill-name/);
+  assert.match(html, /id="startupSkillsEnabled"/);
   assert.match(html, /data-startup-order/);
   assert.doesNotMatch(html, /data-startup-file/);
   assert.doesNotMatch(html, /@startup-context/);
@@ -171,6 +248,34 @@ test("CLI init and doctor work in a fresh project", () => {
   assert.match(doctor, /Context Room OK/);
 });
 
+test("init adds Context Room runtime files to local Git excludes", () => {
+  const root = makeRoot();
+  execFileSync("git", ["init"], { cwd: root, stdio: "ignore" });
+  initializeContextRoomProject(root, { allowedPaths: ["docs/"] });
+  const result = ensureRuntimeGitExcludes(root);
+  const excludePath = result.path || execFileSync("git", ["rev-parse", "--git-dir"], { cwd: root, encoding: "utf8" }).trim() + "/info/exclude";
+  const exclude = fs.readFileSync(path.isAbsolute(excludePath) ? excludePath : path.join(root, excludePath), "utf8");
+
+  assert.match(exclude, /Context Room runtime state/);
+  assert.match(exclude, /\.context-room\/session-state\.json/);
+  assert.match(exclude, /\.context-room\/agent-command\.json/);
+  assert.match(exclude, /\.context-room\/agent-annotations\.json/);
+});
+
+test("runtime Git excludes are scoped when Context Room root is a Git subdirectory", () => {
+  const repo = makeRoot();
+  const root = path.join(repo, "project");
+  fs.mkdirSync(root);
+  execFileSync("git", ["init"], { cwd: repo, stdio: "ignore" });
+  initializeContextRoomProject(root, { allowedPaths: ["docs/"] });
+  const gitDir = execFileSync("git", ["rev-parse", "--git-dir"], { cwd: repo, encoding: "utf8" }).trim();
+  const exclude = fs.readFileSync(path.join(repo, gitDir, "info", "exclude"), "utf8");
+
+  assert.match(exclude, /project\/\.context-room\/session-state\.json/);
+  assert.match(exclude, /project\/\.context-room\/agent-command\.json/);
+  assert.match(exclude, /project\/\.context-room\/memory-webapp-backups\//);
+});
+
 test("CLI guard blocks commits when watched docs changed without review", () => {
   const root = makeRoot();
   execFileSync("git", ["init"], { cwd: root, stdio: "ignore" });
@@ -187,7 +292,9 @@ test("CLI guard blocks commits when watched docs changed without review", () => 
     () => execFileSync(process.execPath, [cli, "guard"], { cwd: root, encoding: "utf8", stdio: "pipe" }),
     (error) => {
       const output = `${error.stdout || ""}${error.stderr || ""}`;
-      assert.match(output, /Unverified watched documentation changes/);
+      assert.match(output, /Context Room guard blocked this commit/);
+      assert.match(output, /need human review/);
+      assert.match(output, /Agents must not mark files verified on the user's behalf/);
       assert.match(output, /README\.md/);
       return true;
     },
@@ -196,6 +303,78 @@ test("CLI guard blocks commits when watched docs changed without review", () => 
   writeDocReviewDecision(root, "README.md", { status: "verified", note: "test baseline" });
   const output = execFileSync(process.execPath, [cli, "guard"], { cwd: root, encoding: "utf8" });
   assert.match(output, /No unverified watched documentation changes/);
+
+  const unverified = writeDocReviewDecision(root, "README.md", { status: "unverified", note: "undo" });
+  assert.equal(unverified.status, "unverified");
+  assert.throws(
+    () => execFileSync(process.execPath, [cli, "guard"], { cwd: root, encoding: "utf8", stdio: "pipe" }),
+    (error) => {
+      const output = `${error.stdout || ""}${error.stderr || ""}`;
+      assert.match(output, /Context Room guard blocked this commit/);
+      assert.match(output, /README\.md/);
+      return true;
+    },
+  );
+});
+
+test("collaboration state, commands, annotations, and queue are agent-safe", () => {
+  const root = makeRoot();
+  fs.mkdirSync(path.join(root, "docs"));
+  fs.writeFileSync(path.join(root, "docs/guide.md"), "# Guide\n\n## Purpose\nKeep humans in control.\n");
+  initializeContextRoomProject(root, { allowedPaths: ["docs/"], watchAllow: ["docs/"] });
+
+  const session = writeCollaborationSessionState(root, {
+    page: "file",
+    openFile: "docs/guide.md",
+    selectedPath: "docs/guide.md",
+    visibleHeading: "## Purpose",
+    scrollPercent: 42,
+    pendingMiniDiffs: 2,
+    gitDiffOpen: true,
+    explorerFilter: "watched",
+    dirty: false,
+  });
+  assert.equal(session.openFile, "docs/guide.md");
+  assert.equal(readCollaborationSessionState(root).visibleHeading, "## Purpose");
+
+  const command = writeAgentCommand(root, { view: "file", path: "docs/guide.md", targetType: "heading", targetValue: "Purpose" });
+  assert.equal(command.path, "docs/guide.md");
+  assert.deepEqual(readAgentCommand(root).command.target, { type: "heading", value: "Purpose" });
+
+  const annotation = appendAgentAnnotation(root, { path: "docs/guide.md", target: "Purpose", targetType: "heading", note: "Ask the user to verify this section." });
+  const annotations = readAgentAnnotations(root, "docs/guide.md").annotations;
+  assert.equal(annotations.length, 1);
+  assert.equal(annotations[0].id, annotation.id);
+  assert.equal(annotations[0].resolved, false);
+
+  const queue = buildAgentReviewQueue(root);
+  assert.match(queue.note, /Human verification must happen/);
+  assert.ok(Array.isArray(queue.queue));
+});
+
+test("CLI agent commands expose state, navigation, annotations, and queue without verify", () => {
+  const root = makeRoot();
+  fs.mkdirSync(path.join(root, "docs"));
+  fs.writeFileSync(path.join(root, "docs/guide.md"), "# Guide\n");
+  initializeContextRoomProject(root, { allowedPaths: ["docs/"], watchAllow: ["docs/"] });
+  const cli = path.resolve("bin/context-room.mjs");
+
+  const open = JSON.parse(execFileSync(process.execPath, [cli, "agent", "open", "--root", root, "--path", "docs/guide.md", "--heading", "Guide"], { encoding: "utf8" }));
+  assert.equal(open.command.path, "docs/guide.md");
+  assert.equal(open.command.target.type, "heading");
+
+  const stateOutput = JSON.parse(execFileSync(process.execPath, [cli, "agent", "state", "--root", root], { encoding: "utf8" }));
+  assert.equal(stateOutput.status, "No active webapp session state has been published yet.");
+
+  const annotation = JSON.parse(execFileSync(process.execPath, [cli, "agent", "annotate", "--root", root, "--path", "docs/guide.md", "--note", "Review this with the user."], { encoding: "utf8" }));
+  assert.equal(annotation.annotation.path, "docs/guide.md");
+
+  const queue = JSON.parse(execFileSync(process.execPath, [cli, "agent", "queue", "--root", root], { encoding: "utf8" }));
+  assert.match(queue.note, /Human verification/);
+
+  const help = execFileSync(process.execPath, [cli, "--help"], { encoding: "utf8" });
+  assert.match(help, /context-room agent state/);
+  assert.doesNotMatch(help, /agent verify/);
 });
 
 test("doc QA detects watched changes when context root is a git subdirectory", () => {
@@ -707,6 +886,88 @@ test("app CSS keeps hub sections stacked and cards responsive", () => {
   assert.match(html, /\.hub-folder-meta code\s*\{\s*flex:\s*1 1 auto;\s*\}/);
 });
 
+test("card hover spotlight follows the pointer without intercepting clicks", () => {
+  const html = renderAppHtml();
+
+  assert.match(html, /--spotlight-x:\s*50%;\s*--spotlight-y:\s*50%/);
+  assert.match(html, /radial-gradient\(360px circle at var\(--spotlight-x\) var\(--spotlight-y\)/);
+  assert.match(html, /pointer-events:\s*none/);
+  assert.match(html, /\.hub-folder-card\.spotlight-active::before/);
+  assert.match(html, /const SPOTLIGHT_CARD_SELECTOR = ".*\.hub-folder-card.*\.startup-context-item/);
+  assert.match(html, /function updateCardSpotlightAt\(x, y\)/);
+  assert.match(html, /document\.elementFromPoint\(x, y\)/);
+  assert.match(html, /function updateCardSpotlight\(event\)/);
+  assert.match(html, /function refreshCardSpotlightAfterScroll\(\)/);
+  assert.match(html, /document\.addEventListener\("pointermove", updateCardSpotlight, \{ passive: true \}\)/);
+  assert.match(html, /document\.addEventListener\("scroll", refreshCardSpotlightAfterScroll, \{ capture: true, passive: true \}\)/);
+});
+
+test("rendered app supports selectable file themes and colored markdown reading", () => {
+  const html = renderAppHtml();
+
+  assert.match(html, /data-file-theme="context-room"/);
+  assert.match(html, /const FILE_THEMES = \[/);
+  assert.match(html, /"vscode-dark"/);
+  assert.match(html, /"dracula"/);
+  assert.match(html, /id="fileTheme"/);
+  assert.match(html, />App theme<\/label>/);
+  assert.match(html, /id="autoOpenGitDiff"/);
+  assert.match(html, /> Auto-open Git diff<\/label>/);
+  assert.match(html, /function applyFileTheme\(\)/);
+  assert.match(html, /document\.documentElement\.dataset\.appTheme = currentFileThemeId\(\)/);
+  assert.match(html, /function autoOpenGitDiffEnabled\(\)/);
+  assert.match(html, /function collapsedByGitDiffPreference\(diff\)/);
+  assert.match(html, /autoOpenGitDiff:\s*el\("autoOpenGitDiff"\)\?\.checked !== false/);
+  assert.match(html, /renderFileThemeOptions\(appearance\.fileTheme\)/);
+  assert.match(html, /:root\[data-file-theme="dracula"\]\s*\{[\s\S]*--bg:\s*#282a36;[\s\S]*--panel:/);
+  assert.match(html, /:root\[data-file-theme="light-plus"\]\s*\{[\s\S]*color-scheme:\s*light;[\s\S]*--bg:\s*#f6f8fa;[\s\S]*--on-accent:\s*#ffffff/);
+  assert.match(html, /body\s*\{[\s\S]*radial-gradient\(circle at top left, var\(--body-glow-1\)/);
+  assert.match(html, /aside\s*\{[^}]*background:\s*var\(--surface-sidebar\)/);
+  assert.match(html, /\.docqa-home\s*\{[^}]*background:\s*radial-gradient\(circle at 18% 0%, var\(--body-glow-3\)/);
+  assert.match(html, /\.workspace-dock\s*\{[^}]*background:\s*var\(--surface-floating-soft\)/);
+  assert.match(html, /function renderMarkdownLineView\(text, options = \{\}\)/);
+  assert.match(html, /id="docReader" class="doc-editor markdown-view"/);
+  assert.match(html, /data-heading-text/);
+  assert.match(html, /\.markdown-line\.h1\s*\{[^}]*color:\s*var\(--file-h1\)/);
+  assert.match(html, /\.markdown-inline-code/);
+  assert.match(html, /function scrollMarkdownViewToNeedle\(needle, type = "text"\)/);
+  assert.match(html, /function visibleMarkdownReader\(\)/);
+  assert.match(html, /const reader = visibleMarkdownReader\(\);/);
+  assert.match(html, /visibleMarkdownReader\(\) \|\| activeEditor\(\) \|\| el\("viewer"\)/);
+});
+
+test("normal and startup files open directly editable while review mode owns verification", () => {
+  const html = renderAppHtml();
+
+  assert.match(html, /async function selectFile\(path, options = \{\}\)[\s\S]*state\.dirty = false;\s*state\.mode = "edit";/);
+  assert.match(html, /async function selectStartupContextFile\(order\)[\s\S]*state\.dirty = false;\s*state\.mode = "edit";/);
+  assert.match(html, /async function selectStartupSkillFile\(folderOrder, skillName\)[\s\S]*state\.dirty = false;\s*state\.mode = "edit";/);
+  assert.match(html, /state\.mode === "edit"\s*\?\s*'<textarea id="docEditor"/);
+  assert.match(html, /writeSelectedDiskFile\(content\)/);
+  assert.match(html, /api\("\/api\/startup-context\/file", \{/);
+  assert.match(html, /api\("\/api\/startup-skills\/file", \{/);
+  assert.match(html, /reviewAction: isStartupFile \? null : reviewActionForSelectedFile\(\)/);
+  assert.match(html, /deletable: !isStartupFile/);
+  assert.match(html, /el\("viewer"\)\.hidden = false;\s*el\("editor"\)\.hidden = true;\s*renderPlanetSystem\(\);/);
+  assert.doesNotMatch(html, /data-file-mode-toggle/);
+});
+
+test("verification actions are limited to files opened from the review queue and can be undone", () => {
+  const html = renderAppHtml();
+
+  assert.match(html, /reviewModePath: null, reviewModeStatus: null/);
+  assert.match(html, /selectFile\(button\.dataset\.reviewPath, \{ revealInExplorer: !isNarrowLayout\(\), reviewMode: true \}\)/);
+  assert.match(html, /state\.reviewModePath = options\.reviewMode \? path : null;/);
+  assert.match(html, /function reviewActionForSelectedFile\(\)/);
+  assert.match(html, /if \(!state\.selected \|\| state\.reviewModePath !== state\.selected\) return null;/);
+  assert.match(html, /status: "unverified", label: "Mark unverified"/);
+  assert.match(html, /data-file-review-decision/);
+  assert.match(html, /applyReviewDecision\(state\.selected, event\.currentTarget\.dataset\.fileReviewDecision\)/);
+  assert.match(html, /status === "unverified"/);
+  assert.doesNotMatch(html, /selectedFileNeedsReview/);
+  assert.doesNotMatch(html, /data-file-verify/);
+});
+
 test("save preserves the editor scroll position after rerendering", () => {
   const html = renderAppHtml();
 
@@ -714,6 +975,7 @@ test("save preserves the editor scroll position after rerendering", () => {
   assert.match(html, /renderViewer\(\);\s*restoreEditorViewState\(viewState\);/);
   assert.match(html, /function isScrollableY\(element\)/);
   assert.match(html, /function activeDocumentScrollTarget\(\)/);
+  assert.match(html, /const documentSurface = document\.querySelector\("\.external-review-doc"\) \|\| el\("docEditor"\) \|\| el\("docReader"\);/);
   assert.match(html, /if \(isScrollableY\(documentSurface\)\) return documentSurface;/);
   assert.match(html, /if \(isScrollableY\(el\("viewer"\)\)\) return el\("viewer"\);/);
   assert.match(html, /function externalReviewBlockElement\(blockId\)/);
@@ -728,6 +990,7 @@ test("save preserves the editor scroll position after rerendering", () => {
   assert.match(html, /event\.stopPropagation\(\)/);
   assert.match(html, /anchorTop/);
   assert.match(html, /document\.querySelector\("\.external-review-doc"\)/);
+  assert.match(html, /snapshot\.documentScrollTarget === "docReader"/);
   assert.match(html, /documentScrollTop/);
   assert.match(html, /editorScrollTop/);
   assert.match(html, /viewerScrollTop/);
@@ -755,6 +1018,26 @@ test("Ctrl or Cmd S saves the selected dirty file", () => {
   assert.match(html, /if \(handleSaveShortcut\(event\)\) return;/);
 });
 
+test("rendered app exposes agent collaboration hooks without human review bypass", () => {
+  const html = renderAppHtml();
+
+  assert.match(html, /id="agentToast"/);
+  assert.match(html, /function buildSessionStatePayload\(\)/);
+  assert.match(html, /function activeEditorCaretLineIndex\(editor\)/);
+  assert.match(html, /api\("\/api\/session-state"/);
+  assert.match(html, /function startAgentCommandPolling\(\)/);
+  assert.match(html, /api\("\/api\/agent\/command"\)/);
+  assert.match(html, /function executeAgentCommand\(command\)/);
+  assert.match(html, /function applyAgentScrollTarget\(command\)/);
+  assert.match(html, /function renderAgentAnnotations\(path\)/);
+  assert.match(html, /api\("\/api\/agent\/annotations\?path="/);
+  assert.match(html, /api\("\/api\/agent\/annotations\/resolve"/);
+  assert.match(html, /\.agent-annotation/);
+  assert.match(html, /\.agent-toast/);
+  assert.doesNotMatch(html, /agent\/verify/);
+  assert.doesNotMatch(html, /agent[\s\S]{0,120}\/api\/docqa\/review/);
+});
+
 test("disk changes stay pending for review instead of silently reloading the open file", () => {
   const html = renderAppHtml();
 
@@ -767,19 +1050,33 @@ test("disk changes stay pending for review instead of silently reloading the ope
   assert.match(html, /data-external-block-decision="accept"/);
   assert.match(html, /data-external-block-decision="reject"/);
   assert.match(html, /data-external-block-id/);
+  assert.match(html, /data-external-review-all="accept"/);
+  assert.match(html, /data-external-review-all="reject"/);
   assert.match(html, />OK<\/button>/);
   assert.match(html, />x<\/button>/);
+  assert.match(html, />Accept all<\/button>/);
+  assert.match(html, />Reject all<\/button>/);
   assert.match(html, /buildExternalReviewBlocks/);
   assert.match(html, /chooseExternalReviewBlock/);
+  assert.match(html, /function chooseAllExternalReviewBlocks\(decision\)/);
+  assert.match(html, /function wireExternalReviewAllButtons\(root = document\)/);
   assert.match(html, /updateExternalReviewBlockInPlace\(blocks, blockId, viewState\)/);
+  assert.match(html, /function updateExternalReviewDocumentInPlace\(blocks\)/);
+  assert.match(html, /settleExternalReviewBlocks\(\[blockId\], viewState, \{ restoreScroll: false \}\)/);
+  assert.match(html, /settleExternalReviewBlocks\(\[blockId\], viewState, \{ restoreScroll: false \}\);[\s\S]*if \(pending\.length\)/);
+  assert.match(html, /const updatedInPlace = updateExternalReviewBlockInPlace\(blocks, blockId, viewState\);[\s\S]*if \(!updatedInPlace\) renderViewer\(\);\s*updateHeader\(\);/);
   assert.match(html, /externalReviewRowsForDecision/);
   assert.match(html, /external-review-block context resolved/);
   assert.match(html, /external-review-block context resolved [^"]*empty/);
-  assert.match(html, /external-review-resolved-label/);
-  assert.match(html, /external-review-placeholder/);
+  assert.doesNotMatch(html, /external-review-resolved-label/);
+  assert.doesNotMatch(html, /external-review-placeholder/);
+  assert.doesNotMatch(html, /Change rejected/);
+  assert.doesNotMatch(html, /Change accepted/);
   assert.match(html, /computeExternalReviewContent/);
   assert.match(html, /renderExternalReviewDocument/);
   assert.match(html, /renderExternalReviewActions/);
+  assert.match(html, /summary\.pending > 1 \|\| summary\.pendingLines > 1/);
+  assert.match(html, /pendingBlock && \(row\.type === "add" \|\| row\.type === "del"\)/);
   assert.match(html, /state\.externalChange = \{[\s\S]*reviewDecisions: \{\},[\s\S]*\};\s*state\.selectedDiff = diff;\s*state\.diffCollapsed = true;/);
   assert.match(html, /const viewState = captureEditorViewState\(\);[\s\S]*state\.externalChange = \{[\s\S]*renderViewer\(\);\s*restoreEditorViewState\(viewState\);/);
   assert.match(html, /const previousHeight = current\.getBoundingClientRect\(\)\.height;/);
@@ -793,13 +1090,17 @@ test("disk changes stay pending for review instead of silently reloading the ope
   assert.match(html, /if \(!finishExternalReviewPanelInPlace\(viewState\)\) \{[\s\S]*renderViewer\(\);\s*restoreEditorViewState\(viewState\);/);
   assert.match(html, /actions\.outerHTML = renderFileActionButtons\(\{/);
   assert.match(html, /function settleFinishedExternalReview\(viewState\)/);
+  assert.match(html, /function settleExternalReviewBlocks\(blocksOrIds, viewState, options = \{\}\)/);
+  assert.match(html, /const restoreScroll = options\.restoreScroll !== false/);
+  assert.match(html, /!block\.classList\.contains\("settling"\) && !block\.classList\.contains\("settled"\)/);
+  assert.match(html, /block\.classList\.add\("settled"\)/);
   assert.match(html, /window\.setTimeout\(\(\) => settleFinishedExternalReview\(viewState\), 520\)/);
   assert.match(html, /\.external-review-block\.resolved\.settling\s*\{[^}]*height 2s ease[^}]*min-height 2s ease/);
   assert.match(html, /block\.classList\.add\("settling"\)/);
   assert.match(html, /const targetHeight = block\.classList\.contains\("empty"\) \? 0 : Math\.ceil\(block\.scrollHeight\);/);
   assert.match(html, /window\.setTimeout\(\(\) => \{[\s\S]*block\.classList\.remove\("settling"\)[\s\S]*\}, 2050\);/);
-  assert.match(html, /\.external-review-doc\.settled \.external-review-resolved-label,[^}]*\.external-review-doc\.settled \.external-review-placeholder\s*\{\s*display:\s*none/);
-  assert.match(html, /\.external-review-doc\.settled \.external-review-block\.resolved\.empty\s*\{[^}]*min-height:\s*0/);
+  assert.match(html, /\.external-review-doc\.settled \.external-review-block\.resolved\.empty/);
+  assert.match(html, /\.external-review-block\.resolved\.settled\.empty\s*\{[^}]*min-height:\s*0/);
   assert.match(html, /resetExternalChangeState\(\);\s*\/\/ Returning from inline review should keep[\s\S]*state\.diffCollapsed = true;/);
   assert.match(html, /block\.decision === "accept"[\s\S]*row\.type !== "del"/);
   assert.match(html, /block\.decision === "reject"[\s\S]*row\.type !== "add"/);
@@ -807,6 +1108,18 @@ test("disk changes stay pending for review instead of silently reloading the ope
   assert.doesNotMatch(html, /external-change-panel/);
   assert.match(html, /file changed on disk · review before applying/);
   assert.match(html, /function blockPendingExternalChange/);
+  assert.match(html, /if \(blockPendingExternalChange\(delta < 0 \? "before going back" : "before going forward"\)\) return;/);
+  assert.match(html, /const targetBlockId = closestExternalReviewChangeBlockId\(\);/);
+  assert.match(html, /const focus = \(\) => focusExternalReviewChange\(targetBlockId\) \|\| focusNearestExternalReviewChange\(\);/);
+  assert.match(html, /review the highlighted change/);
+  assert.match(html, /function focusNearestExternalReviewChange\(\)/);
+  assert.match(html, /function focusExternalReviewChange\(blockId\)/);
+  assert.match(html, /function closestExternalReviewChangeElement\(\)/);
+  assert.match(html, /target\.scrollIntoView\(\{ behavior: "smooth", block: "center", inline: "nearest" \}\)/);
+  assert.match(html, /\.external-review-block\.attention/);
+  assert.match(html, /@keyframes externalReviewAttention/);
+  assert.match(html, /if \(!state\.dirty && !activeExternalChange\(\)\) return;/);
+  assert.match(html, /if \(activeExternalChange\(\)\) focusNearestExternalReviewChange\(\);/);
   assert.match(html, /apply or reject before saving/);
   assert.doesNotMatch(html, /setStatus\("reloaded from disk"\);\n  \} catch \(error\) \{\n    setStatus\(error\.message\);\n  \}\n\}/);
 });

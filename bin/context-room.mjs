@@ -2,7 +2,20 @@
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { buildAgentBrief, buildContextRoomDoctorReport, buildDocQaReport, createMemoryServer, initializeContextRoomProject, readMemoryWebappSettings, CONFIG_FILE } from "../src/context_room.mjs";
+import {
+  appendAgentAnnotation,
+  buildAgentBrief,
+  buildAgentReviewQueue,
+  buildContextRoomDoctorReport,
+  buildDocQaReport,
+  createMemoryServer,
+  initializeContextRoomProject,
+  readAgentAnnotations,
+  readCollaborationSessionState,
+  readMemoryWebappSettings,
+  writeAgentCommand,
+  CONFIG_FILE,
+} from "../src/context_room.mjs";
 
 function parseArgs(argv) {
   const args = { _: [] };
@@ -29,7 +42,7 @@ function splitList(value) {
 }
 
 function usage() {
-  return `Context Room\n\nUsage:\n  context-room init [--title "My Project"] [--allow docs/,src/] [--watch docs/]\n  context-room start [--port 4317] [--root .]\n  context-room doctor [--root .] [--strict]\n  context-room guard [--root .] [--profile review-only|strict|advisory]\n  context-room brief [--root .] [--task "what the agent will do"] [--limit 12]\n  context-room install-hook [--root .]\n\nConfig: ${CONFIG_FILE}\n`;
+  return `Context Room\n\nUsage:\n  context-room init [--title "My Project"] [--allow docs/,src/] [--watch docs/]\n  context-room start [--port 4317] [--root .]\n  context-room doctor [--root .] [--strict]\n  context-room guard [--root .] [--profile review-only|strict|advisory]\n  context-room brief [--root .] [--task "what the agent will do"] [--limit 12]\n  context-room agent state [--root .]\n  context-room agent open [--root .] [--path docs/INDEX.md] [--view hub|settings|file|diff] [--heading "Purpose"] [--text "needle"] [--percent 50]\n  context-room agent annotate --root . --path docs/INDEX.md --note "Human-facing note" [--target "text"]\n  context-room agent queue [--root .]\n  context-room install-hook [--root .]\n\nConfig: ${CONFIG_FILE}\n`;
 }
 
 const args = parseArgs(process.argv.slice(2));
@@ -79,7 +92,7 @@ if (command === "guard") {
   const blockingHealth = doctor ? doctor.issues.filter((issue) => ["critical", "high"].includes(issue.severity)) : [];
   const shouldBlock = profile !== "advisory" && (report.queue.length || (profile === "strict" && blockingHealth.length));
   if (report.queue.length) {
-    console.error("Unverified watched documentation changes:");
+    console.error("Context Room guard blocked this commit: watched documentation changes need human review:");
     for (const item of report.queue) console.error(`- ${item.gitStatus.trim() || "changed"} ${item.path}`);
   }
   if (blockingHealth.length) {
@@ -87,7 +100,10 @@ if (command === "guard") {
     for (const issue of blockingHealth.slice(0, 20)) console.error(`- [${issue.severity}] ${issue.path ? `${issue.path}: ` : ""}${issue.message}`);
   }
   if (shouldBlock) {
-    console.error("\nOpen Context Room, fix health issues if strict, review diffs, and mark watched docs verified before committing.");
+    console.error(
+      "\nOpen Context Room and have the user review each diff before committing. Agents must not mark files verified on the user's behalf.",
+    );
+    if (blockingHealth.length) console.error("If strict health issues are listed, fix them before asking the user to verify.");
     process.exit(1);
   }
   if (profile === "advisory" && (report.queue.length || blockingHealth.length)) {
@@ -101,6 +117,56 @@ if (command === "guard") {
 if (command === "brief") {
   process.stdout.write(buildAgentBrief(root, { task: args.task || "", limit: Number(args.limit || 12) }));
   process.exit(0);
+}
+
+if (command === "agent") {
+  const action = args._[1] || "state";
+  if (action === "state") {
+    console.log(JSON.stringify(readCollaborationSessionState(root), null, 2));
+    process.exit(0);
+  }
+  if (action === "queue" || action === "review-queue") {
+    console.log(JSON.stringify(buildAgentReviewQueue(root), null, 2));
+    process.exit(0);
+  }
+  if (action === "open" || action === "navigate" || action === "scroll" || action === "highlight") {
+    const targetType = args.heading ? "heading" : args.text ? "text" : args.percent !== undefined ? "percent" : "";
+    const targetValue = args.heading || args.text || args.percent || "";
+    const command = writeAgentCommand(root, {
+      action: action === "open" ? "navigate" : action,
+      view: args.view || (args.path ? "file" : "hub"),
+      path: args.path || "",
+      targetType,
+      targetValue,
+      highlight: args.highlight !== false,
+      message: args.message || "",
+      source: "agent-cli",
+    });
+    console.log(JSON.stringify({ command }, null, 2));
+    process.exit(0);
+  }
+  if (action === "annotate") {
+    if (!args.path || !args.note) {
+      console.error("Usage: context-room agent annotate --root . --path docs/INDEX.md --note \"Human-facing note\" [--target \"text\"]");
+      process.exit(1);
+    }
+    const annotation = appendAgentAnnotation(root, {
+      path: args.path,
+      note: args.note,
+      target: args.target || args.heading || args.text || "",
+      targetType: args.heading ? "heading" : args.text || args.target ? "text" : "file",
+      source: "agent-cli",
+    });
+    console.log(JSON.stringify({ annotation }, null, 2));
+    process.exit(0);
+  }
+  if (action === "annotations") {
+    console.log(JSON.stringify(readAgentAnnotations(root, args.path || ""), null, 2));
+    process.exit(0);
+  }
+  console.error(`Unknown agent command: ${action}\n`);
+  console.error(usage());
+  process.exit(1);
 }
 
 if (command === "install-hook") {
