@@ -28,6 +28,13 @@
       "uniqueItems": true,
       "default": []
     },
+    "reviewPaths": {
+      "type": "array",
+      "description": "Important files or folders that stay in the review queue until a human verifies the current content, even when there is no Git diff.",
+      "items": { "$ref": "#/$defs/projectPath" },
+      "uniqueItems": true,
+      "default": []
+    },
     "bestPractices": {
       "type": "array",
       "description": "Short documentation best practices shown in the Context Room hub.",
@@ -64,7 +71,7 @@
           "type": "array",
           "items": { "type": "string", "minLength": 1 },
           "uniqueItems": true,
-          "default": [".codex/skills", ".agents/skills", "skills"]
+          "default": [".codex/skills", "skills"]
         }
       }
     },

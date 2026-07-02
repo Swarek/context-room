@@ -25,7 +25,7 @@ const HERMES_CRON_JOBS_FILE = "~/.hermes/cron/jobs.json";
 const HERMES_CRON_JOBS_FOLDER = "~/.hermes/cron/jobs/";
 const HERMES_CRON_MD_FOLDER = "~/.hermes/cron/jobs-md/";
 const DEFAULT_STARTUP_CONTEXT = { enabled: false, fileNames: ["AGENTS.md", "CLAUDE.md"] };
-const DEFAULT_STARTUP_SKILLS = { enabled: true, folderNames: [".codex/skills", ".agents/skills", "skills"] };
+const DEFAULT_STARTUP_SKILLS = { enabled: true, folderNames: [".codex/skills", "skills"] };
 export const FILE_THEME_OPTIONS = [
   { id: "context-room", label: "Context Room", description: "Default dark theme" },
   { id: "vscode-dark", label: "VS Code Dark", description: "Quiet editor contrast" },
@@ -43,6 +43,12 @@ export const DOCUMENTATION_BEST_PRACTICES = [
   "Update or delete stale context instead of accumulating contradictory prose.",
 ];
 export const DEFAULT_MARKDOWN_TEMPLATES = [
+  {
+    id: "blank",
+    title: "Blank",
+    description: "Start with an empty Markdown file.",
+    content: "",
+  },
   {
     id: "agents",
     title: "Agent instructions",
@@ -298,7 +304,7 @@ export function isAllowedMemoryPath(relPath, settings = defaultMemoryWebappSetti
 
 export function resolveMemoryPath(root, relPath) {
   const normalized = normalizeRelPath(relPath);
-  const settings = readMemoryWebappSettings(root);
+  const settings = effectiveMemoryWebappSettings(root);
   if (!isAllowedMemoryPath(normalized, settings)) {
     throw new Error(`Path not allowed in context room: ${relPath}`);
   }
@@ -312,8 +318,18 @@ export function resolveMemoryPath(root, relPath) {
   return resolvedPath;
 }
 
-export function listMemoryFiles(root = process.cwd()) {
-  const settings = readMemoryWebappSettings(root);
+export function listMemoryFiles(root = process.cwd(), { externalRoots = [] } = {}) {
+  const baseSettings = effectiveMemoryWebappSettings(root);
+  const activeRepoRoots = sanitizePathList((externalRoots || []).filter((item) => !normalizeRelPath(String(item || "")).startsWith("~")))
+    .map((item) => item.endsWith("/") ? item : item + "/");
+  const activeExternalRoots = sanitizeExternalPathList(externalRoots || []);
+  const settings = activeRepoRoots.length || activeExternalRoots.length
+    ? {
+        ...baseSettings,
+        allowedPaths: activeRepoRoots.length ? appendUniquePaths(baseSettings.allowedPaths || [], activeRepoRoots) : baseSettings.allowedPaths,
+        externalAllowedPaths: activeExternalRoots.length ? appendUniquePaths(baseSettings.externalAllowedPaths || [], activeExternalRoots) : baseSettings.externalAllowedPaths,
+      }
+    : baseSettings;
   const byPath = new Map();
   if (settings.integrations?.hermes) {
     syncCronMarkdownSources(root);
@@ -330,7 +346,7 @@ export function listMemoryFiles(root = process.cwd()) {
     const externalPath = resolveExternalPath(normalizeRelPath(prefix));
     if (externalPath && fs.existsSync(externalPath)) {
       const stats = fs.statSync(externalPath);
-      const found = stats.isDirectory() ? walkExternalTextFiles(externalPath, externalPath, normalizeRelPath(prefix).replace(/\/$/, "") + "/") : [normalizeRelPath(prefix)];
+      const found = stats.isDirectory() ? walkExternalTextFiles(externalPath, externalPath, normalizeRelPath(prefix).replace(/\/$/, "") + "/", settings) : [normalizeRelPath(prefix)];
       for (const rel of found) {
         if (byPath.has(rel) || !isAllowedMemoryPath(rel, settings)) continue;
         byPath.set(rel, {
@@ -358,7 +374,7 @@ export function listMemoryFiles(root = process.cwd()) {
     for (const prefix of ALLOWED_EXTERNAL_PREFIXES) {
       const absDir = resolveExternalPath(prefix);
       if (!absDir || !fs.existsSync(absDir)) continue;
-      for (const rel of walkExternalTextFiles(absDir, absDir, prefix)) {
+      for (const rel of walkExternalTextFiles(absDir, absDir, prefix, settings)) {
         if (byPath.has(rel)) continue;
         byPath.set(rel, {
           path: rel,
@@ -367,6 +383,22 @@ export function listMemoryFiles(root = process.cwd()) {
           impact: "Skill installed in Hermes. Available globally for sessions in the current profile.",
         });
       }
+    }
+  }
+  for (const prefix of sanitizeExternalPathList(externalRoots)) {
+    const clean = normalizeRelPath(prefix).replace(/\/$/, "");
+    if (!isAllowedExternalFolderPath(clean, settings) && !isAllowedMemoryPath(clean, settings)) continue;
+    const absDir = resolveExternalPath(clean);
+    if (!absDir || !fs.existsSync(absDir)) continue;
+    const stats = fs.statSync(absDir);
+    const found = stats.isDirectory() ? walkExternalTextFiles(absDir, absDir, clean + "/", settings) : [clean];
+    for (const rel of found) {
+      if (byPath.has(rel) || !isAllowedMemoryPath(rel, settings)) continue;
+      byPath.set(rel, {
+        path: rel,
+        label: path.basename(rel),
+        category: categoryForPath(rel),
+      });
     }
   }
 
@@ -446,6 +478,7 @@ export function listStartupContextFiles(root = process.cwd(), settings = readMem
         fileName: item.fileName,
         absolutePath: item.abs,
         displayPath: displayPath(item.abs),
+        explorerPath: memoryPathForAbsolutePath(root, item.abs),
         kind: "startup-context",
       },
     };
@@ -490,15 +523,13 @@ export function listStartupSkillFolders(root = process.cwd(), settings = readMem
       const abs = path.join(dir, folderName);
       if (seen.has(abs) || !fs.existsSync(abs) || !fs.statSync(abs).isDirectory()) continue;
       seen.add(abs);
-      const skills = fs.readdirSync(abs, { withFileTypes: true })
-        .filter((entry) => entry.isDirectory() && !entry.name.startsWith(".") && fs.existsSync(path.join(abs, entry.name, "SKILL.md")))
-        .map((entry) => entry.name)
-        .sort((a, b) => a.localeCompare(b, "fr"));
-      const looseFiles = fs.readdirSync(abs, { withFileTypes: true })
-        .filter((entry) => entry.isFile() && entry.name.endsWith(".md") && entry.name !== "README.md")
-        .map((entry) => entry.name.replace(/\.md$/i, ""))
-        .sort((a, b) => a.localeCompare(b, "fr"));
-      found.push({ abs, dir, folderName, skills: [...new Set([...skills, ...looseFiles])] });
+      found.push({ abs, dir, folderName, skills: startupSkillNamesInFolder(abs), readOnly: false });
+
+      for (const nested of startupSkillNamespaceFolders(abs, folderName)) {
+        if (seen.has(nested.abs)) continue;
+        seen.add(nested.abs);
+        found.push({ ...nested, dir, readOnly: true });
+      }
     }
   }
   return found.map((item, index) => ({
@@ -508,7 +539,88 @@ export function listStartupSkillFolders(root = process.cwd(), settings = readMem
     displayPath: displayPath(item.abs),
     skillCount: item.skills.length,
     skills: item.skills.slice(0, 60),
+    readOnly: Boolean(item.readOnly),
   }));
+}
+
+function startupSkillNamesInFolder(abs) {
+  const entries = fs.readdirSync(abs, { withFileTypes: true });
+  const skills = entries
+    .filter((entry) => entry.isDirectory() && !entry.name.startsWith(".") && fs.existsSync(path.join(abs, entry.name, "SKILL.md")))
+    .map((entry) => entry.name)
+    .sort((a, b) => a.localeCompare(b, "fr"));
+  const looseFiles = entries
+    .filter((entry) => entry.isFile() && entry.name.endsWith(".md") && entry.name !== "README.md")
+    .map((entry) => entry.name.replace(/\.md$/i, ""))
+    .sort((a, b) => a.localeCompare(b, "fr"));
+  return [...new Set([...skills, ...looseFiles])];
+}
+
+function startupSkillNamespaceFolders(abs, folderName) {
+  return fs.readdirSync(abs, { withFileTypes: true })
+    .filter((entry) => entry.isDirectory() && entry.name.startsWith("."))
+    .map((entry) => {
+      const nestedAbs = path.join(abs, entry.name);
+      return {
+        abs: nestedAbs,
+        folderName: `${folderName}/${entry.name}`,
+        skills: startupSkillNamesInFolder(nestedAbs),
+      };
+    })
+    .filter((item) => item.skills.length)
+    .sort((a, b) => a.folderName.localeCompare(b.folderName, "fr"));
+}
+
+function effectiveMemoryWebappSettings(root = process.cwd()) {
+  const settings = readMemoryWebappSettings(root);
+  return withStartupSkillExternalPaths(root, settings);
+}
+
+function withStartupSkillExternalPaths(root, settings = defaultMemoryWebappSettings()) {
+  const startupSkillPaths = startupSkillExternalAllowedPaths(root, settings);
+  return {
+    ...settings,
+    externalAllowedPaths: appendUniquePaths(settings.externalAllowedPaths || [], startupSkillPaths),
+  };
+}
+
+function startupSkillExternalAllowedPaths(root, settings = readMemoryWebappSettings(root)) {
+  return listStartupSkillFolders(root, settings).flatMap((folder) => {
+    const folderRoot = path.resolve(folder.absolutePath);
+    return (folder.skills || []).map((skillName) => {
+      const skillDir = path.resolve(folderRoot, skillName);
+      const skillFile = path.resolve(folderRoot, `${skillName}.md`);
+      if (fs.existsSync(path.join(skillDir, "SKILL.md"))) {
+        const memoryPath = memoryPathForAbsolutePath(root, skillDir) + "/";
+        return memoryPath.startsWith("~/") ? memoryPath : null;
+      }
+      if (fs.existsSync(skillFile)) {
+        const memoryPath = memoryPathForAbsolutePath(root, skillFile);
+        return memoryPath.startsWith("~/") ? memoryPath : null;
+      }
+      return null;
+    }).filter(Boolean);
+  });
+}
+
+function startupSkillExplorerRootPath(root = process.cwd(), folderOrder = 0, skillName = "", settings = readMemoryWebappSettings(root)) {
+  const { folder, requestedName, abs } = resolveStartupSkillFile(root, folderOrder, skillName, settings);
+  if (path.basename(abs) !== "SKILL.md") return memoryPathForAbsolutePath(root, abs);
+  return memoryPathForAbsolutePath(root, path.join(folder.absolutePath, requestedName)) + "/";
+}
+
+function startupContextExplorerPath(root = process.cwd(), order = 0, settings = readMemoryWebappSettings(root)) {
+  const found = resolveStartupContextFile(root, order, settings);
+  if (!found?.startupContext?.absolutePath) return "";
+  return memoryPathForAbsolutePath(root, found.startupContext.absolutePath);
+}
+
+function memoryPathForAbsolutePath(root, absPath) {
+  const resolvedRoot = path.resolve(root);
+  const resolvedPath = path.resolve(absPath);
+  if (resolvedPath === resolvedRoot) return "";
+  if (resolvedPath.startsWith(`${resolvedRoot}${path.sep}`)) return path.relative(resolvedRoot, resolvedPath).replaceAll(path.sep, "/");
+  return displayPath(resolvedPath);
 }
 
 export function readStartupSkillFile(root = process.cwd(), folderOrder = 0, skillName = "", settings = readMemoryWebappSettings(root)) {
@@ -529,24 +641,78 @@ export function readStartupSkillFile(root = process.cwd(), folderOrder = 0, skil
       order: `${folder.order}:${requestedName}`,
       fileName,
       displayPath: displayPath(abs),
+      explorerPath: memoryPathForAbsolutePath(root, abs),
       kind: "startup-skill",
       folder: folder.displayPath,
       skillName: requestedName,
+      explorerRoot: startupSkillExplorerRootPath(root, folder.order, requestedName, settings).replace(/\/$/, ""),
     },
   };
 }
 
 export function writeStartupSkillFile(root = process.cwd(), folderOrder = 0, skillName = "", content = "", settings = readMemoryWebappSettings(root)) {
   const { folder, requestedName, abs } = resolveStartupSkillFile(root, folderOrder, skillName, settings);
+  if (folder.readOnly) throw new Error(`Startup skill folder is read-only: ${folder.displayPath}`);
   const fileName = path.basename(abs) === "SKILL.md" ? `${requestedName}/SKILL.md` : path.basename(abs);
   return writeAbsoluteStartupFile(abs, content, {
     order: `${folder.order}:${requestedName}`,
     fileName,
     displayPath: displayPath(abs),
+    explorerPath: memoryPathForAbsolutePath(root, abs),
     kind: "startup-skill",
     folder: folder.displayPath,
     skillName: requestedName,
+    explorerRoot: startupSkillExplorerRootPath(root, folder.order, requestedName, settings).replace(/\/$/, ""),
   });
+}
+
+export function createStartupSkillFile(root = process.cwd(), folderOrder = 0, skillName = "", settings = readMemoryWebappSettings(root)) {
+  const normalizedOrder = Number(folderOrder);
+  const folder = listStartupSkillFolders(root, settings).find((item) => item.order === normalizedOrder);
+  if (!folder) throw new Error(`Startup skill folder not found: ${folderOrder}`);
+  if (folder.readOnly) throw new Error(`Startup skill folder is read-only: ${folder.displayPath}`);
+  const requestedName = normalizeStartupSkillName(skillName);
+  const folderAbs = path.resolve(folder.absolutePath);
+  const skillDir = path.resolve(folderAbs, requestedName);
+  if (!skillDir.startsWith(`${folderAbs}${path.sep}`)) throw new Error(`Startup skill path escapes folder: ${skillName}`);
+  if (fs.existsSync(skillDir) || fs.existsSync(`${skillDir}.md`)) throw new Error(`Startup skill already exists: ${requestedName}`);
+  fs.mkdirSync(skillDir, { recursive: false });
+  const abs = path.join(skillDir, "SKILL.md");
+  fs.writeFileSync(abs, startupSkillTemplate(requestedName), "utf8");
+  return readStartupSkillFile(root, normalizedOrder, requestedName, settings);
+}
+
+export function deleteStartupSkill(root = process.cwd(), folderOrder = 0, skillName = "", settings = readMemoryWebappSettings(root)) {
+  const { folder, requestedName, abs } = resolveStartupSkillFile(root, folderOrder, skillName, settings);
+  if (folder.readOnly) throw new Error(`Startup skill folder is read-only: ${folder.displayPath}`);
+  const folderAbs = path.resolve(folder.absolutePath);
+  const resolvedAbs = path.resolve(abs);
+  if (!resolvedAbs.startsWith(`${folderAbs}${path.sep}`)) throw new Error(`Startup skill path escapes folder: ${skillName}`);
+  const skillDir = path.resolve(folderAbs, requestedName);
+  const isDirectorySkill = path.basename(resolvedAbs) === "SKILL.md" && path.dirname(resolvedAbs) === skillDir;
+  const backupSourceAbs = isDirectorySkill ? skillDir : resolvedAbs;
+  const backupRel = buildBackupPath(displayPath(backupSourceAbs));
+  const backupAbs = path.join(root, backupRel);
+  fs.mkdirSync(path.dirname(backupAbs), { recursive: true });
+  if (isDirectorySkill) {
+    fs.cpSync(backupSourceAbs, backupAbs, { recursive: true, errorOnExist: false });
+    fs.rmSync(skillDir, { recursive: true, force: false });
+  } else {
+    fs.copyFileSync(resolvedAbs, backupAbs);
+    fs.unlinkSync(resolvedAbs);
+  }
+  return { folder: folder.order, skillName: requestedName, deleted: true, backupPath: backupRel };
+}
+
+function normalizeStartupSkillName(skillName) {
+  const clean = String(skillName || "").toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "").replace(/[^a-z0-9_-]+/g, "-").replace(/^-+|-+$/g, "");
+  if (!clean) throw new Error("Skill name is required");
+  if (!/^[a-z0-9][a-z0-9_-]*$/.test(clean) || isBlockedPath(clean)) throw new Error(`Invalid startup skill name: ${skillName}`);
+  return clean;
+}
+
+function startupSkillTemplate(skillName) {
+  return `---\nname: ${skillName}\ndescription: Describe when agents should use this skill.\n---\n\n# ${skillName}\n\n## Use when\n\n- \n\n## Goal\n\n\n## Do\n\n1. \n\n## Validate\n\n- \n\n## Stop when\n\n- \n\n## Output\n\n- \n\n## Anti-patterns\n\n- \n`;
 }
 
 function resolveStartupContextFile(root, order, settings = readMemoryWebappSettings(root)) {
@@ -615,6 +781,7 @@ function publicStartupContextFile(file) {
       order: file.startupContext.order,
       fileName: file.startupContext.fileName,
       displayPath: file.startupContext.displayPath,
+      explorerPath: file.startupContext.explorerPath,
       kind: "startup-context",
     },
   };
@@ -657,23 +824,70 @@ export function writeMemoryFile(root, relPath, content) {
 
 export function createMarkdownFile(root, { path: relPath, title = "New document", templateId = "context-golden", applyTemplate = false, metadata = {} } = {}) {
   const normalized = normalizeMarkdownTemplateTarget(relPath);
-  const abs = resolveMemoryPath(root, normalized);
+  const settings = effectiveMemoryWebappSettings(root);
+  const alreadyAllowed = isAllowedMemoryPath(normalized, settings);
+  const abs = alreadyAllowed ? resolveMemoryPath(root, normalized) : resolveCreatableRepoPath(root, normalized);
   if (fs.existsSync(abs)) throw new Error(`Markdown file already exists: ${normalized}`);
+  if (!alreadyAllowed) allowCreatedMemoryPath(root, normalized);
   const content = applyTemplate ? renderMarkdownTemplateForPath(root, normalized, { title, templateId, metadata }) : "";
   return writeMemoryFile(root, normalized, content);
 }
 
 export function createFolder(root, { path: relPath } = {}) {
-  const settings = readMemoryWebappSettings(root);
+  const settings = effectiveMemoryWebappSettings(root);
   const normalized = normalizeRelPath(String(relPath || "")).replace(/\/$/, "");
   if (!normalized) throw new Error("Folder path is required");
-  if (!isAllowedFolderPath(normalized, settings)) throw new Error(`Folder path not allowed in context room: ${relPath}`);
+  const alreadyAllowed = isAllowedFolderPath(normalized, settings);
+  const abs = alreadyAllowed ? resolveMemoryFolderPath(root, normalized, settings) : resolveCreatableRepoPath(root, normalized);
+  if (fs.existsSync(abs)) throw new Error(`Folder already exists: ${normalized}`);
+  if (!alreadyAllowed) allowCreatedMemoryPath(root, normalized + "/");
+  fs.mkdirSync(abs, { recursive: true });
+  return { path: normalized + "/", existed: false };
+}
+
+function allowCreatedMemoryPath(root, relPath) {
+  const normalized = normalizeRelPath(String(relPath || ""));
+  const settings = readMemoryWebappSettings(root);
+  const allowedPaths = appendUniquePath(settings.allowedPaths || [], normalized);
+  const watchAllow = appendUniquePath(settings.watchAllow || [], normalized);
+  writeMemoryWebappSettings(root, { ...settings, allowedPaths, watchAllow });
+}
+
+function appendUniquePath(list, relPath) {
+  const normalized = normalizeRelPath(String(relPath || ""));
+  return [...new Set([...(list || []).map((item) => normalizeRelPath(item)), normalized])].filter(Boolean);
+}
+
+function appendUniquePaths(list, relPaths = []) {
+  return [...new Set([...(list || []), ...(relPaths || [])].map((item) => normalizeRelPath(String(item || ""))))].filter(Boolean);
+}
+
+function resolveCreatableRepoPath(root, relPath) {
+  const normalized = normalizeRelPath(String(relPath || "")).replace(/\/$/, "");
+  if (!normalized || normalized.startsWith("../") || normalized.includes("/../") || path.isAbsolute(normalized)) {
+    throw new Error(`Path escapes repository root: ${relPath}`);
+  }
+  if (normalized.startsWith("~")) throw new Error(`External paths cannot be created from the explorer: ${relPath}`);
+  if (isBlockedPath(normalized) || hasSkippedPathSegment(normalized)) throw new Error(`Path not allowed in context room: ${relPath}`);
   const resolvedRoot = path.resolve(root);
   const abs = path.resolve(resolvedRoot, normalized);
   if (abs !== resolvedRoot && !abs.startsWith(`${resolvedRoot}${path.sep}`)) throw new Error(`Path escapes repository root: ${relPath}`);
-  if (fs.existsSync(abs)) throw new Error(`Folder already exists: ${normalized}`);
-  fs.mkdirSync(abs, { recursive: true });
-  return { path: normalized + "/", existed: false };
+  return abs;
+}
+
+function resolveMemoryFolderPath(root, relPath, settings = effectiveMemoryWebappSettings(root)) {
+  const normalized = normalizeRelPath(String(relPath || "")).replace(/\/$/, "");
+  if (!isAllowedFolderPath(normalized, settings)) throw new Error(`Path not allowed in context room: ${relPath}`);
+  const external = resolveExternalPath(normalized);
+  if (external) return external;
+  const resolvedRoot = path.resolve(root);
+  const abs = path.resolve(resolvedRoot, normalized);
+  if (abs !== resolvedRoot && !abs.startsWith(`${resolvedRoot}${path.sep}`)) throw new Error(`Path escapes repository root: ${relPath}`);
+  return abs;
+}
+
+function hasSkippedPathSegment(relPath) {
+  return normalizeRelPath(relPath).split("/").some((part) => SKIP_DIRS.has(part));
 }
 
 export function applyMarkdownTemplateToFile(root, { path: relPath, title = "New document", templateId = "context-golden" } = {}) {
@@ -690,28 +904,31 @@ export function applyMarkdownTemplateToFile(root, { path: relPath, title = "New 
   return writeMemoryFile(root, normalized, content);
 }
 
-export function renderExplorerContextMenuMarkup({ targetPath = "", directory = "", selectionCount = 1, templates = DEFAULT_MARKDOWN_TEMPLATES } = {}) {
+export function renderExplorerContextMenuMarkup({ targetPath = "", directory = "", selectionCount = 1, templates = DEFAULT_MARKDOWN_TEMPLATES, settings = defaultMemoryWebappSettings() } = {}) {
   const normalizedTarget = normalizeRelPath(String(targetPath || ""));
   const cleanDirectory = normalizeRelPath(String(directory || "")).replace(/\/$/, "");
   const directoryLabel = cleanDirectory || "project root";
+  const markdownDirectory = cleanDirectory;
+  const markdownDirectoryLabel = markdownDirectory || "project root";
   const selectionLabel = selectionCount > 1 ? `${selectionCount} selected` : (normalizedTarget || directoryLabel);
   const defaultFolderPath = defaultFolderPathForDirectory(cleanDirectory);
+  const createActions = '<button class="secondary" type="button" data-context-new-file>New file</button>' +
+    '<button class="secondary" type="button" data-context-new-folder>New folder</button>';
   const targetActions = normalizedTarget
     ? '<button class="secondary" type="button" data-context-watch>Watch</button>' +
-      '<button class="secondary" type="button" data-context-new-file>New file</button>' +
-      '<button class="secondary" type="button" data-context-new-folder>New folder</button>' +
+      createActions +
       '<button class="secondary" type="button" data-context-select>Select</button>' +
       '<button class="secondary danger-action" type="button" data-context-delete>Delete</button>'
-    : '<button class="secondary" type="button" data-context-new-file>New file</button>' +
-      '<button class="secondary" type="button" data-context-new-folder>New folder</button>';
+    : createActions;
   return '<div class="explorer-context-title"><span>Actions</span><code>' + escapeHtmlServer(selectionLabel) + '</code></div>' +
     '<div class="explorer-context-actions menu-actions" data-context-action-list>' +
       targetActions +
     '</div>' +
     '<div class="explorer-context-form" data-context-new-file-form hidden>' +
-      '<div class="explorer-context-title"><span>New file</span><code>' + escapeHtmlServer(directoryLabel) + '</code></div>' +
+      '<div class="explorer-context-title"><span>New file</span><code>' + escapeHtmlServer(markdownDirectoryLabel) + '</code></div>' +
       '<label class="explorer-context-label" for="contextMarkdownTitle">Name</label>' +
-      '<input id="contextMarkdownTitle" placeholder="Document title" value="New document" />' +
+      '<input id="contextMarkdownTitle" placeholder="File name" value="New document" />' +
+      '<div id="contextMarkdownError" class="explorer-context-error" hidden></div>' +
       '<div class="explorer-context-actions form-actions"><button id="contextCancelMarkdown" class="secondary" type="button" title="Cancel" aria-label="Cancel">Cancel</button><button id="contextCreateMarkdown" class="primary" type="button">Create</button></div>' +
     '</div>' +
     '<div class="explorer-context-form" data-context-new-folder-form hidden>' +
@@ -765,7 +982,7 @@ function renderMarkdownTemplate(content, values = {}) {
 
 export function deleteMemoryPaths(root, relPaths = []) {
   if (!Array.isArray(relPaths) || relPaths.length === 0) throw new Error("No paths selected for deletion");
-  const settings = readMemoryWebappSettings(root);
+  const settings = effectiveMemoryWebappSettings(root);
   const deleted = [];
   const uniquePaths = [...new Set(relPaths.map((item) => normalizeRelPath(String(item || ""))).filter(Boolean))];
   for (const relPath of uniquePaths) {
@@ -775,7 +992,7 @@ export function deleteMemoryPaths(root, relPaths = []) {
       if (result.deleted) deleted.push(normalized);
       continue;
     }
-    if (isAllowedExternalPath(normalized)) {
+    if (isAllowedExternalPath(normalized, settings)) {
       const abs = resolveExternalPath(normalized);
       if (!abs || !fs.existsSync(abs)) continue;
       const stats = fs.statSync(abs);
@@ -785,10 +1002,10 @@ export function deleteMemoryPaths(root, relPaths = []) {
         continue;
       }
       if (!stats.isDirectory()) throw new Error(`Not a file or folder: ${relPath}`);
-      const prefix = externalPrefixForPath(normalized);
+      const prefix = externalPrefixForPath(normalized, settings);
       const baseDir = resolveExternalPath(prefix);
       if (!prefix || !baseDir) throw new Error(`Path not allowed in context room: ${relPath}`);
-      const files = walkExternalTextFiles(abs, baseDir, prefix).filter((file) => isAllowedMemoryPath(file, settings));
+      const files = walkExternalTextFiles(abs, baseDir, prefix, settings).filter((file) => isAllowedMemoryPath(file, settings));
       for (const file of files.sort((a, b) => b.length - a.length)) {
         const fileAbs = resolveExternalPath(file);
         if (fileAbs && fs.existsSync(fileAbs)) {
@@ -1673,6 +1890,10 @@ export function buildConfigDiagnostics(root = process.cwd(), settings = readMemo
     const covered = (settings.allowedPaths || []).some((allowed) => pathMatchesSetting(relPath, allowed) || pathMatchesSetting(allowed, relPath));
     if (!covered) issues.push({ type: "watch_not_allowed", severity: "high", message: `Watched path is not covered by allowedPaths: ${relPath}.` });
   }
+  for (const relPath of settings.reviewPaths || []) {
+    const covered = (settings.allowedPaths || []).some((allowed) => pathMatchesSetting(relPath, allowed) || pathMatchesSetting(allowed, relPath));
+    if (!covered) issues.push({ type: "review_not_allowed", severity: "high", message: `Review path is not covered by allowedPaths: ${relPath}.` });
+  }
   const duplicateIds = hubInfo.ids.filter((id, index) => hubInfo.ids.indexOf(id) !== index);
   for (const id of [...new Set(duplicateIds)]) issues.push({ type: "duplicate_hub_id", severity: "medium", message: `Duplicate hub section/card id: ${id}.` });
   for (const relPath of hubInfo.paths) {
@@ -1834,15 +2055,16 @@ export function buildDocQaReport(root = process.cwd()) {
   const queue = files.map((file) => {
     const classification = classifyDocPath(file.path);
     const gitStatus = gitStatuses.get(file.path) || "";
+    const reviewRequired = isRequiredReviewPath(file.path, settings);
     const abs = resolveExternalPath(file.path) || path.join(root, file.path);
     const content = file.exists && fs.existsSync(abs) && file.bytes <= MAX_FILE_BYTES ? fs.readFileSync(abs, "utf8") : "";
     const metadata = parseDocMetadata(content, file.path);
     const issues = computeDocIssues({ path: file.path, content, gitStatus, metadata });
     const riskScore = riskScoreFor({ classification, issues, gitStatus });
     const review = currentReviewFor(reviewState.reviews, file.path, content);
-    return { path: file.path, label: file.label, summary: file.summary, updatedAt: file.updatedAt, classification, metadata, gitStatus, issues, riskScore, review };
-  }).filter((item) => item.gitStatus.trim()
-  ).filter((item) => isWatchedPath(item.path, settings)
+    return { path: file.path, label: file.label, summary: file.summary, updatedAt: file.updatedAt, classification, metadata, gitStatus, reviewRequired, issues, riskScore, review };
+  }).filter((item) => item.gitStatus.trim() || item.reviewRequired
+  ).filter((item) => isWatchedPath(item.path, settings) || item.reviewRequired
   ).filter((item) => !(item.review?.status === "verified" && item.review.current)
   ).sort((a, b) => reviewSeverityRank(a) - reviewSeverityRank(b)
     || reviewOrderRank(a.path) - reviewOrderRank(b.path)
@@ -1854,6 +2076,7 @@ export function buildDocQaReport(root = process.cwd()) {
       totalDocs: files.length,
       changedDocs: queue.filter((item) => item.gitStatus.trim()).length,
       needsReview: queue.length,
+      requiredReview: queue.filter((item) => item.reviewRequired && !item.gitStatus.trim()).length,
       critical: queue.filter((item) => item.issues.some((issue) => issue.severity === "critical")).length,
       high: queue.filter((item) => item.issues.some((issue) => issue.severity === "high")).length,
       prompts: files.filter((file) => classifyDocPath(file.path).type === "prompt").length,
@@ -1940,6 +2163,7 @@ export function createDefaultProjectConfig({ title = "Context Room", allowedPath
     title,
     allowedPaths: sanitizePathList(allowedPaths),
     watchAllow: sanitizePathList(watchAllow),
+    reviewPaths: [],
     integrations: { hermes: false },
     appearance: { fileTheme: DEFAULT_FILE_THEME, autoOpenGitDiff: true },
     startupContext: { ...DEFAULT_STARTUP_CONTEXT },
@@ -2215,6 +2439,7 @@ function normalizeMemoryWebappSettings(raw = {}, base = defaultMemoryWebappSetti
     title: String(raw.title || base.title || "Context Room").trim() || "Context Room",
     allowedPaths: sanitizePathList(raw.allowedPaths ?? base.allowedPaths ?? ALLOWED_PREFIXES),
     watchAllow: sanitizePathList(raw.watchAllow ?? base.watchAllow),
+    reviewPaths: sanitizePathList(raw.reviewPaths ?? base.reviewPaths ?? []),
     integrations: { hermes: Boolean(raw.integrations?.hermes ?? base.integrations?.hermes ?? false) },
     appearance: normalizeAppearanceSettings(raw.appearance ?? base.appearance),
     startupContext: normalizeStartupContextSettings(raw.startupContext ?? base.startupContext),
@@ -2282,8 +2507,9 @@ function sanitizeMarkdownTemplates(value) {
 function normalizeMarkdownTemplate(template = {}, index = 0) {
   const title = String(template.title || template.name || "").trim() || `Template ${index + 1}`;
   const id = sanitizeHubCardId(template.id || title || `template-${index + 1}`);
-  const content = String(template.content || "").trimEnd() + "\n";
-  if (!id || !title || !content.trim()) return null;
+  const rawContent = typeof template.content === "string" ? template.content : "";
+  const content = rawContent.trim() ? rawContent.trimEnd() + "\n" : "";
+  if (!id || !title || (!content.trim() && id !== "blank")) return null;
   return {
     id,
     title,
@@ -2360,9 +2586,19 @@ function sanitizePathList(value) {
   return [...new Set(value.map((item) => normalizeRelPath(String(item || ""))).filter((item) => item && !item.startsWith("../") && !item.includes("/../") && !path.isAbsolute(item) && !isBlockedPath(item)))];
 }
 
+function sanitizeExternalPathList(value) {
+  if (!Array.isArray(value)) return [];
+  return [...new Set(value.map((item) => normalizeRelPath(String(item || ""))).filter((item) => item && item.startsWith("~/") && !item.includes("/../") && !isBlockedPath(item)))];
+}
+
 function isWatchedPath(relPath, settings = defaultMemoryWebappSettings()) {
   const normalized = normalizeRelPath(relPath);
   return settings.watchAllow.some((pattern) => pathMatchesSetting(normalized, pattern));
+}
+
+function isRequiredReviewPath(relPath, settings = defaultMemoryWebappSettings()) {
+  const normalized = normalizeRelPath(relPath);
+  return (settings.reviewPaths || []).some((pattern) => pathMatchesSetting(normalized, pattern));
 }
 
 function pathMatchesSetting(relPath, pattern) {
@@ -2469,7 +2705,13 @@ async function routeRequest(req, res, root) {
     return;
   }
   if (req.method === "GET" && url.pathname === "/api/files") {
-    sendJson(res, 200, { files: listMemoryFiles(root), root });
+    const startupSkillFolder = url.searchParams.get("startupSkillFolder") || "";
+    const startupSkill = url.searchParams.get("startupSkill") || "";
+    const startupContextOrder = url.searchParams.get("startupContextOrder") || "";
+    const externalRoots = [];
+    if (startupSkillFolder && startupSkill) externalRoots.push(startupSkillExplorerRootPath(root, startupSkillFolder, startupSkill));
+    if (startupContextOrder) externalRoots.push(startupContextExplorerPath(root, startupContextOrder));
+    sendJson(res, 200, { files: listMemoryFiles(root, { externalRoots }), root });
     return;
   }
   if (req.method === "GET" && url.pathname === "/api/startup-context") {
@@ -2478,6 +2720,16 @@ async function routeRequest(req, res, root) {
   }
   if (req.method === "GET" && url.pathname === "/api/startup-skills") {
     sendJson(res, 200, { folders: listStartupSkillFolders(root), root });
+    return;
+  }
+  if (req.method === "POST" && url.pathname === "/api/startup-skills/create") {
+    const body = await readJsonBody(req);
+    sendJson(res, 200, createStartupSkillFile(root, body.folder, body.skill));
+    return;
+  }
+  if (req.method === "POST" && url.pathname === "/api/startup-skills/delete") {
+    const body = await readJsonBody(req);
+    sendJson(res, 200, deleteStartupSkill(root, body.folder, body.skill));
     return;
   }
   if (req.method === "GET" && url.pathname === "/api/startup-skills/file") {
@@ -2663,16 +2915,16 @@ function walkTextFiles(dir, root, settings = defaultMemoryWebappSettings()) {
   return results;
 }
 
-function walkExternalTextFiles(dir, baseDir, virtualPrefix) {
+function walkExternalTextFiles(dir, baseDir, virtualPrefix, settings = defaultMemoryWebappSettings()) {
   const results = [];
   for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
     if (entry.name.startsWith(".") || SKIP_DIRS.has(entry.name)) continue;
     const abs = path.join(dir, entry.name);
     if (entry.isDirectory()) {
-      results.push(...walkExternalTextFiles(abs, baseDir, virtualPrefix));
+      results.push(...walkExternalTextFiles(abs, baseDir, virtualPrefix, settings));
     } else if (entry.isFile()) {
       const rel = virtualPrefix + path.relative(baseDir, abs).replaceAll(path.sep, "/");
-      if (isAllowedMemoryPath(rel)) results.push(rel);
+      if (isAllowedMemoryPath(rel, settings)) results.push(rel);
     }
   }
   return results;
@@ -2682,7 +2934,7 @@ function isAllowedFolderPath(relPath, settings = defaultMemoryWebappSettings()) 
   const normalized = normalizeRelPath(relPath).replace(/\/$/, "");
   if (!normalized || normalized.startsWith("../") || normalized.includes("/../") || path.isAbsolute(normalized)) return false;
   if (isBlockedPath(normalized)) return false;
-  if (normalized.startsWith("~")) return false;
+  if (normalized.startsWith("~")) return isAllowedExternalFolderPath(normalized, settings);
   const allowed = sanitizePathList(settings.allowedPaths || ALLOWED_PREFIXES);
   return allowed.some((prefix) => {
     const clean = prefix.replace(/\/$/, "");
@@ -2690,11 +2942,11 @@ function isAllowedFolderPath(relPath, settings = defaultMemoryWebappSettings()) 
   });
 }
 
-function isAllowedExternalPath(relPath) {
+function isAllowedExternalPath(relPath, settings = defaultMemoryWebappSettings()) {
   const normalized = normalizeRelPath(relPath).replace(/\/$/, "");
   if (!normalized || normalized.startsWith("../") || normalized.includes("/../") || path.isAbsolute(normalized)) return false;
   if (isBlockedPath(normalized)) return false;
-  return Boolean(externalPrefixForPath(normalized));
+  return Boolean(externalPrefixForPath(normalized, settings));
 }
 
 function isAllowedExternalMemoryPath(relPath, settings = defaultMemoryWebappSettings()) {
@@ -2703,13 +2955,25 @@ function isAllowedExternalMemoryPath(relPath, settings = defaultMemoryWebappSett
   if (normalized.startsWith("~/.hermes/")) {
     return Boolean(settings.integrations?.hermes) && ALLOWED_EXTERNAL_PREFIXES.some((prefix) => normalized.startsWith(prefix));
   }
-  const allowed = sanitizePathList(settings.allowedPaths || []);
+  const allowed = sanitizeExternalPathList(settings.externalAllowedPaths || []);
   return allowed.some((pattern) => pathMatchesSetting(normalized, pattern));
 }
 
-function externalPrefixForPath(relPath) {
+function isAllowedExternalFolderPath(relPath, settings = defaultMemoryWebappSettings()) {
   const normalized = normalizeRelPath(relPath).replace(/\/$/, "");
-  return ALLOWED_EXTERNAL_PREFIXES.find((prefix) => {
+  if (!normalized || normalized.startsWith("../") || normalized.includes("/../") || path.isAbsolute(normalized)) return false;
+  if (isBlockedPath(normalized)) return false;
+  if (normalized.startsWith("~/.hermes/")) {
+    return Boolean(settings.integrations?.hermes) && ALLOWED_EXTERNAL_PREFIXES.some((prefix) => pathMatchesSetting(normalized, prefix));
+  }
+  const allowed = sanitizeExternalPathList(settings.externalAllowedPaths || []);
+  return allowed.some((pattern) => pathMatchesSetting(normalized, pattern) || pathMatchesSetting(pattern, normalized));
+}
+
+function externalPrefixForPath(relPath, settings = defaultMemoryWebappSettings()) {
+  const normalized = normalizeRelPath(relPath).replace(/\/$/, "");
+  const prefixes = [...ALLOWED_EXTERNAL_PREFIXES, ...sanitizeExternalPathList(settings.externalAllowedPaths || [])];
+  return prefixes.find((prefix) => {
     const clean = prefix.replace(/\/$/, "");
     return normalized === clean || normalized.startsWith(`${clean}/`);
   }) || null;
@@ -2778,6 +3042,7 @@ function resolveExternalPath(relPath) {
   if (relPath === "~/.hermes/cron/jobs.json") return path.join(getHermesHome(), "cron", "jobs.json");
   if (relPath === "~/.hermes/skills/") return path.join(getHermesHome(), "skills") + path.sep;
   if (relPath.startsWith("~/.hermes/skills/")) return path.join(getHermesHome(), "skills", relPath.slice("~/.hermes/skills/".length));
+  if (relPath.startsWith("~/")) return path.join(osHome(), relPath.slice(2));
   return null;
 }
 
@@ -2790,7 +3055,7 @@ function osHome() {
 }
 
 function backupSafePath(relPath) {
-  return relPath.replace(/^~\/\.hermes\//, "external/hermes/");
+  return relPath.replace(/^~\/\.hermes\//, "external/hermes/").replace(/^~\//, "external/home/");
 }
 
 function isBlockedPath(relPath) {
@@ -2880,6 +3145,20 @@ export function renderAppHtml() {
       --surface-card-hover: rgba(139,211,255,0.08);
       --surface-reader: rgba(3, 7, 18, 0.42);
       --label-strong: #dce8fb;
+      --space-1: 4px;
+      --space-2: 8px;
+      --space-3: 12px;
+      --space-4: 16px;
+      --space-5: 20px;
+      --space-6: 24px;
+      --space-8: 32px;
+      --page-padding: var(--space-6);
+      --panel-header-padding: var(--space-5) var(--space-6);
+      --panel-body-padding: var(--space-4) var(--space-6);
+      --card-padding: var(--space-4);
+      --compact-card-padding: var(--space-3);
+      --control-height: 40px;
+      --control-padding: var(--space-3) var(--space-4);
       --file-panel-bg: rgba(8,13,27,0.72);
       --file-header-bg: rgba(8,13,27,0.36);
       --file-bg: rgba(3,7,18,0.16);
@@ -3105,7 +3384,7 @@ export function renderAppHtml() {
       --file-marker: #6e7781;
       --file-hr: rgba(5,80,174,0.22);
     }
-    * { box-sizing: border-box; }
+    *, *::before, *::after { box-sizing: border-box; }
     body {
       margin: 0;
       min-height: 100vh;
@@ -3121,17 +3400,17 @@ export function renderAppHtml() {
     body::after { background: radial-gradient(circle at 65% 48%, var(--body-glow-3), transparent 22rem), radial-gradient(circle at 30% 74%, var(--body-glow-4), transparent 26rem); animation: nebulaPulse 12s ease-in-out infinite alternate; }
     .app { position: relative; z-index: 1; display: grid; grid-template-columns: 390px 1fr; height: 100vh; min-height: 0; overflow: hidden; transition: grid-template-columns 260ms ease; }
     .app.sidebar-collapsed { grid-template-columns: 76px 1fr; }
-    aside { border-right: 1px solid var(--line); padding: 14px 18px; background: var(--surface-sidebar); backdrop-filter: blur(22px); height: 100vh; min-height: 0; overflow: auto; display: block; transition: padding 260ms ease, background 260ms ease; }
-    .app.sidebar-collapsed aside { padding: 14px 10px; overflow: visible; }
+    aside { border-right: 1px solid var(--line); padding: var(--space-4) var(--space-5); background: var(--surface-sidebar); backdrop-filter: blur(22px); height: 100vh; min-height: 0; overflow: auto; display: block; transition: padding 260ms ease, background 260ms ease; }
+    .app.sidebar-collapsed aside { padding: var(--space-4) var(--space-2); overflow: visible; }
     .app.sidebar-collapsed .sidebar-toggle { position: fixed; left: 16px; top: 16px; z-index: 20; background: var(--surface-floating); }
-    .sidebar-head { display: grid; grid-template-columns: 1fr auto; gap: 10px; align-items: start; }
+    .sidebar-head { display: grid; grid-template-columns: 1fr auto; gap: var(--space-3); align-items: start; }
     .sidebar-toggle { border: 1px solid rgba(139,211,255,0.28); border-radius: 14px; background: rgba(255,255,255,0.06); color: var(--text); width: 42px; height: 42px; cursor: pointer; box-shadow: 0 0 28px rgba(139,211,255,0.12); transition: transform 160ms ease, background 160ms ease; }
     .sidebar-toggle:hover { transform: translateY(-1px); background: rgba(139,211,255,0.12); }
     .explorer-open { display: none; border: 1px solid rgba(139,211,255,0.28); border-radius: 14px; background: rgba(255,255,255,0.06); color: var(--text); width: 42px; height: 42px; cursor: pointer; align-items: center; justify-content: center; box-shadow: 0 0 28px rgba(139,211,255,0.12); transition: transform 160ms ease, background 160ms ease; }
     .explorer-open:hover { transform: translateY(-1px); background: rgba(139,211,255,0.12); }
     .app.sidebar-collapsed .sidebar-copy, .app.sidebar-collapsed .workspace-dock, .app.sidebar-collapsed .search-row, .app.sidebar-collapsed .watch-filter-row, .app.sidebar-collapsed .selection-bar, .app.sidebar-collapsed .explorer-title, .app.sidebar-collapsed .tree, .app.sidebar-collapsed .hint { opacity: 0; pointer-events: none; transform: translateX(-10px); }
     .sidebar-copy, .workspace-dock, .search-row, .watch-filter-row, .selection-bar, .explorer-title, .tree, .hint { transition: opacity 180ms ease, transform 180ms ease; }
-    main { padding: 24px; display: grid; grid-template-rows: 1fr; gap: 18px; min-width: 0; min-height: 0; overflow: hidden; }
+    main { padding: var(--page-padding); display: grid; grid-template-rows: 1fr; gap: var(--space-4); min-width: 0; min-height: 0; overflow: hidden; }
     h1 { font-size: 24px; margin: 0 0 6px; letter-spacing: -0.04em; }
     .subtitle { color: var(--muted); line-height: 1.35; font-size: 13px; }
     .launch-map { display: grid; grid-template-columns: repeat(3, 1fr); gap: 6px; margin: 10px 0; }
@@ -3140,7 +3419,7 @@ export function renderAppHtml() {
     .launch-card.hot { border-color: rgba(141, 240, 180, 0.42); background: rgba(141, 240, 180, 0.08); }
     .launch-card strong { display: block; font-size: 11px; line-height: 1.2; }
     .launch-card span { display: none; }
-    .quick-files { display: grid; gap: 5px; margin: 6px 0 10px; overflow: visible; padding-right: 4px; }
+    .quick-files { display: grid; gap: var(--space-1); margin: var(--space-2) 0 var(--space-3); overflow: visible; padding-right: var(--space-1); }
     .quick-group { display: grid; gap: 4px; }
     .quick-group-title { color: var(--muted); font-size: 10px; font-weight: 850; text-transform: uppercase; letter-spacing: 0.1em; margin: 6px 0 2px; }
     .quick-file { width: 100%; border: 1px solid color-mix(in srgb, var(--line) 88%, transparent); border-radius: 9px; background: var(--surface-card); color: var(--text); text-align: left; padding: 6px 8px; cursor: pointer; display: grid; gap: 1px; }
@@ -3150,23 +3429,25 @@ export function renderAppHtml() {
     .quick-file span { color: var(--muted); font-size: 11px; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
     .search-row { display: grid; grid-template-columns: 1fr auto; gap: 8px; align-items: center; margin: 10px 0 10px; }
 
-    .search { width: 100%; margin: 20px 0 16px; padding: 13px 14px; border-radius: 14px; border: 1px solid var(--line); background: rgba(255,255,255,0.05); color: var(--text); outline: none; }
+    .search { width: 100%; margin: var(--space-5) 0 var(--space-4); padding: var(--space-3) var(--space-4); border-radius: 14px; border: 1px solid var(--line); background: rgba(255,255,255,0.05); color: var(--text); outline: none; }
     .search-row .search { margin: 0; }
-    .clear-search { border: 1px solid var(--line); border-radius: 14px; padding: 12px 13px; background: rgba(255,255,255,0.055); color: var(--muted); cursor: pointer; }
+    .clear-search { border: 1px solid var(--line); border-radius: 14px; padding: var(--space-3); background: rgba(255,255,255,0.055); color: var(--muted); cursor: pointer; }
     .clear-search:hover { color: var(--text); background: rgba(255,255,255,0.085); }
-    .watch-filter-row { display: flex; gap: 4px; margin: -3px 0 6px; align-items: center; }
+    .watch-filter-row { display: flex; gap: var(--space-1); margin: 0 0 var(--space-2); align-items: center; }
     .watch-filter { border: 1px solid color-mix(in srgb, var(--line) 88%, transparent); border-radius: 999px; padding: 4px 7px; background: var(--surface-card); color: var(--muted); cursor: pointer; font-size: 10px; font-weight: 850; line-height: 1; }
     .watch-filter:hover { color: var(--text); background: var(--surface-card-hover); }
     .watch-filter.active { color: var(--on-accent); border-color: transparent; background: linear-gradient(135deg, var(--accent), var(--accent-2)); }
-    .explorer-context-menu { position: fixed; z-index: 80; width: min(245px, calc(100vw - 24px)); border: 1px solid color-mix(in srgb, var(--accent) 24%, transparent); border-radius: 14px; background: var(--surface-floating); box-shadow: 0 18px 48px rgba(0,0,0,0.38); backdrop-filter: blur(20px); padding: 8px; display: grid; gap: 7px; }
+    .explorer-context-menu { position: fixed; z-index: 80; width: min(248px, calc(100vw - 24px)); border: 1px solid color-mix(in srgb, var(--accent) 24%, transparent); border-radius: 14px; background: var(--surface-floating); box-shadow: 0 18px 48px rgba(0,0,0,0.38); backdrop-filter: blur(20px); padding: var(--space-2); display: grid; gap: var(--space-2); }
     .explorer-context-menu[hidden] { display: none; }
     .explorer-context-title { display: grid; gap: 2px; color: var(--label-strong); font-size: 11px; font-weight: 900; padding: 2px 4px; }
     .explorer-context-title code { color: var(--accent); font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 10px; font-weight: 700; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-    .explorer-context-form { display: grid; gap: 7px; }
+    .explorer-context-form { display: grid; gap: var(--space-2); }
     .explorer-context-form[hidden] { display: none; }
     .explorer-context-label { color: var(--muted); font-size: 10px; font-weight: 850; text-transform: uppercase; letter-spacing: 0.08em; padding: 0 2px; }
     .explorer-context-form input, .explorer-context-form select, .file-template-select { width: 100%; padding: 8px 10px; border: 1px solid rgba(148,163,184,0.18); border-radius: 10px; background: rgba(255,255,255,0.045); color: var(--text); font: 12px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace; }
     .explorer-context-form input:focus { outline: none; border-color: rgba(139,211,255,0.5); background: rgba(139,211,255,0.06); }
+    .explorer-context-error { border: 1px solid rgba(255,140,157,0.34); border-radius: 10px; padding: 8px 10px; background: rgba(255,140,157,0.10); color: #ffc0c8; font-size: 11px; line-height: 1.35; overflow-wrap: anywhere; }
+    .explorer-context-error[hidden] { display: none; }
     .explorer-context-actions { display: grid; grid-template-columns: 1fr auto; gap: 6px; align-items: center; }
     .explorer-context-actions[hidden] { display: none; }
     .explorer-context-actions.menu-actions { grid-template-columns: 1fr; }
@@ -3174,7 +3455,7 @@ export function renderAppHtml() {
     .explorer-context-menu .explorer-context-actions button { padding: 8px 10px; border-radius: 10px; font-size: 12px; line-height: 1.2; }
     select option { color: #111827; background: #ffffff; }
     select option:checked { color: #07101e; background: #93c5fd; }
-    .empty-template-actions { display: grid; grid-template-columns: minmax(140px, 220px) auto; gap: 8px; align-items: center; }
+    .empty-template-actions { display: grid; grid-template-columns: minmax(150px, 240px); gap: 8px; align-items: center; }
     .empty-template-actions .file-template-select { min-width: 0; }
     .explorer-title { color: var(--accent); font-size: 11px; font-weight: 850; text-transform: uppercase; letter-spacing: 0.12em; margin: 10px 0 6px; }
     .tree { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; font-size: 13px; line-height: 1.35; overflow: visible; padding-right: 4px; min-height: 180px; }
@@ -3187,39 +3468,50 @@ export function renderAppHtml() {
     .twisty { color: var(--muted); width: 13px; flex: 0 0 auto; }
     .icon { width: 16px; flex: 0 0 auto; opacity: 0.9; }
     .tree-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-    .tree-children { margin-left: 15px; border-left: 1px solid rgba(148,163,184,0.12); padding-left: 4px; }
+    .tree-children { margin-left: var(--space-4); border-left: 1px solid rgba(148,163,184,0.12); padding-left: var(--space-1); }
     .topbar, .editor-shell { background: var(--panel); border: 1px solid var(--line); border-radius: 24px; box-shadow: var(--shadow); backdrop-filter: blur(24px); }
     .topbar { display: none; }
     .topbar { display: none; }
     .selected-title { font-size: 22px; font-weight: 850; letter-spacing: -0.03em; }
     .selected-path { color: var(--muted); font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; margin-top: 5px; }
     .selected-impact { color: #c5d2e8; font-size: 14px; line-height: 1.45; margin-top: 12px; max-width: 980px; }
-    .actions { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; justify-content: flex-end; }
+    .actions { display: flex; gap: var(--space-3); align-items: center; flex-wrap: wrap; justify-content: flex-end; }
     .history-nav { display: flex; gap: 6px; }
     .history-nav button { min-width: 42px; padding-left: 12px; padding-right: 12px; }
     button.primary, button.secondary { border: 0; border-radius: 14px; padding: 12px 16px; color: var(--on-accent); background: linear-gradient(135deg, var(--accent), var(--accent-2)); font-weight: 850; cursor: pointer; transition: transform 160ms ease, filter 160ms ease, background 160ms ease; }
     button.primary:hover, button.secondary:hover { transform: translateY(-1px); filter: brightness(1.08); }
     button.secondary { background: rgba(255,255,255,0.08); color: var(--text); border: 1px solid var(--line); }
     button:disabled { opacity: 0.45; cursor: not-allowed; }
+    button.save-pending, .file-action.save-pending { position: relative; overflow: hidden; opacity: 0.92 !important; cursor: wait !important; filter: saturate(0.92); }
+    button.save-pending::after, .file-action.save-pending::after { content: ""; position: absolute; inset: -35%; pointer-events: none; background: linear-gradient(105deg, transparent 34%, rgba(255,255,255,0.28) 48%, transparent 62%); transform: translateX(-125%); animation: savePendingSweep 1150ms ease-in-out infinite; }
+    button.save-confirmed, .file-action.save-confirmed { position: relative; overflow: hidden; opacity: 1 !important; color: var(--on-accent) !important; background: linear-gradient(135deg, var(--good), color-mix(in srgb, var(--good) 64%, var(--accent))) !important; box-shadow: 0 0 0 3px color-mix(in srgb, var(--good) 18%, transparent), 0 0 28px color-mix(in srgb, var(--good) 24%, transparent); animation: saveConfirmPulse 900ms ease both; }
+    button.save-confirmed::after, .file-action.save-confirmed::after { content: ""; position: absolute; inset: -35%; pointer-events: none; background: linear-gradient(105deg, transparent 34%, rgba(255,255,255,0.45) 48%, transparent 62%); transform: translateX(-125%); animation: saveConfirmShine 900ms ease forwards; }
+    @keyframes savePendingSweep { 0% { transform: translateX(-125%); } 70%, 100% { transform: translateX(125%); } }
+    @keyframes saveConfirmPulse { 0% { transform: scale(0.985); } 38% { transform: scale(1.025); } 100% { transform: scale(1); } }
+    @keyframes saveConfirmShine { to { transform: translateX(125%); } }
     .status { color: var(--muted); font-size: 13px; min-width: 150px; text-align: right; }
     .editor-shell { min-height: 0; overflow: hidden; position: relative; }
-    .workspace-dock { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; margin: 0 0 12px; padding: 7px; border: 1px solid var(--line); border-radius: 18px; background: var(--surface-floating-soft); backdrop-filter: blur(18px); box-shadow: 0 16px 48px rgba(0,0,0,0.22); }
-    .dock-button { border: 1px solid rgba(148,163,184,0.22); border-radius: 12px; background: rgba(255,255,255,0.06); color: var(--text); padding: 9px 11px; font-weight: 850; cursor: pointer; }
+    .workspace-dock { display: inline-flex; max-width: 100%; gap: var(--space-1); align-items: center; flex-wrap: wrap; margin: 0 0 var(--space-3); padding: var(--space-1); border: 1px solid var(--line); border-radius: 16px; background: var(--surface-floating-soft); backdrop-filter: blur(18px); box-shadow: 0 16px 48px rgba(0,0,0,0.22); }
+    .dock-button { display: inline-flex; align-items: center; justify-content: center; min-width: var(--control-height); min-height: var(--control-height); border: 1px solid rgba(148,163,184,0.22); border-radius: 12px; background: rgba(255,255,255,0.06); color: var(--text); padding: 0 var(--space-3); font-weight: 850; line-height: 1; white-space: nowrap; cursor: pointer; }
+    .workspace-dock .dock-button[hidden] { display: none !important; }
+    #back.dock-button, #forward.dock-button { padding: 0; }
     .dock-button:hover { transform: translateY(-1px); background: rgba(139,211,255,0.12); }
     .dock-button.primary { color: var(--on-accent); border: 0; background: linear-gradient(135deg, var(--accent), var(--accent-2)); }
+    .dock-button.diff-dock-button { min-width: auto; margin-left: var(--space-1); padding: 0 var(--space-3); color: var(--label-strong); border-color: color-mix(in srgb, var(--accent) 28%, transparent); background: color-mix(in srgb, var(--accent) 8%, transparent); font-size: 12px; letter-spacing: 0.01em; }
+    .dock-button.diff-dock-button.active { color: var(--on-accent); border-color: transparent; background: linear-gradient(135deg, var(--accent), var(--accent-2)); }
     .dock-status { display: none; }
-    .docqa-home { height: 100%; padding: 24px; overflow: auto; position: relative; background: radial-gradient(circle at 18% 0%, var(--body-glow-3), transparent 28rem), var(--surface-wash); scroll-padding-bottom: 28px; }
-    .docqa-grid { display: grid; grid-template-columns: 1fr; gap: 18px; align-items: start; }
+    .docqa-home { height: 100%; padding: var(--page-padding); overflow: auto; position: relative; background: radial-gradient(circle at 18% 0%, var(--body-glow-3), transparent 28rem), var(--surface-wash); scroll-padding-bottom: var(--space-8); }
+    .docqa-grid { display: grid; grid-template-columns: 1fr; gap: var(--space-5); align-items: start; }
     .docqa-panel { border: 1px solid var(--line); border-radius: 22px; background: var(--panel); box-shadow: var(--shadow); overflow: hidden; }
-    .docqa-panel header { padding: 18px 20px; border-bottom: 1px solid var(--line); display: flex; justify-content: space-between; gap: 12px; align-items: baseline; }
+    .docqa-panel header { padding: var(--panel-header-padding); border-bottom: 1px solid var(--line); display: flex; justify-content: space-between; gap: var(--space-3); align-items: baseline; }
     .docqa-panel h2 { margin: 0; font-size: 18px; letter-spacing: -0.03em; }
     .docqa-panel .muted { color: var(--muted); font-size: 12px; }
-    .review-summary { display: flex; gap: 10px; align-items: stretch; flex-wrap: wrap; }
+    .review-summary { display: flex; gap: var(--space-3); align-items: stretch; flex-wrap: wrap; }
     .review-summary-item { min-width: 118px; border: 1px solid color-mix(in srgb, var(--line) 88%, transparent); border-radius: 16px; background: var(--surface-card); padding: 10px 12px; }
     .review-summary-item strong { display: block; font-size: 24px; line-height: 1; }
     .review-summary-item span { display: block; color: var(--muted); font-size: 10px; text-transform: uppercase; letter-spacing: 0.1em; margin-top: 6px; }
     .review-list { display: grid; gap: 8px; padding: 12px; max-height: clamp(220px, 34vh, 360px); overflow: auto; overscroll-behavior-y: auto; scrollbar-gutter: stable; }
-    .review-item { border: 1px solid color-mix(in srgb, var(--line) 88%, transparent); border-radius: 16px; background: var(--surface-card); color: var(--text); text-align: left; padding: 13px; cursor: pointer; display: grid; gap: 8px; }
+    .review-item { border: 1px solid color-mix(in srgb, var(--line) 88%, transparent); border-radius: 16px; background: var(--surface-card); color: var(--text); text-align: left; padding: var(--space-4); cursor: pointer; display: grid; gap: var(--space-2); }
     .review-item:hover, .review-item.active { border-color: color-mix(in srgb, var(--accent) 42%, transparent); background: var(--surface-card-hover); transform: translateX(2px); }
     .review-top { display: flex; justify-content: space-between; gap: 12px; align-items: center; }
     .review-title { font-weight: 850; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -3228,102 +3520,148 @@ export function renderAppHtml() {
     .chip { border: 1px solid var(--line); border-radius: 999px; padding: 4px 8px; color: var(--label-strong); background: var(--surface-card); font-size: 10px; font-weight: 800; text-transform: uppercase; letter-spacing: 0.08em; }
     .chip.critical { border-color: rgba(255,140,157,0.58); color: #ffc0c8; background: rgba(255,140,157,0.10); }
     .chip.high { border-color: rgba(255,196,107,0.55); color: #ffd79c; background: rgba(255,196,107,0.10); }
-    .inspector-body { padding: 16px 18px; display: grid; gap: 14px; }
+    .inspector-body { padding: var(--panel-body-padding); display: grid; gap: var(--space-4); }
     .inspector-path { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; color: var(--accent); overflow-wrap: anywhere; }
     .issue-list { display: grid; gap: 8px; }
     .issue { border-left: 3px solid color-mix(in srgb, var(--accent) 50%, transparent); padding: 8px 10px; background: var(--surface-card); border-radius: 10px; color: var(--text); font-size: 13px; }
     .issue.critical { border-left-color: var(--danger); }
     .issue.high { border-left-color: #ffc46b; }
     .docqa-actions { display: flex; gap: 8px; flex-wrap: wrap; }
-    .markdown-tools { padding: 16px 18px 18px; display: grid; gap: 16px; }
-    .best-practice-list { margin: 0; padding-left: 20px; display: grid; gap: 7px; color: var(--text); font-size: 13px; line-height: 1.45; }
-    .markdown-create { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 180px), 1fr)); gap: 10px; align-items: end; }
-    .markdown-create .settings-field.paths { grid-column: span 2; }
+    .markdown-tools { padding: var(--panel-body-padding); display: grid; gap: var(--space-4); }
+    .best-practice-list { margin: 0; padding-left: var(--space-5); display: grid; gap: var(--space-2); color: var(--text); font-size: 13px; line-height: 1.45; }
+    .markdown-create { max-width: 1120px; margin: 0 auto; display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); gap: var(--space-4); align-items: start; }
+    .markdown-create .settings-field { min-width: 0; }
+    .markdown-create .settings-field.paths { grid-column: 1 / -1; }
+    .new-doc-title-field { grid-column: span 3; }
+    .new-doc-compact-field { grid-column: span 2; }
     .markdown-create button { align-self: end; min-height: 42px; }
-    .new-doc-actions { grid-column: 1 / -1; display: flex; justify-content: flex-end; gap: 10px; flex-wrap: wrap; }
+    .new-doc-actions { grid-column: 1 / -1; display: flex; justify-content: flex-end; gap: var(--space-3); flex-wrap: wrap; }
     .markdown-create .settings-field select { display: block; width: 100%; padding: 10px; border: 1px solid rgba(148,163,184,0.18); border-radius: 14px; background: rgba(255,255,255,0.045); color: var(--text); font: 12px/1.45 ui-monospace, SFMono-Regular, Menlo, monospace; }
-    .path-picker-field { grid-column: span 2; }
-    .path-picker { position: relative; display: grid; grid-template-columns: minmax(0, 1.2fr) minmax(0, 1fr); gap: 8px; padding: 10px; border: 1px solid color-mix(in srgb, var(--accent) 18%, transparent); border-radius: 16px; background: var(--surface-card); }
-    .path-picker-trigger { min-width: 0; min-height: 42px; border: 1px solid var(--line); border-radius: 14px; padding: 10px 12px; background: var(--surface-card); color: var(--text); cursor: pointer; display: grid; grid-template-columns: 1fr auto; gap: 10px; align-items: center; text-align: left; }
-    .path-picker-trigger:hover, .path-picker-trigger[aria-expanded="true"] { border-color: color-mix(in srgb, var(--accent) 42%, transparent); background: var(--surface-card-hover); }
-    .path-picker-trigger code { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text); font: 12px/1.45 ui-monospace, SFMono-Regular, Menlo, monospace; }
-    .path-picker-trigger span { color: var(--muted); font-size: 13px; }
-    .path-picker-menu { position: absolute; z-index: 70; top: calc(100% + 8px); left: 10px; width: min(620px, calc(100vw - 56px)); max-height: min(430px, 52vh); border: 1px solid color-mix(in srgb, var(--accent) 26%, transparent); border-radius: 16px; background: var(--surface-floating); box-shadow: 0 24px 70px rgba(0,0,0,0.42); backdrop-filter: blur(20px); padding: 10px; display: grid; gap: 10px; }
-    .path-picker-menu[hidden] { display: none; }
-    .path-picker-search { width: 100%; padding: 10px 12px; border: 1px solid rgba(148,163,184,0.20); border-radius: 12px; background: rgba(255,255,255,0.055); color: var(--text); font: 12px/1.45 ui-monospace, SFMono-Regular, Menlo, monospace; }
-    .path-picker-options { display: grid; gap: 5px; max-height: min(330px, 40vh); overflow: auto; padding-right: 3px; }
-    .path-picker-option { width: 100%; min-width: 0; border: 1px solid color-mix(in srgb, var(--line) 84%, transparent); border-radius: 10px; padding: 9px 10px; background: var(--surface-card); color: var(--label-strong); cursor: pointer; display: grid; grid-template-columns: 1fr auto; gap: 10px; align-items: center; text-align: left; }
-    .path-picker-option:hover, .path-picker-option.active { border-color: color-mix(in srgb, var(--accent) 45%, transparent); background: var(--surface-card-hover); }
-    .path-picker-option code { min-width: 0; color: var(--accent); font: 12px/1.35 ui-monospace, SFMono-Regular, Menlo, monospace; overflow-wrap: anywhere; }
-    .path-picker-option span { color: var(--muted); font-size: 10px; text-transform: uppercase; letter-spacing: 0.08em; white-space: nowrap; }
-    .path-picker-empty { color: var(--muted); padding: 10px; font-size: 13px; }
-    .path-picker-preview { grid-column: 1 / -1; display: flex; align-items: center; gap: 8px; min-width: 0; color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: 0.08em; }
+    .path-picker-field { grid-column: 1 / -1; }
+    .path-picker { position: relative; display: grid; gap: var(--space-4); padding: var(--space-4); border: 1px solid color-mix(in srgb, var(--accent) 22%, transparent); border-radius: 20px; background: linear-gradient(145deg, color-mix(in srgb, var(--surface-card) 92%, var(--accent) 8%), color-mix(in srgb, var(--surface-card) 94%, var(--accent-2) 6%)); box-shadow: 0 18px 54px rgba(0,0,0,0.18); }
+    .path-picker-main { display: grid; grid-template-columns: minmax(0, 1.35fr) minmax(220px, 0.65fr); gap: var(--space-3); align-items: start; }
+    .path-picker-control { min-width: 0; display: grid; gap: var(--space-2); }
+    .path-picker-control-title { color: var(--muted); font-size: 10px; font-weight: 900; letter-spacing: 0.12em; text-transform: uppercase; }
+    .locked-folder-display { min-width: 0; min-height: var(--control-height); display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: var(--space-2); align-items: center; padding: 0 var(--space-3); border: 1px solid color-mix(in srgb, var(--line) 90%, transparent); border-radius: 14px; background: color-mix(in srgb, var(--surface-floating-soft) 72%, transparent); }
+    .locked-folder-display code { min-width: 0; color: var(--accent); font: 12px/1.45 ui-monospace, SFMono-Regular, Menlo, monospace; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .locked-folder-display span { flex: 0 0 auto; color: var(--muted); font-size: 10px; font-weight: 900; letter-spacing: 0.1em; text-transform: uppercase; }
+    .path-picker input[id="markdownCreateFileName"] { min-height: var(--control-height); }
+    .path-picker-preview { display: flex; align-items: center; gap: 8px; min-width: 0; padding: var(--space-3); border: 1px solid color-mix(in srgb, var(--accent) 18%, transparent); border-radius: 14px; background: rgba(139,211,255,0.06); color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: 0.08em; }
     .path-picker-preview code { min-width: 0; color: var(--accent); font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; text-transform: none; letter-spacing: 0; overflow-wrap: anywhere; }
-    .settings-page { height: 100%; overflow: auto; padding: 24px; background: radial-gradient(circle at 20% 0%, var(--body-glow-4), transparent 28rem), var(--surface-wash); }
-    .settings-page .settings-card { max-width: 1180px; margin: 0 auto; }
+    .settings-page { height: 100%; overflow: auto; padding: var(--page-padding); background: radial-gradient(circle at 20% 0%, var(--body-glow-4), transparent 28rem), var(--surface-wash); }
+    .settings-page .settings-card { max-width: 1240px; margin: 0 auto; }
     .settings-card { box-shadow: var(--shadow); background: var(--panel); border: 1px solid var(--line); backdrop-filter: blur(18px); }
-    .settings-card header { padding: 18px 20px; border-bottom: 1px solid var(--line); align-items: center; gap: 10px; }
+    .settings-card header { padding: var(--panel-header-padding); border-bottom: 1px solid var(--line); align-items: center; gap: var(--space-3); }
     .settings-card h2 { font-size: 22px; letter-spacing: -0.04em; }
-    .settings-panel { padding: 20px; display: grid; gap: 18px; }
-    .settings-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
-    .settings-field { display: grid; gap: 6px; }
-    .settings-field label, .settings-title { color: var(--muted); font-size: 11px; font-weight: 850; text-transform: uppercase; letter-spacing: 0.09em; }
-    .settings-field textarea, .settings-field input, .settings-field select { display: block; width: 100%; padding: 10px; border: 1px solid var(--line); border-radius: 14px; background: var(--surface-card); color: var(--text); font: 12px/1.45 ui-monospace, SFMono-Regular, Menlo, monospace; }
-    .settings-field textarea { min-height: 88px; height: 88px; resize: vertical; }
-    .hub-card-options { display: grid; gap: 12px; }
-    .hub-card-option { display: flex; align-items: center; gap: 6px; border: 1px solid var(--line); border-radius: 999px; padding: 7px 10px; color: var(--label-strong); background: var(--surface-card); font-size: 12px; }
-    .hub-section-editor { display: grid; gap: 10px; padding-top: 12px; border-top: 1px solid rgba(139,211,255,0.24); }
-    .hub-section-editor:first-child { padding-top: 0; border-top: 0; }
-    .hub-section-editor-head { display: grid; grid-template-columns: 1fr auto auto; gap: 8px; align-items: end; }
-    .hub-card-editor { display: grid; gap: 10px; padding: 12px; border: 1px solid color-mix(in srgb, var(--line) 86%, transparent); border-radius: 18px; background: var(--surface-card); }
-    .hub-card-editor.nested { margin-left: 18px; border-left-color: rgba(139,211,255,0.42); }
-    .hub-card-children { display: grid; gap: 8px; padding-left: 8px; border-left: 1px solid rgba(139,211,255,0.20); }
-    .hub-card-editor-head { display: flex; justify-content: space-between; gap: 10px; align-items: center; }
-    .hub-card-editor-title { display: flex; gap: 8px; align-items: center; color: var(--label-strong); font-size: 12px; font-weight: 850; }
-    .hub-card-editor-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+    .settings-panel { padding: 20px; display: grid; gap: 16px; }
+    .settings-shell { display: grid; gap: var(--space-4); }
+    .settings-section { border: 1px solid color-mix(in srgb, var(--line) 88%, transparent); border-radius: 22px; background: linear-gradient(145deg, color-mix(in srgb, var(--surface-card) 92%, var(--accent) 8%), var(--surface-card)); overflow: hidden; }
+    .settings-section summary { list-style: none; }
+    .settings-section summary::-webkit-details-marker { display: none; }
+    .settings-section.collapsible > .settings-section-head { cursor: pointer; }
+    .settings-section.collapsible:not([open]) > .settings-section-head { border-bottom: 0; }
+    .settings-section.collapsible:not([open]) > .settings-section-body { display: none; }
+    .settings-section-head { display: flex; justify-content: space-between; gap: var(--space-4); align-items: flex-start; padding: var(--space-4) var(--space-5); border-bottom: 1px solid color-mix(in srgb, var(--line) 84%, transparent); background: color-mix(in srgb, var(--surface-floating-soft) 78%, transparent); }
+    .settings-section-title { display: grid; gap: var(--space-2); min-width: 0; }
+    .settings-section-title h3 { margin: 0; color: var(--label-strong); font-size: 16px; line-height: 1.2; letter-spacing: 0; }
+    .settings-kicker, .settings-title { color: var(--accent); font-size: 10px; font-weight: 900; text-transform: uppercase; letter-spacing: 0.12em; }
+    .settings-section-copy { margin: 0; color: var(--muted); font-size: 13px; line-height: 1.4; }
+    .settings-section-actions { display: flex; align-items: center; justify-content: flex-end; gap: 8px; flex-wrap: wrap; }
+    .settings-pill { border: 1px solid color-mix(in srgb, var(--accent) 28%, transparent); border-radius: 999px; padding: var(--space-2) var(--space-3); color: var(--label-strong); background: color-mix(in srgb, var(--accent) 9%, transparent); font-size: 11px; font-weight: 850; line-height: 1; white-space: nowrap; }
+    .settings-section-toggle { border-color: color-mix(in srgb, var(--accent) 38%, transparent); color: var(--accent); min-width: 52px; text-align: center; }
+    .settings-section[open] .settings-section-toggle::after { content: "hide"; }
+    .settings-section:not([open]) .settings-section-toggle::after { content: "open"; }
+    .settings-section-body { padding: var(--space-4) var(--space-5) var(--space-5); display: grid; gap: var(--space-4); }
+    .settings-body-toolbar { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; color: var(--muted); font-size: 12px; }
+    .settings-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: var(--space-4); align-items: start; }
+    .settings-grid.compact { grid-template-columns: minmax(220px, 0.72fr) minmax(240px, 1fr); }
+    .settings-field { display: grid; gap: 8px; min-width: 0; align-content: start; }
+    .settings-field label, .settings-field-title { color: var(--muted); font-size: 11px; font-weight: 850; text-transform: uppercase; letter-spacing: 0.09em; }
+    .settings-field textarea, .settings-field input, .settings-field select { display: block; width: 100%; min-width: 0; padding: var(--space-3); border: 1px solid color-mix(in srgb, var(--line) 92%, transparent); border-radius: 14px; background: color-mix(in srgb, var(--surface-reader) 74%, var(--surface-card)); color: var(--text); font: 12px/1.45 ui-monospace, SFMono-Regular, Menlo, monospace; box-shadow: inset 0 1px 0 rgba(255,255,255,0.025); }
+    .settings-field textarea:focus, .settings-field input:focus, .settings-field select:focus { outline: none; border-color: color-mix(in srgb, var(--accent) 55%, transparent); box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 16%, transparent); }
+    .settings-field textarea { min-height: 118px; height: 118px; resize: vertical; }
+    .settings-field.large textarea { min-height: 150px; height: 150px; }
+    .settings-field-note, .settings-help { margin: -2px 0 0; color: var(--muted); font-size: 12px; line-height: 1.45; }
+    .settings-toggle { position: relative; display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 12px; align-items: center; min-height: 64px; padding: 12px; border: 1px solid color-mix(in srgb, var(--line) 88%, transparent); border-radius: 16px; background: color-mix(in srgb, var(--surface-reader) 64%, var(--surface-card)); color: var(--text); cursor: pointer; text-transform: none; letter-spacing: 0; font-size: inherit; font-weight: inherit; }
+    .settings-toggle:hover { border-color: color-mix(in srgb, var(--accent) 38%, transparent); background: var(--surface-card-hover); }
+    .settings-toggle input { position: absolute; opacity: 0; pointer-events: none; }
+    .settings-switch { width: 42px; height: 24px; border-radius: 999px; border: 1px solid color-mix(in srgb, var(--line) 95%, transparent); background: rgba(148,163,184,0.16); position: relative; box-shadow: inset 0 1px 4px rgba(0,0,0,0.25); }
+    .settings-switch::after { content: ""; position: absolute; width: 18px; height: 18px; left: 2px; top: 2px; border-radius: 50%; background: var(--muted); transition: transform 160ms ease, background 160ms ease; }
+    .settings-toggle input:checked + .settings-switch { border-color: color-mix(in srgb, var(--accent) 62%, transparent); background: color-mix(in srgb, var(--accent) 28%, transparent); }
+    .settings-toggle input:checked + .settings-switch::after { transform: translateX(18px); background: var(--accent); }
+    .settings-toggle input:focus-visible + .settings-switch { outline: 2px solid color-mix(in srgb, var(--accent) 62%, transparent); outline-offset: 3px; }
+    .settings-toggle-copy { display: grid; gap: var(--space-1); min-width: 0; }
+    .settings-toggle-copy strong { color: var(--label-strong); font-size: 13px; line-height: 1.25; }
+    .settings-toggle-copy em { color: var(--muted); font-size: 12px; line-height: 1.35; font-style: normal; }
+    .settings-theme-preview { border: 1px solid color-mix(in srgb, var(--file-line) 92%, transparent); border-radius: 18px; overflow: hidden; background: var(--file-bg); box-shadow: inset 0 1px 0 rgba(255,255,255,0.025); }
+    .settings-theme-preview-head { display: flex; justify-content: space-between; gap: var(--space-3); align-items: center; padding: var(--space-3); border-bottom: 1px solid var(--file-line); background: var(--file-header-bg); color: var(--file-fg); font-size: 11px; font-weight: 850; text-transform: uppercase; letter-spacing: 0.08em; }
+    .settings-theme-preview .doc-editor { min-height: 0; max-height: none; padding: var(--space-4); font-size: 12px; line-height: 1.55; background: transparent; }
+    .hub-card-options { display: grid; gap: var(--space-3); }
+    .hub-card-option { min-height: 36px; display: flex; align-items: center; gap: var(--space-2); border: 1px solid var(--line); border-radius: 999px; padding: var(--space-2) var(--space-3); color: var(--label-strong); background: var(--surface-card); font-size: 12px; }
+    .settings-editor-list { gap: var(--space-4); }
+    .hub-section-editor { display: grid; gap: var(--space-4); padding: var(--space-4); border: 1px solid color-mix(in srgb, var(--line) 86%, transparent); border-radius: 16px; background: color-mix(in srgb, var(--surface-card) 96%, var(--accent) 4%); }
+    .hub-section-editor summary { list-style: none; cursor: pointer; }
+    .hub-section-editor summary::-webkit-details-marker { display: none; }
+    .hub-section-editor:not([open]) > :not(summary) { display: none; }
+    .hub-section-editor-summary, .template-editor-summary, .hub-card-editor-summary { min-height: 32px; display: flex; align-items: center; justify-content: space-between; gap: var(--space-3); color: var(--label-strong); font-size: 12px; font-weight: 850; }
+    .hub-section-editor-summary span, .template-editor-summary span, .hub-card-editor-summary span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .hub-section-editor-summary code, .template-editor-summary code, .hub-card-editor-summary code { flex: 0 0 auto; color: var(--accent); font: 11px/1.35 ui-monospace, SFMono-Regular, Menlo, monospace; overflow-wrap: anywhere; }
+    .hub-section-editor-head { display: grid; grid-template-columns: minmax(0, 1fr) auto auto; gap: var(--space-3); align-items: end; }
+    .hub-card-editor { display: grid; gap: var(--space-4); padding: var(--space-4); border: 1px solid color-mix(in srgb, var(--line) 86%, transparent); border-radius: 16px; background: var(--surface-card); }
+    .hub-card-editor summary { list-style: none; cursor: pointer; }
+    .hub-card-editor summary::-webkit-details-marker { display: none; }
+    .hub-card-editor:not([open]) > :not(summary) { display: none; }
+    .hub-card-editor.nested { margin-left: 0; border-left-color: color-mix(in srgb, var(--accent) 38%, transparent); background: color-mix(in srgb, var(--surface-card) 94%, var(--accent) 6%); }
+    .hub-card-children { display: grid; gap: 0; padding-left: 0; border-left: 0; }
+    .hub-card-children:not(:empty) { gap: var(--space-3); margin: var(--space-1) 0 0 var(--space-2); padding-left: var(--space-3); border-left: 1px solid color-mix(in srgb, var(--accent) 24%, transparent); }
+    .hub-card-editor-head { display: flex; justify-content: space-between; gap: var(--space-3); align-items: flex-start; flex-wrap: wrap; }
+    .hub-card-editor-title { min-height: 32px; display: flex; gap: var(--space-2); align-items: center; color: var(--label-strong); font-size: 12px; font-weight: 850; }
+    .hub-card-editor-grid { display: grid; grid-template-columns: 1fr 1fr; gap: var(--space-3); }
     .hub-card-editor .paths { grid-column: 1 / -1; }
-    .template-editor { display: grid; gap: 10px; padding: 12px; border: 1px solid color-mix(in srgb, var(--line) 86%, transparent); border-radius: 18px; background: var(--surface-card); }
-    .template-editor-head { display: flex; justify-content: space-between; gap: 10px; align-items: center; color: var(--label-strong); font-size: 12px; font-weight: 850; }
-    .template-enabled-toggle { display: inline-flex; gap: 8px; align-items: center; color: var(--label-strong); font-size: 12px; font-weight: 850; }
+    .template-editor { display: grid; gap: var(--space-3); padding: var(--space-3); border: 1px solid color-mix(in srgb, var(--line) 86%, transparent); border-radius: 18px; background: var(--surface-card); }
+    .template-editor summary { list-style: none; cursor: pointer; }
+    .template-editor summary::-webkit-details-marker { display: none; }
+    .template-editor:not([open]) > :not(summary) { display: none; }
+    .template-editor-head { display: flex; justify-content: space-between; gap: var(--space-3); align-items: center; color: var(--label-strong); font-size: 12px; font-weight: 850; }
+    .template-enabled-toggle { display: inline-flex; gap: 8px; align-items: center; color: var(--label-strong); font-size: 12px; font-weight: 850; text-transform: none; letter-spacing: 0; }
     .template-enabled-toggle input { width: auto; accent-color: var(--accent); }
-    .settings-help { margin: -2px 0 0; color: var(--muted); font-size: 12px; line-height: 1.45; }
-    .template-editor-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+    .template-editor-grid { display: grid; grid-template-columns: 1fr 1fr; gap: var(--space-3); }
     .template-editor .template-body { grid-column: 1 / -1; }
     .template-editor .template-body textarea { min-height: 220px; height: 220px; }
-    .settings-footer { display: flex; justify-content: space-between; gap: 12px; align-items: center; color: var(--muted); font-size: 12px; }
-    .hub-folders { margin-top: 16px; display: grid; gap: 26px; }
-    .hub-breadcrumb { display: flex; flex-wrap: wrap; align-items: center; gap: 7px; margin-bottom: -6px; padding: 10px 12px; border: 1px solid color-mix(in srgb, var(--accent) 18%, transparent); border-radius: 18px; background: var(--surface-floating-soft); color: var(--muted); font-size: 12px; font-weight: 800; }
-    .hub-crumb { border: 1px solid var(--line); border-radius: 999px; padding: 7px 10px; background: var(--surface-card); color: var(--label-strong); cursor: pointer; font-weight: 850; }
+    .settings-footer { position: sticky; bottom: 0; z-index: 12; display: flex; justify-content: space-between; gap: var(--space-3); align-items: center; margin: 0 calc(var(--space-5) * -1) calc(var(--space-5) * -1); padding: var(--space-4) var(--space-5); color: var(--muted); font-size: 12px; border-top: 1px solid color-mix(in srgb, var(--line) 88%, transparent); background: color-mix(in srgb, var(--surface-floating) 92%, transparent); backdrop-filter: blur(18px); }
+    .hub-folders { margin-top: var(--space-4); display: grid; gap: var(--space-6); }
+    .hub-breadcrumb { display: flex; flex-wrap: wrap; align-items: center; gap: var(--space-2); margin-bottom: calc(var(--space-2) * -1); padding: var(--space-2) var(--space-3); border: 1px solid color-mix(in srgb, var(--accent) 18%, transparent); border-radius: 18px; background: var(--surface-floating-soft); color: var(--muted); font-size: 12px; font-weight: 800; }
+    .hub-crumb { border: 1px solid var(--line); border-radius: 999px; padding: var(--space-2) var(--space-3); background: var(--surface-card); color: var(--label-strong); cursor: pointer; font-weight: 850; }
     .hub-crumb:hover { color: var(--on-accent); background: linear-gradient(135deg, var(--accent), var(--accent-2)); transform: translateY(-1px); }
     .hub-crumb.current { pointer-events: none; color: var(--accent); background: rgba(139,211,255,0.10); }
     .hub-crumb-separator { color: rgba(148,163,184,0.52); }
-    .hub-section { display: grid; gap: 14px; padding-top: 18px; border-top: 1px solid rgba(139,211,255,0.24); }
+    .hub-section { display: grid; gap: var(--space-4); padding-top: var(--space-6); border-top: 1px solid rgba(139,211,255,0.24); }
     .hub-section:first-child { border-top: 0; padding-top: 0; }
     .hub-section-title { color: var(--muted); font-size: 12px; font-weight: 900; text-transform: uppercase; letter-spacing: 0.13em; }
-    .hub-section-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 260px), 1fr)); gap: 14px; align-items: start; }
+    .hub-section-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 260px), 1fr)); gap: var(--space-4); align-items: start; }
     .hub-folder-card { min-width: 0; border: 1px solid color-mix(in srgb, var(--line) 88%, transparent); border-radius: 22px; padding: 0; min-height: 132px; background: linear-gradient(145deg, color-mix(in srgb, var(--accent) 10%, var(--surface-card)), color-mix(in srgb, var(--accent-2) 6%, var(--surface-card))); color: var(--text); text-align: left; display: grid; gap: 0; box-shadow: 0 18px 54px rgba(0,0,0,0.24); overflow: hidden; }
     .hub-folder-card.navigation { background: linear-gradient(145deg, color-mix(in srgb, var(--accent-2) 13%, var(--surface-card)), color-mix(in srgb, var(--accent) 7%, var(--surface-card))); }
     .hub-folder-card.expanded { grid-column: 1 / -1; border-color: color-mix(in srgb, var(--accent) 38%, transparent); background: linear-gradient(145deg, color-mix(in srgb, var(--accent) 13%, var(--surface-card)), color-mix(in srgb, var(--accent-2) 8%, var(--surface-card))); }
     .hub-folder-card.current { border-color: color-mix(in srgb, var(--accent) 54%, transparent); }
     .hub-folder-card:hover { transform: translateY(-2px); border-color: color-mix(in srgb, var(--accent) 42%, transparent); background: linear-gradient(145deg, color-mix(in srgb, var(--accent) 16%, var(--surface-card)), color-mix(in srgb, var(--accent-2) 10%, var(--surface-card))); }
-    .hub-folder-card-main { width: 100%; min-width: 0; min-height: 132px; border: 0; border-radius: 22px; padding: 18px; background: transparent; color: inherit; text-align: left; cursor: pointer; display: grid; align-content: space-between; gap: 12px; }
+    .hub-folder-card-main { width: 100%; min-width: 0; min-height: 132px; border: 0; border-radius: 22px; padding: var(--space-5); background: transparent; color: inherit; text-align: left; cursor: pointer; display: grid; align-content: space-between; gap: var(--space-3); }
     .hub-folder-card-main:focus-visible { outline: 2px solid rgba(139,211,255,0.74); outline-offset: -4px; }
     .hub-folder-card.expanded > .hub-folder-card-main { min-height: 104px; }
-    .hub-folder-children { display: grid; gap: 12px; padding: 0 14px 14px; }
-    .hub-folder-children-head { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; padding: 13px 4px 0; border-top: 1px solid rgba(148,163,184,0.16); color: var(--muted); font-size: 12px; font-weight: 850; }
+    .hub-folder-children { display: grid; gap: var(--space-3); padding: 0 var(--space-4) var(--space-4); }
+    .hub-folder-children-head { display: flex; flex-wrap: wrap; gap: var(--space-2); align-items: center; padding: var(--space-3) var(--space-1) 0; border-top: 1px solid rgba(148,163,184,0.16); color: var(--muted); font-size: 12px; font-weight: 850; }
     .hub-folder-children-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 230px), 1fr)); gap: 12px; }
     .hub-folder-children .hub-folder-card { min-height: 112px; box-shadow: none; }
-    .hub-folder-children .hub-folder-card-main { min-height: 112px; padding: 14px; border-radius: 18px; }
+    .hub-folder-children .hub-folder-card-main { min-height: 112px; padding: var(--space-4); border-radius: 18px; }
     .hub-folder-card strong { display: block; min-width: 0; font-size: 20px; line-height: 1.05; letter-spacing: 0; overflow-wrap: anywhere; }
     .hub-folder-card span { min-width: 0; color: var(--muted); font-size: 13px; line-height: 1.35; overflow-wrap: anywhere; }
     .hub-folder-card code { min-width: 0; color: var(--accent); font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; line-height: 1.25; overflow-wrap: anywhere; white-space: normal; }
-    .hub-folder-meta { min-width: 0; display: flex; justify-content: space-between; gap: 10px; align-items: end; color: var(--label-strong); font-size: 12px; text-transform: uppercase; letter-spacing: 0.08em; }
+    .hub-folder-meta { min-width: 0; display: flex; justify-content: space-between; gap: var(--space-3); align-items: end; color: var(--label-strong); font-size: 12px; text-transform: uppercase; letter-spacing: 0.08em; }
     .hub-folder-meta code { flex: 1 1 auto; }
     .hub-folder-meta span { flex: 0 0 auto; text-align: right; white-space: nowrap; }
-    .startup-context-panel { display: grid; gap: 10px; padding-top: 18px; border-top: 1px solid rgba(139,211,255,0.24); }
+    .startup-context-panel { display: grid; gap: var(--space-3); padding-top: var(--space-6); border-top: 1px solid rgba(139,211,255,0.24); }
     .startup-context-copy { color: var(--muted); font-size: 13px; line-height: 1.4; }
     .startup-context-list { display: grid; gap: 8px; }
-    .startup-context-item { min-width: 0; border: 1px solid color-mix(in srgb, var(--line) 88%, transparent); border-radius: 14px; padding: 12px 14px; background: var(--surface-card); color: var(--text); cursor: pointer; text-align: left; display: grid; grid-template-columns: minmax(120px, 0.28fr) minmax(0, 1fr); gap: 12px; align-items: center; }
+    .startup-context-item { min-width: 0; border: 1px solid color-mix(in srgb, var(--line) 88%, transparent); border-radius: 14px; padding: var(--space-3) var(--space-4); background: var(--surface-card); color: var(--text); cursor: pointer; text-align: left; display: grid; grid-template-columns: minmax(120px, 0.28fr) minmax(0, 1fr); gap: var(--space-3); align-items: center; }
     .startup-context-item:hover { transform: translateY(-1px); border-color: color-mix(in srgb, var(--accent) 42%, transparent); background: var(--surface-card-hover); }
     .startup-context-item.readonly { cursor: default; }
     .startup-context-item.readonly:hover { transform: none; border-color: color-mix(in srgb, var(--line) 88%, transparent); background: var(--surface-card); }
@@ -3332,13 +3670,27 @@ export function renderAppHtml() {
     .startup-skill-names { min-width: 0; display: grid; gap: 4px; }
     .startup-skill-names code { min-width: 0; color: var(--muted); font: 12px/1.35 ui-monospace, SFMono-Regular, Menlo, monospace; overflow-wrap: anywhere; }
     .startup-skill-names em { color: var(--muted); font-style: normal; font-size: 12px; line-height: 1.4; overflow-wrap: anywhere; }
-    .startup-skill-buttons { min-width: 0; display: flex; flex-wrap: wrap; gap: 6px; }
-    .startup-skill-button { border: 1px solid rgba(139,211,255,0.24); border-radius: 999px; padding: 5px 8px; background: rgba(139,211,255,0.08); color: var(--text); cursor: pointer; font: 11px/1.2 ui-monospace, SFMono-Regular, Menlo, monospace; overflow-wrap: anywhere; }
-    .startup-skill-button:hover { border-color: rgba(139,211,255,0.5); background: rgba(139,211,255,0.14); }
-    .launch-card, .review-item, .hub-folder-card, .startup-context-item, .card, .conflict-card { position: relative; isolation: isolate; overflow: hidden; --spotlight-x: 50%; --spotlight-y: 50%; }
-    .launch-card::before, .review-item::before, .hub-folder-card::before, .startup-context-item::before, .card::before, .conflict-card::before { content: ""; position: absolute; inset: 0; z-index: 0; border-radius: inherit; pointer-events: none; background: radial-gradient(360px circle at var(--spotlight-x) var(--spotlight-y), rgba(139,211,255,0.18), rgba(182,156,255,0.08) 30%, transparent 62%); opacity: 0; transition: opacity 180ms ease; }
-    .launch-card.spotlight-active::before, .launch-card:focus-within::before, .review-item.spotlight-active::before, .review-item:focus-within::before, .hub-folder-card.spotlight-active::before, .hub-folder-card:focus-within::before, .startup-context-item.spotlight-active::before, .startup-context-item:focus-within::before, .card.spotlight-active::before, .card:focus-within::before, .conflict-card.spotlight-active::before, .conflict-card:focus-within::before { opacity: 1; }
-    .launch-card > *, .review-item > *, .hub-folder-card > *, .startup-context-item > *, .card > *, .conflict-card > * { position: relative; z-index: 1; }
+    .startup-skill-buttons { min-width: 0; display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+    .startup-skill-pill { max-width: 100%; display: inline-flex; align-items: center; position: relative; border: 1px solid rgba(139,211,255,0.24); border-radius: 999px; background: rgba(139,211,255,0.08); overflow: visible; transition: border-color 160ms ease, background 160ms ease, transform 160ms ease; }
+    .startup-skill-pill:hover, .startup-skill-pill:focus-within { border-color: rgba(139,211,255,0.5); background: rgba(139,211,255,0.14); transform: translateY(-1px); }
+    .startup-skill-button { min-width: 0; border: 0; padding: 5px 8px; background: transparent; color: var(--text); cursor: pointer; font: 11px/1.2 ui-monospace, SFMono-Regular, Menlo, monospace; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .startup-skill-delete { position: absolute; top: -7px; right: -7px; z-index: 4; width: 18px; height: 18px; padding: 0; border: 1px solid rgba(139,211,255,0.42); border-radius: 999px; background: rgba(139,211,255,0.14); color: var(--accent); cursor: pointer; opacity: 0; pointer-events: none; transform: scale(0.7); box-shadow: 0 8px 18px rgba(0,0,0,0.28); transition: opacity 120ms ease, transform 140ms ease, background 120ms ease, border-color 120ms ease; display: grid; place-items: center; font-size: 12px; font-weight: 900; line-height: 1; }
+    .startup-skill-pill:hover .startup-skill-delete, .startup-skill-pill:focus-within .startup-skill-delete { opacity: 1; pointer-events: auto; transform: scale(1); }
+    .startup-skill-delete:hover { background: rgba(139,211,255,0.22); border-color: rgba(139,211,255,0.68); color: var(--text); }
+    .startup-skill-add { width: 28px; height: 28px; border: 1px solid rgba(139,211,255,0.28); border-radius: 999px; background: rgba(139,211,255,0.08); color: var(--accent); cursor: pointer; font-weight: 900; line-height: 1; transition: transform 160ms ease, border-color 160ms ease, background 160ms ease; }
+    .startup-skill-add:hover, .startup-skill-add:focus-visible { transform: translateY(-1px); border-color: rgba(139,211,255,0.54); background: rgba(139,211,255,0.16); }
+    .startup-skill-create { display: inline-flex; align-items: center; gap: 4px; padding: 3px; border: 1px solid rgba(139,211,255,0.32); border-radius: 999px; background: rgba(6,12,24,0.36); box-shadow: inset 0 1px 0 rgba(255,255,255,0.04); }
+    .startup-skill-create input { width: 150px; min-width: 90px; height: 26px; border: 0; border-radius: 999px; background: rgba(255,255,255,0.08); color: var(--text); padding: 0 10px; font: 11px/1.2 ui-monospace, SFMono-Regular, Menlo, monospace; outline: none; }
+    .startup-skill-create input:focus { box-shadow: 0 0 0 2px rgba(139,211,255,0.28); }
+    .startup-skill-create button { width: 24px; height: 24px; border: 1px solid rgba(148,163,184,0.18); border-radius: 999px; background: rgba(255,255,255,0.06); color: var(--text); cursor: pointer; font-size: 12px; line-height: 1; display: grid; place-items: center; }
+    .startup-skill-create button:hover, .startup-skill-create button:focus-visible { background: rgba(139,211,255,0.14); border-color: rgba(139,211,255,0.36); }
+    .startup-skill-create button[data-startup-skill-create-cancel] { color: #ffb7c2; }
+    .startup-skill-folder::before { display: none; }
+    .startup-skill-folder.spotlight-active::before, .startup-skill-folder:focus-within::before { opacity: 0; }
+    .launch-card, .review-item, .hub-folder-card, .startup-context-item, .settings-section, .settings-toggle, .settings-theme-preview, .template-editor, .hub-section-editor, .hub-card-editor, .path-picker, .card, .conflict-card { position: relative; isolation: isolate; overflow: hidden; --spotlight-x: 50%; --spotlight-y: 50%; }
+    .launch-card::before, .review-item::before, .hub-folder-card::before, .startup-context-item::before, .settings-section::before, .settings-toggle::before, .settings-theme-preview::before, .template-editor::before, .hub-section-editor::before, .hub-card-editor::before, .path-picker::before, .card::before, .conflict-card::before { content: ""; position: absolute; inset: 0; z-index: 0; border-radius: inherit; pointer-events: none; background: radial-gradient(360px circle at var(--spotlight-x) var(--spotlight-y), rgba(139,211,255,0.18), rgba(182,156,255,0.08) 30%, transparent 62%); opacity: 0; transition: opacity 180ms ease; }
+    .launch-card.spotlight-active::before, .launch-card:focus-within::before, .review-item.spotlight-active::before, .review-item:focus-within::before, .hub-folder-card.spotlight-active::before, .hub-folder-card:focus-within::before, .startup-context-item.spotlight-active::before, .startup-context-item:focus-within::before, .settings-section.spotlight-active::before, .settings-section:focus-within::before, .settings-toggle.spotlight-active::before, .settings-toggle:focus-within::before, .settings-theme-preview.spotlight-active::before, .settings-theme-preview:focus-within::before, .template-editor.spotlight-active::before, .template-editor:focus-within::before, .hub-section-editor.spotlight-active::before, .hub-section-editor:focus-within::before, .hub-card-editor.spotlight-active::before, .hub-card-editor:focus-within::before, .path-picker.spotlight-active::before, .path-picker:focus-within::before, .card.spotlight-active::before, .card:focus-within::before, .conflict-card.spotlight-active::before, .conflict-card:focus-within::before { opacity: 1; }
+    .launch-card > *, .review-item > *, .hub-folder-card > *, .startup-context-item > *, .settings-section > *, .settings-toggle > *, .settings-theme-preview > *, .template-editor > *, .hub-section-editor > *, .hub-card-editor > *, .path-picker > *, .card > *, .conflict-card > * { position: relative; z-index: 1; }
     .selection-bar { margin: 6px 0 8px; padding: 5px 6px 5px 10px; border: 1px solid color-mix(in srgb, var(--accent) 18%, transparent); border-radius: 999px; background: var(--surface-floating-soft); display: flex; gap: 8px; align-items: center; justify-content: space-between; box-shadow: 0 10px 28px rgba(0,0,0,0.18); }
     .selection-bar[hidden] { display: none; }
     .selection-summary { min-width: 0; color: var(--label-strong); font-size: 11px; font-weight: 850; letter-spacing: 0.02em; white-space: nowrap; }
@@ -3346,7 +3698,7 @@ export function renderAppHtml() {
     .selection-action { width: 28px; height: 28px; padding: 0; border: 1px solid rgba(148,163,184,0.18); border-radius: 999px; background: rgba(255,255,255,0.045); color: var(--muted); font-size: 13px; line-height: 1; cursor: pointer; display: grid; place-items: center; }
     .selection-action:hover { color: var(--text); background: rgba(139,211,255,0.10); transform: translateY(-1px); }
     .selection-action.danger-action { border-color: rgba(255,140,157,0.24) !important; color: #ffb5c0 !important; }
-    .tree-entry { display: flex; align-items: stretch; gap: 5px; }
+    .tree-entry { display: flex; align-items: stretch; gap: var(--space-1); }
     .tree-entry .tree-row { flex: 1; }
     .tree-entry.selected .tree-row { border-color: rgba(139,211,255,0.34); background: rgba(139,211,255,0.085); box-shadow: inset 2px 0 0 rgba(139,211,255,0.48); }
     .tree-entry.selected .tree-row::after { content: "✓"; margin-left: auto; color: var(--accent); font-size: 10px; line-height: 1; flex: 0 0 auto; }
@@ -3390,18 +3742,18 @@ export function renderAppHtml() {
     @keyframes planetFloat { from { translate: 0 -8px; } to { translate: 0 12px; } }
     @keyframes planetZoom { from { transform: translate(-50%, -50%) scale(0.35); opacity: 0; } to { transform: translate(-50%, -50%) scale(1); opacity: 1; } }
     @keyframes satelliteIn { from { opacity: 0; transform: translate(-50%, -50%) scale(0.25); } to { opacity: 1; transform: translate(-50%, -50%) scale(1); } }
-    textarea, .viewer { width: 100%; height: 100%; min-height: calc(100vh - 48px); border: 0; outline: none; padding: 34px; background: var(--surface-reader); color: var(--text); font: 18px/1.72 ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; }
+    textarea, .viewer { width: 100%; height: 100%; min-height: calc(100vh - 48px); border: 0; outline: none; padding: var(--space-8); background: var(--surface-reader); color: var(--text); font: 18px/1.72 ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; }
     textarea { resize: none; display: none; }
     .viewer { white-space: pre-wrap; overflow: auto; }
-    .review-workspace { display: grid; grid-template-columns: minmax(320px, 0.92fr) minmax(420px, 1.08fr); gap: 18px; min-height: 100%; }
+    .review-workspace { display: grid; grid-template-columns: minmax(320px, 0.92fr) minmax(420px, 1.08fr); gap: var(--space-5); min-height: 100%; }
     .review-workspace.no-diff { grid-template-columns: 1fr; }
     .diff-panel, .file-panel { border: 1px solid var(--line); border-radius: 22px; background: var(--panel); overflow: hidden; min-width: 0; }
     .file-panel { border-color: var(--file-line); background: var(--file-panel-bg); }
-    .diff-header, .file-panel header { padding: 15px 17px; border-bottom: 1px solid var(--line); display: flex; justify-content: space-between; gap: 10px; align-items: center; color: var(--label-strong); font-family: Inter, ui-sans-serif, system-ui, sans-serif; }
+    .diff-header, .file-panel header { padding: var(--space-4) var(--space-5); border-bottom: 1px solid var(--line); display: flex; justify-content: space-between; gap: var(--space-3); align-items: center; color: var(--label-strong); font-family: Inter, ui-sans-serif, system-ui, sans-serif; }
     .file-panel header { border-bottom-color: var(--file-line); background: var(--file-header-bg); color: var(--file-fg); }
     .diff-header strong, .file-panel strong { font-size: 13px; letter-spacing: 0.08em; text-transform: uppercase; }
     .diff-meta { color: var(--muted); font-size: 12px; white-space: nowrap; }
-    .diff-code, .doc-content, .doc-editor { margin: 0; padding: 18px; white-space: pre-wrap; overflow: auto; max-height: calc(100vh - 162px); font: 13px/1.55 ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; }
+    .diff-code, .doc-content, .doc-editor { margin: 0; padding: var(--space-5); white-space: pre-wrap; overflow: auto; max-height: calc(100vh - 162px); font: 13px/1.55 ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; }
     .doc-content { font-size: 15px; line-height: 1.7; }
     .doc-editor { display: block; width: 100%; min-height: calc(100vh - 162px); border: 0; border-radius: 0; resize: none; background: var(--file-bg); color: var(--file-fg); outline: none; font-size: 15px; line-height: 1.7; caret-color: var(--file-h1); }
     .doc-editor::selection, .markdown-view ::selection { background: color-mix(in srgb, var(--file-h2) 32%, transparent); }
@@ -3419,19 +3771,46 @@ export function renderAppHtml() {
     .markdown-line.code, .markdown-line.fence { color: var(--file-code); background: color-mix(in srgb, var(--file-code) 10%, transparent); }
     .markdown-line.frontmatter, .markdown-line.hr { color: var(--file-marker); }
     .markdown-inline-code { color: var(--file-code); background: color-mix(in srgb, var(--file-code) 12%, transparent); border-radius: 4px; padding: 0 3px; }
+    .markdown-path { color: var(--file-list); border-bottom: 1px solid color-mix(in srgb, var(--file-list) 36%, transparent); }
+    .markdown-path[data-doc-link-path] { cursor: pointer; text-decoration: none; background-image: linear-gradient(90deg, transparent, color-mix(in srgb, var(--accent) 72%, transparent), transparent); background-repeat: no-repeat; background-size: 0 2px; background-position: 0 100%; transition: color 140ms ease, border-color 140ms ease, background-color 140ms ease, box-shadow 140ms ease; }
+    .markdown-path[data-doc-link-path]:hover, .markdown-path[data-doc-link-path].doc-link-hover-target, .doc-link-modifier-active .markdown-path[data-doc-link-path]:hover { color: var(--accent); border-color: color-mix(in srgb, var(--accent) 72%, transparent); background-color: color-mix(in srgb, var(--accent) 9%, transparent); box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 7%, transparent); animation: docLinkClickableSweep 1.1s ease-in-out infinite; }
+    .doc-link-modifier-active .markdown-path[data-doc-link-path] { border-color: color-mix(in srgb, var(--accent) 54%, transparent); background-color: color-mix(in srgb, var(--accent) 5%, transparent); }
+    @keyframes docLinkClickableSweep { 0% { background-size: 0 2px; background-position: 0 100%; } 46% { background-size: 100% 2px; background-position: 0 100%; } 100% { background-size: 0 2px; background-position: 100% 100%; } }
+    .markdown-doc-link { color: var(--file-list); border-bottom: 1px solid color-mix(in srgb, var(--file-list) 42%, transparent); text-decoration: none; }
+    .markdown-inline-code.markdown-path { color: var(--file-list); }
+    .markdown-editor-shell { position: relative; min-height: calc(100vh - 162px); max-height: calc(100vh - 162px); overflow: hidden; background: var(--file-bg); isolation: isolate; }
+    .markdown-editor-shell .doc-editor { min-height: 100%; max-height: none; box-sizing: border-box; }
+    .markdown-editor-highlight { position: absolute; inset: 0; z-index: 1; pointer-events: none; overflow: auto; background: transparent; color: var(--file-fg); scrollbar-width: none; }
+    .markdown-editor-highlight::-webkit-scrollbar { display: none; }
+    .markdown-editor-input { position: absolute; inset: 0; width: 100%; height: 100%; z-index: 2; resize: none; overflow: auto; background: transparent !important; color: transparent !important; -webkit-text-fill-color: transparent !important; caret-color: var(--file-h1); text-shadow: none !important; }
+    .markdown-editor-input.doc-link-hover { cursor: pointer; }
+    .markdown-editor-input::selection { background: color-mix(in srgb, var(--file-h2) 34%, transparent); color: transparent !important; -webkit-text-fill-color: transparent !important; }
+    .markdown-editor-highlight .markdown-line { margin: 0; padding: 0; border: 0; min-height: 1.7em; font-size: inherit; line-height: inherit; font-weight: inherit; letter-spacing: 0; }
+    .markdown-editor-highlight .markdown-line.h1, .markdown-editor-highlight .markdown-line.h2, .markdown-editor-highlight .markdown-line.h3, .markdown-editor-highlight .markdown-line.h4 { margin: 0; padding: 0; border: 0; font-size: inherit; line-height: inherit; font-weight: inherit; }
+    .markdown-editor-highlight .markdown-line.h1 { color: var(--file-h1); }
+    .markdown-editor-highlight .markdown-line.h2 { color: var(--file-h2); }
+    .markdown-editor-highlight .markdown-line.h3 { color: var(--file-h3); }
+    .markdown-editor-highlight .markdown-line.h4 { color: var(--file-h4); }
+    .markdown-editor-highlight .markdown-line.list { padding-left: 0; }
+    .markdown-editor-highlight .markdown-line.list .markdown-marker, .markdown-editor-highlight .markdown-path { color: var(--file-list); }
+    .markdown-editor-highlight .markdown-line.quote { color: var(--file-quote); border-left: 0; padding-left: 0; opacity: 1; }
+    .markdown-editor-highlight .markdown-line.code, .markdown-editor-highlight .markdown-line.fence { color: var(--file-code); background: transparent; }
+    .markdown-editor-highlight .markdown-line.frontmatter, .markdown-editor-highlight .markdown-line.hr { color: var(--file-marker); }
+    .markdown-editor-highlight .markdown-inline-code { color: var(--file-code); padding: 0; border-radius: 0; background: transparent; }
+    .markdown-editor-highlight .markdown-inline-code.markdown-path { color: var(--file-list); }
     .agent-focus-pulse.markdown-line { border-radius: 8px; }
     .diff-line { display: block; padding: 1px 8px; border-radius: 6px; }
     .diff-line.add { color: #b9ffd0; background: rgba(141,240,180,0.08); }
     .diff-line.del { color: #ffc0c8; background: rgba(255,140,157,0.08); }
     .diff-line.hunk { color: #b69cff; background: rgba(182,156,255,0.08); }
     .diff-line.meta { color: var(--muted); }
-    .diff-raw-meta { margin: 2px 18px 0; color: rgba(148,163,184,0.55); font: 10px/1.45 ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; }
+    .diff-raw-meta { margin: var(--space-1) var(--space-5) 0; color: rgba(148,163,184,0.55); font: 10px/1.45 ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; }
     .diff-raw-meta summary { cursor: pointer; width: fit-content; list-style: none; font-family: Inter, ui-sans-serif, system-ui, sans-serif; font-size: 9px; font-weight: 750; color: rgba(148,163,184,0.42); }
     .diff-raw-meta summary::-webkit-details-marker { display: none; }
     .diff-raw-meta pre { margin: 6px 0 0; padding: 8px 10px; border-radius: 10px; background: rgba(255,255,255,0.025); white-space: pre-wrap; }
-    .diff-empty { padding: 18px; color: var(--muted); font: 14px/1.5 Inter, ui-sans-serif, system-ui, sans-serif; }
-    .conflict-panel { position: sticky; top: 0; z-index: 8; margin: 14px; border: 1px solid rgba(255,196,107,0.54); border-radius: 16px; background: linear-gradient(135deg, rgba(255,196,107,0.18), rgba(255,140,157,0.12)); box-shadow: 0 14px 44px rgba(0,0,0,0.24); padding: 14px; display: grid; gap: 12px; font-family: Inter, ui-sans-serif, system-ui, sans-serif; color: #f7efe1; }
-    .external-review-actions { align-items: center; flex-wrap: nowrap; }
+    .diff-empty { padding: var(--space-5); color: var(--muted); font: 14px/1.5 Inter, ui-sans-serif, system-ui, sans-serif; }
+    .conflict-panel { position: sticky; top: 0; z-index: 8; margin: var(--space-4); border: 1px solid rgba(255,196,107,0.54); border-radius: 16px; background: linear-gradient(135deg, rgba(255,196,107,0.18), rgba(255,140,157,0.12)); box-shadow: 0 14px 44px rgba(0,0,0,0.24); padding: var(--space-4); display: grid; gap: var(--space-3); font-family: Inter, ui-sans-serif, system-ui, sans-serif; color: #f7efe1; }
+    .external-review-actions { align-items: center; flex-wrap: wrap; justify-content: flex-end; }
     .external-choice { min-height: 24px; padding: 4px 8px; border-radius: 999px; font-size: 11px; font-weight: 900; letter-spacing: 0; box-shadow: 0 6px 18px rgba(0,0,0,0.22); }
     .external-choice.icon { width: 25px; min-height: 24px; padding: 0; display: inline-flex; align-items: center; justify-content: center; }
     .external-choice.bulk { min-height: 28px; padding: 5px 9px; font-size: 10px; }
@@ -3448,9 +3827,9 @@ export function renderAppHtml() {
     .external-review-block.resolved.settling { overflow: hidden; transition: height 2s ease, min-height 2s ease, margin 2s ease, padding 2s ease, border-width 2s ease, background 220ms ease, border-color 220ms ease; }
     .external-review-block.resolved.accept { border-left-color: rgba(93,244,143,0.46); background: rgba(48,215,111,0.06); }
     .external-review-block.resolved.reject { border-left-color: rgba(255,140,157,0.42); background: rgba(255,86,117,0.055); }
-    .external-review-doc.settled .external-review-block.resolved, .external-review-block.resolved.settled { margin: 0; padding: 0; border-left-color: transparent; background: transparent; }
-    .external-review-doc.settled .external-review-block.resolved.accept, .external-review-doc.settled .external-review-block.resolved.reject, .external-review-block.resolved.settled.accept, .external-review-block.resolved.settled.reject { background: transparent; }
-    .external-review-doc.settled .external-review-block.resolved.empty, .external-review-block.resolved.settled.empty { min-height: 0; height: 0; border: 0; overflow: hidden; }
+    .external-review-block.resolved.settled { margin: 0; padding: 0; border-left-color: transparent; background: transparent; }
+    .external-review-block.resolved.settled.accept, .external-review-block.resolved.settled.reject { background: transparent; }
+    .external-review-block.resolved.settled.empty { min-height: 0; height: 0; border: 0; overflow: hidden; }
     .external-review-lines { display: grid; gap: 1px; min-width: 0; }
     .external-review-block-controls { position: absolute; top: 4px; right: 4px; z-index: 2; display: flex; gap: 4px; align-items: center; padding: 2px; border: 1px solid var(--line); border-radius: 999px; background: var(--surface-floating-soft); opacity: 0.66; transition: opacity 140ms ease, transform 140ms ease, border-color 140ms ease; }
     .external-review-block.change:hover .external-review-block-controls, .external-review-block.change:focus-within .external-review-block-controls { opacity: 1; border-color: rgba(139,211,255,0.26); transform: translateY(-1px); }
@@ -3462,14 +3841,14 @@ export function renderAppHtml() {
     .external-review-line.del .marker { color: #ff9cac; }
     .external-review-line.ctx { color: rgba(226,236,255,0.86); }
     .external-review-block.resolved.empty { min-height: 32px; overflow: hidden; }
-    .agent-annotations { display: grid; gap: 7px; padding: 10px 14px 0; }
-    .agent-annotation { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 10px; align-items: center; border-left: 2px solid rgba(182,156,255,0.62); border-radius: 0 10px 10px 0; background: rgba(182,156,255,0.075); padding: 8px 10px; color: rgba(226,236,255,0.9); font: 12px/1.4 Inter, ui-sans-serif, system-ui, sans-serif; }
+    .agent-annotations { display: grid; gap: var(--space-2); padding: var(--space-3) var(--space-4) 0; }
+    .agent-annotation { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: var(--space-3); align-items: center; border-left: 2px solid rgba(182,156,255,0.62); border-radius: 0 10px 10px 0; background: rgba(182,156,255,0.075); padding: var(--space-2) var(--space-3); color: rgba(226,236,255,0.9); font: 12px/1.4 Inter, ui-sans-serif, system-ui, sans-serif; }
     .agent-annotation strong { display: block; color: #f2edff; font-size: 11px; text-transform: uppercase; letter-spacing: 0.08em; margin-bottom: 3px; }
     .agent-annotation code { color: var(--accent-2); font: 11px/1.3 ui-monospace, SFMono-Regular, Menlo, monospace; overflow-wrap: anywhere; }
-    .agent-annotation-actions { display: flex; gap: 5px; align-items: center; }
-    .agent-toast { position: fixed; right: 18px; bottom: 18px; z-index: 60; max-width: min(420px, calc(100vw - 36px)); border: 1px solid rgba(139,211,255,0.34); border-radius: 18px; background: rgba(13,22,42,0.96); box-shadow: var(--shadow); padding: 12px; color: var(--text); font: 13px/1.4 Inter, ui-sans-serif, system-ui, sans-serif; }
+    .agent-annotation-actions { display: flex; gap: var(--space-1); align-items: center; }
+    .agent-toast { position: fixed; right: var(--space-5); bottom: var(--space-5); z-index: 60; max-width: min(420px, calc(100vw - 40px)); border: 1px solid rgba(139,211,255,0.34); border-radius: 18px; background: rgba(13,22,42,0.96); box-shadow: var(--shadow); padding: var(--space-3); color: var(--text); font: 13px/1.4 Inter, ui-sans-serif, system-ui, sans-serif; }
     .agent-toast strong { display: block; margin-bottom: 4px; }
-    .agent-toast-actions { display: flex; gap: 7px; justify-content: flex-end; margin-top: 10px; }
+    .agent-toast-actions { display: flex; gap: var(--space-2); justify-content: flex-end; margin-top: var(--space-3); }
     .agent-focus-pulse { animation: agentFocusPulse 1.5s ease; }
     @keyframes externalReviewAttention { 0%, 100% { box-shadow: 0 0 0 rgba(139,211,255,0); } 28% { box-shadow: 0 0 0 6px rgba(139,211,255,0.16); } 56% { box-shadow: 0 0 0 2px rgba(139,211,255,0.08); } }
     @keyframes agentFocusPulse { 0%, 100% { box-shadow: 0 0 0 rgba(182,156,255,0); } 25% { box-shadow: 0 0 0 5px rgba(182,156,255,0.16), inset 0 0 0 1px rgba(182,156,255,0.34); } 60% { box-shadow: 0 0 0 2px rgba(182,156,255,0.1), inset 0 0 0 1px rgba(182,156,255,0.2); } }
@@ -3478,7 +3857,7 @@ export function renderAppHtml() {
     .conflict-actions { display: flex; gap: 8px; flex-wrap: wrap; }
     .conflict-compare { display: grid; gap: 12px; min-width: 0; }
     .conflict-card { min-width: 0; border: 1px solid var(--line); border-radius: 14px; background: var(--surface-card); overflow: hidden; }
-    .conflict-card-head { display: flex; justify-content: space-between; gap: 10px; align-items: center; padding: 8px 10px; border-bottom: 1px solid rgba(148,163,184,0.12); color: var(--muted); font-size: 11px; font-weight: 850; text-transform: uppercase; letter-spacing: 0.08em; }
+    .conflict-card-head { display: flex; justify-content: space-between; gap: var(--space-3); align-items: center; padding: var(--space-2) var(--space-3); border-bottom: 1px solid rgba(148,163,184,0.12); color: var(--muted); font-size: 11px; font-weight: 850; text-transform: uppercase; letter-spacing: 0.08em; }
     .conflict-card-head small { color: rgba(226,236,255,0.58); font-size: 10px; font-weight: 800; letter-spacing: 0.04em; text-transform: none; }
     .conflict-card-head .diff-line { display: inline; padding: 1px 5px; border-radius: 999px; }
     .conflict-diff { max-height: min(42vh, 440px); overflow: auto; padding: 10px; font: 12px/1.46 ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; }
@@ -3491,30 +3870,28 @@ export function renderAppHtml() {
     .conflict-diff-line.ctx { color: rgba(226,236,255,0.82); border-left: 3px solid transparent; }
     .conflict-diff-line.skip { color: rgba(148,163,184,0.72); background: rgba(148,163,184,0.07); border-left: 3px solid transparent; font-style: italic; }
     .conflict-diff-line.skip .marker { color: rgba(148,163,184,0.62); }
-    .conflict-merge { display: grid; gap: 10px; padding: 10px; }
+    .conflict-merge { display: grid; gap: var(--space-3); padding: var(--space-3); }
     .conflict-merge textarea { display: block; width: 100%; min-height: min(42vh, 430px); resize: vertical; border: 1px solid rgba(148,163,184,0.18); border-radius: 12px; background: rgba(2,6,23,0.56); color: var(--text); outline: none; padding: 12px; font: 12px/1.48 ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; white-space: pre-wrap; overflow-wrap: anywhere; }
     .conflict-merge-actions { display: flex; gap: 8px; flex-wrap: wrap; justify-content: flex-end; }
     @media (max-width: 760px) { .external-review-actions { flex-wrap: wrap; justify-content: flex-start; } .external-review-block.change { padding-right: 0; } .external-review-block-controls { position: static; width: fit-content; margin: 4px 0 2px 8px; opacity: 1; } .external-review-line { grid-template-columns: 22px minmax(0, 1fr); } }
-    .file-header-copy { min-width: 0; display: grid; gap: 5px; }
+    .file-header-copy { min-width: 0; display: grid; gap: var(--space-1); }
     .file-header-copy .diff-meta { white-space: normal; line-height: 1.35; }
     .file-actions { display: flex; gap: 8px; align-items: center; flex: 0 0 auto; }
-    .file-action { border: 1px solid rgba(148,163,184,0.18); border-radius: 12px; padding: 9px 12px; background: rgba(255,255,255,0.06); color: var(--text); font-weight: 850; cursor: pointer; }
+    .file-action { border: 1px solid rgba(148,163,184,0.18); border-radius: 12px; padding: var(--space-2) var(--space-3); min-height: 36px; background: rgba(255,255,255,0.06); color: var(--text); font-weight: 850; cursor: pointer; }
     .file-action:hover { transform: translateY(-1px); background: rgba(139,211,255,0.12); }
     .file-action.primary { color: var(--on-accent); border: 0; background: linear-gradient(135deg, var(--accent), var(--accent-2)); }
-    .confirm-backdrop { position: fixed; inset: 0; z-index: 90; display: grid; place-items: center; padding: 18px; background: rgba(2,6,23,0.72); backdrop-filter: blur(14px); }
-    .confirm-dialog { width: min(420px, 100%); border: 1px solid var(--line); border-radius: 18px; background: var(--surface-floating); box-shadow: 0 22px 80px rgba(0,0,0,0.45); padding: 18px; color: var(--text); }
+    .confirm-backdrop { position: fixed; inset: 0; z-index: 90; display: grid; place-items: center; padding: var(--space-5); background: rgba(2,6,23,0.72); backdrop-filter: blur(14px); }
+    .confirm-dialog { width: min(420px, 100%); border: 1px solid var(--line); border-radius: 18px; background: var(--surface-floating); box-shadow: 0 22px 80px rgba(0,0,0,0.45); padding: var(--space-6); color: var(--text); }
     .confirm-dialog strong { display: block; font-size: 18px; line-height: 1.2; margin-bottom: 8px; }
     .confirm-dialog p { margin: 0; color: var(--muted); font-size: 14px; line-height: 1.45; overflow-wrap: anywhere; }
     .confirm-actions { display: flex; justify-content: flex-end; gap: 8px; flex-wrap: wrap; margin-top: 18px; }
-    .diff-toggle { border: 1px solid rgba(139,211,255,0.24); border-radius: 14px; padding: 10px 13px; margin-bottom: 10px; background: rgba(139,211,255,0.08); color: var(--text); font-weight: 850; cursor: pointer; }
-    .diff-toggle:hover { transform: translateY(-1px); background: rgba(139,211,255,0.14); }
     @media (max-width: 1280px) { .review-workspace { grid-template-columns: 1fr; } .diff-code, .doc-content { max-height: none; } }
     .viewer a.path-link { color: var(--accent); text-decoration: none; border-bottom: 1px solid rgba(139,211,255,0.35); cursor: pointer; }
     .viewer a.path-link:hover { color: #ffffff; border-bottom-color: #ffffff; }
     .mode-toggle { display: flex; border: 1px solid var(--line); border-radius: 14px; overflow: hidden; }
-    .mode-toggle button { border: 0; background: transparent; color: var(--muted); padding: 11px 13px; font-weight: 850; cursor: pointer; }
+    .mode-toggle button { border: 0; background: transparent; color: var(--muted); padding: var(--space-3); font-weight: 850; cursor: pointer; }
     .mode-toggle button.active { color: var(--on-accent); background: linear-gradient(135deg, var(--accent), var(--accent-2)); }
-    .cards { display: none; grid-template-columns: repeat(3, 1fr); gap: 10px; margin: 18px 0; }
+    .cards { display: none; grid-template-columns: repeat(3, 1fr); gap: var(--space-3); margin: var(--space-5) 0; }
     .card { padding: 12px; border-radius: 16px; border: 1px solid var(--line); background: rgba(255,255,255,0.045); }
     .card strong { display: block; font-size: 18px; margin-bottom: 3px; }
     .card span { color: var(--muted); font-size: 12px; }
@@ -3526,45 +3903,51 @@ export function renderAppHtml() {
     @media (prefers-reduced-motion: reduce) { *, *::before, *::after { animation: none !important; transition: none !important; } }
     @media (max-width: 980px) {
       body { overflow: hidden; }
-      .app, .app.sidebar-collapsed { grid-template-columns: 1fr; height: 100dvh; overflow: hidden; padding-top: 58px; }
-      aside { position: fixed; z-index: 30; top: 0; left: 0; right: 0; height: min(62dvh, 560px); max-height: min(62dvh, 560px); border-right: 0; border-bottom: 1px solid var(--line); padding: 10px; overflow: auto; box-shadow: 0 18px 60px rgba(0,0,0,0.42); }
-      .app.sidebar-collapsed aside { height: 58px; max-height: 58px; padding: 8px 10px; overflow: hidden; }
+      .app, .app.sidebar-collapsed { grid-template-columns: 1fr; height: 100dvh; overflow: hidden; padding-top: 56px; }
+      aside { position: fixed; z-index: 30; top: 0; left: 0; right: 0; height: min(62dvh, 560px); max-height: min(62dvh, 560px); border-right: 0; border-bottom: 1px solid var(--line); padding: var(--space-3); overflow: auto; box-shadow: 0 18px 60px rgba(0,0,0,0.42); }
+      .app.sidebar-collapsed aside { height: 56px; max-height: 56px; padding: var(--space-2) var(--space-3); overflow: hidden; }
       .app.sidebar-collapsed .sidebar-toggle { position: absolute; left: auto; right: 10px; top: 8px; z-index: 31; width: 40px; height: 40px; }
       .app.sidebar-collapsed .sidebar-copy, .app.sidebar-collapsed .search-row, .app.sidebar-collapsed .watch-filter-row, .app.sidebar-collapsed .selection-bar, .app.sidebar-collapsed .explorer-title, .app.sidebar-collapsed .tree, .app.sidebar-collapsed .hint { opacity: 0; pointer-events: none; transform: translateY(-8px); }
-      .app.sidebar-collapsed .workspace-dock { opacity: 1; pointer-events: auto; transform: none; width: calc(100% - 50px); margin: 0; padding: 5px; overflow-x: auto; flex-wrap: nowrap; scrollbar-width: none; }
+      .app.sidebar-collapsed .workspace-dock { opacity: 1; pointer-events: auto; transform: none; width: calc(100% - 50px); margin: 0; padding: 4px; overflow-x: auto; flex-wrap: nowrap; scrollbar-width: none; }
       .app.sidebar-collapsed .workspace-dock::-webkit-scrollbar { display: none; }
       .workspace-dock { margin-right: 50px; }
       .app:not(.sidebar-collapsed) .workspace-dock { margin-right: 0; }
-      .dock-button { padding: 8px 10px; white-space: nowrap; }
+      .dock-button { min-height: 36px; min-width: 36px; padding: 0 10px; white-space: nowrap; }
+      #back.dock-button, #forward.dock-button { padding: 0; }
+      .dock-button.diff-dock-button { padding: 0 11px; }
       .sidebar-head { position: absolute; right: 10px; top: 8px; display: block; }
-      .app:not(.sidebar-collapsed) .sidebar-head { position: static; display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 4px 2px 8px; }
+      .app:not(.sidebar-collapsed) .sidebar-head { position: static; display: flex; align-items: center; justify-content: space-between; gap: var(--space-3); padding: var(--space-1) var(--space-1) var(--space-2); }
       .sidebar-copy { padding-right: 52px; }
       .app:not(.sidebar-collapsed) .sidebar-copy { padding-right: 0; flex: 1 1 auto; min-width: 0; }
       .sidebar-toggle { width: 40px; height: 40px; }
-      main { height: calc(100dvh - 58px); padding: 10px; overflow: hidden; }
+      main { height: calc(100dvh - 56px); padding: var(--space-3); overflow: hidden; }
       .editor-shell { height: 100%; min-height: 0; border-radius: 18px; }
       .docqa-home, .settings-page { height: 100%; padding: 12px; overflow: auto; }
       .docqa-panel { border-radius: 18px; }
-      .docqa-panel header { padding: 14px; align-items: flex-start; flex-direction: column; }
+      .docqa-panel header { padding: var(--space-4); align-items: flex-start; flex-direction: column; }
       .review-summary { width: 100%; }
       .review-summary-item { flex: 1; min-width: 0; }
       .review-list { max-height: none; }
-      .review-item { padding: 11px; }
+      .review-item { padding: var(--space-3); }
       .review-top { align-items: flex-start; }
       .settings-grid, .hub-card-editor-grid, .template-editor-grid, .markdown-create { grid-template-columns: 1fr; }
-      .markdown-create .settings-field.paths, .path-picker-field, .path-picker-preview, .new-doc-actions { grid-column: 1; }
-      .path-picker { grid-template-columns: 1fr; }
-      .path-picker-menu { left: 8px; right: 8px; width: auto; }
-      .hub-folders { gap: 18px; }
+      .settings-grid.compact { grid-template-columns: 1fr; }
+      .settings-section-head { flex-direction: column; }
+      .settings-section-actions { justify-content: flex-start; width: 100%; }
+      .hub-section-editor, .hub-card-editor { gap: var(--space-3); padding: var(--space-3); }
+      .hub-card-children:not(:empty) { margin-left: var(--space-1); padding-left: var(--space-2); }
+      .markdown-create .settings-field.paths, .new-doc-title-field, .new-doc-compact-field, .path-picker-field, .path-picker-preview, .new-doc-actions { grid-column: 1; }
+      .path-picker-main { grid-template-columns: 1fr; }
+      .hub-folders { gap: var(--space-5); }
       .hub-folder-card { min-height: 116px; border-radius: 18px; }
-      .hub-folder-card-main { min-height: 116px; padding: 15px; border-radius: 18px; }
-      .hub-folder-children { padding: 0 12px 12px; }
+      .hub-folder-card-main { min-height: 116px; padding: var(--space-4); border-radius: 18px; }
+      .hub-folder-children { padding: 0 var(--space-3) var(--space-3); }
       .hub-folder-card strong { font-size: 18px; }
-      .startup-context-item { grid-template-columns: 1fr; gap: 5px; }
+      .startup-context-item { grid-template-columns: 1fr; gap: var(--space-2); }
       textarea, .viewer { min-height: 100%; padding: 16px; font-size: 14px; line-height: 1.58; }
       .review-workspace { grid-template-columns: 1fr; gap: 12px; }
       .diff-code, .doc-content, .doc-editor { max-height: none; padding: 12px; font-size: 12px; }
-      .diff-header, .file-panel header { padding: 12px; align-items: flex-start; }
+      .diff-header, .file-panel header { padding: var(--space-3); align-items: flex-start; }
       .file-actions { gap: 6px; flex-wrap: wrap; justify-content: flex-end; }
       .conflict-compare { grid-template-columns: 1fr; }
       .file-action { padding: 8px 10px; }
@@ -3579,19 +3962,21 @@ export function renderAppHtml() {
     }
     @media (max-width: 640px) {
       body { overflow: hidden; }
-      .app, .app.sidebar-collapsed { grid-template-columns: 1fr; grid-template-rows: 1fr; height: 100dvh; padding: 54px 0 0; overflow: hidden; }
+      .app, .app.sidebar-collapsed { grid-template-columns: 1fr; grid-template-rows: 1fr; height: 100dvh; padding: 52px 0 0; overflow: hidden; }
       .explorer-open { display: inline-flex; position: fixed; top: 8px; right: 8px; z-index: 35; width: 38px; height: 38px; border-radius: 12px; }
       .app.explorer-expanded .explorer-open { display: none; }
-      .workspace-dock, .app.sidebar-collapsed .workspace-dock { position: fixed; top: 0; left: 0; right: 0; z-index: 33; width: 100%; height: 54px; margin: 0; padding: 7px 52px 7px 8px; gap: 5px; border: 0; border-bottom: 1px solid var(--line); border-radius: 0; background: var(--surface-floating); backdrop-filter: blur(18px); box-shadow: 0 8px 24px rgba(0,0,0,0.32); flex-wrap: nowrap; overflow-x: auto; scrollbar-width: none; opacity: 1; pointer-events: auto; transform: none; }
-      .app.sidebar-collapsed .workspace-dock { width: 100%; padding: 7px 52px 7px 8px; margin: 0; opacity: 1; }
+      .workspace-dock, .app.sidebar-collapsed .workspace-dock { position: fixed; top: 0; left: 0; right: 0; z-index: 33; width: 100%; height: 52px; margin: 0; padding: var(--space-2) 52px var(--space-2) var(--space-2); gap: var(--space-1); border: 0; border-bottom: 1px solid var(--line); border-radius: 0; background: var(--surface-floating); backdrop-filter: blur(18px); box-shadow: 0 8px 24px rgba(0,0,0,0.32); flex-wrap: nowrap; overflow-x: auto; scrollbar-width: none; opacity: 1; pointer-events: auto; transform: none; }
+      .app.sidebar-collapsed .workspace-dock { width: 100%; padding: var(--space-2) 52px var(--space-2) var(--space-2); margin: 0; opacity: 1; }
       .app.explorer-expanded .workspace-dock { display: none; }
       .workspace-dock::-webkit-scrollbar { display: none; }
-      .workspace-dock .dock-button { padding: 8px 11px; white-space: nowrap; flex: 0 0 auto; }
+      .workspace-dock .dock-button { min-height: 36px; min-width: 36px; padding: 0 10px; white-space: nowrap; flex: 0 0 auto; }
+      .workspace-dock #back.dock-button, .workspace-dock #forward.dock-button { padding: 0; }
+      .workspace-dock .dock-button.diff-dock-button { padding: 0 11px; }
       .workspace-dock .dock-status { display: none; }
       aside { position: fixed; left: 0; right: 0; bottom: 0; top: auto; width: 100%; height: auto; max-height: 0; min-height: 0; margin: 0; padding: 0; border: 0; border-radius: 22px 22px 0 0; background: rgba(6,10,22,0.985); backdrop-filter: none; box-shadow: 0 -20px 70px rgba(0,0,0,0.55); overflow: auto; overscroll-behavior: contain; transition: transform 280ms cubic-bezier(.2,.9,.2,1), max-height 280ms ease, padding 280ms ease; transform: translateY(100%); pointer-events: none; }
-      .app.explorer-expanded aside { height: min(66dvh, 560px) !important; max-height: min(66dvh, 560px) !important; padding: 0 12px 14px !important; border-top: 1px solid var(--line) !important; transform: translateY(0) !important; pointer-events: auto !important; }
+      .app.explorer-expanded aside { height: min(66dvh, 560px) !important; max-height: min(66dvh, 560px) !important; padding: 0 var(--space-3) var(--space-4) !important; border-top: 1px solid var(--line) !important; transform: translateY(0) !important; pointer-events: auto !important; }
       .app.sidebar-collapsed aside { height: auto; max-height: 0; padding: 0; border: 0; transform: translateY(100%); pointer-events: none; }
-      .sidebar-head { position: sticky; top: 0; z-index: 2; display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 12px 2px 10px; background: rgba(6,10,22,0.98); border-bottom: 1px solid rgba(148,163,184,0.16); }
+      .sidebar-head { position: sticky; top: 0; z-index: 2; display: flex; align-items: center; justify-content: space-between; gap: var(--space-3); padding: var(--space-3) var(--space-1); background: rgba(6,10,22,0.98); border-bottom: 1px solid rgba(148,163,184,0.16); }
       .sidebar-copy { padding-right: 0; flex: 1 1 auto; min-width: 0; }
       .sidebar-copy h1 { font-size: 15px; margin: 0; }
       .sidebar-copy .subtitle { font-size: 11px; }
@@ -3603,37 +3988,43 @@ export function renderAppHtml() {
       .explorer-title { margin: 8px 0 4px; }
       .tree { font-size: 13px; padding-right: 2px; }
       .hint { font-size: 11px; line-height: 1.4; padding: 8px 0 2px; }
-      main { height: calc(100dvh - 54px); padding: 10px; overflow: hidden; }
+      main { height: calc(100dvh - 52px); padding: var(--space-2); overflow: hidden; }
       .editor-shell { height: 100%; min-height: 0; border-radius: 16px; }
-      .docqa-home, .settings-page { padding: 12px 10px; }
+      .docqa-home, .settings-page { padding: var(--space-2); }
       .docqa-panel { border-radius: 16px; }
       .docqa-panel header { padding: 12px; }
       .review-summary-item { min-width: 0; }
-      .review-item { padding: 10px; }
-      .hub-folders { gap: 14px; margin-top: 12px; }
+      .review-item { padding: var(--space-3); }
+      .hub-folders { gap: var(--space-4); margin-top: var(--space-3); }
       .hub-folder-card { min-height: 104px; border-radius: 16px; }
-      .hub-folder-card-main { min-height: 104px; padding: 14px; border-radius: 16px; }
-      .hub-folder-children { padding: 0 10px 10px; gap: 10px; }
-      .hub-folder-children-grid { gap: 10px; }
+      .hub-folder-card-main { min-height: 104px; padding: var(--space-4); border-radius: 16px; }
+      .hub-folder-children { padding: 0 var(--space-2) var(--space-2); gap: var(--space-2); }
+      .hub-folder-children-grid { gap: var(--space-2); }
       .hub-folder-card strong { font-size: 17px; }
       .hub-folder-card span { font-size: 12px; }
-      .hub-breadcrumb { padding: 8px 10px; font-size: 11px; gap: 5px; }
+      .hub-breadcrumb { padding: var(--space-2) var(--space-3); font-size: 11px; gap: var(--space-1); }
       .hub-crumb { padding: 6px 9px; font-size: 11px; }
-      textarea, .viewer { min-height: 100%; padding: 14px; font-size: 14px; line-height: 1.6; overflow-wrap: anywhere; }
+      textarea, .viewer { min-height: 100%; padding: var(--space-4); font-size: 14px; line-height: 1.6; overflow-wrap: anywhere; }
       .diff-code, .doc-content, .doc-editor { padding: 10px; font-size: 12px; line-height: 1.5; overflow-wrap: anywhere; }
-      .diff-header, .file-panel header { padding: 10px 12px; }
+      .diff-header, .file-panel header { padding: var(--space-3); }
       .file-actions { gap: 6px; }
       .file-action { padding: 8px 10px; font-size: 13px; }
       .selected-title { font-size: 18px; }
       .selected-path, .selected-impact { font-size: 12px; }
       .selected-impact { margin-top: 8px; }
       .actions { gap: 8px; }
-      button.primary, button.secondary { padding: 10px 13px; font-size: 13px; }
+      button.primary, button.secondary { padding: var(--space-2) var(--space-3); min-height: 36px; font-size: 13px; }
       .history-nav button { min-width: 38px; padding: 8px 10px; }
       .mode-toggle button { padding: 9px 11px; font-size: 13px; }
-      .diff-toggle { padding: 9px 11px; margin-bottom: 8px; }
       .settings-field textarea, .settings-field input { font-size: 12px; }
       .settings-footer { flex-direction: column; align-items: flex-start; gap: 8px; }
+      .settings-section-head, .settings-section-body { padding: var(--space-3); }
+      .settings-toggle { min-height: 58px; padding: 10px; }
+      .hub-section-editor-head { grid-template-columns: 1fr; align-items: stretch; }
+      .hub-section-editor-head button { justify-self: start; }
+      .hub-card-editor-head { flex-direction: column; align-items: flex-start; }
+      .hub-card-editor-head .docqa-actions { justify-content: flex-start; }
+      .hub-card-children:not(:empty) { margin-left: 0; }
       .planet-system { min-height: 560px; }
       .cosmos-home { padding: 12px; }
       .planet-stage { min-height: 520px; }
@@ -3650,6 +4041,7 @@ export function renderAppHtml() {
         <button id="hub" class="dock-button" type="button" title="Hub / settings">hub</button>
         <button id="back" class="dock-button" type="button" title="Previous file">←</button>
         <button id="forward" class="dock-button" type="button" title="Next file">→</button>
+        <button id="gitDiffToggle" class="dock-button diff-dock-button" type="button" title="Show Git diff" hidden>Show Git diff</button>
         <button id="reload" class="dock-button" type="button" hidden>reload</button>
         <button id="verifyCurrent" class="dock-button" type="button" hidden>verified</button>
         <button id="deleteCurrent" class="dock-button danger-action" type="button" hidden>delete</button>
@@ -3744,7 +4136,7 @@ export function renderAppHtml() {
   <div id="explorerContextMenu" class="explorer-context-menu" hidden></div>
   <div id="agentToast" class="agent-toast" hidden></div>
 <script>
-const state = { files: [], startupContextFiles: [], startupSkillFolders: [], selectedStartupContext: null, docqa: null, doctor: null, settings: null, settingsOpen: false, page: "hub", pendingMarkdown: null, availableHubCards: [], hubFolders: [], hubSections: [], rootHubSections: [], activeHubCardId: null, selectedReview: null, reviewModePath: null, reviewModeStatus: null, selected: null, selectedDiff: null, fileConflict: null, externalChange: null, conflictCompare: false, conflictMergeText: null, conflictMergeKey: "", conflictMergeMode: "auto", conflictCheckTimer: null, diffCollapsed: false, saved: "", savedHash: null, dirty: false, mode: "view", homeView: "root", planetStack: ["root"], filePanel: false, history: [], historyIndex: -1, pathFilters: [], explorerWatchFilter: "all", selectedForDelete: new Set(), selectionRequest: 0, mobileSidebarTouched: false, sessionStateTimer: null, agentCommandTimer: null, lastAgentCommandId: "", pendingAgentCommand: null, agentAnnotations: {}, userActiveAt: 0, expanded: new Set(["data", "automations", "integrations", "skills", "tools", "~", "~/.hermes", "~/.hermes/memories", "~/.hermes/skills"]) };
+const state = { files: [], startupContextFiles: [], startupSkillFolders: [], activeStartupSkillExplorer: null, activeStartupContextExplorer: null, startupSkillCreateFolder: null, selectedStartupContext: null, docqa: null, doctor: null, settings: null, settingsOpen: false, page: "hub", pendingMarkdown: null, availableHubCards: [], hubFolders: [], hubSections: [], rootHubSections: [], activeHubCardId: null, selectedReview: null, reviewModePath: null, reviewModeStatus: null, selected: null, selectedDiff: null, fileConflict: null, externalChange: null, conflictCompare: false, conflictMergeText: null, conflictMergeKey: "", conflictMergeMode: "auto", conflictCheckTimer: null, diffCollapsed: false, saved: "", savedHash: null, dirty: false, mode: "view", homeView: "root", planetStack: ["root"], filePanel: false, history: [], historyIndex: -1, pathFilters: [], explorerWatchFilter: "all", explorerRenderKey: "", selectedForDelete: new Set(), selectionRequest: 0, openingFilePath: null, mobileSidebarTouched: false, sessionStateTimer: null, agentCommandTimer: null, lastAgentCommandId: "", pendingAgentCommand: null, agentAnnotations: {}, userActiveAt: 0, markdownHighlightFrame: 0, markdownHighlightText: "", markdownHighlightLastText: "", expanded: new Set(["data", "automations", "integrations", "skills", "tools", "~", "~/.hermes", "~/.hermes/memories", "~/.hermes/skills"]) };
 const FILE_THEMES = ${JSON.stringify(FILE_THEME_OPTIONS)};
 const DEFAULT_FILE_THEME = "${DEFAULT_FILE_THEME}";
 const MAIN_FILE_PATHS = new Set([
@@ -3798,12 +4190,24 @@ async function api(path, options) {
 
 function currentFileThemeId() {
   const wanted = state.settings?.appearance?.fileTheme || DEFAULT_FILE_THEME;
+  return normalizeFileThemeId(wanted);
+}
+
+function normalizeFileThemeId(wanted) {
   return FILE_THEMES.some((theme) => theme.id === wanted) ? wanted : DEFAULT_FILE_THEME;
 }
 
-function applyFileTheme() {
-  document.documentElement.dataset.fileTheme = currentFileThemeId();
-  document.documentElement.dataset.appTheme = currentFileThemeId();
+function applyFileTheme(themeId = currentFileThemeId()) {
+  const clean = normalizeFileThemeId(themeId);
+  document.documentElement.dataset.fileTheme = clean;
+  document.documentElement.dataset.appTheme = clean;
+}
+
+function previewSelectedFileTheme() {
+  const clean = normalizeFileThemeId(el("fileTheme")?.value || currentFileThemeId());
+  applyFileTheme(clean);
+  const label = el("settingsThemePreviewName");
+  if (label) label.textContent = clean;
 }
 
 function autoOpenGitDiffEnabled() {
@@ -3900,7 +4304,7 @@ function currentMarkdownViewHeading() {
 }
 
 function visibleMarkdownReader() {
-  const reader = el("docReader");
+  const reader = el("docReader") || el("docHighlighter");
   if (!reader || reader.hidden) return null;
   const style = window.getComputedStyle(reader);
   if (style.display === "none" || style.visibility === "hidden") return null;
@@ -4041,7 +4445,9 @@ function scrollMarkdownViewToNeedle(needle, type = "text") {
     ? lines.find((line) => line.dataset.headingText && (normalizeHeadingText(line.dataset.headingText) === normalizedWanted || normalizeHeadingText((line.dataset.headingMarker || "") + " " + line.dataset.headingText) === normalizedWanted))
     : lines.find((line) => line.textContent.toLowerCase().includes(wanted.toLowerCase()));
   if (!target) return false;
-  reader.scrollTop = Math.max(0, target.offsetTop - reader.clientHeight * 0.34);
+  const scroller = el("docEditor") || reader;
+  scroller.scrollTop = Math.max(0, target.offsetTop - scroller.clientHeight * 0.34);
+  syncMarkdownEditorScroll();
   pulseAgentFocus(target);
   return true;
 }
@@ -4236,36 +4642,82 @@ function updateExplorerWatchFilterButtons() {
   });
 }
 
-function renderFiles() {
-  const tree = buildTree(visibleFiles());
+function explorerRenderKey(files) {
+  return JSON.stringify({
+    files: files.map((file) => [file.path, file.label, file.category]),
+    selected: state.selected,
+    selectedForDelete: [...state.selectedForDelete].sort(),
+    expanded: [...state.expanded].sort(),
+    search: el("search")?.value || "",
+    pathFilters: state.pathFilters || [],
+    watchFilter: state.explorerWatchFilter,
+    watchAllow: state.settings?.watchAllow || [],
+    activeStartupSkill: state.activeStartupSkillExplorer,
+    activeStartupContext: state.activeStartupContextExplorer,
+  });
+}
+
+function renderFiles({ force = false } = {}) {
+  wireExplorerTreeEvents();
+  const files = visibleFiles();
+  const nextKey = explorerRenderKey(files);
+  if (!force && state.explorerRenderKey === nextKey) {
+    updateExplorerWatchFilterButtons();
+    updateSelectionBar();
+    return;
+  }
+  state.explorerRenderKey = nextKey;
+  const tree = buildTree(files);
   el("files").innerHTML = renderTreeChildren(tree, 0);
   updateExplorerWatchFilterButtons();
-  document.querySelectorAll("[data-file-path]").forEach((button) => {
-    button.addEventListener("click", (event) => {
+  updateSelectionBar();
+}
+
+function wireExplorerTreeEvents() {
+  const holder = el("files");
+  if (!holder || holder.dataset.wired === "true") return;
+  holder.dataset.wired = "true";
+  holder.addEventListener("click", (event) => {
+    const target = event.target instanceof Element ? event.target : null;
+    if (!target) return;
+    const toggle = target.closest("[data-toggle-folder]");
+    if (toggle && holder.contains(toggle)) {
+      event.stopPropagation();
+      openSidebarIfCollapsed();
+      toggleFolder(toggle.dataset.toggleFolder);
+      return;
+    }
+    const fileButton = target.closest("[data-file-path]");
+    if (fileButton && holder.contains(fileButton)) {
       hideExplorerContextMenu();
-      if (shouldToggleSelection(event)) toggleDeleteSelection(button.dataset.filePath);
-      else selectFile(button.dataset.filePath).catch((error) => setStatus(error.message));
-    });
-    button.addEventListener("contextmenu", (event) => openExplorerContextMenu(event, { kind: "file", path: button.dataset.filePath }));
-  });
-  document.querySelectorAll("[data-folder-path]").forEach((button) => {
-    button.addEventListener("click", (event) => {
+      if (shouldToggleSelection(event)) toggleDeleteSelection(fileButton.dataset.filePath);
+      else selectFile(fileButton.dataset.filePath).catch((error) => setStatus(error.message));
+      return;
+    }
+    const folderButton = target.closest("[data-folder-path]");
+    if (folderButton && holder.contains(folderButton)) {
       hideExplorerContextMenu();
-      const selectPath = button.dataset.folderPath + "/";
+      const selectPath = folderButton.dataset.folderPath + "/";
       if (shouldToggleSelection(event)) toggleDeleteSelection(selectPath);
       else {
         openSidebarIfCollapsed();
-        toggleFolder(button.dataset.folderPath);
+        toggleFolder(folderButton.dataset.folderPath);
       }
-    });
-    button.addEventListener("contextmenu", (event) => openExplorerContextMenu(event, { kind: "folder", path: button.dataset.folderPath }));
+    }
   });
-  document.querySelectorAll("[data-toggle-folder]").forEach((button) => button.addEventListener("click", (event) => {
-    event.stopPropagation();
-    openSidebarIfCollapsed();
-    toggleFolder(button.dataset.toggleFolder);
-  }));
-  updateSelectionBar();
+  holder.addEventListener("contextmenu", (event) => {
+    const target = event.target instanceof Element ? event.target : null;
+    if (!target) return;
+    const fileButton = target.closest("[data-file-path]");
+    if (fileButton && holder.contains(fileButton)) {
+      openExplorerContextMenu(event, { kind: "file", path: fileButton.dataset.filePath });
+      return;
+    }
+    const folderButton = target.closest("[data-folder-path]");
+    if (folderButton && holder.contains(folderButton)) {
+      openExplorerContextMenu(event, { kind: "folder", path: folderButton.dataset.folderPath });
+    }
+  });
 }
 
 function shouldToggleSelection(event) {
@@ -4286,6 +4738,11 @@ function explorerTargetDirectory(target = {}) {
   return parentDirectoryFromUiPath(relPath);
 }
 
+function markdownCreateDirectoryForTarget(target = state.explorerContextTarget) {
+  const directory = normalizeUiPath(target?.directory || "").replace(/\/$/, "");
+  return directory;
+}
+
 function parentDirectoryFromUiPath(relPath) {
   const parts = normalizeUiPath(relPath).split("/").filter(Boolean);
   parts.pop();
@@ -4302,23 +4759,26 @@ function renderExplorerContextMenu(x, y) {
   const target = state.explorerContextTarget;
   if (!menu || !target || !state.settings) return;
   const directoryLabel = target.directory || "project root";
+  const markdownDirectory = markdownCreateDirectoryForTarget(target);
+  const markdownDirectoryLabel = markdownDirectory || "project root";
   const label = target.path || directoryLabel;
+  const createActions = '<button class="secondary" type="button" data-context-new-file>New file</button>' +
+    '<button class="secondary" type="button" data-context-new-folder>New folder</button>';
   const targetActions = target.path
     ? '<button class="secondary" type="button" data-context-watch>Watch</button>' +
-      '<button class="secondary" type="button" data-context-new-file>New file</button>' +
-      '<button class="secondary" type="button" data-context-new-folder>New folder</button>' +
+      createActions +
       '<button class="secondary" type="button" data-context-select>Select</button>' +
       '<button class="secondary danger-action" type="button" data-context-delete>Delete</button>'
-    : '<button class="secondary" type="button" data-context-new-file>New file</button>' +
-      '<button class="secondary" type="button" data-context-new-folder>New folder</button>';
+    : createActions;
   menu.innerHTML = '<div class="explorer-context-title"><span>Actions</span><code>' + escapeHtml(label) + '</code></div>' +
     '<div class="explorer-context-actions menu-actions" data-context-action-list>' +
       targetActions +
     '</div>' +
     '<div class="explorer-context-form" data-context-new-file-form hidden>' +
-      '<div class="explorer-context-title"><span>New file</span><code>' + escapeHtml(directoryLabel) + '</code></div>' +
+      '<div class="explorer-context-title"><span>New file</span><code>' + escapeHtml(markdownDirectoryLabel) + '</code></div>' +
       '<label class="explorer-context-label" for="contextMarkdownTitle">Name</label>' +
-      '<input id="contextMarkdownTitle" placeholder="Document title" value="New document" />' +
+      '<input id="contextMarkdownTitle" placeholder="File name" value="New document" />' +
+      '<div id="contextMarkdownError" class="explorer-context-error" hidden></div>' +
       '<div class="explorer-context-actions form-actions"><button id="contextCancelMarkdown" class="secondary" type="button" title="Cancel" aria-label="Cancel">Cancel</button><button id="contextCreateMarkdown" class="primary" type="button">Create</button></div>' +
     '</div>' +
     '<div class="explorer-context-form" data-context-new-folder-form hidden>' +
@@ -4336,7 +4796,12 @@ function renderExplorerContextMenu(x, y) {
   document.querySelector("[data-context-new-folder]")?.addEventListener("click", showContextNewFolderForm);
   document.querySelector("[data-context-select]")?.addEventListener("click", selectExplorerContextTarget);
   document.querySelector("[data-context-delete]")?.addEventListener("click", () => deleteExplorerContextTarget().catch((error) => setStatus(error.message)));
-  el("contextCreateMarkdown")?.addEventListener("click", () => createMarkdownFromContextMenu().catch((error) => setStatus(error.message)));
+  el("contextCreateMarkdown")?.addEventListener("click", () => submitMarkdownFromContextMenu());
+  el("contextMarkdownTitle")?.addEventListener("keydown", (event) => {
+    if (event.key !== "Enter") return;
+    event.preventDefault();
+    submitMarkdownFromContextMenu();
+  });
   el("contextCancelMarkdown")?.addEventListener("click", hideExplorerContextMenu);
   el("contextCreateFolder")?.addEventListener("click", () => createFolderFromContextMenu().catch((error) => setStatus(error.message)));
   el("contextCancelFolder")?.addEventListener("click", hideExplorerContextMenu);
@@ -4365,6 +4830,7 @@ function showContextNewFileForm() {
   if (actionList) actionList.hidden = true;
   if (!form) return;
   form.hidden = false;
+  setContextMarkdownError("");
   el("contextMarkdownTitle")?.focus();
   el("contextMarkdownTitle")?.select();
 }
@@ -4432,12 +4898,50 @@ async function deleteExplorerContextTarget() {
 
 async function createMarkdownFromContextMenu() {
   const title = el("contextMarkdownTitle")?.value.trim() || "New document";
-  const directory = state.explorerContextTarget?.directory || "";
+  const directory = markdownCreateDirectoryForTarget();
   const relPath = markdownPathFromName(directory, title);
   if (!relPath) throw new Error("New markdown name is required");
+  setStatus("creating file...");
+  const result = await api("/api/markdown/create", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ path: relPath, title, applyTemplate: false }),
+  });
   hideExplorerContextMenu();
-  showNewDocPage({ title, path: relPath, directory });
-  setStatus("new document setup");
+  const parent = parentDirectoryFromUiPath(result.path);
+  if (parent) state.expanded.add(parent);
+  await loadFiles();
+  await selectFile(result.path, { revealInExplorer: true });
+  setStatus("file created");
+}
+
+async function submitMarkdownFromContextMenu() {
+  const button = el("contextCreateMarkdown");
+  setContextMarkdownError("");
+  if (button?.disabled) return;
+  const previousLabel = button?.textContent || "Create";
+  if (button) {
+    button.disabled = true;
+    button.textContent = "Creating...";
+  }
+  try {
+    await createMarkdownFromContextMenu();
+  } catch (error) {
+    setContextMarkdownError(error.message || "Could not create file");
+    setStatus(error.message || "Could not create file");
+  } finally {
+    if (button && document.body.contains(button)) {
+      button.disabled = false;
+      button.textContent = previousLabel;
+    }
+  }
+}
+
+function setContextMarkdownError(message) {
+  const box = el("contextMarkdownError");
+  if (!box) return;
+  box.textContent = message || "";
+  box.hidden = !message;
 }
 
 function markdownPathFromName(directory, name) {
@@ -4536,6 +5040,7 @@ async function deletePaths(paths) {
   state.selectedForDelete.clear();
   if (selected.includes(state.selected) || result.deleted.includes(state.selected)) {
     state.selected = null;
+    state.openingFilePath = null;
     state.selectedDiff = null;
     resetExternalChangeState();
     state.savedHash = null;
@@ -4692,7 +5197,7 @@ function iconForPath(filePath) {
 
 async function loadFiles() {
   setStatus("chargement...");
-  const [data, docqa, doctor, settingsData, startupData, startupSkillsData] = await Promise.all([api("/api/files"), api("/api/docqa"), api("/api/doctor"), api("/api/settings"), api("/api/startup-context"), api("/api/startup-skills")]);
+  const [data, docqa, doctor, settingsData, startupData, startupSkillsData] = await Promise.all([api(filesApiPath()), api("/api/docqa"), api("/api/doctor"), api("/api/settings"), api("/api/startup-context"), api("/api/startup-skills")]);
   state.files = data.files;
   state.startupContextFiles = startupData.files || [];
   state.startupSkillFolders = startupSkillsData.folders || [];
@@ -4711,6 +5216,19 @@ async function loadFiles() {
   scheduleSessionStatePush();
 }
 
+function filesApiPath() {
+  const params = new URLSearchParams();
+  const activeSkill = state.activeStartupSkillExplorer;
+  const activeContext = state.activeStartupContextExplorer;
+  if (activeSkill?.folder && activeSkill?.skill) {
+    params.set("startupSkillFolder", activeSkill.folder);
+    params.set("startupSkill", activeSkill.skill);
+  }
+  if (activeContext?.order) params.set("startupContextOrder", activeContext.order);
+  const query = params.toString();
+  return query ? "/api/files?" + query : "/api/files";
+}
+
 async function selectFile(path, options = {}) {
   if (!path) return;
   if (state.selected && path !== state.selected && !options.forceReload && blockPendingExternalChange("before changing file")) return;
@@ -4718,7 +5236,9 @@ async function selectFile(path, options = {}) {
 
   const requestId = ++state.selectionRequest;
   state.selected = path;
+  state.openingFilePath = path;
   state.selectedStartupContext = null;
+  state.activeStartupContextExplorer = null;
   state.reviewModePath = options.reviewMode ? path : null;
   state.reviewModeStatus = options.reviewMode ? reviewStatusForPath(path) : null;
   state.page = "file";
@@ -4764,6 +5284,7 @@ async function selectFile(path, options = {}) {
     if (!isCurrentSelection(requestId, path)) return;
     state.saved = data.content;
     state.savedHash = data.contentHash;
+    state.openingFilePath = null;
     el("editor").value = data.content;
     await loadAnnotationsForPath(path).catch(() => {});
     if (options.pushHistory !== false) pushHistory(path);
@@ -4784,7 +5305,10 @@ async function selectFile(path, options = {}) {
         if (isCurrentSelection(requestId, path)) setStatus(error.message);
       });
   } catch (error) {
-    if (isCurrentSelection(requestId, path)) setStatus(error.message);
+    if (isCurrentSelection(requestId, path)) {
+      state.openingFilePath = null;
+      setStatus(error.message);
+    }
   }
 }
 
@@ -4799,6 +5323,7 @@ async function selectStartupContextFile(order) {
   const selectedKey = "startup-context-" + order;
   const pendingFile = (state.startupContextFiles || []).find((file) => String(file.startupContext.order) === String(order));
   state.selected = selectedKey;
+  state.openingFilePath = selectedKey;
   state.selectedStartupContext = pendingFile?.startupContext || { order, fileName: "Startup context", displayPath: "" };
   state.reviewModePath = null;
   state.reviewModeStatus = null;
@@ -4811,7 +5336,9 @@ async function selectStartupContextFile(order) {
   state.page = "file";
   state.settingsOpen = false;
   state.pendingMarkdown = null;
-  collapseSidebarOnNarrow();
+  state.pathFilters = [];
+  el("search").value = "";
+  openSidebarIfCollapsed();
   document.querySelector(".editor-shell").classList.remove("planet-file-open");
   document.querySelector(".editor-shell").classList.add("file-open");
   el("home").hidden = true;
@@ -4831,16 +5358,25 @@ async function selectStartupContextFile(order) {
     const data = await api("/api/startup-context/file?order=" + encodeURIComponent(order));
     if (!isCurrentSelection(requestId, selectedKey)) return;
     state.selectedStartupContext = data.startupContext;
+    const selectedPath = startupContextSelectedExplorerPath(data.startupContext);
+    state.selected = selectedPath || selectedKey;
+    activateStartupContextExplorer(data.startupContext);
     state.saved = data.content;
     state.savedHash = data.contentHash;
+    state.openingFilePath = null;
     el("editor").value = data.content;
+    await loadFiles();
+    revealActiveStartupContextExplorer();
     updateHeader();
     updatePreview();
     renderViewer();
     setStatus("startup context open");
     scheduleSessionStatePush();
   } catch (error) {
-    if (isCurrentSelection(requestId, selectedKey)) setStatus(error.message);
+    if (isCurrentSelection(requestId, selectedKey)) {
+      state.openingFilePath = null;
+      setStatus(error.message);
+    }
   }
 }
 
@@ -4850,6 +5386,8 @@ async function selectStartupSkillFile(folderOrder, skillName) {
   const requestId = ++state.selectionRequest;
   const selectedKey = "startup-skill-" + folderOrder + "-" + skillName;
   state.selected = selectedKey;
+  state.openingFilePath = selectedKey;
+  state.activeStartupContextExplorer = null;
   state.selectedStartupContext = { order: folderOrder + ":" + skillName, fileName: skillName + "/SKILL.md", displayPath: "Startup skill" };
   state.reviewModePath = null;
   state.reviewModeStatus = null;
@@ -4862,7 +5400,9 @@ async function selectStartupSkillFile(folderOrder, skillName) {
   state.page = "file";
   state.settingsOpen = false;
   state.pendingMarkdown = null;
-  collapseSidebarOnNarrow();
+  state.pathFilters = [];
+  el("search").value = "";
+  openSidebarIfCollapsed();
   document.querySelector(".editor-shell").classList.remove("planet-file-open");
   document.querySelector(".editor-shell").classList.add("file-open");
   el("home").hidden = true;
@@ -4882,28 +5422,173 @@ async function selectStartupSkillFile(folderOrder, skillName) {
     const data = await api("/api/startup-skills/file?folder=" + encodeURIComponent(folderOrder) + "&skill=" + encodeURIComponent(skillName));
     if (!isCurrentSelection(requestId, selectedKey)) return;
     state.selectedStartupContext = data.startupContext;
+    state.selected = startupSkillSelectedExplorerPath(data.startupContext) || selectedKey;
+    activateStartupSkillExplorer(folderOrder, data.startupContext?.skillName || skillName, data.startupContext);
     state.saved = data.content;
     state.savedHash = data.contentHash;
+    state.openingFilePath = null;
     el("editor").value = data.content;
+    await loadFiles();
+    revealActiveStartupSkillExplorer();
     updateHeader();
     updatePreview();
     renderViewer();
     setStatus("startup skill open");
     scheduleSessionStatePush();
   } catch (error) {
-    if (isCurrentSelection(requestId, selectedKey)) setStatus(error.message);
+    if (isCurrentSelection(requestId, selectedKey)) {
+      state.openingFilePath = null;
+      setStatus(error.message);
+    }
   }
+}
+
+function createStartupSkillFromPanel(folderOrder) {
+  if (!folderOrder) return;
+  if (state.dirty && !confirm("You have unsaved changes. Create a new skill?")) return;
+  state.startupSkillCreateFolder = String(folderOrder);
+  renderHubFolders();
+  focusStartupSkillCreateInput(folderOrder);
+}
+
+function focusStartupSkillCreateInput(folderOrder) {
+  window.requestAnimationFrame(() => {
+    const input = document.querySelector('[data-startup-skill-create-input="' + cssEscape(String(folderOrder)) + '"]');
+    input?.focus();
+    input?.select();
+  });
+}
+
+function cancelStartupSkillCreate() {
+  state.startupSkillCreateFolder = null;
+  renderHubFolders();
+  setStatus("skill creation cancelled");
+}
+
+async function submitStartupSkillCreateForm(folderOrder) {
+  if (!folderOrder) return;
+  const input = document.querySelector('[data-startup-skill-create-input="' + cssEscape(String(folderOrder)) + '"]');
+  const rawName = input?.value || "";
+  const skillName = slugifyUiId(rawName);
+  if (!skillName) {
+    setStatus("skill name required");
+    input?.focus();
+    return;
+  }
+  setStatus("creating startup skill...");
+  const result = await api("/api/startup-skills/create", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ folder: folderOrder, skill: skillName }),
+  });
+  state.startupSkillCreateFolder = null;
+  state.startupSkillFolders = (await api("/api/startup-skills")).folders || [];
+  renderHubFolders();
+  await selectStartupSkillFile(folderOrder, result.startupContext?.skillName || skillName);
+  setStatus("startup skill created");
+}
+
+function activateStartupSkillExplorer(folderOrder, skillName, startupContext = null) {
+  const rootPath = startupSkillExplorerRootFromContext(startupContext);
+  if (!rootPath) {
+    state.activeStartupSkillExplorer = null;
+    return;
+  }
+  state.activeStartupSkillExplorer = {
+    folder: String(folderOrder),
+    skill: String(skillName || startupContext?.skillName || ""),
+    rootPath,
+  };
+}
+
+function startupSkillExplorerRootFromContext(startupContext = null) {
+  if (startupContext?.kind !== "startup-skill") return "";
+  if (startupContext.explorerRoot) return normalizeUiPath(startupContext.explorerRoot).replace(/\/$/, "");
+  const folder = normalizeUiPath(startupContext.folder || "").replace(/\/$/, "");
+  const skillName = normalizeUiPath(startupContext.skillName || "").replace(/\/$/, "");
+  const fileName = normalizeUiPath(startupContext.fileName || "");
+  if (folder && skillName && fileName.endsWith("/SKILL.md")) return folder + "/" + skillName;
+  return parentDirectoryFromUiPath(startupContext.displayPath || "");
+}
+
+function startupSkillSelectedExplorerPath(startupContext = state.selectedStartupContext) {
+  if (startupContext?.kind !== "startup-skill") return "";
+  if (startupContext.explorerPath) return normalizeUiPath(startupContext.explorerPath).replace(/\/$/, "");
+  return normalizeUiPath(startupContext.displayPath || "").replace(/\/$/, "");
+}
+
+function activateStartupContextExplorer(startupContext = null) {
+  const selectedPath = startupContextSelectedExplorerPath(startupContext);
+  if (!selectedPath) {
+    state.activeStartupContextExplorer = null;
+    return;
+  }
+  state.activeStartupContextExplorer = {
+    order: String(startupContext.order || ""),
+    path: selectedPath,
+  };
+}
+
+function startupContextSelectedExplorerPath(startupContext = state.selectedStartupContext) {
+  if (startupContext?.kind !== "startup-context") return "";
+  if (startupContext.explorerPath) return normalizeUiPath(startupContext.explorerPath).replace(/\/$/, "");
+  return normalizeUiPath(startupContext.displayPath || "").replace(/\/$/, "");
+}
+
+function expandAndRevealExplorerPath(path) {
+  const clean = normalizeUiPath(path).replace(/\/$/, "");
+  if (!clean) return;
+  for (const folder of parentFolders(clean).slice(0, -1)) state.expanded.add(folder);
+  renderFiles({ force: true });
+  scrollExplorerToPath(clean);
+}
+
+function revealActiveStartupSkillExplorer() {
+  const rootPath = normalizeUiPath(state.activeStartupSkillExplorer?.rootPath || "").replace(/\/$/, "");
+  if (!rootPath) return;
+  const selectedPath = startupSkillSelectedExplorerPath();
+  expandAndRevealExplorerPath(selectedPath || rootPath);
+}
+
+function revealActiveStartupContextExplorer() {
+  const selectedPath = startupContextSelectedExplorerPath();
+  expandAndRevealExplorerPath(selectedPath || state.activeStartupContextExplorer?.path || "");
+}
+
+async function deleteStartupSkillFromPanel(folderOrder, skillName) {
+  if (!folderOrder || !skillName) return;
+  const selectedKey = "startup-skill-" + folderOrder + "-" + skillName;
+  const unsavedNote = state.selected === selectedKey && state.dirty ? "\n\nUnsaved editor changes will be lost." : "";
+  if (!confirm("Delete startup skill " + skillName + "? Context Room will back it up first." + unsavedNote)) return;
+  setStatus("deleting startup skill...");
+  const result = await api("/api/startup-skills/delete", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ folder: folderOrder, skill: skillName }),
+  });
+  state.startupSkillFolders = (await api("/api/startup-skills")).folders || [];
+  if (state.selected === selectedKey) {
+    state.activeStartupSkillExplorer = null;
+    state.selected = null;
+    state.selectedStartupContext = null;
+    showHome();
+  } else {
+    renderHubFolders();
+  }
+  setStatus(result.backupPath ? "startup skill deleted · backup created" : "startup skill deleted");
 }
 
 function scrollExplorerToPath(path) {
   const aside = document.querySelector("aside");
-  const target = document.querySelector('[data-file-path="' + cssEscape(path) + '"]');
+  const clean = normalizeUiPath(path).replace(/\/$/, "");
+  const target = document.querySelector('[data-file-path="' + cssEscape(clean) + '"]') || document.querySelector('[data-folder-path="' + cssEscape(clean) + '"]');
   if (!aside || !target) return;
   aside.scrollTop += target.getBoundingClientRect().top - aside.getBoundingClientRect().top - 120;
 }
 
 function showHome() {
   state.page = "hub";
+  state.openingFilePath = null;
   state.settingsOpen = false;
   state.pendingMarkdown = null;
   state.filePanel = false;
@@ -4968,6 +5653,7 @@ function showNewDocPage({ title = "New document", path = "docs/new-document.md",
   state.settingsOpen = false;
   state.pendingMarkdown = { title, path, directory };
   state.selected = null;
+  state.openingFilePath = null;
   state.selectedStartupContext = null;
   state.selectedDiff = null;
   resetExternalChangeState();
@@ -5001,29 +5687,25 @@ function renderNewDocPanel() {
   const initialFileName = initialPath.fileName || markdownFileNameFromName(pending.title);
   const initialPreview = markdownPathFromParts(initialFolder, initialFileName);
   holder.innerHTML = '<div class="markdown-create" data-structured-doc-form>' +
-    '<div class="settings-field"><label for="markdownCreateTitle">Title</label><input id="markdownCreateTitle" value="' + escapeHtml(pending.title) + '" /></div>' +
+    '<div class="settings-field new-doc-title-field"><label for="markdownCreateTitle">Title</label><input id="markdownCreateTitle" value="' + escapeHtml(pending.title) + '" /></div>' +
     '<div class="settings-field path-picker-field"><label>Path</label><div class="path-picker" data-path-picker>' +
       '<input id="markdownCreateFolder" type="hidden" value="' + escapeHtml(initialFolder) + '" />' +
-      '<button id="markdownCreateFolderButton" class="path-picker-trigger" type="button" aria-haspopup="listbox" aria-expanded="false" aria-controls="markdownCreateFolderMenu"><code id="markdownCreateFolderLabel">' + escapeHtml(pathFolderLabel(initialFolder)) + '</code><span>choose</span></button>' +
-      '<input id="markdownCreateFileName" aria-label="File name" data-auto-name="true" value="' + escapeHtml(initialFileName) + '" />' +
       '<input id="markdownCreatePath" type="hidden" value="' + escapeHtml(initialPreview) + '" />' +
-      '<div id="markdownCreateFolderMenu" class="path-picker-menu" hidden><input id="markdownCreateFolderSearch" class="path-picker-search" placeholder="search folder..." /><div id="markdownCreateFolderOptions" class="path-picker-options" role="listbox" aria-label="Folder choices"></div></div>' +
+      '<div class="path-picker-main">' +
+        '<div class="path-picker-control"><span class="path-picker-control-title">Location</span><div class="locked-folder-display"><code id="markdownCreateFolderDisplay">' + escapeHtml(pathFolderLabel(initialFolder)) + '</code><span>selected</span></div></div>' +
+        '<div class="path-picker-control"><label class="path-picker-control-title" for="markdownCreateFileName">File</label><input id="markdownCreateFileName" aria-label="File name" data-auto-name="true" value="' + escapeHtml(initialFileName) + '" /></div>' +
+      '</div>' +
       '<div class="path-picker-preview"><span>final path</span><code id="markdownCreatePathPreview">' + escapeHtml(initialPreview) + '</code></div>' +
     '</div></div>' +
-    '<div class="settings-field"><label for="markdownCreateTemplate">Template</label><select id="markdownCreateTemplate">' + renderTemplateOptions("context-golden") + '</select></div>' +
-    '<div class="settings-field"><label for="markdownCreateKind">Kind</label><select id="markdownCreateKind"><option value="canonical">canonical</option><option value="index">index</option><option value="agents">agents</option><option value="procedure">procedure</option><option value="decision">decision</option></select></div>' +
-    '<div class="settings-field"><label for="markdownCreateScope">Scope</label><input id="markdownCreateScope" value="project" /></div>' +
-    '<div class="settings-field"><label for="markdownCreateStatus">Status</label><select id="markdownCreateStatus"><option value="current">current</option><option value="draft">draft</option><option value="historical">historical</option><option value="superseded">superseded</option></select></div>' +
-    '<div class="settings-field"><label for="markdownCreateCanonical">Canonical for</label><input id="markdownCreateCanonical" value="' + escapeHtml(canonical) + '" placeholder="feature or system name" /></div>' +
+    '<div class="settings-field new-doc-compact-field"><label for="markdownCreateTemplate">Template</label><select id="markdownCreateTemplate">' + renderTemplateOptions("context-golden") + '</select></div>' +
+    '<div class="settings-field new-doc-compact-field"><label for="markdownCreateKind">Kind</label><select id="markdownCreateKind"><option value="canonical">canonical</option><option value="index">index</option><option value="agents">agents</option><option value="procedure">procedure</option><option value="decision">decision</option></select></div>' +
+    '<div class="settings-field new-doc-compact-field"><label for="markdownCreateScope">Scope</label><input id="markdownCreateScope" value="project" /></div>' +
+    '<div class="settings-field new-doc-compact-field"><label for="markdownCreateStatus">Status</label><select id="markdownCreateStatus"><option value="current">current</option><option value="draft">draft</option><option value="historical">historical</option><option value="superseded">superseded</option></select></div>' +
+    '<div class="settings-field new-doc-compact-field"><label for="markdownCreateCanonical">Canonical for</label><input id="markdownCreateCanonical" value="' + escapeHtml(canonical) + '" placeholder="feature or system name" /></div>' +
     '<div class="settings-field paths"><label for="markdownCreateSources">Sources</label><textarea id="markdownCreateSources" placeholder="one source path or URL per line"></textarea></div>' +
     '<div class="new-doc-actions"><button id="cancelStructuredMarkdown" class="secondary" type="button">Cancel</button><button id="createStructuredMarkdown" class="primary" type="button">Create file</button></div>' +
   '</div>';
   el("markdownCreateTitle")?.addEventListener("input", suggestStructuredMarkdownPath);
-  el("markdownCreateFolderButton")?.addEventListener("click", () => togglePathPickerMenu());
-  el("markdownCreateFolderSearch")?.addEventListener("input", () => renderPathPickerOptions(el("markdownCreateFolderSearch")?.value || ""));
-  el("markdownCreateFolderSearch")?.addEventListener("keydown", (event) => {
-    if (event.key === "Escape") togglePathPickerMenu(false);
-  });
   el("markdownCreateFileName")?.addEventListener("input", () => {
     el("markdownCreateFileName").dataset.autoName = "false";
     updateStructuredMarkdownPath();
@@ -5032,7 +5714,6 @@ function renderNewDocPanel() {
   el("markdownCreateTemplate")?.addEventListener("change", syncStructuredTemplateKind);
   el("cancelStructuredMarkdown")?.addEventListener("click", () => goHub());
   el("createStructuredMarkdown")?.addEventListener("click", () => createStructuredMarkdownFromWizard().catch((error) => setStatus(error.message)));
-  renderPathPickerOptions();
   updateStructuredMarkdownPath();
 }
 
@@ -5045,80 +5726,8 @@ function suggestStructuredMarkdownPath() {
   if (canonical && !canonical.value.trim()) canonical.value = slugifyUiId(title).replaceAll("-", "_");
 }
 
-function markdownFolderOptions(selectedFolder = "") {
-  const folders = new Set([""]);
-  const addFolder = (folderPath) => {
-    const clean = normalizeUiPath(folderPath).replace(/\/$/, "");
-    if (!clean || clean.startsWith("~")) {
-      if (!clean) folders.add("");
-      return;
-    }
-    folders.add(clean);
-    for (const parent of parentFolders(clean)) folders.add(parent);
-  };
-  addFolder(selectedFolder);
-  addFolder(state.pendingMarkdown?.directory || "");
-  for (const item of state.files || []) {
-    const folder = parentDirectoryFromUiPath(item.path || "");
-    if (folder) addFolder(folder);
-  }
-  for (const configured of [...(state.settings?.allowedPaths || []), ...(state.settings?.watchAllow || [])]) {
-    const clean = normalizeUiPath(configured);
-    if (clean.endsWith("/")) addFolder(clean);
-  }
-  return [...folders]
-    .sort((a, b) => (a === "" ? -1 : b === "" ? 1 : a.localeCompare(b)))
-    .map((value) => ({ value, label: value ? value + "/" : "project root" }));
-}
-
 function pathFolderLabel(folder = "") {
   return folder ? normalizeUiPath(folder).replace(/\/$/, "") + "/" : "project root";
-}
-
-function togglePathPickerMenu(forceOpen) {
-  const menu = el("markdownCreateFolderMenu");
-  const button = el("markdownCreateFolderButton");
-  if (!menu || !button) return;
-  const open = typeof forceOpen === "boolean" ? forceOpen : menu.hidden;
-  menu.hidden = !open;
-  button.setAttribute("aria-expanded", open ? "true" : "false");
-  if (open) {
-    const search = el("markdownCreateFolderSearch");
-    if (search) {
-      search.value = "";
-      renderPathPickerOptions();
-      search.focus();
-    }
-  }
-}
-
-function renderPathPickerOptions(query = "") {
-  const holder = el("markdownCreateFolderOptions");
-  if (!holder) return;
-  const selected = normalizeUiPath(el("markdownCreateFolder")?.value || "").replace(/\/$/, "");
-  const cleanQuery = String(query || "").toLowerCase().trim();
-  const options = markdownFolderOptions(selected).filter((folder) => {
-    if (!cleanQuery) return true;
-    return folder.label.toLowerCase().includes(cleanQuery) || folder.value.toLowerCase().includes(cleanQuery);
-  });
-  holder.innerHTML = options.length
-    ? options.slice(0, 80).map((folder) =>
-      '<button class="path-picker-option ' + (folder.value === selected ? 'active' : '') + '" type="button" role="option" aria-selected="' + (folder.value === selected ? 'true' : 'false') + '" data-path-folder="' + escapeHtml(folder.value) + '">' +
-        '<code>' + escapeHtml(folder.label) + '</code><span>' + (folder.value === selected ? 'current' : 'select') + '</span>' +
-      '</button>'
-    ).join("")
-    : '<div class="path-picker-empty">No folder matches this search.</div>';
-  holder.querySelectorAll("[data-path-folder]").forEach((button) => button.addEventListener("click", () => setStructuredFolder(button.dataset.pathFolder || "")));
-}
-
-function setStructuredFolder(folder) {
-  const clean = normalizeUiPath(folder).replace(/\/$/, "");
-  const input = el("markdownCreateFolder");
-  const label = el("markdownCreateFolderLabel");
-  if (input) input.value = clean;
-  if (label) label.textContent = pathFolderLabel(clean);
-  togglePathPickerMenu(false);
-  updateStructuredMarkdownPath();
 }
 
 function splitMarkdownPath(relPath = "") {
@@ -5135,18 +5744,22 @@ function markdownFileNameFromName(name) {
 }
 
 function markdownPathFromParts(folder, fileName) {
-  const cleanFolder = normalizeUiPath(folder).replace(/\/$/, "");
+  const cleanFolder = normalizeUiPath(folder).replace(/^\/+/, "").replace(/\/{2,}/g, "/").replace(/\/$/, "");
   const cleanFileName = markdownFileNameFromName(fileName);
   return (cleanFolder ? cleanFolder + "/" : "") + cleanFileName;
 }
 
 function updateStructuredMarkdownPath() {
-  const folder = el("markdownCreateFolder")?.value || "";
+  const folder = normalizeUiPath(el("markdownCreateFolder")?.value || "").replace(/^\/+/, "").replace(/\/{2,}/g, "/").replace(/\/$/, "");
   const fileName = el("markdownCreateFileName")?.value || el("markdownCreateTitle")?.value || "New document";
   const relPath = markdownPathFromParts(folder, fileName);
   const pathInput = el("markdownCreatePath");
+  const folderInput = el("markdownCreateFolder");
+  const folderDisplay = el("markdownCreateFolderDisplay");
   const preview = el("markdownCreatePathPreview");
   if (pathInput) pathInput.value = relPath;
+  if (folderInput) folderInput.value = folder;
+  if (folderDisplay) folderDisplay.textContent = pathFolderLabel(folder);
   if (preview) preview.textContent = relPath;
   if (state.pendingMarkdown) {
     state.pendingMarkdown.path = relPath;
@@ -5214,6 +5827,10 @@ function renderTemplateOptions(selectedId = "context-golden") {
   return visibleMarkdownTemplates(templates).map((template) => '<option value="' + escapeHtml(template.id) + '" ' + (template.id === selectedId ? 'selected' : '') + '>' + escapeHtml(template.title) + '</option>').join("");
 }
 
+function renderFileTemplateOptions(selectedId = "") {
+  return '<option value="" disabled ' + (!selectedId ? 'selected' : '') + '>Choose template...</option>' + renderTemplateOptions(selectedId);
+}
+
 function renderReviewSummary(summary = {}) {
   const changed = Number(summary.changedDocs || 0).toLocaleString("en-US");
   const needsReview = Number(summary.needsReview || 0).toLocaleString("en-US");
@@ -5221,8 +5838,9 @@ function renderReviewSummary(summary = {}) {
     '<div class="review-summary-item"><strong>' + needsReview + '</strong><span>to review</span></div>';
 }
 
-function gitStatusLabel(status) {
+function gitStatusLabel(status, reviewRequired = false) {
   const clean = String(status || "").trim();
+  if (!clean && reviewRequired) return "review";
   if (!clean) return "modified";
   if (clean === "??") return "new";
   if (clean === "M" || clean === "M M" || clean.includes("M")) return "modified";
@@ -5234,7 +5852,7 @@ function gitStatusLabel(status) {
 }
 
 function renderReviewItem(item) {
-  const gitLabel = gitStatusLabel(item.gitStatus);
+  const gitLabel = gitStatusLabel(item.gitStatus, item.reviewRequired);
   return '<button class="review-item ' + (state.selectedReview === item.path ? "active" : "") + '" type="button" data-review-path="' + escapeHtml(item.path) + '">' +
     '<div class="review-top"><div class="review-title">' + escapeHtml(item.label || item.path) + '</div><span class="chip high">' + escapeHtml(gitLabel) + '</span></div>' +
     '<div class="review-path">' + escapeHtml(item.path) + '</div>' +
@@ -5242,13 +5860,16 @@ function renderReviewItem(item) {
   '</button>';
 }
 
-function renderFileActionButtons({ reviewAction = null, dirty = false, canApplyTemplate = false, blockedByConflict = false, deletable = true } = {}) {
-  return '<div class="file-actions">' +
-    (canApplyTemplate ? '<div class="empty-template-actions"><select class="file-template-select" data-empty-template-select aria-label="Template">' + renderTemplateOptions() + '</select><button class="file-action" type="button" data-apply-template>Use template</button></div>' : '') +
+function renderFileActionButtons(options = {}) {
+  return '<div class="file-actions">' + renderFileActionItems(options) + '</div>';
+}
+
+function renderFileActionItems({ reviewAction = null, dirty = false, templateState = null, blockedByConflict = false, deletable = true } = {}) {
+  return '' +
+    (templateState ? '<div class="empty-template-actions"><select class="file-template-select" data-empty-template-select aria-label="Template">' + renderFileTemplateOptions(templateState.selectedId) + '</select></div>' : '') +
     (reviewAction ? '<button class="file-action" type="button" data-file-review-decision="' + escapeHtml(reviewAction.status) + '">' + escapeHtml(reviewAction.label) + '</button>' : '') +
     (deletable ? '<button class="file-action danger-action" type="button" data-file-delete>Delete</button>' : '') +
-    '<button class="file-action primary" type="button" data-file-save ' + (!dirty || blockedByConflict ? 'disabled' : '') + (blockedByConflict ? ' title="Resolve the disk change before saving"' : '') + '>Save</button>' +
-  '</div>';
+    '<button class="file-action primary" type="button" data-file-save ' + (!dirty || blockedByConflict ? 'disabled' : '') + (blockedByConflict ? ' title="Resolve the disk change before saving"' : '') + '>Save</button>';
 }
 
 function reviewStatusForPath(path) {
@@ -5262,43 +5883,110 @@ function reviewActionForSelectedFile() {
   return { status: "verified", label: "Mark verified" };
 }
 
+const SETTINGS_THEME_PREVIEW_DOC = "# Preview document\n\n> Scope: docs/\n\n## Read first\n\n- Start in docs/INDEX.md.\n- Keep website/docs/ current.\n\n### Paths\n\nUse AGENTS.md, website/docs/, and our_agentic_system/docs/.";
+
+function renderSettingsSection({ kicker, title, copy, pills = [], body = "", open = true } = {}) {
+  return '<details class="settings-section collapsible" ' + (open ? 'open' : '') + '>' +
+    '<summary class="settings-section-head">' +
+      '<div class="settings-section-title"><span class="settings-kicker">' + escapeHtml(kicker || "") + '</span><h3>' + escapeHtml(title || "") + '</h3>' + (copy ? '<p class="settings-section-copy">' + escapeHtml(copy) + '</p>' : '') + '</div>' +
+      '<div class="settings-section-actions">' + pills.map((pill) => '<span class="settings-pill">' + escapeHtml(pill) + '</span>').join("") + '<span class="settings-pill settings-section-toggle" aria-hidden="true"></span></div>' +
+    '</summary>' +
+    '<div class="settings-section-body">' + body + '</div>' +
+  '</details>';
+}
+
+function renderSettingsThemePreview(themeId = currentFileThemeId()) {
+  return '<div class="settings-theme-preview" aria-label="Document theme preview">' +
+    '<div class="settings-theme-preview-head"><span>Document preview</span><code id="settingsThemePreviewName">' + escapeHtml(themeId) + '</code></div>' +
+    '<div class="doc-editor markdown-view">' + renderMarkdownLines(SETTINGS_THEME_PREVIEW_DOC) + '</div>' +
+  '</div>';
+}
+
 function renderSettingsPanel() {
   const holder = el("settingsPanel");
   if (!holder || !state.settings) return;
   const watchAllow = (state.settings.watchAllow || []).join("\n");
+  const reviewPaths = (state.settings.reviewPaths || []).join("\n");
   const bestPractices = (state.settings.bestPractices || []).join("\n");
   const startupContext = state.settings.startupContext || { enabled: false, fileNames: ["AGENTS.md", "CLAUDE.md"] };
   const startupFileNames = (startupContext.fileNames || []).join("\n");
-  const startupSkills = state.settings.startupSkills || { enabled: true, folderNames: [".codex/skills", ".agents/skills", "skills"] };
+  const startupSkills = state.settings.startupSkills || { enabled: true, folderNames: [".codex/skills", "skills"] };
   const startupSkillFolderNames = (startupSkills.folderNames || []).join("\n");
   const appearance = state.settings.appearance || { fileTheme: DEFAULT_FILE_THEME, autoOpenGitDiff: true };
   const markdownTemplates = state.settings.markdownTemplates || [];
   const sections = state.settings.hubSections?.length ? state.settings.hubSections : [{ id: "main", title: "Main", cards: state.settings.customHubCards || state.availableHubCards || [] }];
-  holder.innerHTML = '<div class="settings-grid">' +
-    '<div class="settings-field"><label for="watchAllow">Watched folders/files</label><textarea id="watchAllow" placeholder="one path per line · empty = nothing to review">' + escapeHtml(watchAllow) + '</textarea></div>' +
-    '<div class="settings-field"><label for="bestPractices">Docs best practices</label><textarea id="bestPractices" placeholder="one practice per line">' + escapeHtml(bestPractices) + '</textarea></div>' +
-    '<div class="settings-field"><label class="template-enabled-toggle" for="startupContextEnabled"><input id="startupContextEnabled" type="checkbox" ' + (startupContext.enabled ? 'checked' : '') + ' /> Startup context scanner</label><textarea id="startupContextFileNames" placeholder="one filename per line">' + escapeHtml(startupFileNames) + '</textarea></div>' +
-    '<div class="settings-field"><label class="template-enabled-toggle" for="startupSkillsEnabled"><input id="startupSkillsEnabled" type="checkbox" ' + (startupSkills.enabled !== false ? 'checked' : '') + ' /> Startup skills scanner</label><textarea id="startupSkillFolderNames" placeholder="one folder path per line">' + escapeHtml(startupSkillFolderNames) + '</textarea></div>' +
-    '<div class="settings-field"><label for="fileTheme">App theme</label><select id="fileTheme">' + renderFileThemeOptions(appearance.fileTheme) + '</select></div>' +
-    '<div class="settings-field"><label class="template-enabled-toggle" for="autoOpenGitDiff"><input id="autoOpenGitDiff" type="checkbox" ' + (appearance.autoOpenGitDiff !== false ? 'checked' : '') + ' /> Auto-open Git diff</label><p class="settings-help">When enabled, files with a Git diff open with the diff visible. When disabled, use the Show Git diff button manually.</p></div>' +
+  const watchCount = (state.settings.watchAllow || []).length;
+  const reviewPathCount = (state.settings.reviewPaths || []).length;
+  const practiceCount = (state.settings.bestPractices || []).length;
+  const startupContextCount = (startupContext.fileNames || []).length;
+  const startupSkillFolderCount = (startupSkills.folderNames || []).length;
+  holder.innerHTML = '<div class="settings-shell">' +
+  renderSettingsSection({
+    kicker: "Review",
+    title: "Watched docs",
+    copy: "Changed files listed here require human review before handoff.",
+    pills: [watchCount + " watched", reviewPathCount + " required", practiceCount + " rules"],
+    open: true,
+    body: '<div class="settings-grid">' +
+      '<div class="settings-field large"><label for="watchAllow">Watched folders/files</label><span class="settings-field-note">One path per line.</span><textarea id="watchAllow" placeholder="docs/&#10;website/docs/">' + escapeHtml(watchAllow) + '</textarea></div>' +
+      '<div class="settings-field large"><label for="reviewPaths">Required review files</label><span class="settings-field-note">Important files that stay in review until verified, even without a Git diff.</span><textarea id="reviewPaths" placeholder="AGENTS.md&#10;docs/INDEX.md">' + escapeHtml(reviewPaths) + '</textarea></div>' +
+      '<div class="settings-field large"><label for="bestPractices">Docs best practices</label><span class="settings-field-note">Short rules shown on the hub.</span><textarea id="bestPractices" placeholder="one practice per line">' + escapeHtml(bestPractices) + '</textarea></div>' +
+    '</div>',
+  }) +
+  renderSettingsSection({
+    kicker: "Startup",
+    title: "Injected context scanners",
+    copy: "Files and skill folders discovered above this Context Room root.",
+    pills: [startupContextCount + " names", startupSkillFolderCount + " folders"],
+    open: true,
+    body: '<div class="settings-grid">' +
+      '<div class="settings-field"><label class="settings-toggle" for="startupContextEnabled"><input id="startupContextEnabled" type="checkbox" ' + (startupContext.enabled ? 'checked' : '') + ' /><span class="settings-switch" aria-hidden="true"></span><span class="settings-toggle-copy"><strong>Startup context</strong><em>List agent instruction files above the repo.</em></span></label><textarea id="startupContextFileNames" placeholder="one filename per line">' + escapeHtml(startupFileNames) + '</textarea></div>' +
+      '<div class="settings-field"><label class="settings-toggle" for="startupSkillsEnabled"><input id="startupSkillsEnabled" type="checkbox" ' + (startupSkills.enabled !== false ? 'checked' : '') + ' /><span class="settings-switch" aria-hidden="true"></span><span class="settings-toggle-copy"><strong>Startup skills</strong><em>List global skill folders visible to agents.</em></span></label><textarea id="startupSkillFolderNames" placeholder="one folder path per line">' + escapeHtml(startupSkillFolderNames) + '</textarea></div>' +
+    '</div>',
+  }) +
+  renderSettingsSection({
+    kicker: "Appearance",
+    title: "Theme and diff behavior",
+    copy: "Theme changes preview instantly; Save keeps them in the project config.",
+    open: true,
+    body: '<div class="settings-grid compact">' +
+      '<div class="settings-field"><label for="fileTheme">App theme</label><select id="fileTheme">' + renderFileThemeOptions(appearance.fileTheme) + '</select></div>' +
+      '<div class="settings-field"><label class="settings-toggle" for="autoOpenGitDiff"><input id="autoOpenGitDiff" type="checkbox" ' + (appearance.autoOpenGitDiff !== false ? 'checked' : '') + ' /><span class="settings-switch" aria-hidden="true"></span><span class="settings-toggle-copy"><strong>Auto-open Git diff</strong><em>Leave off to open the diff manually.</em></span></label></div>' +
+    '</div>' + renderSettingsThemePreview(appearance.fileTheme),
+  }) +
+  renderSettingsSection({
+    kicker: "Templates",
+    title: "Markdown document templates",
+    copy: "Reusable shapes for new documentation files.",
+    pills: [markdownTemplates.length + " templates"],
+    open: false,
+    body: '<div class="settings-body-toolbar"><span>Open a template only when you need to edit its fields.</span><button id="addMarkdownTemplate" class="secondary" type="button">+ template</button></div>' +
+      '<div class="hub-card-options settings-editor-list" id="markdownTemplateEditors">' + markdownTemplates.map((template) => renderMarkdownTemplateEditor(template, false)).join("") + '</div>',
+  }) +
+  renderSettingsSection({
+    kicker: "Hub",
+    title: "Sections and cards",
+    copy: "Controls the cards shown on the first screen.",
+    pills: [sections.length + " sections"],
+    open: false,
+    body: '<div class="settings-body-toolbar"><span>Open a section or card only when changing its routing.</span><button id="addHubSection" class="secondary" type="button">+ section</button></div>' +
+      '<div class="hub-card-options settings-editor-list" id="hubSectionEditors">' + sections.map((section) => renderHubSectionEditor(section, false)).join("") + '</div>',
+  }) +
   '</div>' +
-  '<div><div class="settings-title">Markdown templates</div><div class="hub-card-options" id="markdownTemplateEditors">' +
-    markdownTemplates.map(renderMarkdownTemplateEditor).join("") +
-  '</div></div>' +
-  '<div><div class="settings-title">Hub sections and cards</div><div class="hub-card-options" id="hubSectionEditors">' +
-    sections.map(renderHubSectionEditor).join("") +
-  '</div></div>' +
-  '<div class="settings-footer"><span>A card can open files/folders or contain child cards.</span><div class="docqa-actions"><button id="addMarkdownTemplate" class="secondary" type="button">+ template</button><button id="addHubSection" class="secondary" type="button">+ section</button><button id="saveSettings" class="secondary" type="button">save settings</button></div></div>';
+  '<div class="settings-footer"><span>Saved in <code>.context-room/config.json</code></span><div class="docqa-actions"><button id="saveSettings" class="primary" type="button">Save settings</button></div></div>';
   wireHubSettingsButtons(holder);
   wireMarkdownTemplateButtons(holder);
   el("addMarkdownTemplate")?.addEventListener("click", addMarkdownTemplateEditor);
   el("addHubSection")?.addEventListener("click", addHubSectionEditor);
-  el("saveSettings")?.addEventListener("click", saveSettings);
+  el("fileTheme")?.addEventListener("change", previewSelectedFileTheme);
+  previewSelectedFileTheme();
+  el("saveSettings")?.addEventListener("click", () => saveSettings().catch((error) => setStatus(error.message)));
 }
 
-function renderMarkdownTemplateEditor(template = {}) {
+function renderMarkdownTemplateEditor(template = {}, open = false) {
   const enabled = template.enabled !== false;
-  return '<div class="template-editor" data-markdown-template-editor data-template-id="' + escapeHtml(template.id || "") + '">' +
+  return '<details class="template-editor" data-markdown-template-editor data-template-id="' + escapeHtml(template.id || "") + '" ' + (open ? 'open' : '') + '>' +
+    '<summary class="template-editor-summary"><span>' + escapeHtml(template.title || "Untitled template") + '</span><code>' + escapeHtml(template.id || "new-template") + '</code></summary>' +
     '<div class="template-editor-head"><label class="template-enabled-toggle"><input type="checkbox" data-template-enabled ' + (enabled ? 'checked' : '') + ' /> Show in selector</label><button class="selection-action danger-action" type="button" data-remove-markdown-template title="remove this template">×</button></div>' +
     '<div class="template-editor-grid">' +
       '<div class="settings-field"><label>Id</label><input data-template-id-input value="' + escapeHtml(template.id || "") + '" placeholder="context-golden" /></div>' +
@@ -5306,7 +5994,7 @@ function renderMarkdownTemplateEditor(template = {}) {
       '<div class="settings-field"><label>Description</label><input data-template-description value="' + escapeHtml(template.description || "") + '" placeholder="When to use this template" /></div>' +
       '<div class="settings-field template-body"><label>Content</label><textarea data-template-content placeholder="# {{title}}&#10;&#10;## Purpose&#10;...">' + escapeHtml(template.content || "") + '</textarea></div>' +
     '</div>' +
-  '</div>';
+  '</details>';
 }
 
 function wireMarkdownTemplateButtons(root) {
@@ -5316,29 +6004,34 @@ function wireMarkdownTemplateButtons(root) {
 function addMarkdownTemplateEditor() {
   const holder = el("markdownTemplateEditors");
   if (!holder) return;
-  holder.insertAdjacentHTML("beforeend", renderMarkdownTemplateEditor({ id: "custom-" + Date.now().toString(36), title: "New template", description: "", content: "# {{title}}\n\n## Purpose\n\n## Key facts\n\n## References\n" }));
+  holder.insertAdjacentHTML("beforeend", renderMarkdownTemplateEditor({ id: "custom-" + Date.now().toString(36), title: "New template", description: "", content: "# {{title}}\n\n## Purpose\n\n## Key facts\n\n## References\n" }, true));
   wireMarkdownTemplateButtons(holder.lastElementChild);
 }
 
-function renderHubSectionEditor(section) {
+function renderHubSectionEditor(section, open = false) {
   const id = section.id || "section-" + Date.now().toString(36);
-  return '<div class="hub-section-editor" data-hub-section-editor data-section-id="' + escapeHtml(id) + '">' +
+  const cards = section.cards || [];
+  return '<details class="hub-section-editor" data-hub-section-editor data-section-id="' + escapeHtml(id) + '" ' + (open ? 'open' : '') + '>' +
+    '<summary class="hub-section-editor-summary"><span>' + escapeHtml(section.title || "Section") + '</span><code>' + cards.length + ' cards</code></summary>' +
     '<div class="hub-section-editor-head"><div class="settings-field"><label>Section name</label><input data-section-title value="' + escapeHtml(section.title || "Section") + '" placeholder="Section name" /></div><button class="secondary" type="button" data-add-root-card>+ card</button><button class="selection-action danger-action" type="button" data-remove-section title="remove this section">×</button></div>' +
-    '<div class="hub-card-options" data-section-cards>' + (section.cards || []).map((card) => renderHubCardEditor(card, 0)).join("") + '</div>' +
-  '</div>';
+    '<div class="hub-card-options" data-section-cards>' + cards.map((card) => renderHubCardEditor(card, 0, false)).join("") + '</div>' +
+  '</details>';
 }
 
-function renderHubCardEditor(card, depth = 0) {
+function renderHubCardEditor(card, depth = 0, open = false) {
   const paths = (card.paths || [card.path]).filter(Boolean).join("\n");
-  return '<div class="hub-card-editor ' + (depth ? 'nested' : '') + '" data-hub-card-editor data-card-id="' + escapeHtml(card.id || "") + '">' +
+  const children = card.cards || [];
+  const summaryMeta = [paths ? paths.split(/\r?\n/).length + " paths" : "no paths", children.length ? children.length + " subcards" : ""].filter(Boolean).join(" · ");
+  return '<details class="hub-card-editor ' + (depth ? 'nested' : '') + '" data-hub-card-editor data-card-id="' + escapeHtml(card.id || "") + '" ' + (open ? 'open' : '') + '>' +
+    '<summary class="hub-card-editor-summary"><span>' + escapeHtml(card.title || "New card") + '</span><code>' + escapeHtml(summaryMeta) + '</code></summary>' +
     '<div class="hub-card-editor-head"><label class="hub-card-editor-title"><input type="checkbox" data-card-enabled ' + (card.enabled !== false ? 'checked' : '') + ' /> active</label><label class="hub-card-editor-title"><input type="checkbox" data-card-auto-children ' + (card.autoChildren ? 'checked' : '') + ' /> auto subcards</label><div class="docqa-actions"><button class="selection-action" type="button" data-add-child-card title="add a child card">+</button><button class="selection-action danger-action" type="button" data-remove-hub-card title="remove this card">×</button></div></div>' +
     '<div class="hub-card-editor-grid">' +
       '<div class="settings-field"><label>Name</label><input data-card-title value="' + escapeHtml(card.title || "") + '" placeholder="Card name" /></div>' +
       '<div class="settings-field"><label>Description</label><input data-card-description value="' + escapeHtml(card.description || "") + '" placeholder="Short description" /></div>' +
       '<div class="settings-field paths"><label>Included folders / files</label><textarea data-card-paths placeholder="empty if this card only navigates\none path per line">' + escapeHtml(paths) + '</textarea></div>' +
     '</div>' +
-    '<div class="hub-card-children" data-card-children>' + (card.cards || []).map((child) => renderHubCardEditor(child, depth + 1)).join("") + '</div>' +
-  '</div>';
+    '<div class="hub-card-children" data-card-children>' + children.map((child) => renderHubCardEditor(child, depth + 1, false)).join("") + '</div>' +
+  '</details>';
 }
 
 function wireHubSettingsButtons(root) {
@@ -5352,19 +6045,20 @@ function addHubSectionEditor() {
   const holder = el("hubSectionEditors");
   if (!holder) return;
   const id = "section-" + Date.now().toString(36);
-  holder.insertAdjacentHTML("beforeend", renderHubSectionEditor({ id, title: "New section", cards: [] }));
+  holder.insertAdjacentHTML("beforeend", renderHubSectionEditor({ id, title: "New section", cards: [] }, true));
   wireHubSettingsButtons(holder.lastElementChild);
 }
 
 function addHubCardEditor(holder) {
   if (!holder) return;
   const id = "custom-" + Date.now().toString(36);
-  holder.insertAdjacentHTML("beforeend", renderHubCardEditor({ id, title: "New card", description: "", paths: [], cards: [], enabled: true }, holder.closest(".hub-card-editor") ? 1 : 0));
+  holder.insertAdjacentHTML("beforeend", renderHubCardEditor({ id, title: "New card", description: "", paths: [], cards: [], enabled: true }, holder.closest(".hub-card-editor") ? 1 : 0, true));
   wireHubSettingsButtons(holder.lastElementChild);
 }
 
 async function saveSettings() {
   const watchAllow = linesFromTextarea("watchAllow");
+  const reviewPaths = linesFromTextarea("reviewPaths");
   const bestPractices = linesFromTextarea("bestPractices");
   const startupContext = {
     enabled: Boolean(el("startupContextEnabled")?.checked),
@@ -5382,28 +6076,36 @@ async function saveSettings() {
   const hubSections = collectHubSectionEditors();
   const allCards = flattenUiCards(hubSections.flatMap((section) => section.cards));
   const hubCards = Object.fromEntries(allCards.map((card) => [card.id, card.enabled !== false]));
+  const saveButton = el("saveSettings");
+  markButtonSaving(saveButton);
   setStatus("saving settings...");
-  const result = await api("/api/settings", {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({ settings: { watchAllow, bestPractices, startupContext, startupSkills, appearance, markdownTemplates, hubCards, hubSections } }),
-  });
-  state.settings = result.settings;
-  applyFileTheme();
-  state.availableHubCards = result.availableHubCards || state.availableHubCards;
-  state.hubFolders = result.hubCards || [];
-  state.rootHubSections = result.hubSections || [];
-  state.hubSections = state.rootHubSections;
-  state.startupContextFiles = (await api("/api/startup-context")).files || [];
-  state.startupSkillFolders = (await api("/api/startup-skills")).folders || [];
-  const [docqa, doctor] = await Promise.all([api("/api/docqa"), api("/api/doctor")]);
-  state.docqa = docqa;
-  state.doctor = doctor;
-  state.selectedReview = state.docqa.queue[0]?.path || null;
-  if (state.page === "settings") renderSettingsPanel();
-  else renderDocQaDashboard();
-  setStatus("settings saved");
-  scheduleSessionStatePush();
+  try {
+    const result = await api("/api/settings", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ settings: { watchAllow, reviewPaths, bestPractices, startupContext, startupSkills, appearance, markdownTemplates, hubCards, hubSections } }),
+    });
+    state.settings = result.settings;
+    applyFileTheme();
+    state.availableHubCards = result.availableHubCards || state.availableHubCards;
+    state.hubFolders = result.hubCards || [];
+    state.rootHubSections = result.hubSections || [];
+    state.hubSections = state.rootHubSections;
+    state.startupContextFiles = (await api("/api/startup-context")).files || [];
+    state.startupSkillFolders = (await api("/api/startup-skills")).folders || [];
+    const [docqa, doctor] = await Promise.all([api("/api/docqa"), api("/api/doctor")]);
+    state.docqa = docqa;
+    state.doctor = doctor;
+    state.selectedReview = state.docqa.queue[0]?.path || null;
+    if (state.page === "settings") renderSettingsPanel();
+    else renderDocQaDashboard();
+    setStatus("settings saved");
+    flashSavedButton(el("saveSettings"), "Saved");
+    scheduleSessionStatePush();
+  } catch (error) {
+    restoreButtonLabel(saveButton);
+    throw error;
+  }
 }
 
 function collectMarkdownTemplateEditors() {
@@ -5545,6 +6247,7 @@ function showSettingsPage() {
   state.settingsOpen = true;
   state.pendingMarkdown = null;
   state.selected = null;
+  state.openingFilePath = null;
   state.reviewModePath = null;
   state.reviewModeStatus = null;
   state.selectedDiff = null;
@@ -5576,9 +6279,17 @@ function handleHubAction() {
 
 function updateActionBanner() {
   const onFile = state.page === "file" && Boolean(state.selected);
+  const hasGitDiff = onFile && !state.selectedStartupContext && state.selectedDiff?.available !== false && Boolean(state.selectedDiff?.changed);
   el("hub").textContent = state.page === "hub" ? "settings" : "hub";
   el("hub").title = state.page === "hub" ? "Open settings" : "Back to hub";
   ["back", "forward"].forEach((id) => { el(id).hidden = !onFile; });
+  const gitDiffButton = el("gitDiffToggle");
+  if (gitDiffButton) {
+    gitDiffButton.hidden = !hasGitDiff;
+    gitDiffButton.textContent = state.diffCollapsed ? "Show Git diff" : "Hide Git diff";
+    gitDiffButton.title = state.diffCollapsed ? "Show Git diff" : "Hide Git diff";
+    gitDiffButton.classList.toggle("active", hasGitDiff && !state.diffCollapsed);
+  }
   ["reload", "verifyCurrent", "deleteCurrent", "save"].forEach((id) => { el(id).hidden = true; });
 }
 
@@ -5594,6 +6305,26 @@ function renderHubFolders() {
   document.querySelectorAll("[data-hub-crumb]").forEach((button) => button.addEventListener("click", () => openHubPath(button.dataset.hubCrumb || null)));
   document.querySelectorAll("[data-startup-order]").forEach((button) => button.addEventListener("click", () => selectStartupContextFile(button.dataset.startupOrder).catch((error) => setStatus(error.message))));
   document.querySelectorAll("[data-startup-skill-name]").forEach((button) => button.addEventListener("click", () => selectStartupSkillFile(button.dataset.startupSkillFolder, button.dataset.startupSkillName).catch((error) => setStatus(error.message))));
+  document.querySelectorAll("[data-startup-skill-delete]").forEach((button) => button.addEventListener("click", (event) => {
+    event.stopPropagation();
+    deleteStartupSkillFromPanel(button.dataset.startupSkillFolder, button.dataset.startupSkillDelete).catch((error) => setStatus(error.message));
+  }));
+  document.querySelectorAll("[data-startup-skill-create-folder]").forEach((button) => button.addEventListener("click", (event) => {
+    event.stopPropagation();
+    createStartupSkillFromPanel(button.dataset.startupSkillCreateFolder);
+  }));
+  document.querySelectorAll("[data-startup-skill-create-form]").forEach((form) => {
+    form.addEventListener("click", (event) => event.stopPropagation());
+    form.addEventListener("submit", (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      submitStartupSkillCreateForm(form.dataset.startupSkillCreateForm).catch((error) => setStatus(error.message));
+    });
+  });
+  document.querySelectorAll("[data-startup-skill-create-cancel]").forEach((button) => button.addEventListener("click", (event) => {
+    event.stopPropagation();
+    cancelStartupSkillCreate();
+  }));
 }
 
 function renderHubBreadcrumb() {
@@ -5658,10 +6389,23 @@ function renderStartupSkillsPanel() {
   if (!folders.length) return "";
   const body = '<div class="startup-context-list">' + folders.map((folder) => {
     const names = (folder.skills || []).slice(0, 60);
-    const buttons = names.length
-      ? '<div class="startup-skill-buttons">' + names.map((name) => '<button class="startup-skill-button" type="button" data-startup-skill-folder="' + escapeHtml(folder.order) + '" data-startup-skill-name="' + escapeHtml(name) + '">' + escapeHtml(name) + '</button>').join("") + '</div>'
-      : '<em>No SKILL.md folders found here</em>';
-    return '<div class="startup-context-item readonly">' +
+    const isCreating = String(state.startupSkillCreateFolder || "") === String(folder.order || "");
+    const canManage = !folder.readOnly;
+    const skillButtons = names.map((name) => '<span class="startup-skill-pill">' +
+      '<button class="startup-skill-button" type="button" data-startup-skill-folder="' + escapeHtml(folder.order) + '" data-startup-skill-name="' + escapeHtml(name) + '">' + escapeHtml(name) + '</button>' +
+      (canManage ? '<button class="startup-skill-delete" type="button" data-startup-skill-folder="' + escapeHtml(folder.order) + '" data-startup-skill-delete="' + escapeHtml(name) + '" title="Delete ' + escapeHtml(name) + '" aria-label="Delete ' + escapeHtml(name) + '">×</button>' : '') +
+    '</span>').join("");
+    const createControl = !canManage
+      ? '<em>System group</em>'
+      : isCreating
+      ? '<form class="startup-skill-create" data-startup-skill-create-form="' + escapeHtml(folder.order) + '">' +
+          '<input data-startup-skill-create-input="' + escapeHtml(folder.order) + '" placeholder="skill-name" aria-label="New skill name" autocomplete="off" />' +
+          '<button type="submit" title="Create skill" aria-label="Create skill">✓</button>' +
+          '<button type="button" data-startup-skill-create-cancel="' + escapeHtml(folder.order) + '" title="Cancel" aria-label="Cancel">×</button>' +
+        '</form>'
+      : '<button class="startup-skill-add" type="button" data-startup-skill-create-folder="' + escapeHtml(folder.order) + '" title="Create skill in this folder" aria-label="Create skill in this folder">+</button>';
+    const buttons = '<div class="startup-skill-buttons">' + skillButtons + createControl + '</div>' + (!names.length ? '<em>No SKILL.md folders found here</em>' : '');
+    return '<div class="startup-context-item startup-skill-folder readonly">' +
       '<strong>' + escapeHtml((folder.order || "?") + ". " + (folder.skillCount || 0) + " skills") + '</strong>' +
       '<div class="startup-skill-names"><code>' + escapeHtml(folder.displayPath || folder.folderName || "skills") + '</code>' + buttons + '</div>' +
     '</div>';
@@ -5939,6 +6683,7 @@ function goHub() {
   if (state.dirty && !confirm("You have unsaved changes. Return to hub?")) return;
   collapseSidebarOnNarrow();
   state.selected = null;
+  state.openingFilePath = null;
   state.selectedStartupContext = null;
   state.reviewModePath = null;
   state.reviewModeStatus = null;
@@ -5995,25 +6740,101 @@ function setMode(mode = "view") {
   }
 }
 
-async function applyTemplateToCurrentFile() {
-  if (!state.selected) return;
-  if (activeEditor().value.trim() && !confirm("This editor is not empty. Apply template anyway?")) return;
-  const templateId = document.querySelector("[data-empty-template-select]")?.value || "context-golden";
-  const title = pathTitleFromUiPath(state.selected);
-  setStatus("applying template...");
-  await api("/api/markdown/apply-template", {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({ path: state.selected, title, templateId }),
-  });
-  await loadFiles();
-  await selectFile(state.selected, { pushHistory: false, revealInExplorer: false });
-  setStatus("template applied");
-}
-
 function pathTitleFromUiPath(relPath) {
   const name = normalizeUiPath(relPath).split("/").pop() || "New document";
   return name.replace(/\.md$/i, "").split(/[-_]+/).filter(Boolean).map((part) => part.charAt(0).toUpperCase() + part.slice(1)).join(" ") || "New document";
+}
+
+function templateStateForContent(text) {
+  if (!state.selected?.endsWith(".md")) return null;
+  const templates = visibleMarkdownTemplates(state.settings?.markdownTemplates || []);
+  if (!templates.length) return null;
+  const current = String(text || "");
+  if (!current.trim()) {
+    const blank = templates.find((template) => template.id === "blank");
+    return { selectedId: blank?.id || "" };
+  }
+  const match = templates.find((template) => renderTemplateForSelectedPath(template.id) === current);
+  return match ? { selectedId: match.id } : null;
+}
+
+function renderTemplateForSelectedPath(templateId) {
+  const template = (state.settings?.markdownTemplates || []).find((item) => item.id === templateId);
+  if (!template) return "";
+  const normalized = normalizeUiPath(state.selected || "");
+  const title = pathTitleFromUiPath(normalized);
+  return renderUiTemplate(template.content || "", templateValuesForPath(title, normalized));
+}
+
+function renderUiTemplate(content, values = {}) {
+  return String(content || "").replace(/\{\{\s*([A-Za-z0-9_-]+)\s*\}\}/g, (_match, key) => values[key] ?? "");
+}
+
+function templateValuesForPath(title, normalized) {
+  const metadata = metadataDefaultsForUiPath(normalized);
+  return {
+    title,
+    path: normalized,
+    kind: metadata.kind,
+    status: metadata.status,
+    scope: metadata.scope,
+    canonical_for: metadata.canonical_for,
+    last_verified: metadata.last_verified,
+    sources_inline: "[]",
+    sources_list: "- Add source files, commands, or links.",
+    kind_yaml: yamlScalarUi(metadata.kind),
+    status_yaml: yamlScalarUi(metadata.status),
+    scope_yaml: yamlScalarUi(metadata.scope),
+    canonical_for_yaml: yamlScalarUi(metadata.canonical_for),
+    last_verified_yaml: yamlScalarUi(metadata.last_verified),
+  };
+}
+
+function metadataDefaultsForUiPath(relPath) {
+  const kind = inferDocKindFromUiPath(relPath);
+  return {
+    kind,
+    scope: "project",
+    status: "current",
+    canonical_for: kind === "canonical" ? (normalizeUiPath(relPath).split("/").pop() || "").replace(/\.md$/i, "") : "",
+    last_verified: new Date().toISOString().slice(0, 10),
+  };
+}
+
+function inferDocKindFromUiPath(relPath) {
+  const normalized = normalizeUiPath(relPath);
+  const originalBase = normalized.split("/").pop() || "";
+  const base = originalBase.toLowerCase();
+  const lowered = normalized.toLowerCase();
+  if (originalBase === "AGENTS.md" || originalBase === "CLAUDE.md" || base === ".hermes.md") return "agents";
+  if (["index.md", "readme.md"].includes(base)) return "index";
+  if (lowered.includes("decision") || lowered.includes("adr")) return "decision";
+  if (lowered.includes("runbook") || lowered.includes("procedure") || lowered.includes("deployment") || lowered.includes("testing") || lowered.includes("monitoring")) return "procedure";
+  return "canonical";
+}
+
+function yamlScalarUi(value) {
+  const text = String(value || "");
+  if (!text) return '""';
+  if (/^[A-Za-z0-9_./@-]+$/.test(text)) return text;
+  return JSON.stringify(text);
+}
+
+function applySelectedTemplateToEditor(templateId) {
+  if (!state.selected) return;
+  if (!templateId) return;
+  const rendered = renderTemplateForSelectedPath(templateId);
+  const viewState = captureEditorViewState();
+  el("editor").value = rendered;
+  const docEditor = el("docEditor");
+  if (docEditor) docEditor.value = rendered;
+  state.dirty = rendered !== state.saved;
+  updateMarkdownEditorHighlight(rendered, { immediate: true });
+  renderViewer();
+  restoreEditorViewState(viewState);
+  updateHeader();
+  updatePreview();
+  setStatus("template selected");
 }
 
 function renderViewer() {
@@ -6027,28 +6848,24 @@ function renderViewer() {
     : state.files.find((item) => item.path === state.selected) || { label: state.selected, path: state.selected };
   const hasDiff = !isStartupFile && diff.available !== false && diff.changed;
   const diffMarkup = hasDiff ? renderDiffPanel(diff) : "";
-  const showDiffButton = hasDiff && state.diffCollapsed ? '<button class="diff-toggle" type="button" data-show-diff>Show Git diff</button>' : "";
-  const canApplyTemplate = Boolean(!isStartupFile && state.selected?.endsWith(".md") && !text.trim());
+  const templateState = !isStartupFile && !conflict && !externalChange ? templateStateForContent(text) : null;
   const actionsMarkup = externalChange && !conflict
-      ? renderExternalReviewActions(externalChange)
-      : renderFileActionButtons({ reviewAction: isStartupFile ? null : reviewActionForSelectedFile(), dirty: state.dirty, canApplyTemplate, blockedByConflict: Boolean(conflict || externalChange), deletable: !isStartupFile });
+      ? renderExternalReviewActions(externalChange, { fileActionOptions: externalReviewFileActionOptions() })
+      : renderFileActionButtons({ reviewAction: isStartupFile ? null : reviewActionForSelectedFile(), dirty: state.dirty, templateState, blockedByConflict: Boolean(conflict || externalChange), deletable: !isStartupFile });
   const conflictMarkup = conflict ? renderConflictPanel(conflict, text) : "";
   const editorMarkup = !conflict && externalChange
     ? renderExternalReviewDocument(state.saved || "", externalChange.diskContent || "")
     : state.mode === "edit"
-      ? '<textarea id="docEditor" class="doc-editor" spellcheck="false">' + escapeHtml(text) + '</textarea>'
+      ? renderMarkdownEditor(text)
       : renderMarkdownLineView(text);
   const annotationMarkup = !isStartupFile && !conflict ? renderAgentAnnotations(state.selected) : "";
   el("viewer").innerHTML = '<div class="review-workspace ' + (!hasDiff || state.diffCollapsed ? 'no-diff' : '') + '">' +
     (state.diffCollapsed ? "" : diffMarkup) +
-    '<section class="file-panel">' + showDiffButton + '<header><div class="file-header-copy"><strong>' + escapeHtml(file.label || "Document") + '</strong>' + (isStartupFile ? '<span class="muted">' + escapeHtml(file.path) + '</span>' : '') + '</div>' + actionsMarkup + '</header>' + conflictMarkup + annotationMarkup + editorMarkup + '</section></div>';
+    '<section class="file-panel"><header><div class="file-header-copy"><strong>' + escapeHtml(file.label || "Document") + '</strong>' + (isStartupFile ? '<span class="muted">' + escapeHtml(file.path) + '</span>' : '') + '</div>' + actionsMarkup + '</header>' + conflictMarkup + annotationMarkup + editorMarkup + '</section></div>';
+  updateActionBanner();
   document.querySelector("[data-hide-diff]")?.addEventListener("click", (event) => {
     event.preventDefault();
     setDiffCollapsed(true);
-  });
-  document.querySelector("[data-show-diff]")?.addEventListener("click", (event) => {
-    event.preventDefault();
-    setDiffCollapsed(false);
   });
   document.querySelector("[data-revert-diff]")?.addEventListener("click", () => promptRevertCurrentDiff());
   document.querySelector("[data-apply-external-change]")?.addEventListener("click", () => applyExternalChange().catch((error) => setStatus(error.message)));
@@ -6056,6 +6873,7 @@ function renderViewer() {
   wireExternalReviewDecisionButtons();
   wireExternalReviewAllButtons();
   wireAgentAnnotationButtons();
+  wireMarkdownDocLinks();
   document.querySelector("[data-conflict-compare]")?.addEventListener("click", () => toggleConflictCompare());
   document.querySelector("[data-conflict-reload]")?.addEventListener("click", () => promptReloadConflictFromDisk());
   document.querySelector("[data-conflict-keep]")?.addEventListener("click", () => promptKeepConflictEdits());
@@ -6067,31 +6885,83 @@ function renderViewer() {
   wireFileActionButtons();
   const docEditor = el("docEditor");
   if (docEditor) {
+    state.markdownHighlightLastText = docEditor.value;
+    syncMarkdownEditorScroll();
     docEditor.addEventListener("input", () => {
       el("editor").value = docEditor.value;
       state.dirty = docEditor.value !== state.saved;
+      updateMarkdownEditorHighlight(docEditor.value);
       updateHeader();
       updatePreview();
       updateConflictCompareLive(docEditor.value);
       scheduleConflictCheck();
       scheduleSessionStatePush();
     });
+    docEditor.addEventListener("scroll", syncMarkdownEditorScroll, { passive: true });
+    wireMarkdownEditorDocLinks(docEditor);
   }
   syncWorkspaceScroll();
   scheduleSessionStatePush();
 }
 
 function renderMarkdownLineView(text, options = {}) {
+  return '<div id="docReader" class="doc-editor markdown-view" role="document" tabindex="0" aria-label="' + (options.readOnly ? "Read-only document" : "Document preview") + '">' +
+    renderMarkdownLines(text) +
+  '</div>';
+}
+
+function renderMarkdownEditor(text) {
+  return '<div class="markdown-editor-shell">' +
+    '<div id="docHighlighter" class="doc-editor markdown-view markdown-editor-highlight" aria-hidden="true">' + renderMarkdownLines(text) + '</div>' +
+    '<textarea id="docEditor" class="doc-editor markdown-editor-input" spellcheck="false">' + escapeHtml(text) + '</textarea>' +
+  '</div>';
+}
+
+function renderMarkdownLines(text) {
   let inFence = false;
   const lines = String(text || "").split("\n");
-  return '<div id="docReader" class="doc-editor markdown-view" role="document" tabindex="0" aria-label="' + (options.readOnly ? "Read-only document" : "Document preview") + '">' +
-    lines.map((line, index) => {
+  return lines.map((line, index) => {
       const startsFence = /^\s*(\`\`\`|~~~)/.test(line);
       const rendered = renderMarkdownLine(line, index, { inFence: inFence || startsFence });
       if (startsFence) inFence = !inFence;
       return rendered;
-    }).join("") +
-  '</div>';
+    }).join("");
+}
+
+function updateMarkdownEditorHighlight(text, options = {}) {
+  const highlighter = el("docHighlighter");
+  if (!highlighter) return;
+  state.markdownHighlightText = String(text || "");
+  if (options.immediate) {
+    renderMarkdownEditorHighlightNow(state.markdownHighlightText);
+    return;
+  }
+  if (state.markdownHighlightFrame) return;
+  state.markdownHighlightFrame = window.requestAnimationFrame(() => {
+    state.markdownHighlightFrame = 0;
+    if (state.markdownHighlightText === state.markdownHighlightLastText) {
+      syncMarkdownEditorScroll();
+      return;
+    }
+    renderMarkdownEditorHighlightNow(state.markdownHighlightText);
+  });
+}
+
+function renderMarkdownEditorHighlightNow(text) {
+  const highlighter = el("docHighlighter");
+  if (!highlighter) return;
+  const next = String(text || "");
+  highlighter.innerHTML = renderMarkdownLines(next);
+  state.markdownHighlightLastText = next;
+  syncMarkdownEditorScroll();
+}
+
+function syncMarkdownEditorScroll() {
+  const editor = el("docEditor");
+  const highlighter = el("docHighlighter");
+  if (!editor || !highlighter) return;
+  highlighter.scrollTop = editor.scrollTop;
+  highlighter.scrollLeft = editor.scrollLeft;
 }
 
 function renderMarkdownLine(line, index, options = {}) {
@@ -6117,16 +6987,200 @@ function renderMarkdownLine(line, index, options = {}) {
 
 function renderMarkdownInline(value) {
   return String(value || "").split(/(\`[^\`\n]+\`)/g).map((part) => {
-    if (/^\`[^\`\n]+\`$/.test(part)) return '<span class="markdown-inline-code">' + escapeHtml(part) + '</span>';
-    return escapeHtml(part);
+    if (/^\`[^\`\n]+\`$/.test(part)) {
+      const token = part.slice(1, -1);
+      const docLinkAttrs = markdownDocLinkAttributes(token);
+      return '<span class="markdown-inline-code' + (isMarkdownPathToken(token) ? ' markdown-path' : '') + '"' + docLinkAttrs + '>' + escapeHtml(part) + '</span>';
+    }
+    return renderMarkdownPlainInline(part);
   }).join("");
+}
+
+function isMarkdownPathToken(value) {
+  return isMarkdownDocLinkTarget(value) || /^(?:~\/|\.{1,2}\/|\.?[A-Za-z0-9_-]+\/)[A-Za-z0-9_./@~-]+$/.test(String(value || ""));
+}
+
+function renderMarkdownPlainInline(value) {
+  return String(value || "").split(/(\[[^\]\n]+\]\([^) \n]+\))/g).map((part) => {
+    const link = part.match(/^\[([^\]\n]+)\]\(([^) \n]+)\)$/);
+    if (link) {
+      const label = renderMarkdownPlainInline(link[1]);
+      const docLinkAttrs = markdownDocLinkAttributes(link[2]);
+      if (docLinkAttrs) return '<a href="#" class="markdown-doc-link markdown-path"' + docLinkAttrs + '>' + label + '</a>';
+      return escapeHtml(part);
+    }
+    return escapeHtml(part).replace(/(^|[\s([{])((?:~\/|\.{1,2}\/|\.?[A-Za-z0-9_-]+\/)?[A-Za-z0-9_./@~-]*[A-Za-z0-9_@~-]+\.[A-Za-z0-9_-]+(?:#[A-Za-z0-9_.-]+)?|(?:~\/|\.{1,2}\/|\.?[A-Za-z0-9_-]+\/)[A-Za-z0-9_./@~-]+)/g, (match, prefix, rawPath) => {
+      const docLinkAttrs = markdownDocLinkAttributes(rawPath);
+      return prefix + '<span class="markdown-path"' + docLinkAttrs + '>' + rawPath + '</span>';
+    });
+  }).join("");
+}
+
+function markdownDocLinkAttributes(rawTarget) {
+  const resolved = resolveDocLinkPath(rawTarget);
+  if (!resolved) return "";
+  return ' data-doc-link-path="' + escapeHtml(rawTarget) + '" data-doc-link-resolved="' + escapeHtml(resolved) + '" title="Ctrl/Cmd-click to open ' + escapeHtml(resolved) + '"';
+}
+
+function isMarkdownDocLinkTarget(value) {
+  const target = cleanMarkdownDocLinkTarget(value);
+  if (!target) return false;
+  if (/^(?:[a-z][a-z0-9+.-]*:|#)/i.test(target)) return false;
+  return /^(?:~\/|\.{1,2}\/|\.?[A-Za-z0-9_-]+\/)?[A-Za-z0-9_./@~-]*[A-Za-z0-9_@~-]+\.[A-Za-z0-9_-]+(?:#[A-Za-z0-9_.-]+)?$/.test(target) ||
+    /^(?:~\/|\.{1,2}\/|\.?[A-Za-z0-9_-]+\/)[A-Za-z0-9_./@~-]+$/.test(target);
+}
+
+function cleanMarkdownDocLinkTarget(value) {
+  let target = String(value || "").trim();
+  if (!target) return "";
+  target = target.replace(/^<(.+)>$/, "$1").replace(/^[\`'"]|[\`'"]$/g, "");
+  if (/^(?:[a-z][a-z0-9+.-]*:|#)/i.test(target)) return "";
+  return target.split(/[?#]/)[0].replaceAll("\\", "/").trim();
+}
+
+function resolveDocLinkPath(rawTarget) {
+  const target = cleanMarkdownDocLinkTarget(rawTarget);
+  if (!target || !isMarkdownDocLinkTarget(target) || target.startsWith("/")) return "";
+  const candidates = [];
+  if (/^(?:\.{1,2}\/)/.test(target)) {
+    candidates.push(normalizeDocPath(currentDocumentDirectory() ? currentDocumentDirectory() + "/" + target : target));
+  } else {
+    candidates.push(normalizeDocPath(target));
+    const relative = currentDocumentDirectory() ? normalizeDocPath(currentDocumentDirectory() + "/" + target) : "";
+    if (relative && relative !== candidates[0]) candidates.push(relative);
+  }
+  return candidates.find((candidate) => candidate && isKnownContextRoomFile(candidate)) || "";
+}
+
+function normalizeDocPath(value) {
+  const parts = String(value || "").replaceAll("\\", "/").split("/");
+  const stack = [];
+  for (const part of parts) {
+    if (!part || part === ".") continue;
+    if (part === "..") {
+      if (!stack.length) return "";
+      stack.pop();
+      continue;
+    }
+    stack.push(part);
+  }
+  return stack.join("/");
+}
+
+function currentDocumentDirectory() {
+  const selected = String(state.selected || "");
+  if (!selected || selected.startsWith("startup-context-")) return "";
+  const index = selected.lastIndexOf("/");
+  return index > 0 ? selected.slice(0, index) : "";
+}
+
+function isKnownContextRoomFile(filePath) {
+  return state.files.some((file) => file.path === filePath);
+}
+
+function wireMarkdownDocLinks(root = document) {
+  root.querySelectorAll("[data-doc-link-path]").forEach((element) => element.addEventListener("click", (event) => {
+    if (element.tagName === "A") event.preventDefault();
+    if (!event.ctrlKey && !event.metaKey) return;
+    event.preventDefault();
+    event.stopPropagation();
+    openMarkdownDocLink(element.dataset.docLinkResolved || element.dataset.docLinkPath).catch((error) => setStatus(error.message));
+  }));
+}
+
+function wireMarkdownEditorDocLinks(editor) {
+  editor.addEventListener("pointermove", (event) => updateMarkdownEditorDocLinkHover(editor, event), { passive: true });
+  editor.addEventListener("pointerleave", () => clearMarkdownEditorDocLinkHover(editor), { passive: true });
+  editor.addEventListener("click", (event) => {
+    if (!event.ctrlKey && !event.metaKey) return;
+    const target = markdownDocLinkAtPoint(event.clientX, event.clientY) || markdownDocLinkAtOffset(editor.value, editor.selectionStart || 0);
+    if (!target) return;
+    event.preventDefault();
+    event.stopPropagation();
+    openMarkdownDocLink(target).catch((error) => setStatus(error.message));
+  });
+}
+
+function markdownDocLinkAtPoint(clientX, clientY) {
+  const renderedTarget = markdownDocLinkElementAtPoint(clientX, clientY);
+  if (renderedTarget?.dataset?.docLinkPath) return renderedTarget.dataset.docLinkResolved || renderedTarget.dataset.docLinkPath;
+  if (!document.elementsFromPoint) return "";
+  for (const element of document.elementsFromPoint(clientX, clientY)) {
+    const target = element?.closest?.("[data-doc-link-path]");
+    if (target?.dataset?.docLinkPath) return target.dataset.docLinkResolved || target.dataset.docLinkPath;
+  }
+  return "";
+}
+
+function markdownDocLinkElementAtPoint(clientX, clientY) {
+  const highlighter = el("docHighlighter");
+  const editor = el("docEditor");
+  if (!highlighter || !document.elementFromPoint) return null;
+  const previousHighlighterPointerEvents = highlighter.style.pointerEvents;
+  const previousEditorPointerEvents = editor?.style.pointerEvents || "";
+  highlighter.style.pointerEvents = "auto";
+  if (editor) editor.style.pointerEvents = "none";
+  let target = null;
+  try {
+    target = document.elementFromPoint(clientX, clientY)?.closest?.("[data-doc-link-path]") || null;
+  } finally {
+    highlighter.style.pointerEvents = previousHighlighterPointerEvents;
+    if (editor) editor.style.pointerEvents = previousEditorPointerEvents;
+  }
+  return target && highlighter.contains(target) ? target : null;
+}
+
+function updateMarkdownEditorDocLinkHover(editor, event) {
+  const target = markdownDocLinkElementAtPoint(event.clientX, event.clientY);
+  document.querySelectorAll(".doc-link-hover-target").forEach((element) => {
+    if (element !== target) element.classList.remove("doc-link-hover-target");
+  });
+  editor.classList.toggle("doc-link-hover", Boolean(target));
+  if (target) target.classList.add("doc-link-hover-target");
+}
+
+function clearMarkdownEditorDocLinkHover(editor = el("docEditor")) {
+  document.querySelectorAll(".doc-link-hover-target").forEach((element) => element.classList.remove("doc-link-hover-target"));
+  editor?.classList?.remove("doc-link-hover");
+}
+
+async function openMarkdownDocLink(rawTarget) {
+  const resolved = resolveDocLinkPath(rawTarget) || normalizeDocPath(cleanMarkdownDocLinkTarget(rawTarget));
+  if (!resolved || !isKnownContextRoomFile(resolved)) {
+    setStatus("file not available in Context Room: " + cleanMarkdownDocLinkTarget(rawTarget));
+    return;
+  }
+  if (state.selected === resolved) {
+    setStatus("already open");
+    return;
+  }
+  await selectFile(resolved, { revealInExplorer: true });
+}
+
+function markdownDocLinkAtOffset(text, offset) {
+  const value = String(text || "");
+  const safeOffset = Math.max(0, Math.min(Number(offset) || 0, value.length));
+  const lineStart = value.lastIndexOf("\n", Math.max(0, safeOffset - 1)) + 1;
+  const nextBreak = value.indexOf("\n", safeOffset);
+  const lineEnd = nextBreak === -1 ? value.length : nextBreak;
+  const line = value.slice(lineStart, lineEnd);
+  const lineOffset = safeOffset - lineStart;
+  const markdownLinkPattern = /\[[^\]\n]+\]\(([^) \n]+)\)/g;
+  for (const match of line.matchAll(markdownLinkPattern)) {
+    if (lineOffset >= match.index && lineOffset <= match.index + match[0].length) return match[1];
+  }
+  const pathPattern = /\`((?:~\/|\.{1,2}\/|\.?[A-Za-z0-9_-]+\/)?[A-Za-z0-9_./@~-]*[A-Za-z0-9_@~-]+\.[A-Za-z0-9_-]+(?:#[A-Za-z0-9_.-]+)?|(?:~\/|\.{1,2}\/|\.?[A-Za-z0-9_-]+\/)[A-Za-z0-9_./@~-]+)\`|((?:~\/|\.{1,2}\/|\.?[A-Za-z0-9_-]+\/)?[A-Za-z0-9_./@~-]*[A-Za-z0-9_@~-]+\.[A-Za-z0-9_-]+(?:#[A-Za-z0-9_.-]+)?|(?:~\/|\.{1,2}\/|\.?[A-Za-z0-9_-]+\/)[A-Za-z0-9_./@~-]+)/g;
+  for (const match of line.matchAll(pathPattern)) {
+    if (lineOffset >= match.index && lineOffset <= match.index + match[0].length) return match[1] || match[2] || "";
+  }
+  return "";
 }
 
 function wireFileActionButtons(root = document) {
   root.querySelector("[data-file-review-decision]")?.addEventListener("click", (event) => applyReviewDecision(state.selected, event.currentTarget.dataset.fileReviewDecision).catch((error) => setStatus(error.message)));
   root.querySelector("[data-file-save]")?.addEventListener("click", () => saveCurrent().catch((error) => setStatus(error.message)));
   root.querySelector("[data-file-delete]")?.addEventListener("click", () => deletePaths([state.selected]).catch((error) => setStatus(error.message)));
-  root.querySelector("[data-apply-template]")?.addEventListener("click", () => applyTemplateToCurrentFile().catch((error) => setStatus(error.message)));
+  root.querySelector("[data-empty-template-select]")?.addEventListener("change", (event) => applySelectedTemplateToEditor(event.currentTarget.value));
 }
 
 function setDiffCollapsed(collapsed) {
@@ -6134,6 +7188,7 @@ function setDiffCollapsed(collapsed) {
   state.diffCollapsed = Boolean(collapsed);
   renderViewer();
   restoreEditorViewState(viewState);
+  updateActionBanner();
 }
 
 function wireExternalReviewDecisionButtons(root = document) {
@@ -6152,7 +7207,7 @@ function wireExternalReviewAllButtons(root = document) {
   }));
 }
 
-function renderExternalReviewActions(change) {
+function renderExternalReviewActions(change, { fileActionOptions = null } = {}) {
   const beforeText = state.saved || "";
   const afterText = change.diskContent || "";
   const blocks = buildExternalReviewBlocks(beforeText, afterText, change.reviewDecisions || {});
@@ -6164,7 +7219,17 @@ function renderExternalReviewActions(change) {
   return '<div class="file-actions external-review-actions" aria-label="Review disk change">' +
     '<div class="external-change-stats" title="' + escapeHtml(change.path || "This file") + ' changed on disk"><span class="pending">' + summary.pending + ' left</span><span class="add">+' + summary.additions + '</span><span class="del">-' + summary.deletions + '</span></div>' +
     bulkActions +
+    (fileActionOptions ? renderFileActionItems(fileActionOptions) : '') +
   '</div>';
+}
+
+function externalReviewFileActionOptions() {
+  return {
+    reviewAction: null,
+    dirty: state.dirty,
+    blockedByConflict: true,
+    deletable: !Boolean(state.selectedStartupContext),
+  };
 }
 
 function renderExternalReviewDocument(beforeText, afterText) {
@@ -6248,13 +7313,15 @@ async function chooseExternalReviewBlock(decision, blockId) {
   if (!updatedInPlace) renderViewer();
   updateHeader();
   updatePreview();
-  if (updatedInPlace) settleExternalReviewBlocks([blockId], viewState, { restoreScroll: false });
+  const settlePromise = updatedInPlace
+    ? settleExternalReviewBlocks([blockId], viewState, { restoreScroll: false })
+    : Promise.resolve();
   if (pending.length) {
     setStatus(pending.length + " change" + (pending.length > 1 ? "s" : "") + " left to review");
     return;
   }
   setStatus("saving reviewed change...");
-  if (updatedInPlace) await waitForInlineReviewTransition();
+  await waitForInlineReviewTransition(settlePromise);
   await saveExternalReviewDecision(blocks, viewState);
 }
 
@@ -6276,7 +7343,10 @@ async function chooseAllExternalReviewBlocks(decision) {
   updateHeader();
   updatePreview();
   setStatus("saving reviewed changes...");
-  if (updatedInPlace) await waitForInlineReviewTransition();
+  const settlePromise = updatedInPlace
+    ? settleExternalReviewBlocks(pendingBlocks.map((block) => block.id), viewState, { restoreScroll: false })
+    : Promise.resolve();
+  await waitForInlineReviewTransition(settlePromise);
   await saveExternalReviewDecision(blocks, viewState);
 }
 
@@ -6290,12 +7360,6 @@ function updateExternalReviewBlockInPlace(blocks, blockId, viewState) {
   if (next) {
     if (block.decision && previousHeight > 0) next.style.minHeight = Math.ceil(previousHeight) + "px";
     wireExternalReviewDecisionButtons(next);
-  }
-  const actions = document.querySelector(".external-review-actions");
-  const change = activeExternalChange();
-  if (actions && change) {
-    actions.outerHTML = renderExternalReviewActions(change);
-    wireExternalReviewAllButtons(document.querySelector(".external-review-actions") || document);
   }
   return true;
 }
@@ -6312,16 +7376,11 @@ function updateExternalReviewDocumentInPlace(blocks) {
     if (element && previousHeight > 0) element.style.minHeight = Math.ceil(previousHeight) + "px";
   }
   wireExternalReviewDecisionButtons(doc);
-  const actions = document.querySelector(".external-review-actions");
-  const change = activeExternalChange();
-  if (actions && change) {
-    actions.outerHTML = renderExternalReviewActions(change);
-    wireExternalReviewAllButtons(document.querySelector(".external-review-actions") || document);
-  }
   return true;
 }
 
-function waitForInlineReviewTransition() {
+function waitForInlineReviewTransition(settlePromise = null) {
+  if (settlePromise?.then) return settlePromise;
   return new Promise((resolve) => window.setTimeout(resolve, 260));
 }
 
@@ -6377,25 +7436,21 @@ async function saveExternalReviewDecision(blocks, viewState) {
 
 function finishExternalReviewPanelInPlace(viewState) {
   if (!document.querySelector(".external-review-doc")) return false;
-  const actions = document.querySelector(".external-review-actions");
-  if (!actions) return false;
-  actions.outerHTML = renderFileActionButtons({
-    reviewAction: reviewActionForSelectedFile(),
-    dirty: false,
-    canApplyTemplate: false,
-    blockedByConflict: false,
-  });
-  const header = document.querySelector(".file-panel header");
-  if (header) wireFileActionButtons(header);
-  window.setTimeout(() => settleFinishedExternalReview(viewState), 520);
+  window.setTimeout(() => {
+    settleFinishedExternalReview(viewState).then(() => {
+      if (!activeExternalChange() && document.querySelector(".external-review-doc")) {
+        renderViewer();
+        restoreEditorViewState(viewState);
+      }
+    });
+  }, 80);
   return true;
 }
 
 function settleFinishedExternalReview(viewState) {
   const doc = document.querySelector(".external-review-doc");
-  if (!doc || doc.classList.contains("settled")) return;
-  doc.classList.add("settled");
-  settleExternalReviewBlocks([...doc.querySelectorAll(".external-review-block.resolved")], viewState);
+  if (!doc) return Promise.resolve();
+  return settleExternalReviewBlocks([...doc.querySelectorAll(".external-review-block.resolved")], viewState);
 }
 
 function settleExternalReviewBlocks(blocksOrIds, viewState, options = {}) {
@@ -6403,7 +7458,7 @@ function settleExternalReviewBlocks(blocksOrIds, viewState, options = {}) {
   const blocks = blocksOrIds
     .map((item) => typeof item === "string" ? externalReviewBlockElement(item) : item)
     .filter((block) => block?.classList?.contains("resolved") && !block.classList.contains("settling") && !block.classList.contains("settled"));
-  if (!blocks.length) return;
+  if (!blocks.length) return Promise.resolve();
   for (const block of blocks) {
     const startHeight = Math.ceil(block.getBoundingClientRect().height);
     block.classList.add("settling");
@@ -6414,12 +7469,12 @@ function settleExternalReviewBlocks(blocksOrIds, viewState, options = {}) {
   void blocks[0].offsetHeight;
   for (const block of blocks) {
     block.classList.add("settled");
-    const targetHeight = block.classList.contains("empty") ? 0 : Math.ceil(block.scrollHeight);
+    const targetHeight = naturalExternalReviewBlockHeight(block);
     block.style.height = targetHeight + "px";
     block.style.minHeight = targetHeight + "px";
   }
   if (restoreScroll) restoreEditorViewState(viewState);
-  window.setTimeout(() => {
+  return Promise.all(blocks.map(waitForExternalReviewBlockSettle)).then(() => {
     for (const block of blocks) {
       block.classList.remove("settling");
       block.style.height = "";
@@ -6427,7 +7482,45 @@ function settleExternalReviewBlocks(blocksOrIds, viewState, options = {}) {
       block.style.overflow = "";
     }
     if (restoreScroll) restoreEditorViewState(viewState);
-  }, 2050);
+  });
+}
+
+function naturalExternalReviewBlockHeight(block) {
+  const clone = block.cloneNode(true);
+  const rect = block.getBoundingClientRect();
+  clone.classList.remove("settling");
+  clone.classList.add("settled");
+  clone.style.position = "absolute";
+  clone.style.visibility = "hidden";
+  clone.style.pointerEvents = "none";
+  clone.style.left = "-10000px";
+  clone.style.top = "0";
+  clone.style.width = Math.max(1, Math.ceil(rect.width)) + "px";
+  clone.style.height = "";
+  clone.style.minHeight = "";
+  clone.style.overflow = "";
+  document.body.appendChild(clone);
+  const height = Math.ceil(clone.getBoundingClientRect().height);
+  clone.remove();
+  return height;
+}
+
+function waitForExternalReviewBlockSettle(block) {
+  return new Promise((resolve) => {
+    let done = false;
+    const finish = () => {
+      if (done) return;
+      done = true;
+      block.removeEventListener("transitionend", onTransitionEnd);
+      window.clearTimeout(fallback);
+      resolve();
+    };
+    const onTransitionEnd = (event) => {
+      if (event.target === block && event.propertyName === "height") finish();
+    };
+    const fallback = window.setTimeout(finish, 2400);
+    block.addEventListener("transitionend", onTransitionEnd);
+  });
 }
 
 function computeExternalReviewContent(blocks, beforeText, afterText) {
@@ -6772,6 +7865,7 @@ function syncWorkspaceScroll() {
     const sourceMax = Math.max(1, source.scrollHeight - source.clientHeight);
     const targetMax = Math.max(0, target.scrollHeight - target.clientHeight);
     target.scrollTop = targetMax * (source.scrollTop / sourceMax);
+    syncMarkdownEditorScroll();
     window.requestAnimationFrame(() => { syncing = false; });
   };
   diff.addEventListener("scroll", () => mirror(diff, editor), { passive: true });
@@ -7010,13 +8104,13 @@ function focusExternalReviewChange(blockId) {
 }
 
 function scheduleConflictCheck() {
-  if (!state.selected || !state.dirty) return;
+  if (!state.selected || !state.dirty || state.openingFilePath === state.selected || state.savedHash == null) return;
   window.clearTimeout(state.conflictCheckTimer);
   state.conflictCheckTimer = window.setTimeout(() => checkSelectedFileConflict().catch((error) => setStatus(error.message)), 250);
 }
 
 async function checkSelectedFileConflict() {
-  if (!state.selected || !state.dirty) return false;
+  if (!state.selected || !state.dirty || state.openingFilePath === state.selected || state.savedHash == null) return false;
   const path = state.selected;
   const [data, diff] = await Promise.all([
     readSelectedDiskFile(path),
@@ -7189,27 +8283,35 @@ async function saveCurrent(options = {}) {
     setStatus("file changed on disk · apply or reject before saving");
     return;
   }
+  const saveButton = document.querySelector("[data-file-save]");
+  markButtonSaving(saveButton);
   setStatus("saving...");
-  const viewState = captureEditorViewState();
-  const content = activeEditor().value;
-  const result = await writeSelectedDiskFile(content);
-  state.saved = content;
-  state.savedHash = result.contentHash;
-  if (result.startupContext) state.selectedStartupContext = result.startupContext;
-  state.dirty = false;
-  resetConflictState();
-  resetExternalChangeState();
-  await loadFiles();
-  renderViewer();
-  restoreEditorViewState(viewState);
-  setStatus(result.backupPath ? "saved · backup created" : "saved");
-  updateHeader();
+  try {
+    const viewState = captureEditorViewState();
+    const content = activeEditor().value;
+    const result = await writeSelectedDiskFile(content);
+    state.saved = content;
+    state.savedHash = result.contentHash;
+    if (result.startupContext) state.selectedStartupContext = result.startupContext;
+    state.dirty = false;
+    resetConflictState();
+    resetExternalChangeState();
+    await loadFiles();
+    renderViewer();
+    restoreEditorViewState(viewState);
+    setStatus(result.backupPath ? "saved · backup created" : "saved");
+    updateHeader();
+    flashSavedButton(document.querySelector("[data-file-save]"), "Saved");
+  } catch (error) {
+    restoreButtonLabel(saveButton);
+    throw error;
+  }
 }
 
 async function refreshFromDisk() {
   const previousSelected = state.selected;
   try {
-    const [filesData, docqa, doctor, settingsData, startupData, startupSkillsData] = await Promise.all([api("/api/files"), api("/api/docqa"), api("/api/doctor"), api("/api/settings"), api("/api/startup-context"), api("/api/startup-skills")]);
+    const [filesData, docqa, doctor, settingsData, startupData, startupSkillsData] = await Promise.all([api(filesApiPath()), api("/api/docqa"), api("/api/doctor"), api("/api/settings"), api("/api/startup-context"), api("/api/startup-skills")]);
     state.files = filesData.files;
     state.startupContextFiles = startupData.files || [];
     state.startupSkillFolders = startupSkillsData.folders || [];
@@ -7232,6 +8334,7 @@ async function refreshFromDisk() {
     else updateHeader();
 
     if (!previousSelected || previousSelected !== state.selected) return;
+    if (state.openingFilePath === state.selected || state.savedHash == null) return;
     const [data, diff] = await Promise.all([
       readSelectedDiskFile(previousSelected),
       readSelectedDiff(previousSelected),
@@ -7279,6 +8382,47 @@ async function refreshFromDisk() {
 }
 
 function setStatus(text) { el("status").textContent = text; }
+function rememberButtonLabel(button) {
+  if (!button) return "";
+  window.clearTimeout(button._saveConfirmTimer);
+  const original = button.dataset.saveOriginalLabel || button.textContent || "";
+  button.dataset.saveOriginalLabel = original;
+  if (!button.dataset.saveWasDisabled) button.dataset.saveWasDisabled = button.disabled ? "true" : "false";
+  const width = Math.ceil(button.getBoundingClientRect().width);
+  if (width) button.style.minWidth = width + "px";
+  return original;
+}
+function markButtonSaving(button, label = "Saving...") {
+  if (!button) return;
+  rememberButtonLabel(button);
+  button.classList.remove("save-confirmed");
+  button.classList.add("save-pending");
+  button.textContent = label;
+  button.disabled = true;
+  button.setAttribute("aria-live", "polite");
+}
+function restoreButtonLabel(button) {
+  if (!button) return;
+  window.clearTimeout(button._saveConfirmTimer);
+  button.classList.remove("save-pending", "save-confirmed");
+  button.textContent = button.dataset.saveOriginalLabel || button.textContent || "";
+  button.style.minWidth = "";
+  button.disabled = button.dataset.saveWasDisabled === "true";
+  button.removeAttribute("aria-live");
+  delete button.dataset.saveOriginalLabel;
+  delete button.dataset.saveWasDisabled;
+}
+function flashSavedButton(button, label = "Saved") {
+  if (!button) return;
+  rememberButtonLabel(button);
+  button.disabled = button.dataset.saveWasDisabled === "true";
+  button.classList.remove("save-pending", "save-confirmed");
+  button.textContent = label;
+  button.setAttribute("aria-live", "polite");
+  void button.offsetWidth;
+  button.classList.add("save-confirmed");
+  button._saveConfirmTimer = window.setTimeout(() => restoreButtonLabel(button), 1300);
+}
 function activeEditor() { return el("docEditor") || el("editor"); }
 function isScrollableY(element) {
   if (!element) return false;
@@ -7390,6 +8534,7 @@ function restoreEditorViewState(snapshot) {
       try { editor.focus({ preventScroll: true }); }
       catch { editor.focus(); }
     }
+    syncMarkdownEditorScroll();
   };
   apply();
   window.requestAnimationFrame(() => {
@@ -7429,7 +8574,7 @@ function escapeHtml(value) { return String(value).replace(/[&<>"]/g, (ch) => ({"
 function escapeRegExp(value) { return String(value).replace(/[-/\\^$*+?.()|[\]{}]/g, "\\$&"); }
 function cssEscape(value) { return window.CSS && CSS.escape ? CSS.escape(value) : String(value).replace(/(["\\])/g, "\\$1"); }
 
-const SPOTLIGHT_CARD_SELECTOR = ".launch-card, .review-item, .hub-folder-card, .startup-context-item, .card, .conflict-card";
+const SPOTLIGHT_CARD_SELECTOR = ".launch-card, .review-item, .hub-folder-card, .startup-context-item:not(.startup-skill-folder), .settings-section, .settings-toggle, .settings-theme-preview, .template-editor, .hub-section-editor, .hub-card-editor, .path-picker, .card, .conflict-card";
 let spotlightCard = null;
 let spotlightPointer = null;
 let spotlightFrame = 0;
@@ -7455,16 +8600,23 @@ function updateCardSpotlightAt(x, y) {
   const card = element instanceof Element ? element.closest(SPOTLIGHT_CARD_SELECTOR) : null;
   setCardSpotlight(card, x, y);
 }
-function updateCardSpotlight(event) {
-  spotlightPointer = { x: event.clientX, y: event.clientY };
-  updateCardSpotlightAt(spotlightPointer.x, spotlightPointer.y);
-}
-function refreshCardSpotlightAfterScroll() {
+function scheduleCardSpotlightUpdate() {
   if (!spotlightPointer || spotlightFrame) return;
   spotlightFrame = window.requestAnimationFrame(() => {
     spotlightFrame = 0;
     updateCardSpotlightAt(spotlightPointer.x, spotlightPointer.y);
   });
+}
+function updateCardSpotlight(event) {
+  spotlightPointer = { x: event.clientX, y: event.clientY };
+  scheduleCardSpotlightUpdate();
+}
+function refreshCardSpotlightAfterScroll() {
+  scheduleCardSpotlightUpdate();
+}
+
+function setDocLinkModifierActive(active) {
+  document.documentElement.classList.toggle("doc-link-modifier-active", Boolean(active));
 }
 
 el("editor").addEventListener("input", () => {
@@ -7483,11 +8635,6 @@ document.addEventListener("click", (event) => {
   if (!menu || menu.hidden || menu.contains(event.target)) return;
   hideExplorerContextMenu();
 });
-document.addEventListener("click", (event) => {
-  const picker = document.querySelector("[data-path-picker]");
-  if (!picker || picker.contains(event.target)) return;
-  togglePathPickerMenu(false);
-});
 document.addEventListener("pointermove", updateCardSpotlight, { passive: true });
 document.addEventListener("pointerleave", () => {
   spotlightPointer = null;
@@ -7502,14 +8649,19 @@ window.addEventListener("resize", refreshCardSpotlightAfterScroll, { passive: tr
 window.addEventListener("blur", () => {
   spotlightPointer = null;
   clearCardSpotlight();
+  setDocLinkModifierActive(false);
 });
 document.addEventListener("keydown", (event) => {
   markUserActive();
+  setDocLinkModifierActive(event.ctrlKey || event.metaKey);
   if (handleSaveShortcut(event)) return;
   if (event.key === "Escape") {
     hideExplorerContextMenu();
-    togglePathPickerMenu(false);
   }
+});
+document.addEventListener("keyup", (event) => setDocLinkModifierActive(event.ctrlKey || event.metaKey));
+document.addEventListener("visibilitychange", () => {
+  if (document.hidden) setDocLinkModifierActive(false);
 });
 el("sidebarToggle").addEventListener("click", () => {
   state.mobileSidebarTouched = true;
@@ -7532,6 +8684,10 @@ document.querySelectorAll("[data-home-file]").forEach((button) => button.addEven
 el("back").addEventListener("click", () => goHistory(-1).catch((error) => setStatus(error.message)));
 el("forward").addEventListener("click", () => goHistory(1).catch((error) => setStatus(error.message)));
 el("hub").addEventListener("click", () => handleHubAction());
+el("gitDiffToggle").addEventListener("click", () => {
+  if (!state.selectedDiff?.changed) return;
+  setDiffCollapsed(!state.diffCollapsed);
+});
 el("verifyCurrent").addEventListener("click", () => verifyCurrentFile().catch((error) => setStatus(error.message)));
 el("deleteCurrent").addEventListener("click", () => deletePaths([state.selected]).catch((error) => setStatus(error.message)));
 el("watchSelected").addEventListener("click", () => addSelectedToWatch().catch((error) => setStatus(error.message)));

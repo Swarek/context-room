@@ -126,6 +126,8 @@ Minimal config:
 
 `watchAllow` controls the review queue. A watched folder includes changed tracked files and new untracked files inside it.
 
+`reviewPaths` keeps important files or folders in the review queue until a human marks the current content verified, even when Git has no diff for them.
+
 `startupContext` optionally lists agent instruction filenames such as `AGENTS.md` and `CLAUDE.md` from the filesystem root down to the Context Room root. These files are shown read-only and do not pollute the explorer.
 
 `autoChildren: true` on a folder card tells Context Room to infer sub-cards from the folder's immediate files and subfolders.

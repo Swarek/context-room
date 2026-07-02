@@ -50,6 +50,18 @@ Good examples:
 "watchAllow": ["docs/", "skills/", "AGENTS.md", "docs/decisions/"]
 ```
 
+### `reviewPaths`
+
+Required human verification boundary.
+
+Files and folders here appear in the review queue until the current content is marked verified, even when there is no Git diff. Use this for onboarding a new documentation set or forcing a periodic review of agent-critical files.
+
+Good examples:
+
+```json
+"reviewPaths": ["AGENTS.md", "docs/INDEX.md", "skills/docs-architect/SKILL.md"]
+```
+
 ### `hubSections`
 
 Navigation model.
