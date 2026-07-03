@@ -1195,7 +1195,7 @@ test("card hover spotlight follows the pointer without intercepting clicks", () 
   assert.match(html, /function updateCardSpotlight\(event\)/);
   assert.match(html, /scheduleCardSpotlightUpdate\(\);/);
   assert.match(html, /function refreshCardSpotlightAfterScroll\(\)/);
-  assert.match(html, /document\.addEventListener\("pointermove", updateCardSpotlight, \{ passive: true \}\)/);
+  assert.match(html, /document\.addEventListener\("pointermove", \(event\) => \{[\s\S]*updateCardSpotlight\(event\);[\s\S]*setDocLinkModifierActive\(isDocLinkModifierEventActive\(event\)\);[\s\S]*\}, \{ passive: true \}\)/);
   assert.match(html, /document\.addEventListener\("scroll", refreshCardSpotlightAfterScroll, \{ capture: true, passive: true \}\)/);
 });
 
@@ -1273,12 +1273,14 @@ test("rendered app supports selectable file themes and colored markdown reading"
   assert.match(html, /\.markdown-line\.h1\s*\{[^}]*color:\s*var\(--file-h1\)/);
   assert.match(html, /\.markdown-inline-code/);
   assert.match(html, /\.markdown-path\s*\{[^}]*color:\s*var\(--file-list\)/);
-  assert.match(html, /\.markdown-path\[data-doc-link-path\]\s*\{[^}]*cursor:\s*pointer[^}]*background-image:\s*linear-gradient/);
-  assert.match(html, /\.markdown-path\[data-doc-link-path\]:hover, \.markdown-path\[data-doc-link-path\]\.doc-link-hover-target, \.doc-link-modifier-active \.markdown-path\[data-doc-link-path\]:hover\s*\{[^}]*animation:\s*docLinkClickableSweep/);
-  assert.match(html, /\.doc-link-modifier-active \.markdown-path\[data-doc-link-path\]\s*\{[^}]*background-color/);
+  assert.match(html, /\.markdown-path\[data-doc-link-path\]\s*\{[^}]*cursor:\s*inherit[^}]*background-image:\s*linear-gradient/);
+  assert.match(html, /\.doc-link-modifier-active \.markdown-path\[data-doc-link-path\]\s*\{[^}]*cursor:\s*pointer[^}]*background-color/);
+  assert.match(html, /\.doc-link-modifier-active \.markdown-path\[data-doc-link-path\]:hover, \.doc-link-modifier-active \.markdown-path\[data-doc-link-path\]\.doc-link-hover-target\s*\{[^}]*animation:\s*docLinkClickableSweep/);
   assert.match(html, /@keyframes docLinkClickableSweep/);
   assert.match(html, /\.markdown-doc-link\s*\{[^}]*color:\s*var\(--file-list\)/);
   assert.match(html, /\.markdown-inline-code\.markdown-path\s*\{\s*color:\s*var\(--file-list\)/);
+  assert.match(html, /\.viewer a\.path-link\s*\{[^}]*cursor:\s*inherit/);
+  assert.match(html, /\.doc-link-modifier-active \.viewer a\.path-link:hover\s*\{[^}]*cursor:\s*pointer/);
   assert.match(html, /\.markdown-editor-shell\s*\{[^}]*isolation:\s*isolate/);
   assert.match(html, /\.markdown-editor-highlight\s*\{[^}]*z-index:\s*1/);
   assert.match(html, /\.markdown-editor-input\s*\{[^}]*position:\s*absolute;[^}]*-webkit-text-fill-color:\s*transparent !important/);
@@ -1304,6 +1306,7 @@ test("rendered app supports selectable file themes and colored markdown reading"
   assert.match(html, /editor\.addEventListener\("pointermove", \(event\) => updateMarkdownEditorDocLinkHover\(editor, event\), \{ passive: true \}\)/);
   assert.match(html, /editor\.addEventListener\("pointerleave", \(\) => clearMarkdownEditorDocLinkHover\(editor\), \{ passive: true \}\)/);
   assert.match(html, /highlighter\.style\.pointerEvents = "auto";[\s\S]*editor\.style\.pointerEvents = "none";/);
+  assert.match(html, /if \(!state\.docLinkModifierActive\) \{[\s\S]*clearMarkdownEditorDocLinkHover\(editor\);[\s\S]*return;/);
   assert.match(html, /editor\.classList\.toggle\("doc-link-hover", Boolean\(target\)\)/);
   assert.match(html, /target\.classList\.add\("doc-link-hover-target"\)/);
   assert.match(html, /document\.elementsFromPoint\(clientX, clientY\)/);
@@ -1312,10 +1315,16 @@ test("rendered app supports selectable file themes and colored markdown reading"
   assert.match(html, /wireMarkdownDocLinks\(\);/);
   assert.match(html, /wireMarkdownEditorDocLinks\(docEditor\);/);
   assert.match(html, /function setDocLinkModifierActive\(active\)/);
-  assert.match(html, /document\.documentElement\.classList\.toggle\("doc-link-modifier-active", Boolean\(active\)\)/);
-  assert.match(html, /setDocLinkModifierActive\(event\.ctrlKey \|\| event\.metaKey\)/);
-  assert.match(html, /document\.addEventListener\("keyup", \(event\) => setDocLinkModifierActive\(event\.ctrlKey \|\| event\.metaKey\)\)/);
-  assert.match(html, /if \(!event\.ctrlKey && !event\.metaKey\) return;/);
+  assert.match(html, /if \(state\.docLinkModifierActive === next\) return;/);
+  assert.match(html, /state\.docLinkModifierActive = next;/);
+  assert.match(html, /document\.documentElement\.classList\.toggle\("doc-link-modifier-active", next\)/);
+  assert.match(html, /if \(!next\) clearMarkdownEditorDocLinkHover\(\);/);
+  assert.match(html, /function isMacPlatform\(\)/);
+  assert.match(html, /function isDocLinkModifierEventActive\(event\)/);
+  assert.match(html, /return isMacPlatform\(\) \? Boolean\(event\.metaKey\) : Boolean\(event\.ctrlKey\);/);
+  assert.match(html, /setDocLinkModifierActive\(isDocLinkModifierEventActive\(event\)\)/);
+  assert.match(html, /document\.addEventListener\("keyup", \(event\) => setDocLinkModifierActive\(isDocLinkModifierEventActive\(event\)\)\)/);
+  assert.match(html, /if \(!isDocLinkModifierEventActive\(event\)\) return;/);
   assert.match(html, /openMarkdownDocLink\(target\)/);
   assert.match(html, /selectFile\(resolved, \{ revealInExplorer: true \}\)/);
   assert.match(html, /markdown-inline-code' \+ \(isMarkdownPathToken\(token\) \? ' markdown-path' : ''\) \+ '"' \+ docLinkAttrs/);

@@ -3772,9 +3772,9 @@ export function renderAppHtml() {
     .markdown-line.frontmatter, .markdown-line.hr { color: var(--file-marker); }
     .markdown-inline-code { color: var(--file-code); background: color-mix(in srgb, var(--file-code) 12%, transparent); border-radius: 4px; padding: 0 3px; }
     .markdown-path { color: var(--file-list); border-bottom: 1px solid color-mix(in srgb, var(--file-list) 36%, transparent); }
-    .markdown-path[data-doc-link-path] { cursor: pointer; text-decoration: none; background-image: linear-gradient(90deg, transparent, color-mix(in srgb, var(--accent) 72%, transparent), transparent); background-repeat: no-repeat; background-size: 0 2px; background-position: 0 100%; transition: color 140ms ease, border-color 140ms ease, background-color 140ms ease, box-shadow 140ms ease; }
-    .markdown-path[data-doc-link-path]:hover, .markdown-path[data-doc-link-path].doc-link-hover-target, .doc-link-modifier-active .markdown-path[data-doc-link-path]:hover { color: var(--accent); border-color: color-mix(in srgb, var(--accent) 72%, transparent); background-color: color-mix(in srgb, var(--accent) 9%, transparent); box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 7%, transparent); animation: docLinkClickableSweep 1.1s ease-in-out infinite; }
-    .doc-link-modifier-active .markdown-path[data-doc-link-path] { border-color: color-mix(in srgb, var(--accent) 54%, transparent); background-color: color-mix(in srgb, var(--accent) 5%, transparent); }
+    .markdown-path[data-doc-link-path] { cursor: inherit; text-decoration: none; background-image: linear-gradient(90deg, transparent, color-mix(in srgb, var(--accent) 72%, transparent), transparent); background-repeat: no-repeat; background-size: 0 2px; background-position: 0 100%; transition: color 140ms ease, border-color 140ms ease, background-color 140ms ease, box-shadow 140ms ease; }
+    .doc-link-modifier-active .markdown-path[data-doc-link-path] { cursor: pointer; border-color: color-mix(in srgb, var(--accent) 54%, transparent); background-color: color-mix(in srgb, var(--accent) 5%, transparent); }
+    .doc-link-modifier-active .markdown-path[data-doc-link-path]:hover, .doc-link-modifier-active .markdown-path[data-doc-link-path].doc-link-hover-target { color: var(--accent); border-color: color-mix(in srgb, var(--accent) 72%, transparent); background-color: color-mix(in srgb, var(--accent) 9%, transparent); box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 7%, transparent); animation: docLinkClickableSweep 1.1s ease-in-out infinite; }
     @keyframes docLinkClickableSweep { 0% { background-size: 0 2px; background-position: 0 100%; } 46% { background-size: 100% 2px; background-position: 0 100%; } 100% { background-size: 0 2px; background-position: 100% 100%; } }
     .markdown-doc-link { color: var(--file-list); border-bottom: 1px solid color-mix(in srgb, var(--file-list) 42%, transparent); text-decoration: none; }
     .markdown-inline-code.markdown-path { color: var(--file-list); }
@@ -3886,8 +3886,8 @@ export function renderAppHtml() {
     .confirm-dialog p { margin: 0; color: var(--muted); font-size: 14px; line-height: 1.45; overflow-wrap: anywhere; }
     .confirm-actions { display: flex; justify-content: flex-end; gap: 8px; flex-wrap: wrap; margin-top: 18px; }
     @media (max-width: 1280px) { .review-workspace { grid-template-columns: 1fr; } .diff-code, .doc-content { max-height: none; } }
-    .viewer a.path-link { color: var(--accent); text-decoration: none; border-bottom: 1px solid rgba(139,211,255,0.35); cursor: pointer; }
-    .viewer a.path-link:hover { color: #ffffff; border-bottom-color: #ffffff; }
+    .viewer a.path-link { color: var(--file-list); text-decoration: none; border-bottom: 1px solid color-mix(in srgb, var(--file-list) 36%, transparent); cursor: inherit; }
+    .doc-link-modifier-active .viewer a.path-link:hover { color: var(--accent); border-bottom-color: color-mix(in srgb, var(--accent) 72%, transparent); cursor: pointer; }
     .mode-toggle { display: flex; border: 1px solid var(--line); border-radius: 14px; overflow: hidden; }
     .mode-toggle button { border: 0; background: transparent; color: var(--muted); padding: var(--space-3); font-weight: 850; cursor: pointer; }
     .mode-toggle button.active { color: var(--on-accent); background: linear-gradient(135deg, var(--accent), var(--accent-2)); }
@@ -4136,7 +4136,7 @@ export function renderAppHtml() {
   <div id="explorerContextMenu" class="explorer-context-menu" hidden></div>
   <div id="agentToast" class="agent-toast" hidden></div>
 <script>
-const state = { files: [], startupContextFiles: [], startupSkillFolders: [], activeStartupSkillExplorer: null, activeStartupContextExplorer: null, startupSkillCreateFolder: null, selectedStartupContext: null, docqa: null, doctor: null, settings: null, settingsOpen: false, page: "hub", pendingMarkdown: null, availableHubCards: [], hubFolders: [], hubSections: [], rootHubSections: [], activeHubCardId: null, selectedReview: null, reviewModePath: null, reviewModeStatus: null, selected: null, selectedDiff: null, fileConflict: null, externalChange: null, conflictCompare: false, conflictMergeText: null, conflictMergeKey: "", conflictMergeMode: "auto", conflictCheckTimer: null, diffCollapsed: false, saved: "", savedHash: null, dirty: false, mode: "view", homeView: "root", planetStack: ["root"], filePanel: false, history: [], historyIndex: -1, pathFilters: [], explorerWatchFilter: "all", explorerRenderKey: "", selectedForDelete: new Set(), selectionRequest: 0, openingFilePath: null, mobileSidebarTouched: false, sessionStateTimer: null, agentCommandTimer: null, lastAgentCommandId: "", pendingAgentCommand: null, agentAnnotations: {}, userActiveAt: 0, markdownHighlightFrame: 0, markdownHighlightText: "", markdownHighlightLastText: "", expanded: new Set(["data", "automations", "integrations", "skills", "tools", "~", "~/.hermes", "~/.hermes/memories", "~/.hermes/skills"]) };
+const state = { files: [], startupContextFiles: [], startupSkillFolders: [], activeStartupSkillExplorer: null, activeStartupContextExplorer: null, startupSkillCreateFolder: null, selectedStartupContext: null, docqa: null, doctor: null, settings: null, settingsOpen: false, page: "hub", pendingMarkdown: null, availableHubCards: [], hubFolders: [], hubSections: [], rootHubSections: [], activeHubCardId: null, selectedReview: null, reviewModePath: null, reviewModeStatus: null, selected: null, selectedDiff: null, fileConflict: null, externalChange: null, conflictCompare: false, conflictMergeText: null, conflictMergeKey: "", conflictMergeMode: "auto", conflictCheckTimer: null, diffCollapsed: false, saved: "", savedHash: null, dirty: false, mode: "view", homeView: "root", planetStack: ["root"], filePanel: false, history: [], historyIndex: -1, pathFilters: [], explorerWatchFilter: "all", explorerRenderKey: "", selectedForDelete: new Set(), selectionRequest: 0, openingFilePath: null, mobileSidebarTouched: false, sessionStateTimer: null, agentCommandTimer: null, lastAgentCommandId: "", pendingAgentCommand: null, agentAnnotations: {}, userActiveAt: 0, markdownHighlightFrame: 0, markdownHighlightText: "", markdownHighlightLastText: "", docLinkModifierActive: false, expanded: new Set(["data", "automations", "integrations", "skills", "tools", "~", "~/.hermes", "~/.hermes/memories", "~/.hermes/skills"]) };
 const FILE_THEMES = ${JSON.stringify(FILE_THEME_OPTIONS)};
 const DEFAULT_FILE_THEME = "${DEFAULT_FILE_THEME}";
 const MAIN_FILE_PATHS = new Set([
@@ -7081,7 +7081,7 @@ function isKnownContextRoomFile(filePath) {
 function wireMarkdownDocLinks(root = document) {
   root.querySelectorAll("[data-doc-link-path]").forEach((element) => element.addEventListener("click", (event) => {
     if (element.tagName === "A") event.preventDefault();
-    if (!event.ctrlKey && !event.metaKey) return;
+    if (!isDocLinkModifierEventActive(event)) return;
     event.preventDefault();
     event.stopPropagation();
     openMarkdownDocLink(element.dataset.docLinkResolved || element.dataset.docLinkPath).catch((error) => setStatus(error.message));
@@ -7092,7 +7092,7 @@ function wireMarkdownEditorDocLinks(editor) {
   editor.addEventListener("pointermove", (event) => updateMarkdownEditorDocLinkHover(editor, event), { passive: true });
   editor.addEventListener("pointerleave", () => clearMarkdownEditorDocLinkHover(editor), { passive: true });
   editor.addEventListener("click", (event) => {
-    if (!event.ctrlKey && !event.metaKey) return;
+    if (!isDocLinkModifierEventActive(event)) return;
     const target = markdownDocLinkAtPoint(event.clientX, event.clientY) || markdownDocLinkAtOffset(editor.value, editor.selectionStart || 0);
     if (!target) return;
     event.preventDefault();
@@ -7131,6 +7131,11 @@ function markdownDocLinkElementAtPoint(clientX, clientY) {
 }
 
 function updateMarkdownEditorDocLinkHover(editor, event) {
+  setDocLinkModifierActive(isDocLinkModifierEventActive(event));
+  if (!state.docLinkModifierActive) {
+    clearMarkdownEditorDocLinkHover(editor);
+    return;
+  }
   const target = markdownDocLinkElementAtPoint(event.clientX, event.clientY);
   document.querySelectorAll(".doc-link-hover-target").forEach((element) => {
     if (element !== target) element.classList.remove("doc-link-hover-target");
@@ -8616,7 +8621,20 @@ function refreshCardSpotlightAfterScroll() {
 }
 
 function setDocLinkModifierActive(active) {
-  document.documentElement.classList.toggle("doc-link-modifier-active", Boolean(active));
+  const next = Boolean(active);
+  if (state.docLinkModifierActive === next) return;
+  state.docLinkModifierActive = next;
+  document.documentElement.classList.toggle("doc-link-modifier-active", next);
+  if (!next) clearMarkdownEditorDocLinkHover();
+}
+
+function isMacPlatform() {
+  const platform = navigator.userAgentData?.platform || navigator.platform || "";
+  return /mac|iphone|ipad|ipod/i.test(platform);
+}
+
+function isDocLinkModifierEventActive(event) {
+  return isMacPlatform() ? Boolean(event.metaKey) : Boolean(event.ctrlKey);
 }
 
 el("editor").addEventListener("input", () => {
@@ -8635,7 +8653,10 @@ document.addEventListener("click", (event) => {
   if (!menu || menu.hidden || menu.contains(event.target)) return;
   hideExplorerContextMenu();
 });
-document.addEventListener("pointermove", updateCardSpotlight, { passive: true });
+document.addEventListener("pointermove", (event) => {
+  updateCardSpotlight(event);
+  setDocLinkModifierActive(isDocLinkModifierEventActive(event));
+}, { passive: true });
 document.addEventListener("pointerleave", () => {
   spotlightPointer = null;
   clearCardSpotlight();
@@ -8653,13 +8674,13 @@ window.addEventListener("blur", () => {
 });
 document.addEventListener("keydown", (event) => {
   markUserActive();
-  setDocLinkModifierActive(event.ctrlKey || event.metaKey);
+  setDocLinkModifierActive(isDocLinkModifierEventActive(event));
   if (handleSaveShortcut(event)) return;
   if (event.key === "Escape") {
     hideExplorerContextMenu();
   }
 });
-document.addEventListener("keyup", (event) => setDocLinkModifierActive(event.ctrlKey || event.metaKey));
+document.addEventListener("keyup", (event) => setDocLinkModifierActive(isDocLinkModifierEventActive(event)));
 document.addEventListener("visibilitychange", () => {
   if (document.hidden) setDocLinkModifierActive(false);
 });
