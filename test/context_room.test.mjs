@@ -38,12 +38,14 @@ import {
   readCollaborationSessionState,
   readFileDiff,
   readMemoryWebappSettings,
+  readReviewBaseFile,
   readStartupContextFile,
   readStartupSkillFile,
   renderAppHtml,
   renderExplorerContextMenuMarkup,
   renderTemplateOptionsMarkup,
   revertMemoryFile,
+  writeDocReviewBaseline,
   writeStartupContextFile,
   writeStartupSkillFile,
   writeAgentCommand,
@@ -407,6 +409,7 @@ test("init adds Context Room runtime files to local Git excludes", () => {
   assert.match(exclude, /\.context-room\/session-state\.json/);
   assert.match(exclude, /\.context-room\/agent-command\.json/);
   assert.match(exclude, /\.context-room\/agent-annotations\.json/);
+  assert.match(exclude, /\.context-room\/review-baselines\//);
 });
 
 test("runtime Git excludes are scoped when Context Room root is a Git subdirectory", () => {
@@ -420,6 +423,7 @@ test("runtime Git excludes are scoped when Context Room root is a Git subdirecto
 
   assert.match(exclude, /project\/\.context-room\/session-state\.json/);
   assert.match(exclude, /project\/\.context-room\/agent-command\.json/);
+  assert.match(exclude, /project\/\.context-room\/review-baselines\//);
   assert.match(exclude, /project\/\.context-room\/memory-webapp-backups\//);
 });
 
@@ -681,6 +685,66 @@ test("file diff renders new untracked watched docs as a Git new-file patch", () 
   assert.equal(diff.deletions, 0);
   assert.match(diff.patch, /new file mode/);
   assert.match(diff.patch, /\+Agent-written docs\./);
+});
+
+test("review base reads HEAD content for changed files from a git subdirectory", () => {
+  const repo = makeRoot();
+  const root = path.join(repo, "hicharlie.fr");
+  fs.mkdirSync(path.join(root, "docs"), { recursive: true });
+  execFileSync("git", ["init"], { cwd: repo, stdio: "ignore" });
+  execFileSync("git", ["config", "user.email", "context-room@example.test"], { cwd: repo, stdio: "ignore" });
+  execFileSync("git", ["config", "user.name", "Context Room Test"], { cwd: repo, stdio: "ignore" });
+  fs.writeFileSync(path.join(root, "docs/guide.md"), "# Guide\n\nOriginal.\n");
+  fs.writeFileSync(path.join(root, "docs/old.md"), "# Old\n\nRemove me.\n");
+  initializeContextRoomProject(root, { allowedPaths: ["docs/"], watchAllow: ["docs/"] });
+  execFileSync("git", ["add", "."], { cwd: repo, stdio: "ignore" });
+  execFileSync("git", ["commit", "-m", "initial"], { cwd: repo, stdio: "ignore" });
+  fs.writeFileSync(path.join(root, "docs/guide.md"), "# Guide\n\nUpdated.\n");
+  fs.writeFileSync(path.join(root, "docs/new.md"), "# New\n\nDraft.\n");
+  fs.unlinkSync(path.join(root, "docs/old.md"));
+
+  const modified = readReviewBaseFile(root, "docs/guide.md");
+  const added = readReviewBaseFile(root, "docs/new.md");
+  const deleted = readReviewBaseFile(root, "docs/old.md");
+
+  assert.equal(modified.available, true);
+  assert.equal(modified.changeKind, "modified");
+  assert.equal(modified.baseContent, "# Guide\n\nOriginal.\n");
+  assert.equal(modified.currentContent, "# Guide\n\nUpdated.\n");
+  assert.equal(added.available, true);
+  assert.equal(added.changeKind, "added");
+  assert.equal(added.baseContent, "");
+  assert.equal(added.currentContent, "# New\n\nDraft.\n");
+  assert.equal(deleted.available, true);
+  assert.equal(deleted.changeKind, "deleted");
+  assert.equal(deleted.baseContent, "# Old\n\nRemove me.\n");
+  assert.equal(deleted.currentContent, "");
+});
+
+test("review base prefers the last inline review baseline over HEAD", () => {
+  const root = makeRoot();
+  execFileSync("git", ["init"], { cwd: root, stdio: "ignore" });
+  execFileSync("git", ["config", "user.email", "context-room@example.test"], { cwd: root, stdio: "ignore" });
+  execFileSync("git", ["config", "user.name", "Context Room Test"], { cwd: root, stdio: "ignore" });
+  fs.writeFileSync(path.join(root, "README.md"), "# Demo\n");
+  initializeContextRoomProject(root, { allowedPaths: ["README.md"], watchAllow: ["README.md"] });
+  execFileSync("git", ["add", "."], { cwd: root, stdio: "ignore" });
+  execFileSync("git", ["commit", "-m", "initial"], { cwd: root, stdio: "ignore" });
+  fs.writeFileSync(path.join(root, "README.md"), "# Demo\n\nAlready reviewed.\n");
+
+  const baseline = writeDocReviewBaseline(root, "README.md", { note: "inline review applied" });
+  const unchanged = readReviewBaseFile(root, "README.md");
+  fs.writeFileSync(path.join(root, "README.md"), "# Demo\n\nAlready reviewed.\n\nNew small edit.\n");
+  const next = readReviewBaseFile(root, "README.md");
+
+  assert.match(baseline.baselinePath, /\.context-room\/review-baselines\/README\.md\.baseline$/);
+  assert.equal(unchanged.baseline, "review");
+  assert.equal(unchanged.changeKind, "unchanged");
+  assert.equal(unchanged.baseContent, unchanged.currentContent);
+  assert.equal(next.baseline, "review");
+  assert.equal(next.changeKind, "modified");
+  assert.equal(next.baseContent, "# Demo\n\nAlready reviewed.\n");
+  assert.equal(next.currentContent, "# Demo\n\nAlready reviewed.\n\nNew small edit.\n");
 });
 
 test("default config exposes scoped-context best practices and simple markdown templates", () => {
@@ -1401,6 +1465,28 @@ test("verification actions are limited to files opened from the review queue and
   assert.doesNotMatch(html, /data-file-verify/);
 });
 
+test("review queue opens changed files with the inline segment review engine", () => {
+  const html = renderAppHtml();
+
+  assert.match(html, /\/api\/file\/review-base\?path=/);
+  assert.match(html, /async function startChangedFileInlineReview\(path, diff, requestId = state\.selectionRequest\)/);
+  assert.match(html, /if \(options\.reviewMode && diff\?\.changed\) await startChangedFileInlineReview\(path, diff, requestId\);/);
+  assert.match(html, /source: "review"/);
+  assert.match(html, /baseContent: typeof review\.baseContent === "string" \? review\.baseContent : ""/);
+  assert.match(html, /changeKind: review\.changeKind \|\| "modified"/);
+  assert.match(html, /function externalReviewBaseContent\(change = activeExternalChange\(\)\)/);
+  assert.match(html, /async function recordSelectedReviewBaseline\(path = state\.selected, note = ""\)/);
+  assert.match(html, /\/api\/docqa\/review-baseline/);
+  assert.match(html, /if \(change\.source === "review"\) await recordSelectedReviewBaseline\(change\.path, "inline review applied"\);/);
+  assert.match(html, /renderExternalReviewDocument\(externalReviewBaseContent\(externalChange\), externalChange\.diskContent \|\| ""\)/);
+  assert.match(html, /buildExternalReviewBlocks\(externalReviewBaseContent\(change\), change\.diskContent \|\| "", change\.reviewDecisions/);
+  assert.match(html, /computeExternalReviewContent\(blocks, externalReviewBaseContent\(change\), change\.diskContent \|\| ""\)/);
+  assert.match(html, /if \(\(review\.baseContent \|\| ""\) === \(review\.currentContent \|\| ""\)\) \{/);
+  assert.match(html, /changes already reviewed · mark verified when ready/);
+  assert.match(html, /review\.changeKind === "added" \? "new file waiting for review" : "changes waiting for review"/);
+  assert.match(html, /if \(activeExternalChange\(\)\?\.source === "review"\) \{[\s\S]*state\.selectedDiff = await readSelectedDiff\(previousSelected\);[\s\S]*return;[\s\S]*\}/);
+});
+
 test("save preserves the editor scroll position after rerendering", () => {
   const html = renderAppHtml();
 
@@ -1480,7 +1566,7 @@ test("disk changes stay pending for review instead of silently reloading the ope
   assert.match(html, /external-review-doc/);
   assert.match(html, /external-review-block change/);
   assert.match(html, /external-review-line/);
-  assert.match(html, /Document with disk changes highlighted/);
+  assert.match(html, /Document with file changes highlighted/);
   assert.match(html, /data-external-block-decision="accept"/);
   assert.match(html, /data-external-block-decision="reject"/);
   assert.match(html, /data-external-block-id/);

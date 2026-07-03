@@ -17,6 +17,7 @@ export const CONFIG_DIR = ".context-room";
 export const CONFIG_FILE = `${CONFIG_DIR}/config.json`;
 const CONFIG_SCHEMA_URL = "https://raw.githubusercontent.com/Swarek/context-room/main/schemas/config.schema.json";
 const DOCQA_REVIEW_STATE = `${CONFIG_DIR}/review-state.json`;
+const DOCQA_REVIEW_BASELINES = `${CONFIG_DIR}/review-baselines`;
 const COLLAB_SESSION_STATE = `${CONFIG_DIR}/session-state.json`;
 const COLLAB_AGENT_COMMAND = `${CONFIG_DIR}/agent-command.json`;
 const COLLAB_AGENT_ANNOTATIONS = `${CONFIG_DIR}/agent-annotations.json`;
@@ -1078,6 +1079,76 @@ export function readFileDiff(root, relPath) {
   }
 }
 
+export function readReviewBaseFile(root, relPath) {
+  const normalized = normalizeRelPath(relPath);
+  if (!normalized) throw new Error("Path is required");
+  if (resolveExternalPath(normalized)) {
+    const file = readMemoryFile(root, normalized);
+    return {
+      path: normalized,
+      baseContent: "",
+      currentContent: file.content,
+      currentHash: file.contentHash,
+      changeKind: "external",
+      available: false,
+      reason: "Inline Git review is unavailable for files outside the repo.",
+    };
+  }
+  const current = readMemoryFile(root, normalized);
+  const review = readDocReviewState(root).reviews[normalized] || null;
+  const reviewBaseline = readDocReviewBaseline(root, normalized, review);
+  if (reviewBaseline) {
+    const baselineHash = hashContent(reviewBaseline.content);
+    const currentHash = current.contentHash;
+    const changeKind = baselineHash === currentHash ? "unchanged" : current.exists ? "modified" : "deleted";
+    return {
+      path: normalized,
+      baseContent: reviewBaseline.content,
+      currentContent: current.content,
+      currentHash,
+      changeKind,
+      available: true,
+      baseline: "review",
+      baselineHash,
+    };
+  }
+  try {
+    const statusLine = execFileSync("git", ["status", "--porcelain=v1", "--untracked-files=all", "--", normalized], { cwd: root, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).split("\n").find(Boolean) || "";
+    if (!statusLine) {
+      return { path: normalized, baseContent: current.content, currentContent: current.content, currentHash: current.contentHash, changeKind: "unchanged", available: true };
+    }
+    if (statusLine.startsWith("?? ")) {
+      return { path: normalized, baseContent: "", currentContent: current.content, currentHash: current.contentHash, changeKind: "added", available: true };
+    }
+    const treePath = gitTreePathForRootRelative(root, normalized);
+    let baseContent = "";
+    let trackedInHead = true;
+    try {
+      baseContent = execFileSync("git", ["show", "HEAD:" + treePath], { cwd: root, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"], maxBuffer: MAX_FILE_BYTES + 64_000 });
+    } catch {
+      trackedInHead = false;
+    }
+    const statusCode = statusLine.slice(0, 2);
+    const changeKind = !trackedInHead ? "added" : statusCode.includes("D") && !current.exists ? "deleted" : "modified";
+    return { path: normalized, baseContent, currentContent: current.content, currentHash: current.contentHash, changeKind, available: true };
+  } catch {
+    return {
+      path: normalized,
+      baseContent: current.content,
+      currentContent: current.content,
+      currentHash: current.contentHash,
+      changeKind: "unknown",
+      available: false,
+      reason: "Git base is unavailable for this file.",
+    };
+  }
+}
+
+function gitTreePathForRootRelative(root, normalized) {
+  const prefix = gitRepoPrefixForRoot(root);
+  return normalizeRelPath((prefix || "") + normalized);
+}
+
 function buildNewFileDiff(root, normalized, abs) {
   if (!fs.existsSync(abs) || !fs.statSync(abs).isFile()) return { path: normalized, changed: false, additions: 0, deletions: 0, patch: "", available: false, reason: "Git diff is unavailable for this file."};
   const content = fs.readFileSync(abs, "utf8");
@@ -1131,6 +1202,57 @@ export function readDocReviewState(root = process.cwd()) {
   }
 }
 
+function writeDocReviewState(root, state) {
+  const statePath = path.join(root, DOCQA_REVIEW_STATE);
+  fs.mkdirSync(path.dirname(statePath), { recursive: true });
+  fs.writeFileSync(statePath, JSON.stringify(state, null, 2) + "\n", "utf8");
+}
+
+function reviewBaselinePathFor(relPath) {
+  return path.posix.join(DOCQA_REVIEW_BASELINES, backupSafePath(normalizeRelPath(relPath)) + ".baseline");
+}
+
+function writeDocReviewBaselineFile(root, relPath, content) {
+  const baselinePath = reviewBaselinePathFor(relPath);
+  const abs = path.join(root, baselinePath);
+  fs.mkdirSync(path.dirname(abs), { recursive: true });
+  fs.writeFileSync(abs, String(content || ""), "utf8");
+  return {
+    baselinePath,
+    baselineHash: hashContent(content),
+    baselineAt: new Date().toISOString(),
+  };
+}
+
+function readDocReviewBaseline(root, relPath, review = null) {
+  const baselinePath = normalizeRelPath(review?.baselinePath || "");
+  if (!baselinePath || !baselinePath.startsWith(DOCQA_REVIEW_BASELINES + "/")) return null;
+  const abs = path.join(root, baselinePath);
+  if (!fs.existsSync(abs) || !fs.statSync(abs).isFile()) return null;
+  const content = fs.readFileSync(abs, "utf8");
+  const baselineHash = hashContent(content);
+  if (review?.baselineHash && review.baselineHash !== baselineHash) return null;
+  return { path: baselinePath, content, contentHash: baselineHash };
+}
+
+export function writeDocReviewBaseline(root, relPath, { note = "" } = {}) {
+  const normalized = normalizeRelPath(relPath);
+  const state = readDocReviewState(root);
+  const file = readMemoryFile(root, normalized);
+  const existing = state.reviews[normalized] && typeof state.reviews[normalized] === "object" ? state.reviews[normalized] : {};
+  const baseline = writeDocReviewBaselineFile(root, normalized, file.content);
+  const next = {
+    ...existing,
+    baselinePath: baseline.baselinePath,
+    baselineHash: baseline.baselineHash,
+    baselineAt: baseline.baselineAt,
+  };
+  if (note) next.note = String(note || "").slice(0, 500);
+  state.reviews[normalized] = next;
+  writeDocReviewState(root, state);
+  return { path: normalized, ...next };
+}
+
 export function writeDocReviewDecision(root, relPath, { status, note = "" } = {}) {
   const normalized = normalizeRelPath(relPath);
   const allowedStatuses = new Set(["verified", "needs_changes", "snoozed"]);
@@ -1138,22 +1260,22 @@ export function writeDocReviewDecision(root, relPath, { status, note = "" } = {}
   const file = readMemoryFile(root, normalized);
   if (status === "unverified") {
     delete state.reviews[normalized];
-    const statePath = path.join(root, DOCQA_REVIEW_STATE);
-    fs.mkdirSync(path.dirname(statePath), { recursive: true });
-    fs.writeFileSync(statePath, JSON.stringify(state, null, 2) + "\n", "utf8");
+    writeDocReviewState(root, state);
     return { path: normalized, status: "unverified", note: "", reviewedAt: new Date().toISOString(), contentHash: hashContent(file.content) };
   }
   if (!allowedStatuses.has(status)) throw new Error(`Invalid review status: ${status}`);
+  const baseline = writeDocReviewBaselineFile(root, normalized, file.content);
   const decision = {
     status,
     note: String(note || "").slice(0, 500),
     reviewedAt: new Date().toISOString(),
     contentHash: hashContent(file.content),
+    baselinePath: baseline.baselinePath,
+    baselineHash: baseline.baselineHash,
+    baselineAt: baseline.baselineAt,
   };
   state.reviews[normalized] = decision;
-  const statePath = path.join(root, DOCQA_REVIEW_STATE);
-  fs.mkdirSync(path.dirname(statePath), { recursive: true });
-  fs.writeFileSync(statePath, JSON.stringify(state, null, 2) + "\n", "utf8");
+  writeDocReviewState(root, state);
   return { path: normalized, ...decision };
 }
 
@@ -2215,6 +2337,7 @@ export function ensureRuntimeGitExcludes(root = process.cwd()) {
     ".context-room/session-state.json",
     ".context-room/agent-command.json",
     ".context-room/agent-annotations.json",
+    ".context-room/review-baselines/",
     ".context-room/memory-webapp-backups/",
   ].map((entry) => prefix + entry);
   const marker = "# Context Room runtime state";
@@ -2841,6 +2964,11 @@ async function routeRequest(req, res, root) {
     sendJson(res, 200, writeDocReviewDecision(root, body.path, { status: body.status, note: body.note }));
     return;
   }
+  if (req.method === "POST" && url.pathname === "/api/docqa/review-baseline") {
+    const body = await readJsonBody(req);
+    sendJson(res, 200, writeDocReviewBaseline(root, body.path, { note: body.note }));
+    return;
+  }
   if (req.method === "GET" && url.pathname === "/api/file") {
     const relPath = url.searchParams.get("path") || "";
     sendJson(res, 200, readMemoryFile(root, relPath));
@@ -2849,6 +2977,11 @@ async function routeRequest(req, res, root) {
   if (req.method === "GET" && url.pathname === "/api/file/diff") {
     const relPath = url.searchParams.get("path") || "";
     sendJson(res, 200, readFileDiff(root, relPath));
+    return;
+  }
+  if (req.method === "GET" && url.pathname === "/api/file/review-base") {
+    const relPath = url.searchParams.get("path") || "";
+    sendJson(res, 200, readReviewBaseFile(root, relPath));
     return;
   }
   if (req.method === "POST" && url.pathname === "/api/file/revert") {
@@ -4273,7 +4406,7 @@ async function publishSessionState() {
 
 function buildSessionStatePayload() {
   const externalChange = activeExternalChange();
-  const blocks = externalChange ? buildExternalReviewBlocks(state.saved || "", externalChange.diskContent || "", externalChange.reviewDecisions || {}) : [];
+  const blocks = externalChange ? buildExternalReviewBlocks(externalReviewBaseContent(externalChange), externalChange.diskContent || "", externalChange.reviewDecisions || {}) : [];
   const pendingMiniDiffs = blocks.filter((block) => block.kind === "change" && !block.decision).length;
   return {
     source: "webapp",
@@ -5326,16 +5459,20 @@ async function selectFile(path, options = {}) {
     renderViewer();
     setStatus("open");
 
-    api("/api/file/diff?path=" + encodeURIComponent(path))
-      .then((diff) => {
-        if (!isCurrentSelection(requestId, path)) return;
-        state.selectedDiff = diff;
-        state.diffCollapsed = collapsedByGitDiffPreference(diff);
-        renderViewer();
-      })
-      .catch((error) => {
-        if (isCurrentSelection(requestId, path)) setStatus(error.message);
-      });
+    const loadDiff = async () => {
+      const diff = await readSelectedDiff(path);
+      if (!isCurrentSelection(requestId, path)) return;
+      state.selectedDiff = diff;
+      state.diffCollapsed = collapsedByGitDiffPreference(diff);
+      if (options.reviewMode && diff?.changed) await startChangedFileInlineReview(path, diff, requestId);
+      renderViewer();
+    };
+    if (options.reviewMode) await loadDiff().catch((error) => {
+      if (isCurrentSelection(requestId, path)) setStatus(error.message);
+    });
+    else loadDiff().catch((error) => {
+      if (isCurrentSelection(requestId, path)) setStatus(error.message);
+    });
   } catch (error) {
     if (isCurrentSelection(requestId, path)) {
       state.openingFilePath = null;
@@ -6945,7 +7082,7 @@ function renderViewer() {
       : renderFileActionButtons({ reviewAction: isStartupFile ? null : reviewActionForSelectedFile(), dirty: state.dirty, templateState, blockedByConflict: Boolean(conflict || externalChange), deletable: !isStartupFile });
   const conflictMarkup = conflict ? renderConflictPanel(conflict, text) : "";
   const editorMarkup = !conflict && externalChange
-    ? renderExternalReviewDocument(state.saved || "", externalChange.diskContent || "")
+    ? renderExternalReviewDocument(externalReviewBaseContent(externalChange), externalChange.diskContent || "")
     : state.mode === "edit"
       ? renderMarkdownEditor(text)
       : renderMarkdownLineView(text);
@@ -7316,16 +7453,17 @@ function wireExternalReviewAllButtons(root = document) {
 }
 
 function renderExternalReviewActions(change, { fileActionOptions = null } = {}) {
-  const beforeText = state.saved || "";
+  const beforeText = externalReviewBaseContent(change);
   const afterText = change.diskContent || "";
   const blocks = buildExternalReviewBlocks(beforeText, afterText, change.reviewDecisions || {});
   const summary = summarizeExternalReviewBlocks(blocks);
+  const sourceLabel = change.source === "review" ? "Git changes waiting for review" : "File changed on disk";
   const bulkActions = summary.pending > 1 || summary.pendingLines > 1
     ? '<button class="file-action primary external-choice bulk" type="button" data-external-review-all="accept">Accept all</button>' +
       '<button class="file-action danger-action external-choice bulk" type="button" data-external-review-all="reject">Reject all</button>'
     : "";
-  return '<div class="file-actions external-review-actions" aria-label="Review disk change">' +
-    '<div class="external-change-stats" title="' + escapeHtml(change.path || "This file") + ' changed on disk"><span class="pending">' + summary.pending + ' left</span><span class="add">+' + summary.additions + '</span><span class="del">-' + summary.deletions + '</span></div>' +
+  return '<div class="file-actions external-review-actions" aria-label="Review file changes">' +
+    '<div class="external-change-stats" title="' + escapeHtml(sourceLabel + ": " + (change.path || "This file")) + '"><span class="pending">' + summary.pending + ' left</span><span class="add">+' + summary.additions + '</span><span class="del">-' + summary.deletions + '</span></div>' +
     bulkActions +
     (fileActionOptions ? renderFileActionItems(fileActionOptions) : '') +
   '</div>';
@@ -7345,7 +7483,7 @@ function renderExternalReviewDocument(beforeText, afterText) {
   const blocks = buildExternalReviewBlocks(beforeText, afterText, change?.reviewDecisions || {});
   const metricClass = " editor-metrics";
   if (!blocks.some((block) => block.kind === "change")) return '<div class="doc-editor external-review-doc' + metricClass + '"><div class="diff-empty">No textual difference.</div></div>';
-  return '<div class="doc-editor external-review-doc' + metricClass + '" role="document" aria-label="Document with disk changes highlighted">' +
+  return '<div class="doc-editor external-review-doc' + metricClass + '" role="document" aria-label="Document with file changes highlighted">' +
     renderExternalReviewBlocks(blocks) +
   '</div>';
 }
@@ -7466,7 +7604,7 @@ async function chooseExternalReviewBlock(decision, blockId) {
   if (!change || !blockId || (decision !== "accept" && decision !== "reject")) return;
   const viewState = captureEditorViewState({ anchorBlockId: blockId });
   change.reviewDecisions = { ...(change.reviewDecisions || {}), [blockId]: decision };
-  const blocks = buildExternalReviewBlocks(state.saved || "", change.diskContent || "", change.reviewDecisions);
+  const blocks = buildExternalReviewBlocks(externalReviewBaseContent(change), change.diskContent || "", change.reviewDecisions);
   const pending = blocks.filter((block) => block.kind === "change" && !block.decision);
   const updatedInPlace = updateExternalReviewBlockInPlace(blocks, blockId, viewState);
   if (!updatedInPlace) renderViewer();
@@ -7487,7 +7625,7 @@ async function chooseExternalReviewBlock(decision, blockId) {
 async function chooseAllExternalReviewBlocks(decision) {
   const change = activeExternalChange();
   if (!change || (decision !== "accept" && decision !== "reject")) return;
-  const currentBlocks = buildExternalReviewBlocks(state.saved || "", change.diskContent || "", change.reviewDecisions || {});
+  const currentBlocks = buildExternalReviewBlocks(externalReviewBaseContent(change), change.diskContent || "", change.reviewDecisions || {});
   const pendingBlocks = currentBlocks.filter((block) => block.kind === "change" && !block.decision);
   if (!pendingBlocks.length) return;
   const anchorBlockId = closestExternalReviewChangeBlockId() || pendingBlocks[0].id;
@@ -7495,7 +7633,7 @@ async function chooseAllExternalReviewBlocks(decision) {
   const nextDecisions = { ...(change.reviewDecisions || {}) };
   for (const block of pendingBlocks) nextDecisions[block.id] = decision;
   change.reviewDecisions = nextDecisions;
-  const blocks = buildExternalReviewBlocks(state.saved || "", change.diskContent || "", change.reviewDecisions);
+  const blocks = buildExternalReviewBlocks(externalReviewBaseContent(change), change.diskContent || "", change.reviewDecisions);
   const updatedInPlace = updateExternalReviewDocumentInPlace(blocks);
   if (!updatedInPlace) renderViewer();
   restoreEditorViewState(viewState);
@@ -7583,10 +7721,53 @@ function externalReviewTextAnchor(blocks, blockId, mergedText) {
 async function saveExternalReviewDecision(blocks, viewState) {
   const change = activeExternalChange();
   if (!change || state.selected !== change.path) return;
-  const merged = computeExternalReviewContent(blocks, state.saved || "", change.diskContent || "");
+  const merged = computeExternalReviewContent(blocks, externalReviewBaseContent(change), change.diskContent || "");
   viewState.textAnchor = externalReviewTextAnchor(blocks, viewState.anchorBlockId, merged);
   setStatus("saving reviewed changes...");
+  if (change.source === "review" && change.changeKind === "added" && merged.length === 0) {
+    await api("/api/file/revert", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ path: change.path }),
+    });
+    resetConflictState();
+    resetExternalChangeState();
+    state.saved = "";
+    state.savedHash = null;
+    state.dirty = false;
+    el("editor").value = "";
+    await loadFiles();
+    goHub();
+    setStatus("new file rejected · file removed");
+    return;
+  }
+  if (change.source === "review" && change.changeKind === "deleted" && merged.length === 0) {
+    await recordSelectedReviewBaseline(change.path, "inline review applied");
+    resetConflictState();
+    resetExternalChangeState();
+    state.diffCollapsed = true;
+    state.saved = "";
+    state.savedHash = null;
+    state.dirty = false;
+    el("editor").value = "";
+    const docEditor = el("docEditor");
+    if (docEditor) docEditor.value = "";
+    await loadFiles();
+    if (state.selected === change.path) {
+      state.selectedDiff = await readSelectedDiff(change.path);
+      if (!finishExternalReviewPanelInPlace(viewState)) {
+        const restoreState = inlineReviewRestoreViewState(viewState);
+        renderViewer();
+        restoreEditorViewState(restoreState);
+      }
+      updateHeader();
+      updatePreview();
+      setStatus("deletion kept · mark verified when reviewed");
+    }
+    return;
+  }
   const result = await writeSelectedDiskFile(merged, change.path);
+  if (change.source === "review") await recordSelectedReviewBaseline(change.path, "inline review applied");
   resetConflictState();
   resetExternalChangeState();
   // Returning from inline review should keep the reader in the document, not open the Git diff panel.
@@ -8275,6 +8456,10 @@ function activeExternalChange() {
   return state.externalChange && state.externalChange.path === state.selected ? state.externalChange : null;
 }
 
+function externalReviewBaseContent(change = activeExternalChange()) {
+  return typeof change?.baseContent === "string" ? change.baseContent : state.saved || "";
+}
+
 function startupSelectionRequest() {
   const startup = state.selectedStartupContext;
   if (!startup) return null;
@@ -8298,6 +8483,52 @@ async function readSelectedDiskFile(path = state.selected) {
 async function readSelectedDiff(path = state.selected) {
   if (state.selectedStartupContext) return { path, available: false, changed: false, additions: 0, deletions: 0, patch: "" };
   return api("/api/file/diff?path=" + encodeURIComponent(path));
+}
+
+async function readSelectedReviewBase(path = state.selected) {
+  if (state.selectedStartupContext) return null;
+  return api("/api/file/review-base?path=" + encodeURIComponent(path));
+}
+
+async function recordSelectedReviewBaseline(path = state.selected, note = "") {
+  if (!path || state.selectedStartupContext) return null;
+  return api("/api/docqa/review-baseline", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ path, note }),
+  });
+}
+
+async function startChangedFileInlineReview(path, diff, requestId = state.selectionRequest) {
+  if (!path || state.reviewModePath !== path || !diff?.changed) return false;
+  const review = await readSelectedReviewBase(path);
+  if (!isCurrentSelection(requestId, path) || !review?.available) return false;
+  if ((review.baseContent || "") === (review.currentContent || "")) {
+    state.saved = typeof review.currentContent === "string" ? review.currentContent : state.saved || "";
+    state.savedHash = review.currentHash || state.savedHash;
+    state.dirty = false;
+    state.diffCollapsed = true;
+    el("editor").value = state.saved;
+    setStatus("changes already reviewed · mark verified when ready");
+    return false;
+  }
+  state.externalChange = {
+    path,
+    source: "review",
+    baseContent: typeof review.baseContent === "string" ? review.baseContent : "",
+    diskContent: typeof review.currentContent === "string" ? review.currentContent : state.saved || "",
+    diskHash: review.currentHash || state.savedHash,
+    diskUpdatedAt: "",
+    changeKind: review.changeKind || "modified",
+    reviewDecisions: {},
+  };
+  state.saved = state.externalChange.diskContent;
+  state.savedHash = state.externalChange.diskHash || state.savedHash;
+  state.dirty = false;
+  state.diffCollapsed = true;
+  el("editor").value = state.saved;
+  setStatus(review.changeKind === "added" ? "new file waiting for review" : "changes waiting for review");
+  return true;
 }
 
 async function writeSelectedDiskFile(content, path = state.selected) {
@@ -8338,7 +8569,9 @@ function resetExternalChangeState() {
 function blockPendingExternalChange(action = "before leaving") {
   if (!activeExternalChange()) return false;
   const targetBlockId = closestExternalReviewChangeBlockId();
-  setStatus("file changed on disk · review the highlighted change " + action);
+  const change = activeExternalChange();
+  const prefix = change?.source === "review" ? "review pending" : "file changed on disk";
+  setStatus(prefix + " · review the highlighted change " + action);
   if (state.mode !== "view") setMode("view");
   else renderViewer();
   updateHeader();
@@ -8619,6 +8852,12 @@ async function refreshFromDisk() {
 
     if (!previousSelected || previousSelected !== state.selected) return;
     if (state.openingFilePath === state.selected || state.savedHash == null) return;
+    if (activeExternalChange()?.source === "review") {
+      state.selectedDiff = await readSelectedDiff(previousSelected);
+      updateHeader();
+      updatePreview();
+      return;
+    }
     const [data, diff] = await Promise.all([
       readSelectedDiskFile(previousSelected),
       readSelectedDiff(previousSelected),
@@ -8648,6 +8887,8 @@ async function refreshFromDisk() {
     resetConflictState();
     state.externalChange = {
       path: previousSelected,
+      source: "disk",
+      baseContent: state.saved || "",
       diskContent: data.content,
       diskHash: data.contentHash,
       diskUpdatedAt: data.updatedAt || "",
