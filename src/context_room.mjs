@@ -511,6 +511,21 @@ export function writeStartupContextFile(root = process.cwd(), order = 0, content
   return writeAbsoluteStartupFile(found.startupContext.absolutePath, content, publicStartupContextFile(found).startupContext);
 }
 
+export function deleteStartupContextFile(root = process.cwd(), order = 0, settings = readMemoryWebappSettings(root)) {
+  const found = resolveStartupContextFile(root, order, settings);
+  if (!found) throw new Error(`Startup context file not found: ${order}`);
+  const startupContext = publicStartupContextFile(found).startupContext;
+  const abs = path.resolve(found.startupContext.absolutePath);
+  if (!fs.existsSync(abs) || !fs.statSync(abs).isFile()) throw new Error(`Startup context file not found: ${startupContext.displayPath}`);
+  if (path.extname(abs).toLowerCase() !== ".md") throw new Error(`Only Markdown startup context files can be deleted: ${startupContext.displayPath}`);
+  const backupRel = buildBackupPath(startupContext.displayPath);
+  const backupAbs = path.join(root, backupRel);
+  fs.mkdirSync(path.dirname(backupAbs), { recursive: true });
+  fs.copyFileSync(abs, backupAbs);
+  fs.unlinkSync(abs);
+  return { order: startupContext.order, path: startupContext.displayPath, deleted: true, backupPath: backupRel, startupContext };
+}
+
 export function listStartupSkillFolders(root = process.cwd(), settings = readMemoryWebappSettings(root)) {
   const config = normalizeStartupSkillSettings(settings.startupSkills);
   if (!config.enabled) return [];
@@ -2753,6 +2768,11 @@ async function routeRequest(req, res, root) {
     sendJson(res, 200, writeStartupContextFile(root, body.order, body.content));
     return;
   }
+  if (req.method === "POST" && url.pathname === "/api/startup-context/delete") {
+    const body = await readJsonBody(req);
+    sendJson(res, 200, deleteStartupContextFile(root, body.order));
+    return;
+  }
   if (req.method === "GET" && url.pathname === "/api/settings") {
     const settings = readMemoryWebappSettings(root);
     sendJson(res, 200, { settings, hubCards: hubCardsForRoot(root, settings), hubSections: hubSectionsForRoot(root, settings), availableHubCards: settings.customHubCards });
@@ -3798,6 +3818,19 @@ export function renderAppHtml() {
     .markdown-editor-highlight .markdown-line.frontmatter, .markdown-editor-highlight .markdown-line.hr { color: var(--file-marker); }
     .markdown-editor-highlight .markdown-inline-code { color: var(--file-code); padding: 0; border-radius: 0; background: transparent; }
     .markdown-editor-highlight .markdown-inline-code.markdown-path { color: var(--file-list); }
+    .external-review-doc.editor-metrics .markdown-line { margin: 0; padding: 0; border: 0; min-height: 1.7em; font-size: inherit; line-height: inherit; font-weight: inherit; letter-spacing: 0; }
+    .external-review-doc.editor-metrics .markdown-line.h1, .external-review-doc.editor-metrics .markdown-line.h2, .external-review-doc.editor-metrics .markdown-line.h3, .external-review-doc.editor-metrics .markdown-line.h4 { margin: 0; padding: 0; border: 0; font-size: inherit; line-height: inherit; font-weight: inherit; }
+    .external-review-doc.editor-metrics .markdown-line.h1 { color: var(--file-h1); }
+    .external-review-doc.editor-metrics .markdown-line.h2 { color: var(--file-h2); }
+    .external-review-doc.editor-metrics .markdown-line.h3 { color: var(--file-h3); }
+    .external-review-doc.editor-metrics .markdown-line.h4 { color: var(--file-h4); }
+    .external-review-doc.editor-metrics .markdown-line.list { padding-left: 0; }
+    .external-review-doc.editor-metrics .markdown-line.list .markdown-marker, .external-review-doc.editor-metrics .markdown-path { color: var(--file-list); }
+    .external-review-doc.editor-metrics .markdown-line.quote { color: var(--file-quote); border-left: 0; padding-left: 0; opacity: 1; }
+    .external-review-doc.editor-metrics .markdown-line.code, .external-review-doc.editor-metrics .markdown-line.fence { color: var(--file-code); background: transparent; }
+    .external-review-doc.editor-metrics .markdown-line.frontmatter, .external-review-doc.editor-metrics .markdown-line.hr { color: var(--file-marker); }
+    .external-review-doc.editor-metrics .markdown-inline-code { color: var(--file-code); padding: 0; border-radius: 0; background: transparent; }
+    .external-review-doc.editor-metrics .markdown-inline-code.markdown-path { color: var(--file-list); }
     .agent-focus-pulse.markdown-line { border-radius: 8px; }
     .diff-line { display: block; padding: 1px 8px; border-radius: 6px; }
     .diff-line.add { color: #b9ffd0; background: rgba(141,240,180,0.08); }
@@ -3821,25 +3854,24 @@ export function renderAppHtml() {
     .external-change-stats .pending { color: #dbeafe; border-color: rgba(125,211,252,0.28); }
     .external-review-doc { white-space: normal; background: var(--file-bg); }
     .external-review-block { position: relative; min-width: 0; }
-    .external-review-block.change { display: block; position: relative; margin: 6px 0; padding: 2px 34px 2px 0; border-left: 2px solid rgba(125,211,252,0.46); border-radius: 0 10px 10px 0; background: linear-gradient(90deg, rgba(125,211,252,0.06), rgba(125,211,252,0.018) 72%, transparent); }
+    .external-review-block.change { display: block; position: relative; margin: 0; padding: 0; border-radius: 0 10px 10px 0; background: linear-gradient(90deg, rgba(125,211,252,0.06), rgba(125,211,252,0.018) 72%, transparent); box-shadow: inset 2px 0 0 rgba(125,211,252,0.46); }
     .external-review-block.attention { outline: 2px solid rgba(139,211,255,0.82); outline-offset: 2px; animation: externalReviewAttention 1.4s ease; }
-    .external-review-block.resolved { color: rgba(226,236,255,0.86); margin: 4px 0; padding: 2px 78px 2px 0; border-left: 2px solid rgba(148,163,184,0.22); border-radius: 0 10px 10px 0; background: rgba(148,163,184,0.035); transition: min-height 180ms ease, background 220ms ease; }
-    .external-review-block.resolved.settling { overflow: hidden; transition: height 2s ease, min-height 2s ease, margin 2s ease, padding 2s ease, border-width 2s ease, background 220ms ease, border-color 220ms ease; }
-    .external-review-block.resolved.accept { border-left-color: rgba(93,244,143,0.46); background: rgba(48,215,111,0.06); }
-    .external-review-block.resolved.reject { border-left-color: rgba(255,140,157,0.42); background: rgba(255,86,117,0.055); }
-    .external-review-block.resolved.settled { margin: 0; padding: 0; border-left-color: transparent; background: transparent; }
+    .external-review-block.resolved { color: rgba(226,236,255,0.86); margin: 0; padding: 0; border-radius: 0 10px 10px 0; background: rgba(148,163,184,0.035); box-shadow: inset 2px 0 0 rgba(148,163,184,0.22); transition: min-height 180ms ease, background 220ms ease; }
+    .external-review-block.resolved.settling { overflow: hidden; transition: height 2s ease, min-height 2s ease, margin 2s ease, padding 2s ease, background 220ms ease, box-shadow 220ms ease; }
+    .external-review-block.resolved.accept { box-shadow: inset 2px 0 0 rgba(93,244,143,0.46); background: rgba(48,215,111,0.06); }
+    .external-review-block.resolved.reject { box-shadow: inset 2px 0 0 rgba(255,140,157,0.42); background: rgba(255,86,117,0.055); }
+    .external-review-block.resolved.settled { margin: 0; padding: 0; box-shadow: inset 0 0 0 transparent; background: transparent; }
     .external-review-block.resolved.settled.accept, .external-review-block.resolved.settled.reject { background: transparent; }
     .external-review-block.resolved.settled.empty { min-height: 0; height: 0; border: 0; overflow: hidden; }
-    .external-review-lines { display: grid; gap: 1px; min-width: 0; }
+    .external-review-lines { min-width: 0; }
     .external-review-block-controls { position: absolute; top: 4px; right: 4px; z-index: 2; display: flex; gap: 4px; align-items: center; padding: 2px; border: 1px solid var(--line); border-radius: 999px; background: var(--surface-floating-soft); opacity: 0.66; transition: opacity 140ms ease, transform 140ms ease, border-color 140ms ease; }
     .external-review-block.change:hover .external-review-block-controls, .external-review-block.change:focus-within .external-review-block-controls { opacity: 1; border-color: rgba(139,211,255,0.26); transform: translateY(-1px); }
-    .external-review-line { display: grid; grid-template-columns: 28px minmax(0, 1fr); gap: 8px; padding: 1px 8px; border-radius: 5px; white-space: pre-wrap; overflow-wrap: anywhere; line-height: 1.58; }
-    .external-review-line .marker { color: rgba(226,236,255,0.58); user-select: none; }
-    .external-review-line.add { color: #d6ffe0; background: rgba(48,215,111,0.12); }
-    .external-review-line.add .marker { color: #8df0b4; }
-    .external-review-line.del { color: #ffd5dc; background: rgba(255,86,117,0.12); }
-    .external-review-line.del .marker { color: #ff9cac; }
-    .external-review-line.ctx { color: rgba(226,236,255,0.86); }
+    .external-review-line { position: relative; border-radius: 5px; }
+    .external-review-line::before { content: attr(data-review-marker); position: absolute; left: -1.35em; top: 0; width: 1em; color: rgba(226,236,255,0.58); text-align: center; user-select: none; pointer-events: none; }
+    .external-review-line.add { background: rgba(48,215,111,0.12); }
+    .external-review-line.add::before { color: #8df0b4; }
+    .external-review-line.del { background: rgba(255,86,117,0.12); }
+    .external-review-line.del::before { color: #ff9cac; }
     .external-review-block.resolved.empty { min-height: 32px; overflow: hidden; }
     .agent-annotations { display: grid; gap: var(--space-2); padding: var(--space-3) var(--space-4) 0; }
     .agent-annotation { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: var(--space-3); align-items: center; border-left: 2px solid rgba(182,156,255,0.62); border-radius: 0 10px 10px 0; background: rgba(182,156,255,0.075); padding: var(--space-2) var(--space-3); color: rgba(226,236,255,0.9); font: 12px/1.4 Inter, ui-sans-serif, system-ui, sans-serif; }
@@ -3873,7 +3905,7 @@ export function renderAppHtml() {
     .conflict-merge { display: grid; gap: var(--space-3); padding: var(--space-3); }
     .conflict-merge textarea { display: block; width: 100%; min-height: min(42vh, 430px); resize: vertical; border: 1px solid rgba(148,163,184,0.18); border-radius: 12px; background: rgba(2,6,23,0.56); color: var(--text); outline: none; padding: 12px; font: 12px/1.48 ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; white-space: pre-wrap; overflow-wrap: anywhere; }
     .conflict-merge-actions { display: flex; gap: 8px; flex-wrap: wrap; justify-content: flex-end; }
-    @media (max-width: 760px) { .external-review-actions { flex-wrap: wrap; justify-content: flex-start; } .external-review-block.change { padding-right: 0; } .external-review-block-controls { position: static; width: fit-content; margin: 4px 0 2px 8px; opacity: 1; } .external-review-line { grid-template-columns: 22px minmax(0, 1fr); } }
+    @media (max-width: 760px) { .external-review-actions { flex-wrap: wrap; justify-content: flex-start; } .external-review-block-controls { position: static; width: fit-content; margin: 4px 0 2px 8px; opacity: 1; } .external-review-line::before { left: -1.05em; } }
     .file-header-copy { min-width: 0; display: grid; gap: var(--space-1); }
     .file-header-copy .diff-meta { white-space: normal; line-height: 1.35; }
     .file-actions { display: flex; gap: 8px; align-items: center; flex: 0 0 auto; }
@@ -4136,7 +4168,7 @@ export function renderAppHtml() {
   <div id="explorerContextMenu" class="explorer-context-menu" hidden></div>
   <div id="agentToast" class="agent-toast" hidden></div>
 <script>
-const state = { files: [], startupContextFiles: [], startupSkillFolders: [], activeStartupSkillExplorer: null, activeStartupContextExplorer: null, startupSkillCreateFolder: null, selectedStartupContext: null, docqa: null, doctor: null, settings: null, settingsOpen: false, page: "hub", pendingMarkdown: null, availableHubCards: [], hubFolders: [], hubSections: [], rootHubSections: [], activeHubCardId: null, selectedReview: null, reviewModePath: null, reviewModeStatus: null, selected: null, selectedDiff: null, fileConflict: null, externalChange: null, conflictCompare: false, conflictMergeText: null, conflictMergeKey: "", conflictMergeMode: "auto", conflictCheckTimer: null, diffCollapsed: false, saved: "", savedHash: null, dirty: false, mode: "view", homeView: "root", planetStack: ["root"], filePanel: false, history: [], historyIndex: -1, pathFilters: [], explorerWatchFilter: "all", explorerRenderKey: "", selectedForDelete: new Set(), selectionRequest: 0, openingFilePath: null, mobileSidebarTouched: false, sessionStateTimer: null, agentCommandTimer: null, lastAgentCommandId: "", pendingAgentCommand: null, agentAnnotations: {}, userActiveAt: 0, markdownHighlightFrame: 0, markdownHighlightText: "", markdownHighlightLastText: "", docLinkModifierActive: false, expanded: new Set(["data", "automations", "integrations", "skills", "tools", "~", "~/.hermes", "~/.hermes/memories", "~/.hermes/skills"]) };
+const state = { files: [], startupContextFiles: [], startupSkillFolders: [], activeStartupSkillExplorer: null, activeStartupContextExplorer: null, startupSkillCreateFolder: null, startupContextContextTarget: null, selectedStartupContext: null, docqa: null, doctor: null, settings: null, settingsOpen: false, page: "hub", pendingMarkdown: null, availableHubCards: [], hubFolders: [], hubSections: [], rootHubSections: [], activeHubCardId: null, selectedReview: null, reviewModePath: null, reviewModeStatus: null, selected: null, selectedDiff: null, fileConflict: null, externalChange: null, conflictCompare: false, conflictMergeText: null, conflictMergeKey: "", conflictMergeMode: "auto", conflictCheckTimer: null, diffCollapsed: false, saved: "", savedHash: null, dirty: false, mode: "view", homeView: "root", planetStack: ["root"], filePanel: false, history: [], historyIndex: -1, pathFilters: [], explorerWatchFilter: "all", explorerRenderKey: "", selectedForDelete: new Set(), selectionRequest: 0, openingFilePath: null, mobileSidebarTouched: false, sessionStateTimer: null, agentCommandTimer: null, lastAgentCommandId: "", pendingAgentCommand: null, agentAnnotations: {}, userActiveAt: 0, markdownHighlightFrame: 0, markdownHighlightText: "", markdownHighlightLastText: "", docLinkModifierActive: false, expanded: new Set(["data", "automations", "integrations", "skills", "tools", "~", "~/.hermes", "~/.hermes/memories", "~/.hermes/skills"]) };
 const FILE_THEMES = ${JSON.stringify(FILE_THEME_OPTIONS)};
 const DEFAULT_FILE_THEME = "${DEFAULT_FILE_THEME}";
 const MAIN_FILE_PATHS = new Set([
@@ -5555,6 +5587,64 @@ function revealActiveStartupContextExplorer() {
   expandAndRevealExplorerPath(selectedPath || state.activeStartupContextExplorer?.path || "");
 }
 
+function startupContextFileByOrder(order) {
+  return (state.startupContextFiles || []).find((file) => String(file.startupContext?.order || "") === String(order || ""));
+}
+
+function openStartupContextContextMenu(event, order) {
+  event.preventDefault();
+  event.stopPropagation();
+  const file = startupContextFileByOrder(order);
+  const startupContext = file?.startupContext;
+  if (!startupContext) return;
+  state.startupContextContextTarget = startupContext;
+  const menu = el("explorerContextMenu");
+  if (!menu) return;
+  menu.innerHTML = '<div class="explorer-context-title"><span>Startup context</span><code>' + escapeHtml(startupContext.displayPath || startupContext.fileName || "startup context") + '</code></div>' +
+    '<div class="explorer-context-actions menu-actions">' +
+      '<button class="secondary" type="button" data-startup-context-open>Open</button>' +
+      '<button class="secondary danger-action" type="button" data-startup-context-delete>Delete</button>' +
+    '</div>';
+  menu.hidden = false;
+  menu.style.left = event.clientX + "px";
+  menu.style.top = event.clientY + "px";
+  clampContextMenuToViewport(menu);
+  menu.querySelector("[data-startup-context-open]")?.addEventListener("click", () => {
+    hideExplorerContextMenu();
+    selectStartupContextFile(startupContext.order).catch((error) => setStatus(error.message));
+  });
+  menu.querySelector("[data-startup-context-delete]")?.addEventListener("click", () => {
+    hideExplorerContextMenu();
+    deleteStartupContextFromPanel(startupContext.order).catch((error) => setStatus(error.message));
+  });
+}
+
+async function deleteStartupContextFromPanel(order) {
+  if (!order) return;
+  const file = startupContextFileByOrder(order);
+  const startupContext = file?.startupContext || state.startupContextContextTarget;
+  if (!startupContext) return;
+  const isCurrent = String(state.selectedStartupContext?.order || "") === String(order);
+  const unsavedNote = isCurrent && state.dirty ? "\n\nUnsaved editor changes will be lost." : "";
+  if (!confirm("Delete startup context file?\n\n" + startupContext.displayPath + "\n\nContext Room will back it up first." + unsavedNote)) return;
+  setStatus("deleting startup context...");
+  const result = await api("/api/startup-context/delete", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ order }),
+  });
+  if (isCurrent) {
+    state.activeStartupContextExplorer = null;
+    state.selected = null;
+    state.selectedStartupContext = null;
+    state.saved = "";
+    state.savedHash = null;
+    state.dirty = false;
+  }
+  await loadFiles();
+  setStatus(result.backupPath ? "startup context deleted · backup created" : "startup context deleted");
+}
+
 async function deleteStartupSkillFromPanel(folderOrder, skillName) {
   if (!folderOrder || !skillName) return;
   const selectedKey = "startup-skill-" + folderOrder + "-" + skillName;
@@ -6304,6 +6394,7 @@ function renderHubFolders() {
   document.querySelectorAll("[data-hub-card-children]").forEach((button) => button.addEventListener("click", () => openHubChildren(button.dataset.hubCardChildren)));
   document.querySelectorAll("[data-hub-crumb]").forEach((button) => button.addEventListener("click", () => openHubPath(button.dataset.hubCrumb || null)));
   document.querySelectorAll("[data-startup-order]").forEach((button) => button.addEventListener("click", () => selectStartupContextFile(button.dataset.startupOrder).catch((error) => setStatus(error.message))));
+  document.querySelectorAll("[data-startup-order]").forEach((button) => button.addEventListener("contextmenu", (event) => openStartupContextContextMenu(event, button.dataset.startupOrder)));
   document.querySelectorAll("[data-startup-skill-name]").forEach((button) => button.addEventListener("click", () => selectStartupSkillFile(button.dataset.startupSkillFolder, button.dataset.startupSkillName).catch((error) => setStatus(error.message))));
   document.querySelectorAll("[data-startup-skill-delete]").forEach((button) => button.addEventListener("click", (event) => {
     event.stopPropagation();
@@ -6883,25 +6974,28 @@ function renderViewer() {
   });
   document.querySelectorAll("[data-conflict-merge-source]").forEach((button) => button.addEventListener("click", (event) => promptSaveConflictSource(event.currentTarget.dataset.conflictMergeSource)));
   wireFileActionButtons();
-  const docEditor = el("docEditor");
-  if (docEditor) {
-    state.markdownHighlightLastText = docEditor.value;
-    syncMarkdownEditorScroll();
-    docEditor.addEventListener("input", () => {
-      el("editor").value = docEditor.value;
-      state.dirty = docEditor.value !== state.saved;
-      updateMarkdownEditorHighlight(docEditor.value);
-      updateHeader();
-      updatePreview();
-      updateConflictCompareLive(docEditor.value);
-      scheduleConflictCheck();
-      scheduleSessionStatePush();
-    });
-    docEditor.addEventListener("scroll", syncMarkdownEditorScroll, { passive: true });
-    wireMarkdownEditorDocLinks(docEditor);
-  }
+  wireRenderedMarkdownEditor();
   syncWorkspaceScroll();
   scheduleSessionStatePush();
+}
+
+function wireRenderedMarkdownEditor() {
+  const docEditor = el("docEditor");
+  if (!docEditor) return;
+  state.markdownHighlightLastText = docEditor.value;
+  syncMarkdownEditorScroll();
+  docEditor.addEventListener("input", () => {
+    el("editor").value = docEditor.value;
+    state.dirty = docEditor.value !== state.saved;
+    updateMarkdownEditorHighlight(docEditor.value);
+    updateHeader();
+    updatePreview();
+    updateConflictCompareLive(docEditor.value);
+    scheduleConflictCheck();
+    scheduleSessionStatePush();
+  });
+  docEditor.addEventListener("scroll", syncMarkdownEditorScroll, { passive: true });
+  wireMarkdownEditorDocLinks(docEditor);
 }
 
 function renderMarkdownLineView(text, options = {}) {
@@ -6917,15 +7011,24 @@ function renderMarkdownEditor(text) {
   '</div>';
 }
 
-function renderMarkdownLines(text) {
+function renderMarkdownLines(text, options = {}) {
   let inFence = false;
   const lines = String(text || "").split("\n");
+  const decorations = Array.isArray(options.lineDecorations) ? options.lineDecorations : [];
   return lines.map((line, index) => {
       const startsFence = /^\s*(\`\`\`|~~~)/.test(line);
       const rendered = renderMarkdownLine(line, index, { inFence: inFence || startsFence });
       if (startsFence) inFence = !inFence;
-      return rendered;
+      return decorateMarkdownLine(rendered, decorations[index]);
     }).join("");
+}
+
+function decorateMarkdownLine(rendered, decoration) {
+  if (!decoration) return rendered;
+  const extraClass = decoration.className ? " " + decoration.className : "";
+  const markerAttr = decoration.marker ? ' data-review-marker="' + escapeHtml(decoration.marker) + '"' : "";
+  const finalLineAttr = Number.isInteger(decoration.finalLineIndex) ? ' data-final-line-index="' + decoration.finalLineIndex + '"' : "";
+  return String(rendered).replace(/^<div class="markdown-line([^"]*)"/, '<div class="markdown-line' + extraClass + '$1"' + markerAttr + finalLineAttr);
 }
 
 function updateMarkdownEditorHighlight(text, options = {}) {
@@ -7240,25 +7343,37 @@ function externalReviewFileActionOptions() {
 function renderExternalReviewDocument(beforeText, afterText) {
   const change = activeExternalChange();
   const blocks = buildExternalReviewBlocks(beforeText, afterText, change?.reviewDecisions || {});
-  if (!blocks.some((block) => block.kind === "change")) return '<div class="doc-editor external-review-doc"><div class="diff-empty">No textual difference.</div></div>';
-  return '<div class="doc-editor external-review-doc" role="document" aria-label="Document with disk changes highlighted">' +
-    blocks.map((block) => renderExternalReviewBlock(block)).join("") +
+  const metricClass = " editor-metrics";
+  if (!blocks.some((block) => block.kind === "change")) return '<div class="doc-editor external-review-doc' + metricClass + '"><div class="diff-empty">No textual difference.</div></div>';
+  return '<div class="doc-editor external-review-doc' + metricClass + '" role="document" aria-label="Document with disk changes highlighted">' +
+    renderExternalReviewBlocks(blocks) +
   '</div>';
 }
 
-function renderExternalReviewBlock(block) {
+function renderExternalReviewBlocks(blocks) {
+  let finalLineStart = 0;
+  return blocks.map((block) => {
+    const html = renderExternalReviewBlock(block, { finalLineStart });
+    finalLineStart += externalReviewRenderedRows(block).length;
+    return html;
+  }).join("");
+}
+
+function renderExternalReviewBlock(block, options = {}) {
   if (block.kind !== "change") {
-    return '<div class="external-review-block context">' + block.rows.map((row) => renderExternalReviewLine(row)).join("") + '</div>';
+    return '<div class="external-review-block context markdown-view">' +
+      renderMarkdownLines(block.rows.map((row) => row.line).join("\n"), { lineDecorations: finalLineDecorations(block.rows, options.finalLineStart) }) +
+    '</div>';
   }
   if (block.decision) {
     const rows = externalReviewRowsForDecision(block);
     return '<div class="external-review-block context resolved ' + escapeHtml(block.decision) + (rows.length ? '' : ' empty') + '" data-external-review-block="' + escapeHtml(block.id) + '">' +
-      rows.map((row) => renderExternalReviewLine(row)).join("") +
+      renderExternalReviewFinalLines(rows, { finalLineStart: options.finalLineStart }) +
     '</div>';
   }
   const decisionClass = block.decision || "pending";
   return '<div class="external-review-block change ' + decisionClass + '" data-external-review-block="' + escapeHtml(block.id) + '">' +
-    '<div class="external-review-lines">' + block.rows.map((row) => renderExternalReviewLine(row)).join("") + '</div>' +
+    renderExternalReviewRows(block.rows, { finalLineStart: options.finalLineStart }) +
     '<div class="external-review-block-controls" aria-label="Review this change">' +
       '<button class="file-action primary external-choice icon" type="button" data-external-block-decision="accept" data-external-block-id="' + escapeHtml(block.id) + '" title="Accept this change">OK</button>' +
       '<button class="file-action danger-action external-choice icon" type="button" data-external-block-decision="reject" data-external-block-id="' + escapeHtml(block.id) + '" title="Reject this change">x</button>' +
@@ -7266,9 +7381,48 @@ function renderExternalReviewBlock(block) {
   '</div>';
 }
 
-function renderExternalReviewLine(row) {
-  const marker = row.type === "add" ? "+" : row.type === "del" ? "-" : " ";
-  return '<div class="external-review-line ' + row.type + '"><span class="marker">' + escapeHtml(marker) + '</span><span>' + escapeHtml(row.line || " ") + '</span></div>';
+function renderExternalReviewRows(rows, options = {}) {
+  const text = rows.map((row) => row.line).join("\n");
+  const lineDecorations = rows.map((row) => {
+    const finalLineIndex = finalLineIndexForRow(row, rows, options.finalLineStart);
+    if (row.type !== "add" && row.type !== "del") return null;
+    const marker = row.type === "add" ? "+" : row.type === "del" ? "-" : "";
+    return { className: "external-review-line " + row.type, marker, finalLineIndex };
+  });
+  return '<div class="external-review-lines markdown-view">' + renderMarkdownLines(text, { lineDecorations }) + '</div>';
+}
+
+function renderExternalReviewFinalLines(rows, options = {}) {
+  if (!rows.length) return "";
+  return '<div class="external-review-final-lines markdown-view">' +
+    renderMarkdownLines(rows.map((row) => row.line).join("\n"), { lineDecorations: finalLineDecorations(rows, options.finalLineStart) }) +
+  '</div>';
+}
+
+function externalReviewRenderedRows(block) {
+  if (block.kind !== "change") return block.rows;
+  if (block.decision) return externalReviewRowsForDecision(block);
+  return block.rows;
+}
+
+function externalReviewFinalLineStart(blocks, blockId) {
+  let finalLineStart = 0;
+  for (const block of blocks) {
+    if (block.id === blockId) return finalLineStart;
+    finalLineStart += externalReviewRenderedRows(block).length;
+  }
+  return finalLineStart;
+}
+
+function finalLineDecorations(rows, finalLineStart = null) {
+  if (!Number.isInteger(finalLineStart)) return [];
+  return rows.map((_row, index) => ({ finalLineIndex: finalLineStart + index }));
+}
+
+function finalLineIndexForRow(row, rows, finalLineStart = null) {
+  if (!Number.isInteger(finalLineStart)) return null;
+  const index = rows.indexOf(row);
+  return index >= 0 ? finalLineStart + index : null;
 }
 
 function externalReviewRowsForDecision(block) {
@@ -7360,12 +7514,13 @@ function updateExternalReviewBlockInPlace(blocks, blockId, viewState) {
   const current = externalReviewBlockElement(blockId);
   if (!block || !current) return false;
   const previousHeight = current.getBoundingClientRect().height;
-  current.outerHTML = renderExternalReviewBlock(block);
+  current.outerHTML = renderExternalReviewBlock(block, { finalLineStart: externalReviewFinalLineStart(blocks, blockId) });
   const next = externalReviewBlockElement(blockId);
   if (next) {
     if (block.decision && previousHeight > 0) next.style.minHeight = Math.ceil(previousHeight) + "px";
     wireExternalReviewDecisionButtons(next);
   }
+  refreshExternalReviewFinalLineIndexes(blocks);
   return true;
 }
 
@@ -7373,7 +7528,7 @@ function updateExternalReviewDocumentInPlace(blocks) {
   const doc = document.querySelector(".external-review-doc");
   if (!doc) return false;
   const previousHeights = new Map([...doc.querySelectorAll("[data-external-review-block]")].map((element) => [element.dataset.externalReviewBlock, element.getBoundingClientRect().height]));
-  doc.innerHTML = blocks.map((block) => renderExternalReviewBlock(block)).join("");
+  doc.innerHTML = renderExternalReviewBlocks(blocks);
   for (const block of blocks) {
     if (block.kind !== "change" || !block.decision) continue;
     const element = externalReviewBlockElement(block.id);
@@ -7381,7 +7536,23 @@ function updateExternalReviewDocumentInPlace(blocks) {
     if (element && previousHeight > 0) element.style.minHeight = Math.ceil(previousHeight) + "px";
   }
   wireExternalReviewDecisionButtons(doc);
+  refreshExternalReviewFinalLineIndexes(blocks);
   return true;
+}
+
+function refreshExternalReviewFinalLineIndexes(blocks) {
+  const doc = document.querySelector(".external-review-doc");
+  if (!doc) return;
+  const elements = [...doc.querySelectorAll(":scope > .external-review-block")];
+  let finalLineStart = 0;
+  for (let index = 0; index < blocks.length && index < elements.length; index++) {
+    const rows = externalReviewRenderedRows(blocks[index]);
+    [...elements[index].querySelectorAll(".markdown-line")].forEach((line, lineIndex) => {
+      if (lineIndex < rows.length) line.dataset.finalLineIndex = String(finalLineStart + lineIndex);
+      else delete line.dataset.finalLineIndex;
+    });
+    finalLineStart += rows.length;
+  }
 }
 
 function waitForInlineReviewTransition(settlePromise = null) {
@@ -7430,8 +7601,9 @@ async function saveExternalReviewDecision(blocks, viewState) {
   if (state.selected === change.path) {
     state.selectedDiff = await readSelectedDiff(change.path);
     if (!finishExternalReviewPanelInPlace(viewState)) {
+      const restoreState = inlineReviewRestoreViewState(viewState);
       renderViewer();
-      restoreEditorViewState(viewState);
+      restoreEditorViewState(restoreState);
     }
     updateHeader();
     updatePreview();
@@ -7444,12 +7616,42 @@ function finishExternalReviewPanelInPlace(viewState) {
   window.setTimeout(() => {
     settleFinishedExternalReview(viewState).then(() => {
       if (!activeExternalChange() && document.querySelector(".external-review-doc")) {
-        renderViewer();
-        restoreEditorViewState(viewState);
+        finalizeExternalReviewPanelInPlace(viewState);
       }
     });
   }, 80);
   return true;
+}
+
+function finalizeExternalReviewPanelInPlace(viewState) {
+  const doc = document.querySelector(".external-review-doc");
+  if (!doc) return false;
+  const text = el("editor").value || state.saved || "";
+  const visualAnchor = captureMarkdownVisualAnchor(doc);
+  const restoreState = inlineReviewRestoreViewState(viewState);
+  doc.outerHTML = state.mode === "edit" ? renderMarkdownEditor(text) : renderMarkdownLineView(text);
+  replaceExternalReviewActionsInPlace(text);
+  wireMarkdownDocLinks();
+  wireRenderedMarkdownEditor();
+  syncWorkspaceScroll();
+  restoreEditorViewState(restoreState, { deferred: false });
+  restoreMarkdownVisualAnchor(visualAnchor);
+  scheduleSessionStatePush();
+  return true;
+}
+
+function replaceExternalReviewActionsInPlace(text = "") {
+  const actions = document.querySelector(".file-panel > header .file-actions");
+  if (!actions) return;
+  const templateState = !state.selectedStartupContext && !activeFileConflict() ? templateStateForContent(text) : null;
+  actions.outerHTML = renderFileActionButtons({
+    reviewAction: state.selectedStartupContext ? null : reviewActionForSelectedFile(),
+    dirty: state.dirty,
+    templateState,
+    blockedByConflict: Boolean(activeFileConflict()),
+    deletable: !Boolean(state.selectedStartupContext),
+  });
+  wireFileActionButtons(document.querySelector(".file-panel > header") || document);
 }
 
 function settleFinishedExternalReview(viewState) {
@@ -7464,6 +7666,8 @@ function settleExternalReviewBlocks(blocksOrIds, viewState, options = {}) {
     .map((item) => typeof item === "string" ? externalReviewBlockElement(item) : item)
     .filter((block) => block?.classList?.contains("resolved") && !block.classList.contains("settling") && !block.classList.contains("settled"));
   if (!blocks.length) return Promise.resolve();
+  const anchor = viewState?.anchorBlockId ? externalReviewBlockElement(viewState.anchorBlockId) : null;
+  const anchorTop = anchor ? anchor.getBoundingClientRect().top : null;
   for (const block of blocks) {
     const startHeight = Math.ceil(block.getBoundingClientRect().height);
     block.classList.add("settling");
@@ -7478,7 +7682,9 @@ function settleExternalReviewBlocks(blocksOrIds, viewState, options = {}) {
     block.style.height = targetHeight + "px";
     block.style.minHeight = targetHeight + "px";
   }
+  if (anchor && typeof anchorTop === "number") shiftScrollForElement(anchor, anchor.getBoundingClientRect().top - anchorTop);
   if (restoreScroll) restoreEditorViewState(viewState);
+  const transitionScrollStart = captureInlineReviewScrollSnapshot(viewState);
   return Promise.all(blocks.map(waitForExternalReviewBlockSettle)).then(() => {
     for (const block of blocks) {
       block.classList.remove("settling");
@@ -7486,25 +7692,98 @@ function settleExternalReviewBlocks(blocksOrIds, viewState, options = {}) {
       block.style.minHeight = "";
       block.style.overflow = "";
     }
-    if (restoreScroll) restoreEditorViewState(viewState);
+    const scrolledDuringTransition = rememberInlineReviewLiveScrollIfChanged(viewState, transitionScrollStart);
+    if (!scrolledDuringTransition) {
+      if (anchor && typeof anchorTop === "number") shiftScrollForElement(anchor, anchor.getBoundingClientRect().top - anchorTop);
+      if (restoreScroll) restoreEditorViewState(viewState);
+    }
   });
+}
+
+function captureInlineReviewScrollSnapshot(viewState = null) {
+  if (!viewState) return null;
+  return captureEditorViewState({ anchorBlockId: viewState.anchorBlockId || "" });
+}
+
+function inlineReviewScrollChangedSince(snapshot) {
+  if (!snapshot) return false;
+  const current = captureInlineReviewScrollSnapshot(snapshot);
+  if (!current) return false;
+  const keys = [
+    "documentScrollTop",
+    "documentScrollLeft",
+    "editorScrollTop",
+    "editorScrollLeft",
+    "viewerScrollTop",
+    "viewerScrollLeft",
+    "windowScrollX",
+    "windowScrollY",
+  ];
+  return keys.some((key) => Math.abs((current[key] || 0) - (snapshot[key] || 0)) > 2);
+}
+
+function rememberInlineReviewLiveScrollIfChanged(viewState, snapshot) {
+  if (!viewState || !inlineReviewScrollChangedSince(snapshot)) return false;
+  viewState.userScrolledDuringInlineReview = true;
+  viewState.liveScrollState = captureEditorViewState({ anchorBlockId: viewState.anchorBlockId || "" });
+  viewState.liveScrollState.textAnchor = null;
+  return true;
+}
+
+function inlineReviewRestoreViewState(viewState) {
+  if (!viewState?.userScrolledDuringInlineReview) return viewState;
+  return viewState.liveScrollState || captureEditorViewState({ anchorBlockId: viewState.anchorBlockId || "" });
+}
+
+function captureMarkdownVisualAnchor(root = null) {
+  const container = root || document.querySelector(".external-review-doc") || el("docHighlighter") || el("docReader");
+  if (!container) return null;
+  const scroller = activeDocumentScrollTarget();
+  const scrollRect = scroller && scroller !== document.body && scroller !== document.documentElement
+    ? scroller.getBoundingClientRect()
+    : { top: 0, bottom: window.innerHeight || document.documentElement.clientHeight || 0 };
+  const lines = [...container.querySelectorAll(".markdown-line")];
+  const visibleLine = lines.find((line) => {
+    const rect = line.getBoundingClientRect();
+    return rect.bottom > scrollRect.top + 1 && rect.top < scrollRect.bottom - 1;
+  });
+  if (!visibleLine) return null;
+  const lineIndex = visibleLine.dataset.finalLineIndex || visibleLine.dataset.lineIndex || "";
+  if (!lineIndex) return null;
+  return { lineIndex, top: visibleLine.getBoundingClientRect().top };
+}
+
+function restoreMarkdownVisualAnchor(anchor) {
+  if (!anchor?.lineIndex) return false;
+  const root = el("docHighlighter") || el("docReader") || document;
+  const line = root.querySelector('.markdown-line[data-line-index="' + cssEscape(anchor.lineIndex) + '"]');
+  if (!line) return false;
+  const delta = line.getBoundingClientRect().top - anchor.top;
+  if (Math.abs(delta) < 0.5) return true;
+  const scroller = activeDocumentScrollTarget();
+  if (scroller && scroller !== document.body && scroller !== document.documentElement) scroller.scrollTop += delta;
+  else window.scrollBy(0, delta);
+  syncMarkdownEditorScroll();
+  return true;
 }
 
 function naturalExternalReviewBlockHeight(block) {
   const clone = block.cloneNode(true);
   const rect = block.getBoundingClientRect();
+  const parent = block.parentElement || document.body;
   clone.classList.remove("settling");
   clone.classList.add("settled");
   clone.style.position = "absolute";
   clone.style.visibility = "hidden";
   clone.style.pointerEvents = "none";
-  clone.style.left = "-10000px";
+  clone.style.left = "0";
   clone.style.top = "0";
   clone.style.width = Math.max(1, Math.ceil(rect.width)) + "px";
   clone.style.height = "";
   clone.style.minHeight = "";
   clone.style.overflow = "";
-  document.body.appendChild(clone);
+  clone.style.zIndex = "-1";
+  parent.appendChild(clone);
   const height = Math.ceil(clone.getBoundingClientRect().height);
   clone.remove();
   return height;
@@ -8503,8 +8782,9 @@ function captureEditorViewState(options = {}) {
     focused: document.activeElement === editor,
   };
 }
-function restoreEditorViewState(snapshot) {
+function restoreEditorViewState(snapshot, options = {}) {
   if (!snapshot || snapshot.path !== state.selected) return;
+  const deferred = options.deferred !== false;
   const apply = () => {
     const editor = snapshot.textAnchor ? (el("docEditor") || activeEditor()) : (snapshot.editorId ? el(snapshot.editorId) : activeEditor());
     const viewer = el("viewer");
@@ -8542,6 +8822,7 @@ function restoreEditorViewState(snapshot) {
     syncMarkdownEditorScroll();
   };
   apply();
+  if (!deferred) return;
   window.requestAnimationFrame(() => {
     apply();
     window.requestAnimationFrame(apply);

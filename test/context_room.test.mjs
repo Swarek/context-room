@@ -22,6 +22,7 @@ import {
   createFolder,
   createMarkdownFile,
   createDefaultProjectConfig,
+  deleteStartupContextFile,
   deleteMemoryPaths,
   deleteStartupSkill,
   ensureRuntimeGitExcludes,
@@ -171,6 +172,8 @@ test("startup context scanner lists configured agent files from ancestors to roo
   const memoryFiles = listMemoryFiles(root);
   const opened = readStartupContextFile(root, 2);
   const written = writeStartupContextFile(root, 2, "# Updated Claude\n");
+  const rewritten = readStartupContextFile(root, 2);
+  const deleted = deleteStartupContextFile(root, 2);
 
   assert.deepEqual(files.map((file) => file.startupContext.fileName), ["AGENTS.md", "CLAUDE.md", "AGENTS.md"]);
   assert.deepEqual(files.map((file) => file.startupContext.order), [1, 2, 3]);
@@ -182,8 +185,12 @@ test("startup context scanner lists configured agent files from ancestors to roo
   assert.equal(opened.content, "# Parent Claude\n");
   assert.equal(opened.startupContext.fileName, "CLAUDE.md");
   assert.equal(opened.startupContext.explorerPath, opened.startupContext.displayPath);
-  assert.equal(written.contentHash, readStartupContextFile(root, 2).contentHash);
-  assert.equal(fs.readFileSync(path.join(parent, "CLAUDE.md"), "utf8"), "# Updated Claude\n");
+  assert.equal(written.contentHash, rewritten.contentHash);
+  assert.equal(deleted.deleted, true);
+  assert.equal(deleted.path, opened.startupContext.displayPath);
+  assert.equal(fs.existsSync(path.join(parent, "CLAUDE.md")), false);
+  assert.ok(fs.existsSync(path.join(root, deleted.backupPath)));
+  assert.equal(fs.readFileSync(path.join(root, deleted.backupPath), "utf8"), "# Updated Claude\n");
 });
 
 test("opened startup context files can be exposed and selected in the explorer", () => {
@@ -334,6 +341,11 @@ test("startup context virtual files stay out of the explorer tree", () => {
   assert.match(html, /function submitStartupSkillCreateForm\(folderOrder\)/);
   assert.match(html, /function cancelStartupSkillCreate\(\)/);
   assert.match(html, /function deleteStartupSkillFromPanel\(folderOrder, skillName\)/);
+  assert.match(html, /addEventListener\("contextmenu", \(event\) => openStartupContextContextMenu\(event, button\.dataset\.startupOrder\)\)/);
+  assert.match(html, /function openStartupContextContextMenu\(event, order\)/);
+  assert.match(html, /data-startup-context-delete/);
+  assert.match(html, /async function deleteStartupContextFromPanel\(order\)/);
+  assert.match(html, /api\("\/api\/startup-context\/delete"/);
   assert.match(html, /function filesApiPath\(\)/);
   assert.match(html, /startupContextOrder/);
   assert.match(html, /function activateStartupSkillExplorer\(folderOrder, skillName, startupContext = null\)/);
@@ -1285,11 +1297,28 @@ test("rendered app supports selectable file themes and colored markdown reading"
   assert.match(html, /\.markdown-editor-highlight\s*\{[^}]*z-index:\s*1/);
   assert.match(html, /\.markdown-editor-input\s*\{[^}]*position:\s*absolute;[^}]*-webkit-text-fill-color:\s*transparent !important/);
   assert.match(html, /\.markdown-editor-input\.doc-link-hover\s*\{\s*cursor:\s*pointer;\s*\}/);
+  assert.match(html, /\.markdown-editor-highlight \.markdown-line\s*\{[^}]*padding:\s*0;[^}]*font-size:\s*inherit/);
   assert.match(html, /\.markdown-editor-highlight \.markdown-line\.h1\s*\{\s*color:\s*var\(--file-h1\)/);
   assert.match(html, /\.markdown-editor-highlight \.markdown-line\.h2\s*\{\s*color:\s*var\(--file-h2\)/);
+  assert.match(html, /\.markdown-editor-highlight \.markdown-line\.list\s*\{\s*padding-left:\s*0/);
   assert.match(html, /\.markdown-editor-highlight \.markdown-line\.list \.markdown-marker, \.markdown-editor-highlight \.markdown-path\s*\{\s*color:\s*var\(--file-list\)/);
   assert.match(html, /\.markdown-editor-highlight \.markdown-inline-code\s*\{\s*color:\s*var\(--file-code\)/);
   assert.match(html, /\.markdown-editor-highlight \.markdown-inline-code\.markdown-path\s*\{\s*color:\s*var\(--file-list\)/);
+  assert.match(html, /\.external-review-doc\.editor-metrics \.markdown-line\s*\{[^}]*padding:\s*0;[^}]*font-size:\s*inherit/);
+  assert.match(html, /\.external-review-doc\.editor-metrics \.markdown-line\.h1, \.external-review-doc\.editor-metrics \.markdown-line\.h2, \.external-review-doc\.editor-metrics \.markdown-line\.h3, \.external-review-doc\.editor-metrics \.markdown-line\.h4\s*\{[^}]*border:\s*0/);
+  assert.match(html, /\.external-review-doc\.editor-metrics \.markdown-line\.list\s*\{\s*padding-left:\s*0/);
+  assert.match(html, /\.external-review-doc\.editor-metrics \.markdown-inline-code\s*\{\s*color:\s*var\(--file-code\);[^}]*background:\s*transparent/);
+  assert.doesNotMatch(html, /\.external-review-doc \.markdown-line\s*\{[^}]*padding:\s*0/);
+  assert.doesNotMatch(html, /\.external-review-doc \.markdown-line\.list\s*\{\s*padding-left:\s*0/);
+  assert.doesNotMatch(html, /\.external-review-final-lines \.markdown-line\.h1, \.external-review-line-content \.markdown-line\.h1/);
+  assert.match(html, /function decorateMarkdownLine\(rendered, decoration\)/);
+  assert.match(html, /lineDecorations/);
+  assert.match(html, /data-review-marker/);
+  assert.match(html, /data-final-line-index/);
+  assert.match(html, /\.external-review-line \{[^}]*position:\s*relative/);
+  assert.doesNotMatch(html, /\.external-review-line \{[^}]*grid-template-columns/);
+  assert.match(html, /\.external-review-line::before \{[^}]*content:\s*attr\(data-review-marker\)/);
+  assert.match(html, /\.external-review-block\.change \{[^}]*margin:\s*0;[^}]*padding:\s*0;[^}]*box-shadow:\s*inset 2px 0 0/);
   assert.match(html, /function isMarkdownPathToken\(value\)/);
   assert.match(html, /function resolveDocLinkPath\(rawTarget\)/);
   assert.match(html, /function markdownDocLinkAttributes\(rawTarget\)/);
@@ -1466,20 +1495,35 @@ test("disk changes stay pending for review instead of silently reloading the ope
   assert.match(html, /function chooseAllExternalReviewBlocks\(decision\)/);
   assert.match(html, /function wireExternalReviewAllButtons\(root = document\)/);
   assert.match(html, /updateExternalReviewBlockInPlace\(blocks, blockId, viewState\)/);
+  assert.match(html, /renderExternalReviewBlock\(block, \{ finalLineStart: externalReviewFinalLineStart\(blocks, blockId\) \}\)/);
   assert.match(html, /function updateExternalReviewDocumentInPlace\(blocks\)/);
+  assert.match(html, /doc\.innerHTML = renderExternalReviewBlocks\(blocks\);/);
+  assert.match(html, /function refreshExternalReviewFinalLineIndexes\(blocks\)/);
+  assert.match(html, /refreshExternalReviewFinalLineIndexes\(blocks\);/);
   assert.match(html, /const settlePromise = updatedInPlace[\s\S]*settleExternalReviewBlocks\(\[blockId\], viewState, \{ restoreScroll: false \}\)/);
   assert.match(html, /if \(pending\.length\)[\s\S]*await waitForInlineReviewTransition\(settlePromise\);/);
   assert.match(html, /const updatedInPlace = updateExternalReviewBlockInPlace\(blocks, blockId, viewState\);[\s\S]*if \(!updatedInPlace\) renderViewer\(\);\s*updateHeader\(\);/);
   assert.doesNotMatch(html, /actions\.outerHTML = renderExternalReviewActions/);
   assert.match(html, /externalReviewRowsForDecision/);
+  assert.match(html, /function renderExternalReviewFinalLines\(rows, options = \{\}\)/);
+  assert.match(html, /function renderExternalReviewBlocks\(blocks\)/);
+  assert.match(html, /function externalReviewFinalLineStart\(blocks, blockId\)/);
+  assert.match(html, /function finalLineDecorations\(rows, finalLineStart = null\)/);
+  assert.match(html, /external-review-block context markdown-view[\s\S]*renderMarkdownLines\(block\.rows\.map\(\(row\) => row\.line\)\.join\("\\n"\), \{ lineDecorations: finalLineDecorations\(block\.rows, options\.finalLineStart\) \}\)/);
+  assert.match(html, /external-review-final-lines markdown-view/);
   assert.match(html, /external-review-block context resolved/);
   assert.match(html, /external-review-block context resolved [^"]*empty/);
+  assert.match(html, /external-review-lines markdown-view/);
+  assert.doesNotMatch(html, /external-review-line-content markdown-view/);
+  assert.match(html, /renderMarkdownLines\(text, \{ lineDecorations \}\)/);
   assert.doesNotMatch(html, /external-review-resolved-label/);
   assert.doesNotMatch(html, /external-review-placeholder/);
   assert.doesNotMatch(html, /Change rejected/);
   assert.doesNotMatch(html, /Change accepted/);
   assert.match(html, /computeExternalReviewContent/);
   assert.match(html, /renderExternalReviewDocument/);
+  assert.match(html, /const metricClass = " editor-metrics";/);
+  assert.match(html, /doc-editor external-review-doc' \+ metricClass/);
   assert.match(html, /renderExternalReviewActions/);
   assert.match(html, /function renderFileActionItems\(/);
   assert.match(html, /function externalReviewFileActionOptions\(\)/);
@@ -1501,7 +1545,15 @@ test("disk changes stay pending for review instead of silently reloading the ope
   assert.match(html, /function textOffsetForLineIndex\(lines, lineIndex\)/);
   assert.match(html, /function finishExternalReviewPanelInPlace\(viewState\)/);
   assert.match(html, /if \(!finishExternalReviewPanelInPlace\(viewState\)\) \{[\s\S]*renderViewer\(\);\s*restoreEditorViewState\(viewState\);/);
-  assert.doesNotMatch(html, /actions\.outerHTML = renderFileActionButtons\(\{/);
+  assert.match(html, /function finalizeExternalReviewPanelInPlace\(viewState\)/);
+  assert.match(html, /const visualAnchor = captureMarkdownVisualAnchor\(doc\);/);
+  assert.match(html, /const restoreState = inlineReviewRestoreViewState\(viewState\);/);
+  assert.match(html, /doc\.outerHTML = state\.mode === "edit" \? renderMarkdownEditor\(text\) : renderMarkdownLineView\(text\);/);
+  assert.match(html, /restoreEditorViewState\(restoreState, \{ deferred: false \}\);/);
+  assert.match(html, /restoreMarkdownVisualAnchor\(visualAnchor\);/);
+  assert.match(html, /function replaceExternalReviewActionsInPlace\(text = ""\)/);
+  assert.match(html, /replaceExternalReviewActionsInPlace\(text\);/);
+  assert.match(html, /function wireRenderedMarkdownEditor\(\)/);
   assert.match(html, /function settleFinishedExternalReview\(viewState\)/);
   assert.doesNotMatch(html, /doc\.classList\.add\("settled"\)/);
   assert.match(html, /function settleExternalReviewBlocks\(blocksOrIds, viewState, options = \{\}\)/);
@@ -1509,21 +1561,46 @@ test("disk changes stay pending for review instead of silently reloading the ope
   assert.match(html, /!block\.classList\.contains\("settling"\) && !block\.classList\.contains\("settled"\)/);
   assert.match(html, /block\.classList\.add\("settled"\)/);
   assert.match(html, /settleFinishedExternalReview\(viewState\)\.then/);
-  assert.match(html, /if \(!activeExternalChange\(\) && document\.querySelector\("\.external-review-doc"\)\) \{[\s\S]*renderViewer\(\);[\s\S]*restoreEditorViewState\(viewState\);/);
+  assert.match(html, /if \(!activeExternalChange\(\) && document\.querySelector\("\.external-review-doc"\)\) \{[\s\S]*finalizeExternalReviewPanelInPlace\(viewState\);/);
   assert.match(html, /\.external-review-block\.resolved\.settling\s*\{[^}]*height 2s ease[^}]*min-height 2s ease/);
   assert.match(html, /block\.classList\.add\("settling"\)/);
   assert.match(html, /const targetHeight = naturalExternalReviewBlockHeight\(block\);/);
   assert.match(html, /function naturalExternalReviewBlockHeight\(block\)/);
+  assert.match(html, /const parent = block\.parentElement \|\| document\.body;/);
+  assert.match(html, /parent\.appendChild\(clone\);/);
+  assert.doesNotMatch(html, /document\.body\.appendChild\(clone\);/);
+  assert.match(html, /const anchorTop = anchor \? anchor\.getBoundingClientRect\(\)\.top : null;/);
+  assert.match(html, /shiftScrollForElement\(anchor, anchor\.getBoundingClientRect\(\)\.top - anchorTop\);/);
+  assert.match(html, /const transitionScrollStart = captureInlineReviewScrollSnapshot\(viewState\);/);
+  assert.match(html, /const scrolledDuringTransition = rememberInlineReviewLiveScrollIfChanged\(viewState, transitionScrollStart\);/);
+  assert.match(html, /if \(!scrolledDuringTransition\) \{[\s\S]*restoreEditorViewState\(viewState\);[\s\S]*\}/);
+  assert.match(html, /function captureInlineReviewScrollSnapshot\(viewState = null\)/);
+  assert.match(html, /function inlineReviewScrollChangedSince\(snapshot\)/);
+  assert.match(html, /function rememberInlineReviewLiveScrollIfChanged\(viewState, snapshot\)/);
+  assert.match(html, /viewState\.userScrolledDuringInlineReview = true;/);
+  assert.match(html, /viewState\.liveScrollState = captureEditorViewState/);
+  assert.match(html, /function inlineReviewRestoreViewState\(viewState\)/);
+  assert.match(html, /viewState\.liveScrollState \|\| captureEditorViewState/);
+  assert.match(html, /function captureMarkdownVisualAnchor\(root = null\)/);
+  assert.match(html, /visibleLine\.dataset\.finalLineIndex \|\| visibleLine\.dataset\.lineIndex/);
+  assert.match(html, /function restoreMarkdownVisualAnchor\(anchor\)/);
+  assert.match(html, /root\.querySelector\('\.markdown-line\[data-line-index="/);
   assert.match(html, /clone\.classList\.remove\("settling"\);[\s\S]*clone\.classList\.add\("settled"\);/);
   assert.match(html, /function waitForExternalReviewBlockSettle\(block\)/);
   assert.match(html, /event\.target === block && event\.propertyName === "height"/);
   assert.match(html, /window\.setTimeout\(finish, 2400\)/);
+  assert.match(html, /function restoreEditorViewState\(snapshot, options = \{\}\)/);
+  assert.match(html, /const deferred = options\.deferred !== false;/);
+  assert.match(html, /if \(!deferred\) return;[\s\S]*window\.requestAnimationFrame/);
   assert.doesNotMatch(html, /\.external-review-doc\.settled \.external-review-block\.resolved/);
   assert.match(html, /\.external-review-block\.resolved\.settled\.empty\s*\{[^}]*min-height:\s*0/);
   assert.match(html, /resetExternalChangeState\(\);\s*\/\/ Returning from inline review should keep[\s\S]*state\.diffCollapsed = true;/);
   assert.match(html, /block\.decision === "accept"[\s\S]*row\.type !== "del"/);
   assert.match(html, /block\.decision === "reject"[\s\S]*row\.type !== "add"/);
   assert.doesNotMatch(html, /external-review-block\.accept \.external-review-line\.del/);
+  assert.match(html, /external-review-final-lines markdown-view/);
+  assert.match(html, /external-review-lines markdown-view/);
+  assert.doesNotMatch(html, /external-review-line-content markdown-view/);
   assert.doesNotMatch(html, /external-change-panel/);
   assert.match(html, /file changed on disk · review before applying/);
   assert.match(html, /function blockPendingExternalChange/);
