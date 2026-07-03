@@ -445,6 +445,8 @@ test("CLI guard blocks commits when watched docs changed without review", () => 
       const output = `${error.stdout || ""}${error.stderr || ""}`;
       assert.match(output, /Context Room guard blocked this commit/);
       assert.match(output, /need human review/);
+      assert.match(output, /Open the Context Room webapp for the user/);
+      assert.match(output, /show the Changed files to review queue/);
       assert.match(output, /Agents must not mark files verified on the user's behalf/);
       assert.match(output, /README\.md/);
       return true;
@@ -1472,19 +1474,33 @@ test("review queue opens changed files with the inline segment review engine", (
   assert.match(html, /async function startChangedFileInlineReview\(path, diff, requestId = state\.selectionRequest\)/);
   assert.match(html, /if \(options\.reviewMode && diff\?\.changed\) await startChangedFileInlineReview\(path, diff, requestId\);/);
   assert.match(html, /source: "review"/);
-  assert.match(html, /baseContent: typeof review\.baseContent === "string" \? review\.baseContent : ""/);
+  assert.match(html, /reviewSessions: \{\}/);
+  assert.match(html, /const baseContent = typeof review\.baseContent === "string" \? review\.baseContent : "";/);
+  assert.match(html, /const previousSession = state\.reviewSessions\?\.\[path\] \|\| null;/);
+  assert.match(html, /previousSession\.baseContent === baseContent/);
+  assert.match(html, /previousSession\.diskContent === diskContent/);
+  assert.match(html, /reviewDecisions,\s*};/);
   assert.match(html, /changeKind: review\.changeKind \|\| "modified"/);
   assert.match(html, /function externalReviewBaseContent\(change = activeExternalChange\(\)\)/);
+  assert.match(html, /function rememberActiveReviewSession\(\)/);
+  assert.match(html, /state\.reviewSessions\[change\.path\] = \{/);
+  assert.match(html, /function clearReviewSession\(path\)/);
+  assert.match(html, /function resetExternalChangeState\(options = \{\}\)/);
+  assert.match(html, /if \(options\.discardReview\) clearReviewSession\(path\);/);
   assert.match(html, /async function recordSelectedReviewBaseline\(path = state\.selected, note = ""\)/);
   assert.match(html, /\/api\/docqa\/review-baseline/);
   assert.match(html, /if \(change\.source === "review"\) await recordSelectedReviewBaseline\(change\.path, "inline review applied"\);/);
   assert.match(html, /renderExternalReviewDocument\(externalReviewBaseContent\(externalChange\), externalChange\.diskContent \|\| ""\)/);
   assert.match(html, /buildExternalReviewBlocks\(externalReviewBaseContent\(change\), change\.diskContent \|\| "", change\.reviewDecisions/);
   assert.match(html, /computeExternalReviewContent\(blocks, externalReviewBaseContent\(change\), change\.diskContent \|\| ""\)/);
-  assert.match(html, /if \(\(review\.baseContent \|\| ""\) === \(review\.currentContent \|\| ""\)\) \{/);
+  assert.match(html, /const change = state\.externalChange;/);
+  assert.match(html, /if \(baseContent === diskContent\) \{/);
   assert.match(html, /changes already reviewed · mark verified when ready/);
   assert.match(html, /review\.changeKind === "added" \? "new file waiting for review" : "changes waiting for review"/);
   assert.match(html, /if \(activeExternalChange\(\)\?\.source === "review"\) \{[\s\S]*state\.selectedDiff = await readSelectedDiff\(previousSelected\);[\s\S]*return;[\s\S]*\}/);
+  assert.match(html, /function activeBlockingExternalChange\(\)/);
+  assert.match(html, /return change && change\.source !== "review" \? change : null;/);
+  assert.match(html, /if \(change\.source === "review"\) return false;/);
 });
 
 test("save preserves the editor scroll position after rerendering", () => {
@@ -1635,8 +1651,7 @@ test("disk changes stay pending for review instead of silently reloading the ope
   assert.match(html, /const visualAnchor = captureMarkdownVisualAnchor\(doc\);/);
   assert.match(html, /const restoreState = inlineReviewRestoreViewState\(viewState\);/);
   assert.match(html, /doc\.outerHTML = state\.mode === "edit" \? renderMarkdownEditor\(text\) : renderMarkdownLineView\(text\);/);
-  assert.match(html, /restoreEditorViewState\(restoreState, \{ deferred: false \}\);/);
-  assert.match(html, /restoreMarkdownVisualAnchor\(visualAnchor\);/);
+  assert.match(html, /if \(!restoreMarkdownVisualAnchor\(visualAnchor\)\) restoreEditorViewState\(restoreState, \{ deferred: false \}\);/);
   assert.match(html, /function replaceExternalReviewActionsInPlace\(text = ""\)/);
   assert.match(html, /replaceExternalReviewActionsInPlace\(text\);/);
   assert.match(html, /function wireRenderedMarkdownEditor\(\)/);
@@ -1680,7 +1695,7 @@ test("disk changes stay pending for review instead of silently reloading the ope
   assert.match(html, /if \(!deferred\) return;[\s\S]*window\.requestAnimationFrame/);
   assert.doesNotMatch(html, /\.external-review-doc\.settled \.external-review-block\.resolved/);
   assert.match(html, /\.external-review-block\.resolved\.settled\.empty\s*\{[^}]*min-height:\s*0/);
-  assert.match(html, /resetExternalChangeState\(\);\s*\/\/ Returning from inline review should keep[\s\S]*state\.diffCollapsed = true;/);
+  assert.match(html, /resetExternalChangeState\(change\.source === "review" \? \{ discardReview: true \} : \{\}\);\s*\/\/ Returning from inline review should keep[\s\S]*state\.diffCollapsed = true;/);
   assert.match(html, /block\.decision === "accept"[\s\S]*row\.type !== "del"/);
   assert.match(html, /block\.decision === "reject"[\s\S]*row\.type !== "add"/);
   assert.doesNotMatch(html, /external-review-block\.accept \.external-review-line\.del/);
@@ -1700,8 +1715,9 @@ test("disk changes stay pending for review instead of silently reloading the ope
   assert.match(html, /target\.scrollIntoView\(\{ behavior: "smooth", block: "center", inline: "nearest" \}\)/);
   assert.match(html, /\.external-review-block\.attention/);
   assert.match(html, /@keyframes externalReviewAttention/);
-  assert.match(html, /if \(!state\.dirty && !activeExternalChange\(\)\) return;/);
-  assert.match(html, /if \(activeExternalChange\(\)\) focusNearestExternalReviewChange\(\);/);
+  assert.match(html, /const blockingChange = activeBlockingExternalChange\(\);/);
+  assert.match(html, /if \(!state\.dirty && !blockingChange\) return;/);
+  assert.match(html, /if \(blockingChange\) focusNearestExternalReviewChange\(\);/);
   assert.match(html, /apply or reject before saving/);
   assert.doesNotMatch(html, /setStatus\("reloaded from disk"\);\n  \} catch \(error\) \{\n    setStatus\(error\.message\);\n  \}\n\}/);
 });

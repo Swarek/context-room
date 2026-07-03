@@ -4301,7 +4301,7 @@ export function renderAppHtml() {
   <div id="explorerContextMenu" class="explorer-context-menu" hidden></div>
   <div id="agentToast" class="agent-toast" hidden></div>
 <script>
-const state = { files: [], startupContextFiles: [], startupSkillFolders: [], activeStartupSkillExplorer: null, activeStartupContextExplorer: null, startupSkillCreateFolder: null, startupContextContextTarget: null, selectedStartupContext: null, docqa: null, doctor: null, settings: null, settingsOpen: false, page: "hub", pendingMarkdown: null, availableHubCards: [], hubFolders: [], hubSections: [], rootHubSections: [], activeHubCardId: null, selectedReview: null, reviewModePath: null, reviewModeStatus: null, selected: null, selectedDiff: null, fileConflict: null, externalChange: null, conflictCompare: false, conflictMergeText: null, conflictMergeKey: "", conflictMergeMode: "auto", conflictCheckTimer: null, diffCollapsed: false, saved: "", savedHash: null, dirty: false, mode: "view", homeView: "root", planetStack: ["root"], filePanel: false, history: [], historyIndex: -1, pathFilters: [], explorerWatchFilter: "all", explorerRenderKey: "", selectedForDelete: new Set(), selectionRequest: 0, openingFilePath: null, mobileSidebarTouched: false, sessionStateTimer: null, agentCommandTimer: null, lastAgentCommandId: "", pendingAgentCommand: null, agentAnnotations: {}, userActiveAt: 0, markdownHighlightFrame: 0, markdownHighlightText: "", markdownHighlightLastText: "", docLinkModifierActive: false, expanded: new Set(["data", "automations", "integrations", "skills", "tools", "~", "~/.hermes", "~/.hermes/memories", "~/.hermes/skills"]) };
+const state = { files: [], startupContextFiles: [], startupSkillFolders: [], activeStartupSkillExplorer: null, activeStartupContextExplorer: null, startupSkillCreateFolder: null, startupContextContextTarget: null, selectedStartupContext: null, docqa: null, doctor: null, settings: null, settingsOpen: false, page: "hub", pendingMarkdown: null, availableHubCards: [], hubFolders: [], hubSections: [], rootHubSections: [], activeHubCardId: null, selectedReview: null, reviewModePath: null, reviewModeStatus: null, reviewSessions: {}, selected: null, selectedDiff: null, fileConflict: null, externalChange: null, conflictCompare: false, conflictMergeText: null, conflictMergeKey: "", conflictMergeMode: "auto", conflictCheckTimer: null, diffCollapsed: false, saved: "", savedHash: null, dirty: false, mode: "view", homeView: "root", planetStack: ["root"], filePanel: false, history: [], historyIndex: -1, pathFilters: [], explorerWatchFilter: "all", explorerRenderKey: "", selectedForDelete: new Set(), selectionRequest: 0, openingFilePath: null, mobileSidebarTouched: false, sessionStateTimer: null, agentCommandTimer: null, lastAgentCommandId: "", pendingAgentCommand: null, agentAnnotations: {}, userActiveAt: 0, markdownHighlightFrame: 0, markdownHighlightText: "", markdownHighlightLastText: "", docLinkModifierActive: false, expanded: new Set(["data", "automations", "integrations", "skills", "tools", "~", "~/.hermes", "~/.hermes/memories", "~/.hermes/skills"]) };
 const FILE_THEMES = ${JSON.stringify(FILE_THEME_OPTIONS)};
 const DEFAULT_FILE_THEME = "${DEFAULT_FILE_THEME}";
 const MAIN_FILE_PATHS = new Set([
@@ -4516,7 +4516,7 @@ async function handleAgentCommand(command) {
 
 function shouldDeferAgentCommand(command) {
   if (!command) return false;
-  if (state.dirty || activeExternalChange() || activeFileConflict()) return true;
+  if (state.dirty || activeBlockingExternalChange() || activeFileConflict()) return true;
   return Date.now() - (state.userActiveAt || 0) < 1200 && command.path && command.path !== state.selected;
 }
 
@@ -7731,7 +7731,7 @@ async function saveExternalReviewDecision(blocks, viewState) {
       body: JSON.stringify({ path: change.path }),
     });
     resetConflictState();
-    resetExternalChangeState();
+    resetExternalChangeState({ discardReview: true });
     state.saved = "";
     state.savedHash = null;
     state.dirty = false;
@@ -7744,7 +7744,7 @@ async function saveExternalReviewDecision(blocks, viewState) {
   if (change.source === "review" && change.changeKind === "deleted" && merged.length === 0) {
     await recordSelectedReviewBaseline(change.path, "inline review applied");
     resetConflictState();
-    resetExternalChangeState();
+    resetExternalChangeState({ discardReview: true });
     state.diffCollapsed = true;
     state.saved = "";
     state.savedHash = null;
@@ -7769,7 +7769,7 @@ async function saveExternalReviewDecision(blocks, viewState) {
   const result = await writeSelectedDiskFile(merged, change.path);
   if (change.source === "review") await recordSelectedReviewBaseline(change.path, "inline review applied");
   resetConflictState();
-  resetExternalChangeState();
+  resetExternalChangeState(change.source === "review" ? { discardReview: true } : {});
   // Returning from inline review should keep the reader in the document, not open the Git diff panel.
   state.diffCollapsed = true;
   state.saved = merged;
@@ -7815,8 +7815,7 @@ function finalizeExternalReviewPanelInPlace(viewState) {
   wireMarkdownDocLinks();
   wireRenderedMarkdownEditor();
   syncWorkspaceScroll();
-  restoreEditorViewState(restoreState, { deferred: false });
-  restoreMarkdownVisualAnchor(visualAnchor);
+  if (!restoreMarkdownVisualAnchor(visualAnchor)) restoreEditorViewState(restoreState, { deferred: false });
   scheduleSessionStatePush();
   return true;
 }
@@ -8456,6 +8455,11 @@ function activeExternalChange() {
   return state.externalChange && state.externalChange.path === state.selected ? state.externalChange : null;
 }
 
+function activeBlockingExternalChange() {
+  const change = activeExternalChange();
+  return change && change.source !== "review" ? change : null;
+}
+
 function externalReviewBaseContent(change = activeExternalChange()) {
   return typeof change?.baseContent === "string" ? change.baseContent : state.saved || "";
 }
@@ -8503,7 +8507,10 @@ async function startChangedFileInlineReview(path, diff, requestId = state.select
   if (!path || state.reviewModePath !== path || !diff?.changed) return false;
   const review = await readSelectedReviewBase(path);
   if (!isCurrentSelection(requestId, path) || !review?.available) return false;
-  if ((review.baseContent || "") === (review.currentContent || "")) {
+  const baseContent = typeof review.baseContent === "string" ? review.baseContent : "";
+  const diskContent = typeof review.currentContent === "string" ? review.currentContent : state.saved || "";
+  if (baseContent === diskContent) {
+    clearReviewSession(path);
     state.saved = typeof review.currentContent === "string" ? review.currentContent : state.saved || "";
     state.savedHash = review.currentHash || state.savedHash;
     state.dirty = false;
@@ -8512,15 +8519,21 @@ async function startChangedFileInlineReview(path, diff, requestId = state.select
     setStatus("changes already reviewed · mark verified when ready");
     return false;
   }
+  const previousSession = state.reviewSessions?.[path] || null;
+  const reviewDecisions = previousSession &&
+    previousSession.baseContent === baseContent &&
+    previousSession.diskContent === diskContent
+      ? { ...(previousSession.reviewDecisions || {}) }
+      : {};
   state.externalChange = {
     path,
     source: "review",
-    baseContent: typeof review.baseContent === "string" ? review.baseContent : "",
-    diskContent: typeof review.currentContent === "string" ? review.currentContent : state.saved || "",
+    baseContent,
+    diskContent,
     diskHash: review.currentHash || state.savedHash,
     diskUpdatedAt: "",
     changeKind: review.changeKind || "modified",
-    reviewDecisions: {},
+    reviewDecisions,
   };
   state.saved = state.externalChange.diskContent;
   state.savedHash = state.externalChange.diskHash || state.savedHash;
@@ -8562,16 +8575,36 @@ function resetConflictState() {
   state.conflictMergeMode = "auto";
 }
 
-function resetExternalChangeState() {
+function rememberActiveReviewSession() {
+  const change = state.externalChange;
+  if (!change || change.source !== "review" || !change.path) return;
+  state.reviewSessions[change.path] = {
+    baseContent: externalReviewBaseContent(change),
+    diskContent: change.diskContent || "",
+    diskHash: change.diskHash || "",
+    changeKind: change.changeKind || "modified",
+    reviewDecisions: { ...(change.reviewDecisions || {}) },
+  };
+}
+
+function clearReviewSession(path) {
+  if (!path || !state.reviewSessions) return;
+  delete state.reviewSessions[path];
+}
+
+function resetExternalChangeState(options = {}) {
+  const path = state.externalChange?.path || "";
+  if (options.discardReview) clearReviewSession(path);
+  else rememberActiveReviewSession();
   state.externalChange = null;
 }
 
 function blockPendingExternalChange(action = "before leaving") {
-  if (!activeExternalChange()) return false;
-  const targetBlockId = closestExternalReviewChangeBlockId();
   const change = activeExternalChange();
-  const prefix = change?.source === "review" ? "review pending" : "file changed on disk";
-  setStatus(prefix + " · review the highlighted change " + action);
+  if (!change) return false;
+  if (change.source === "review") return false;
+  const targetBlockId = closestExternalReviewChangeBlockId();
+  setStatus("file changed on disk · review the highlighted change " + action);
   if (state.mode !== "view") setMode("view");
   else renderViewer();
   updateHeader();
@@ -9245,8 +9278,9 @@ el("reload").addEventListener("click", () => {
   selectFile(state.selected, { pushHistory: false, fromPlanet: state.filePanel, forceReload: true }).catch((error) => setStatus(error.message));
 });
 window.addEventListener("beforeunload", (event) => {
-  if (!state.dirty && !activeExternalChange()) return;
-  if (activeExternalChange()) focusNearestExternalReviewChange();
+  const blockingChange = activeBlockingExternalChange();
+  if (!state.dirty && !blockingChange) return;
+  if (blockingChange) focusNearestExternalReviewChange();
   event.preventDefault();
   event.returnValue = "";
 });

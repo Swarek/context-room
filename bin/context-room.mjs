@@ -101,7 +101,7 @@ if (command === "guard") {
   }
   if (shouldBlock) {
     console.error(
-      "\nOpen Context Room and have the user review each diff before committing. Agents must not mark files verified on the user's behalf.",
+      "\nOpen the Context Room webapp for the user, show the Changed files to review queue, and have the user review each diff before committing. Agents must not mark files verified on the user's behalf.",
     );
     if (blockingHealth.length) console.error("If strict health issues are listed, fix them before asking the user to verify.");
     process.exit(1);
