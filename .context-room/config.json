@@ -1,0 +1,351 @@
+{
+  "$schema": "https://raw.githubusercontent.com/Swarek/context-room/main/schemas/config.schema.json",
+  "title": "Context Room",
+  "allowedPaths": [
+    "docs/",
+    "src/",
+    "bin/",
+    "schemas/",
+    "test/",
+    "README.md",
+    "AGENTS.md",
+    "package.json"
+  ],
+  "watchAllow": [
+    "docs/",
+    "README.md",
+    "AGENTS.md"
+  ],
+  "reviewPaths": [
+    "docs/",
+    "README.md",
+    "AGENTS.md"
+  ],
+  "integrations": {
+    "hermes": false
+  },
+  "appearance": {
+    "fileTheme": "context-room",
+    "autoOpenGitDiff": true
+  },
+  "startupContext": {
+    "enabled": true,
+    "fileNames": [
+      "AGENTS.md",
+      "CLAUDE.md"
+    ],
+    "globalPaths": [
+      "~/.codex/AGENTS.md"
+    ]
+  },
+  "startupSkills": {
+    "enabled": true,
+    "folderNames": [
+      ".codex/skills",
+      "skills"
+    ]
+  },
+  "startupHooks": {
+    "enabled": true,
+    "editable": false,
+    "agentHooks": true,
+    "codexHooks": true,
+    "gitHooks": true,
+    "hookManagers": true,
+    "fileNames": [
+      "pre-commit",
+      "pre-push",
+      "commit-msg",
+      "prepare-commit-msg"
+    ],
+    "agentHookSources": [
+      {
+        "id": "codex",
+        "label": "Codex",
+        "paths": [
+          ".codex/hooks.json"
+        ]
+      },
+      {
+        "id": "claude-code",
+        "label": "Claude Code",
+        "paths": [
+          ".claude/settings.json",
+          ".claude/settings.local.json"
+        ]
+      },
+      {
+        "id": "opencode",
+        "label": "OpenCode",
+        "paths": [
+          ".config/opencode/opencode.json",
+          ".config/opencode/plugin/",
+          ".config/opencode/plugins/",
+          ".opencode/plugin/",
+          ".opencode/plugins/",
+          "opencode.json",
+          "opencode.jsonc"
+        ]
+      }
+    ],
+    "agentHookPaths": [
+      ".codex/hooks.json",
+      ".claude/settings.json",
+      ".claude/settings.local.json",
+      ".config/opencode/opencode.json",
+      ".config/opencode/plugin/",
+      ".config/opencode/plugins/",
+      ".opencode/plugin/",
+      ".opencode/plugins/",
+      "opencode.json",
+      "opencode.jsonc"
+    ],
+    "codexPaths": [
+      ".codex/hooks.json"
+    ],
+    "managerPaths": [
+      ".husky/",
+      "lefthook.yml",
+      ".lefthook.yml",
+      "lefthook.yaml",
+      ".lefthook.yaml",
+      ".pre-commit-config.yaml",
+      ".pre-commit-config.yml",
+      "lint-staged.config.js",
+      "lint-staged.config.mjs",
+      "lint-staged.config.cjs",
+      ".lintstagedrc",
+      ".lintstagedrc.json",
+      ".lintstagedrc.js",
+      ".lintstagedrc.cjs",
+      "package.json"
+    ]
+  },
+  "bestPractices": [
+    "One file, one clear scope: name what this document is responsible for and what belongs elsewhere.",
+    "Start with the goal, then the few durable facts that change decisions.",
+    "Keep sections stable and short; prefer links to source files over copied truth.",
+    "Use explicit rules for agents and humans: what to do, avoid, verify, or ask.",
+    "Update or delete stale context instead of accumulating contradictory prose."
+  ],
+  "markdownTemplates": [
+    {
+      "id": "blank",
+      "title": "Blank",
+      "description": "Start with an empty Markdown file.",
+      "content": "",
+      "enabled": true
+    },
+    {
+      "id": "agents",
+      "title": "Agent instructions",
+      "description": "Root or scoped instructions that are injected into AI coding agents.",
+      "content": "---\ncontext_room:\n  kind: agents\n  scope: {{scope_yaml}}\n  status: {{status_yaml}}\n  canonical_for: {{canonical_for_yaml}}\n  last_verified: {{last_verified_yaml}}\n  sources: {{sources_inline}}\n---\n\n# {{title}}\n\n## Purpose\nWhat this instruction file controls, which agents read it, and what it must keep stable.\n\n## Operating Rules\n- Rule one.\n- Rule two.\n- Rule three.\n\n## Read First\n- Files or docs the agent should inspect before changing this scope.\n\n## Do Not\n- Things that would hurt quality, safety, or maintainability.\n\n## Verification\n- Commands, checks, or review gates expected before work is called done.\n",
+      "enabled": true
+    },
+    {
+      "id": "docs-index",
+      "title": "Docs index",
+      "description": "Short map of a documentation folder: what is canonical and where to go next.",
+      "content": "---\ncontext_room:\n  kind: index\n  scope: {{scope_yaml}}\n  status: {{status_yaml}}\n  canonical_for: {{canonical_for_yaml}}\n  last_verified: {{last_verified_yaml}}\n  sources: {{sources_inline}}\n---\n\n# {{title}}\n\n## Purpose\nWhat this documentation area covers.\n\n## Start Here\n- Primary doc:\n- Agent instructions:\n- Runbooks:\n- Decisions:\n\n## Current Sources Of Truth\n- Document or source file:\n\n## Historical Or Secondary Docs\n- Older docs that may still be useful but are not canonical.\n",
+      "enabled": true
+    },
+    {
+      "id": "context-golden",
+      "title": "Canonical doc",
+      "description": "Default source-of-truth document for a product, system, feature, or workflow.",
+      "content": "---\ncontext_room:\n  kind: canonical\n  scope: {{scope_yaml}}\n  status: {{status_yaml}}\n  canonical_for: {{canonical_for_yaml}}\n  last_verified: {{last_verified_yaml}}\n  sources: {{sources_inline}}\n---\n\n# {{title}}\n\n## Purpose\nWhy this file exists, who uses it, and what decision or action it should support.\n\n## Key facts\nThe 5 to 10 most important durable facts. Short, concrete, current.\n\n## Structure\nWhat lives here, what lives elsewhere, and the important paths to know.\n\n## Rules\nConventions, guardrails, pitfalls, quality criteria, and things not to do.\n\n## References\nSources of truth, related files, commands, or useful links. Do not copy what can be linked.\n",
+      "enabled": true
+    },
+    {
+      "id": "procedure",
+      "title": "Procedure",
+      "description": "A short repeatable workflow, runbook, checklist, or operational procedure.",
+      "content": "---\ncontext_room:\n  kind: procedure\n  scope: {{scope_yaml}}\n  status: {{status_yaml}}\n  canonical_for: {{canonical_for_yaml}}\n  last_verified: {{last_verified_yaml}}\n  sources: {{sources_inline}}\n---\n\n# {{title}}\n\n## When To Use\nThe exact situation where this procedure applies.\n\n## Inputs\n- Required files, environment, access, or context.\n\n## Steps\n1. First concrete step.\n2. Second concrete step.\n3. Verification step.\n\n## Failure Modes\n- What can go wrong and how to stop safely.\n\n## References\n{{sources_list}}\n",
+      "enabled": true
+    },
+    {
+      "id": "decision-record",
+      "title": "Decision record",
+      "description": "Small ADR-style note for decisions that should be easy to revisit.",
+      "content": "---\ncontext_room:\n  kind: decision\n  scope: {{scope_yaml}}\n  status: {{status_yaml}}\n  canonical_for: {{canonical_for_yaml}}\n  last_verified: {{last_verified_yaml}}\n  sources: {{sources_inline}}\n---\n\n# {{title}}\n\n## Decision\nThe decision made, in one or two sentences.\n\n## Context\nWhy this question matters now.\n\n## Options considered\nThe serious alternatives and their main trade-off.\n\n## Consequences\nWhat this changes concretely, and what to watch next.\n\n## References\nSources, discussions, PRs, or related files.\n",
+      "enabled": true
+    }
+  ],
+  "hubCards": {
+    "docs": true,
+    "context": false,
+    "source": true,
+    "tests": true,
+    "scripts": false,
+    "readme": true,
+    "agent-docs": false,
+    "product-overview": true,
+    "agent-configuration": true,
+    "features": true
+  },
+  "customHubCards": [
+    {
+      "id": "docs",
+      "title": "Docs",
+      "description": "Project documentation.",
+      "paths": [
+        "docs/"
+      ],
+      "enabled": true,
+      "path": "docs/"
+    },
+    {
+      "id": "product-overview",
+      "title": "Product overview",
+      "description": "Product loop and source map.",
+      "paths": [
+        "docs/product-overview.md"
+      ],
+      "enabled": true,
+      "path": "docs/product-overview.md"
+    },
+    {
+      "id": "agent-configuration",
+      "title": "Agent configuration",
+      "description": "Config fields and agent setup.",
+      "paths": [
+        "docs/agent-configuration.md"
+      ],
+      "enabled": true,
+      "path": "docs/agent-configuration.md"
+    },
+    {
+      "id": "features",
+      "title": "Features",
+      "description": "One page per product feature.",
+      "paths": [
+        "docs/features/"
+      ],
+      "enabled": true,
+      "autoChildren": true,
+      "path": "docs/features/"
+    },
+    {
+      "id": "source",
+      "title": "Source",
+      "description": "Application/source code.",
+      "paths": [
+        "src/",
+        "bin/",
+        "schemas/",
+        "package.json"
+      ],
+      "enabled": true
+    },
+    {
+      "id": "tests",
+      "title": "Tests",
+      "description": "Automated tests.",
+      "paths": [
+        "test/"
+      ],
+      "enabled": true,
+      "path": "test/"
+    },
+    {
+      "id": "readme",
+      "title": "Readme",
+      "description": "Project entry point.",
+      "paths": [
+        "README.md"
+      ],
+      "enabled": true,
+      "path": "README.md"
+    }
+  ],
+  "hubSections": [
+    {
+      "id": "main",
+      "title": "Main",
+      "cards": [
+        {
+          "id": "docs",
+          "title": "Docs",
+          "description": "Project documentation.",
+          "paths": [
+            "docs/"
+          ],
+          "cards": [
+            {
+              "id": "product-overview",
+              "title": "Product overview",
+              "description": "Product loop and source map.",
+              "paths": [
+                "docs/product-overview.md"
+              ],
+              "cards": [],
+              "enabled": true,
+              "path": "docs/product-overview.md"
+            },
+            {
+              "id": "agent-configuration",
+              "title": "Agent configuration",
+              "description": "Config fields and agent setup.",
+              "paths": [
+                "docs/agent-configuration.md"
+              ],
+              "cards": [],
+              "enabled": true,
+              "path": "docs/agent-configuration.md"
+            },
+            {
+              "id": "features",
+              "title": "Features",
+              "description": "One page per product feature.",
+              "paths": [
+                "docs/features/"
+              ],
+              "cards": [],
+              "enabled": true,
+              "autoChildren": true,
+              "path": "docs/features/"
+            }
+          ],
+          "enabled": true,
+          "path": "docs/"
+        },
+        {
+          "id": "source",
+          "title": "Source",
+          "description": "Application/source code.",
+          "paths": [
+            "src/",
+            "bin/",
+            "schemas/",
+            "package.json"
+          ],
+          "cards": [],
+          "enabled": true
+        },
+        {
+          "id": "tests",
+          "title": "Tests",
+          "description": "Automated tests.",
+          "paths": [
+            "test/"
+          ],
+          "cards": [],
+          "enabled": true,
+          "path": "test/"
+        },
+        {
+          "id": "readme",
+          "title": "Readme",
+          "description": "Project entry point.",
+          "paths": [
+            "README.md"
+          ],
+          "cards": [],
+          "enabled": true,
+          "path": "README.md"
+        }
+      ]
+    }
+  ]
+}

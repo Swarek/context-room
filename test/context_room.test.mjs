@@ -11,16 +11,19 @@ import {
   CONFIG_FILE,
   DEFAULT_MARKDOWN_TEMPLATES,
   FILE_THEME_OPTIONS,
+  acknowledgeContextHealthIssue,
   appendAgentAnnotation,
   applyMarkdownTemplateToFile,
   buildAgentBrief,
   buildAgentReviewQueue,
   buildContextRoomDoctorReport,
+  buildContextRoomReports,
   buildDocQaReport,
   buildDocumentationGraph,
   createStartupSkillFile,
   createFolder,
   createMarkdownFile,
+  createMemoryServer,
   createDefaultProjectConfig,
   deleteStartupContextFile,
   deleteMemoryPaths,
@@ -29,17 +32,23 @@ import {
   hubSectionsForRoot,
   initializeContextRoomProject,
   isAllowedMemoryPath,
+  listExplorerFiles,
   listMemoryFiles,
   listStartupContextFiles,
+  listStartupHookFiles,
   listStartupSkillFolders,
   parseDocMetadata,
   readAgentAnnotations,
   readAgentCommand,
   readCollaborationSessionState,
+  readContextHealthAcknowledgements,
   readFileDiff,
+  readGlobalReviewLedger,
+  readMemoryFile,
   readMemoryWebappSettings,
   readReviewBaseFile,
   readStartupContextFile,
+  readStartupHookFile,
   readStartupSkillFile,
   renderAppHtml,
   renderExplorerContextMenuMarkup,
@@ -47,6 +56,7 @@ import {
   revertMemoryFile,
   writeDocReviewBaseline,
   writeStartupContextFile,
+  writeStartupHookFile,
   writeStartupSkillFile,
   writeAgentCommand,
   writeCollaborationSessionState,
@@ -73,6 +83,68 @@ test("rendered app inline script parses before the browser boots it", () => {
   execFileSync(process.execPath, ["--check", scriptPath], { stdio: "pipe" });
   assert.match(script, /function setMode\(mode = "view"\)/);
   assert.doesNotMatch(script, /function setMode\(\)\s*\{\s*state\.mode = "edit"/);
+  assert.match(script, /function diffComparableLine\(line\)/);
+  assert.match(script, /replace\(\/\^\(\\s\*last_verified\\s\*:\)\.\*\/, "\$1 #"\)/);
+  assert.match(script, /replace\(\S+,\s*"\$1#\$2\$3"\)/);
+  assert.match(script, /function diffLinesEqual\(leftLine, rightLine\)/);
+  assert.match(script, /diffLinesEqual\(left\[i\], right\[j\]\)/);
+  assert.match(script, /function reviewIdentityContentForUi\(content\)/);
+  assert.match(script, /function onlyIgnoredReviewMetadataChanged\(leftContent, rightContent\)/);
+});
+
+test("app keeps heavy reports and Git diffs off the critical refresh path", () => {
+  const script = extractInlineAppScript(renderAppHtml());
+  const loadFilesSource = script.slice(script.indexOf("async function loadFiles"), script.indexOf("function reconcileMissingSelectedFile"));
+  const diskRefreshSource = script.slice(script.indexOf("async function refreshFromDisk"), script.indexOf("function scheduleBackgroundRefresh"));
+
+  assert.match(loadFilesSource, /Promise\.all\(\[api\(filesApiPath\(\)\), api\("\/api\/settings"\)\]\)/);
+  assert.doesNotMatch(loadFilesSource, /\/api\/(?:docqa|doctor|startup-context|startup-skills|startup-hooks)/);
+  assert.match(loadFilesSource, /scheduleBackgroundRefresh\(\{ forceReports: true \}\)/);
+  assert.match(script, /const reportsPath = "\/api\/reports"/);
+  assert.match(script, /readFileForOpen\(path, \{ force: options\.forceReload \}\)/);
+  assert.match(diskRefreshSource, /const data = await readSelectedDiskFile\(previousSelected\)/);
+  assert.doesNotMatch(diskRefreshSource, /Promise\.all\(\[[\s\S]*readSelectedDiff/);
+  assert.match(script, /window\.setInterval\(\(\) => scheduleBackgroundRefresh\(\), 5_000\)/);
+});
+
+test("background report and diff endpoints preserve complete results", async (t) => {
+  const root = makeRoot();
+  fs.mkdirSync(path.join(root, "docs"));
+  execFileSync("git", ["init"], { cwd: root, stdio: "ignore" });
+  execFileSync("git", ["config", "user.email", "context-room@example.test"], { cwd: root, stdio: "ignore" });
+  execFileSync("git", ["config", "user.name", "Context Room Test"], { cwd: root, stdio: "ignore" });
+  fs.writeFileSync(path.join(root, "docs", "guide.md"), "# Guide\n");
+  initializeContextRoomProject(root, { allowedPaths: ["docs/"], watchAllow: ["docs/"] });
+  const configPath = path.join(root, CONFIG_FILE);
+  const config = JSON.parse(fs.readFileSync(configPath, "utf8"));
+  config.startupHooks.enabled = false;
+  config.startupSkills.enabled = false;
+  fs.writeFileSync(configPath, JSON.stringify(config, null, 2) + "\n");
+  execFileSync("git", ["add", "."], { cwd: root, stdio: "ignore" });
+  execFileSync("git", ["commit", "-m", "initial"], { cwd: root, stdio: "ignore" });
+  fs.writeFileSync(path.join(root, "docs", "guide.md"), "# Guide\n\nUpdated.\n");
+
+  const direct = buildContextRoomReports(root);
+  assert.equal(direct.docqa.queue[0].path, "docs/guide.md");
+  assert.equal(direct.doctor.docqa.needsReview, 1);
+
+  const { server } = createMemoryServer({ root });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  t.after(() => new Promise((resolve, reject) => server.close((error) => error ? reject(error) : resolve())));
+  const address = server.address();
+  const baseUrl = `http://127.0.0.1:${address.port}`;
+  const [reportsResponse, diffResponse] = await Promise.all([
+    fetch(baseUrl + "/api/reports?fresh=1"),
+    fetch(baseUrl + "/api/file/diff?path=" + encodeURIComponent("docs/guide.md")),
+  ]);
+  const reports = await reportsResponse.json();
+  const diff = await diffResponse.json();
+
+  assert.equal(reportsResponse.status, 200);
+  assert.equal(reports.docqa.queue[0].path, "docs/guide.md");
+  assert.equal(diffResponse.status, 200);
+  assert.equal(diff.changed, true);
+  assert.match(diff.patch, /Updated\./);
 });
 
 test("default config is project-agnostic and supports cards, nested cards, allowed paths, and watched paths", () => {
@@ -87,6 +159,18 @@ test("default config is project-agnostic and supports cards, nested cards, allow
   assert.equal(config.appearance.fileTheme, "context-room");
   assert.equal(config.appearance.autoOpenGitDiff, true);
   assert.deepEqual(config.startupSkills.folderNames, [".codex/skills", "skills"]);
+  assert.equal(config.startupHooks.enabled, true);
+  assert.equal(config.startupHooks.editable, false);
+  assert.equal(config.startupHooks.agentHooks, true);
+  assert.equal(config.startupHooks.codexHooks, true);
+  assert.ok(config.startupHooks.fileNames.includes("pre-commit"));
+  assert.ok(config.startupHooks.agentHookSources.some((source) => source.id === "codex" && source.paths.includes(".codex/hooks.json")));
+  assert.ok(config.startupHooks.agentHookSources.some((source) => source.id === "claude-code" && source.paths.includes(".claude/settings.json")));
+  assert.ok(config.startupHooks.agentHookPaths.includes(".codex/hooks.json"));
+  assert.ok(config.startupHooks.agentHookPaths.includes(".claude/settings.json"));
+  assert.ok(config.startupHooks.agentHookPaths.includes(".opencode/plugins/"));
+  assert.ok(config.startupHooks.codexPaths.includes(".codex/hooks.json"));
+  assert.ok(config.startupHooks.managerPaths.includes(".husky/"));
   assert.ok(FILE_THEME_OPTIONS.some((theme) => theme.id === config.appearance.fileTheme));
   assert.ok(config.allowedPaths.includes("docs/"));
   assert.ok(config.allowedPaths.includes("src/"));
@@ -153,6 +237,48 @@ test("file listing follows project config and does not inject Hermes/LifeOS file
   assert.equal(paths.some((item) => item.includes(".lifeos")), false);
 });
 
+test("explorer listing can show project files outside watched docs as read-only", () => {
+  const root = makeRoot();
+  fs.mkdirSync(path.join(root, "docs"));
+  fs.mkdirSync(path.join(root, "src"));
+  fs.mkdirSync(path.join(root, "node_modules", "pkg"), { recursive: true });
+  fs.writeFileSync(path.join(root, "docs", "guide.md"), "# Guide\n");
+  fs.writeFileSync(path.join(root, "src", "app.ts"), "export const app = true;\n");
+  fs.writeFileSync(path.join(root, "node_modules", "pkg", "hidden.ts"), "export const hidden = true;\n");
+  fs.writeFileSync(path.join(root, ".env.example"), "TOKEN=example\n");
+  initializeContextRoomProject(root, { allowedPaths: ["docs/"], watchAllow: ["docs/"] });
+
+  const files = listExplorerFiles(root);
+  const guide = files.find((file) => file.path === "docs/guide.md");
+  const code = files.find((file) => file.path === "src/app.ts");
+
+  assert.equal(guide?.readOnly, false);
+  assert.equal(code?.readOnly, true);
+  assert.equal(files.some((file) => file.path === "node_modules/pkg/hidden.ts"), false);
+  assert.equal(files.some((file) => file.path === ".env.example"), false);
+});
+
+test("explorer lists env files as redacted sensitive files without exposing values", () => {
+  const root = makeRoot();
+  fs.writeFileSync(path.join(root, ".env"), "DATABASE_URL=postgres://secret\nexport API_TOKEN=super-secret-token\n# ignored\n");
+  initializeContextRoomProject(root, { allowedPaths: ["docs/"], watchAllow: ["docs/"] });
+
+  const files = listExplorerFiles(root);
+  const env = files.find((file) => file.path === ".env");
+  const read = readMemoryFile(root, ".env");
+
+  assert.equal(env?.readOnly, true);
+  assert.equal(env?.sensitive, true);
+  assert.equal(env?.redacted, true);
+  assert.equal(read.readOnly, true);
+  assert.equal(read.sensitive, true);
+  assert.equal(read.redacted, true);
+  assert.match(read.content, /DATABASE_URL/);
+  assert.match(read.content, /API_TOKEN/);
+  assert.doesNotMatch(read.content, /postgres:\/\/secret/);
+  assert.doesNotMatch(read.content, /super-secret-token/);
+});
+
 test("startup context scanner lists configured agent files from ancestors to root", () => {
   const base = makeRoot();
   const parent = path.join(base, "parent");
@@ -195,6 +321,43 @@ test("startup context scanner lists configured agent files from ancestors to roo
   assert.equal(fs.readFileSync(path.join(root, deleted.backupPath), "utf8"), "# Updated Claude\n");
 });
 
+test("startup context scanner includes explicit global agent instruction paths", () => {
+  const originalHome = process.env.HOME;
+  const home = makeRoot();
+  process.env.HOME = home;
+  try {
+    const root = path.join(home, "work", "project");
+    fs.mkdirSync(path.join(home, ".codex"), { recursive: true });
+    fs.mkdirSync(root, { recursive: true });
+    fs.writeFileSync(path.join(home, ".codex", "AGENTS.md"), "# Codex Agents\n");
+    fs.writeFileSync(path.join(root, "AGENTS.md"), "# Project Agents\n");
+    initializeContextRoomProject(root, {
+      allowedPaths: ["docs/"],
+      watchAllow: [],
+    });
+    const configPath = path.join(root, CONFIG_FILE);
+    const config = JSON.parse(fs.readFileSync(configPath, "utf8"));
+    config.startupContext = {
+      enabled: true,
+      fileNames: ["AGENTS.md"],
+      globalPaths: ["~/.codex/AGENTS.md"],
+    };
+    fs.writeFileSync(configPath, JSON.stringify(config, null, 2) + "\n");
+
+    const files = listStartupContextFiles(root);
+    const opened = readStartupContextFile(root, 1);
+
+    assert.deepEqual(files.map((file) => file.startupContext.displayPath), ["~/.codex/AGENTS.md", "~/work/project/AGENTS.md"]);
+    assert.deepEqual(files.map((file) => file.startupContext.explorerPath), ["~/.codex/AGENTS.md", "AGENTS.md"]);
+    assert.equal(files[0].startupContext.source, "global");
+    assert.equal(files[1].startupContext.source, "ancestor");
+    assert.equal(opened.content, "# Codex Agents\n");
+  } finally {
+    if (originalHome === undefined) delete process.env.HOME;
+    else process.env.HOME = originalHome;
+  }
+});
+
 test("opened startup context files can be exposed and selected in the explorer", () => {
   const originalHome = process.env.HOME;
   const base = makeRoot();
@@ -220,6 +383,51 @@ test("opened startup context files can be exposed and selected in the explorer",
     assert.equal(opened.startupContext.displayPath, "~/parent/AGENTS.md");
     assert.equal(opened.startupContext.explorerPath, "~/parent/AGENTS.md");
     assert.ok(files.some((file) => file.path === opened.startupContext.displayPath));
+  } finally {
+    if (originalHome === undefined) delete process.env.HOME;
+    else process.env.HOME = originalHome;
+  }
+});
+
+test("doc QA tracks startup context changes with an internal baseline", () => {
+  const originalHome = process.env.HOME;
+  const base = makeRoot();
+  process.env.HOME = base;
+  try {
+    const parent = path.join(base, "parent");
+    const root = path.join(parent, "project");
+    fs.mkdirSync(root, { recursive: true });
+    fs.writeFileSync(path.join(parent, "AGENTS.md"), "# Parent Agents\n");
+    initializeContextRoomProject(root, {
+      allowedPaths: ["docs/"],
+      watchAllow: [],
+    });
+    const configPath = path.join(root, CONFIG_FILE);
+    const config = JSON.parse(fs.readFileSync(configPath, "utf8"));
+    config.startupContext = { enabled: true, fileNames: ["AGENTS.md"] };
+    fs.writeFileSync(configPath, JSON.stringify(config, null, 2) + "\n");
+
+    const initial = buildDocQaReport(root);
+    fs.writeFileSync(path.join(parent, "AGENTS.md"), "# Parent Agents\n\nNew global rule.\n");
+    const changed = buildDocQaReport(root);
+    const review = readReviewBaseFile(root, "~/parent/AGENTS.md");
+    const baseline = writeDocReviewBaseline(root, "~/parent/AGENTS.md", { note: "inline review applied" });
+    const afterBaseline = buildDocQaReport(root);
+
+    assert.equal(initial.summary.needsReview, 0);
+    assert.equal(changed.summary.needsReview, 1);
+    assert.equal(changed.summary.changedDocs, 1);
+    assert.equal(changed.queue[0].path, "~/parent/AGENTS.md");
+    assert.equal(changed.queue[0].internalChange, true);
+    assert.equal(changed.queue[0].startupContext.order, 1);
+    assert.equal(changed.queue[0].gitStatus.trim(), "M");
+    assert.equal(review.available, true);
+    assert.equal(review.baseline, "review");
+    assert.equal(review.changeKind, "modified");
+    assert.equal(review.baseContent, "# Parent Agents\n");
+    assert.equal(review.currentContent, "# Parent Agents\n\nNew global rule.\n");
+    assert.match(baseline.baselinePath, /\.context-room\/review-baselines\/external\/home\/parent\/AGENTS\.md\.baseline$/);
+    assert.equal(afterBaseline.summary.needsReview, 0);
   } finally {
     if (originalHome === undefined) delete process.env.HOME;
     else process.env.HOME = originalHome;
@@ -327,17 +535,145 @@ test("startup skill folders can be exposed in the explorer for file and folder c
   }
 });
 
+test("startup hooks scanner lists Git hooks and hook-manager files", () => {
+  const root = makeRoot();
+  execFileSync("git", ["init"], { cwd: root, stdio: "ignore" });
+  execFileSync("git", ["config", "user.email", "context-room@example.test"], { cwd: root, stdio: "ignore" });
+  execFileSync("git", ["config", "user.name", "Context Room Test"], { cwd: root, stdio: "ignore" });
+  const gitHooksDir = execFileSync("git", ["rev-parse", "--path-format=absolute", "--git-path", "hooks"], { cwd: root, encoding: "utf8" }).trim();
+  fs.writeFileSync(path.join(gitHooksDir, "pre-commit"), "#!/bin/sh\n# Run secret checks\n# Run type checks\necho git hook\n");
+  fs.chmodSync(path.join(gitHooksDir, "pre-commit"), 0o755);
+  fs.mkdirSync(path.join(root, ".husky"), { recursive: true });
+  fs.writeFileSync(path.join(root, ".husky", "pre-push"), "#!/bin/sh\necho husky\n");
+  fs.chmodSync(path.join(root, ".husky", "pre-push"), 0o755);
+  fs.writeFileSync(path.join(root, "package.json"), JSON.stringify({ "lint-staged": { "*.js": "eslint" } }, null, 2) + "\n");
+  execFileSync("git", ["add", ".husky/pre-push", "package.json"], { cwd: root, stdio: "ignore" });
+  initializeContextRoomProject(root, { allowedPaths: ["docs/"], watchAllow: [] });
+  const configPath = path.join(root, CONFIG_FILE);
+  const config = JSON.parse(fs.readFileSync(configPath, "utf8"));
+  config.startupHooks = {
+    enabled: true,
+    editable: false,
+    gitHooks: true,
+    hookManagers: true,
+    fileNames: ["pre-commit", "pre-push"],
+    managerPaths: [".husky/", "package.json"],
+  };
+  fs.writeFileSync(configPath, JSON.stringify(config, null, 2) + "\n");
+
+  const hooks = listStartupHookFiles(root);
+  const gitHook = hooks.find((file) => file.startupHook.source === "git-hooks");
+  const huskyHook = hooks.find((file) => file.startupHook.source === "husky");
+  const packageHook = hooks.find((file) => file.startupHook.source === "package-hooks");
+  const opened = readStartupHookFile(root, gitHook.startupHook.order);
+
+  assert.equal(hooks.length, 3);
+  assert.equal(gitHook.startupHook.fileName, "pre-commit");
+  assert.equal(gitHook.startupHook.label, "Git pre-commit hook");
+  assert.equal(gitHook.startupHook.description, "Run secret checks · Run type checks");
+  assert.equal(gitHook.startupHook.executable, true);
+  assert.equal(gitHook.startupHook.tracked, false);
+  assert.equal(gitHook.startupHook.readOnly, true);
+  assert.equal(huskyHook.startupHook.fileName, "pre-push");
+  assert.equal(huskyHook.startupHook.tracked, true);
+  assert.equal(packageHook.startupHook.fileName, "package.json");
+  assert.match(opened.content, /git hook/);
+  assert.equal(opened.startupContext.kind, "startup-hook");
+  assert.throws(() => writeStartupHookFile(root, gitHook.startupHook.order, "#!/bin/sh\necho blocked\n"), /editing is disabled/);
+
+  config.startupHooks.editable = true;
+  fs.writeFileSync(configPath, JSON.stringify(config, null, 2) + "\n");
+  const written = writeStartupHookFile(root, huskyHook.startupHook.order, "#!/bin/sh\necho updated\n");
+  assert.equal(readStartupHookFile(root, huskyHook.startupHook.order).content, "#!/bin/sh\necho updated\n");
+  assert.equal(written.startupContext.readOnly, false);
+
+  const graph = buildDocumentationGraph(root);
+  assert.equal(graph.summary.startupHooks, 3);
+  assert.ok(graph.startupHooks.some((file) => file.startupContext.source === "git-hooks"));
+});
+
+test("startup hooks scanner lists agent hooks from Codex, Claude Code, and OpenCode", () => {
+  const repo = makeRoot();
+  const root = path.join(repo, "project");
+  fs.mkdirSync(root, { recursive: true });
+  execFileSync("git", ["init"], { cwd: repo, stdio: "ignore" });
+  execFileSync("git", ["config", "user.email", "context-room@example.test"], { cwd: repo, stdio: "ignore" });
+  execFileSync("git", ["config", "user.name", "Context Room Test"], { cwd: repo, stdio: "ignore" });
+  fs.mkdirSync(path.join(repo, ".codex", "hooks"), { recursive: true });
+  fs.writeFileSync(path.join(repo, ".codex", "hooks", "protect.py"), "#!/usr/bin/env python3\n\"\"\"Protect risky tool calls before execution.\"\"\"\nprint('protect')\n");
+  fs.writeFileSync(path.join(repo, ".codex", "hooks.json"), JSON.stringify({
+    hooks: {
+      PreToolUse: [{
+        hooks: [{
+          type: "command",
+          command: "/bin/sh -lc 'repo_root=$(git rev-parse --show-toplevel); exec /usr/bin/python3 \"$repo_root/.codex/hooks/protect.py\"'",
+          timeout: 5,
+        }],
+      }],
+    },
+  }, null, 2) + "\n");
+  fs.mkdirSync(path.join(repo, ".claude", "hooks"), { recursive: true });
+  fs.writeFileSync(path.join(repo, ".claude", "hooks", "audit.sh"), "#!/bin/sh\n# Check Claude Code edits\necho audit\n");
+  fs.writeFileSync(path.join(repo, ".claude", "settings.json"), JSON.stringify({
+    hooks: {
+      PostToolUse: [{
+        hooks: [{
+          type: "command",
+          command: ".claude/hooks/audit.sh",
+        }],
+      }],
+    },
+  }, null, 2) + "\n");
+  fs.mkdirSync(path.join(repo, ".opencode", "plugins"), { recursive: true });
+  fs.writeFileSync(path.join(repo, ".opencode", "plugins", "policy.ts"), "/** Checks OpenCode tool activity. */\nexport default {}\n");
+  execFileSync("git", ["add", ".codex/hooks.json", ".codex/hooks/protect.py", ".claude/settings.json", ".claude/hooks/audit.sh", ".opencode/plugins/policy.ts"], { cwd: repo, stdio: "ignore" });
+  initializeContextRoomProject(root, { allowedPaths: ["docs/"], watchAllow: [] });
+
+  const hooks = listStartupHookFiles(root);
+  const codexConfig = hooks.find((file) => file.startupHook.source === "codex-agent-hooks");
+  const codexScript = hooks.find((file) => file.startupHook.source === "codex-agent-hook-script");
+  const claudeConfig = hooks.find((file) => file.startupHook.source === "claude-agent-hooks");
+  const claudeScript = hooks.find((file) => file.startupHook.source === "claude-agent-hook-script");
+  const opencodePlugin = hooks.find((file) => file.startupHook.source === "opencode-agent-plugin");
+
+  assert.ok(codexConfig);
+  assert.ok(codexScript);
+  assert.ok(claudeConfig);
+  assert.ok(claudeScript);
+  assert.ok(opencodePlugin);
+  assert.equal(codexConfig.startupHook.provider, "codex");
+  assert.equal(claudeConfig.startupHook.provider, "claude");
+  assert.equal(opencodePlugin.startupHook.provider, "opencode");
+  assert.equal(codexConfig.startupHook.tracked, true);
+  assert.equal(codexConfig.startupHook.event, "hooks.json");
+  assert.match(codexConfig.startupHook.description, /Defines Codex hook events/);
+  assert.equal(codexScript.startupHook.tracked, true);
+  assert.equal(codexScript.startupHook.event, "PreToolUse");
+  assert.equal(codexScript.startupHook.label, "PreToolUse · protect.py");
+  assert.equal(codexScript.startupHook.description, "Protect risky tool calls before execution.");
+  assert.equal(codexScript.startupHook.commandSummary, "runs .codex/hooks/protect.py");
+  assert.equal(claudeScript.startupHook.event, "PostToolUse");
+  assert.equal(claudeScript.startupHook.commandSummary, "runs .claude/hooks/audit.sh");
+  assert.equal(opencodePlugin.startupHook.label, "OpenCode hooks · policy.ts");
+  assert.equal(opencodePlugin.startupHook.description, "Checks OpenCode tool activity.");
+  assert.match(readStartupHookFile(root, codexScript.startupHook.order).content, /protect/);
+});
+
 test("startup context virtual files stay out of the explorer tree", () => {
   const html = renderAppHtml();
 
   assert.match(html, /api\("\/api\/startup-context"\)/);
   assert.match(html, /api\("\/api\/startup-skills"\)/);
+  assert.match(html, /api\("\/api\/startup-hooks"\)/);
+  assert.match(html, /api\("\/api\/startup-hooks\/file\?order="/);
   assert.match(html, /api\("\/api\/startup-skills\/file\?folder="/);
   assert.match(html, /api\("\/api\/startup-skills\/create"/);
   assert.match(html, /api\("\/api\/startup-skills\/delete"/);
   assert.match(html, /function renderStartupSkillsPanel\(\)/);
-  assert.match(html, /function selectStartupSkillFile\(folderOrder, skillName\)/);
-  assert.match(html, /const selectedPath = startupContextSelectedExplorerPath\(data\.startupContext\);[\s\S]*state\.selected = selectedPath \|\| selectedKey;/);
+  assert.match(html, /function renderStartupHooksPanel\(\)/);
+  assert.match(html, /function selectStartupSkillFile\(folderOrder, skillName, options = \{\}\)/);
+  assert.match(html, /function selectStartupHookFile\(order, options = \{\}\)/);
+  assert.match(html, /const selectedPath = startupContextSelectedExplorerPath\(data\.startupContext\);[\s\S]*const finalPath = selectedPath \|\| selectedKey;[\s\S]*state\.selected = finalPath;/);
   assert.match(html, /state\.selected = startupSkillSelectedExplorerPath\(data\.startupContext\) \|\| selectedKey;/);
   assert.match(html, /function createStartupSkillFromPanel\(folderOrder\)/);
   assert.match(html, /function submitStartupSkillCreateForm\(folderOrder\)/);
@@ -363,7 +699,34 @@ test("startup context virtual files stay out of the explorer tree", () => {
   assert.match(html, /activeStartupSkillExplorer: null/);
   assert.match(html, /activeStartupContextExplorer: null/);
   assert.match(html, /Startup skills/);
+  assert.match(html, /Startup hooks/);
+  assert.match(html, /startupHooksHelpOpen: false/);
+  assert.match(html, /startupHookFilter: "all"/);
+  assert.match(html, /data-startup-hooks-help/);
+  assert.match(html, /data-startup-hook-filter/);
+  assert.match(html, /function setStartupHookFilter\(filter = "all"\)/);
+  assert.match(html, /function startupHookKind\(hook = \{\}\)/);
+  assert.match(html, /startupHookFilterLabel\(kind = "all", files = \[\]\)/);
+  assert.match(html, /function startupHookFilterOptions\(files = \[\]/);
+  assert.match(html, /state\.startupHooksHelpOpen = Boolean\(event\.currentTarget\.open\)/);
+  assert.match(html, /Agent hook sources and related hooks/);
+  assert.match(html, /Agent hook sources/);
+  assert.match(html, /Codex/);
+  assert.match(html, /Claude Code/);
+  assert.match(html, /OpenCode/);
+  assert.match(html, /Common agent events/);
+  assert.match(html, /Before tool use/);
+  assert.match(html, /After tool use/);
+  assert.match(html, /User prompt/);
+  assert.match(html, /Session start\/stop/);
+  assert.match(html, /Config and plugins/);
+  assert.match(html, /Git hooks/);
+  assert.match(html, /Hook managers/);
+  assert.match(html, /Examples include Husky/);
+  assert.match(html, /class="startup-hook-kind/);
+  assert.match(html, /\.startup-hook-filter/);
   assert.match(html, /startupSkillFolders: \[\]/);
+  assert.match(html, /startupHookFiles: \[\]/);
   assert.match(html, /data-startup-skill-name/);
   assert.match(html, /data-startup-skill-delete/);
   assert.match(html, /data-startup-skill-create-folder/);
@@ -376,7 +739,13 @@ test("startup context virtual files stay out of the explorer tree", () => {
   assert.doesNotMatch(html, /\.startup-skill-pill:hover[^}]*grid-template-columns/);
   assert.match(html, /\.startup-skill-add/);
   assert.match(html, /id="startupSkillsEnabled"/);
+  assert.match(html, /id="startupHooksEnabled"/);
+  assert.match(html, /id="startupHooksEditable"/);
+  assert.match(html, /id="startupAgentHooks"/);
+  assert.match(html, /id="startupAgentHookSources"/);
+  assert.match(html, /Name \| config path \| plugin folder/);
   assert.match(html, /data-startup-order/);
+  assert.match(html, /data-startup-hook-order/);
   assert.doesNotMatch(html, /data-startup-file/);
   assert.doesNotMatch(html, /@startup-context/);
   assert.doesNotMatch(html, /\$startup-context/);
@@ -406,9 +775,11 @@ test("init adds Context Room runtime files to local Git excludes", () => {
   const exclude = fs.readFileSync(path.isAbsolute(excludePath) ? excludePath : path.join(root, excludePath), "utf8");
 
   assert.match(exclude, /Context Room runtime state/);
+  assert.match(exclude, /\.context-room\/review-ledger\.json/);
   assert.match(exclude, /\.context-room\/session-state\.json/);
   assert.match(exclude, /\.context-room\/agent-command\.json/);
   assert.match(exclude, /\.context-room\/agent-annotations\.json/);
+  assert.match(exclude, /\.context-room\/health-acknowledgements\.json/);
   assert.match(exclude, /\.context-room\/review-baselines\//);
 });
 
@@ -423,6 +794,7 @@ test("runtime Git excludes are scoped when Context Room root is a Git subdirecto
 
   assert.match(exclude, /project\/\.context-room\/session-state\.json/);
   assert.match(exclude, /project\/\.context-room\/agent-command\.json/);
+  assert.match(exclude, /^\.context-room\/review-ledger\.json$/m);
   assert.match(exclude, /project\/\.context-room\/review-baselines\//);
   assert.match(exclude, /project\/\.context-room\/memory-webapp-backups\//);
 });
@@ -468,6 +840,102 @@ test("CLI guard blocks commits when watched docs changed without review", () => 
       return true;
     },
   );
+});
+
+test("shared review ledger verifies the same absolute path and content across rooms", () => {
+  const root = makeRoot();
+  execFileSync("git", ["init"], { cwd: root, stdio: "ignore" });
+  execFileSync("git", ["config", "user.email", "context-room@example.test"], { cwd: root, stdio: "ignore" });
+  execFileSync("git", ["config", "user.name", "Context Room Test"], { cwd: root, stdio: "ignore" });
+  fs.writeFileSync(path.join(root, "README.md"), "# Demo\n");
+  initializeContextRoomProject(root, { allowedPaths: ["README.md"], watchAllow: ["README.md"] });
+  execFileSync("git", ["add", "."], { cwd: root, stdio: "ignore" });
+  execFileSync("git", ["commit", "-m", "initial"], { cwd: root, stdio: "ignore" });
+  fs.writeFileSync(path.join(root, "README.md"), "# Demo\n\nShared review.\n");
+
+  assert.equal(buildDocQaReport(root).queue.some((item) => item.path === "README.md"), true);
+  const verified = writeDocReviewDecision(root, "README.md", { status: "verified", note: "global proof" });
+  const ledger = readGlobalReviewLedger(root);
+  const entries = Object.values(ledger.reviews);
+  assert.equal(entries.length, 1);
+  assert.equal(entries[0].absolutePath, fs.realpathSync(path.join(root, "README.md")));
+  assert.equal(entries[0].contentHash, verified.contentHash);
+
+  fs.unlinkSync(path.join(root, ".context-room", "review-ledger.json"));
+  assert.equal(buildDocQaReport(root).queue.some((item) => item.path === "README.md"), false);
+  assert.equal(Object.values(readGlobalReviewLedger(root).reviews).length, 1);
+
+  fs.unlinkSync(path.join(root, ".context-room", "review-state.json"));
+  assert.equal(buildDocQaReport(root).queue.some((item) => item.path === "README.md"), false);
+
+  writeDocReviewDecision(root, "README.md", { status: "unverified" });
+  assert.equal(buildDocQaReport(root).queue.some((item) => item.path === "README.md"), true);
+});
+
+test("last_verified-only edits preserve local and global review trust", () => {
+  const root = makeRoot();
+  execFileSync("git", ["init"], { cwd: root, stdio: "ignore" });
+  execFileSync("git", ["config", "user.email", "context-room@example.test"], { cwd: root, stdio: "ignore" });
+  execFileSync("git", ["config", "user.name", "Context Room Test"], { cwd: root, stdio: "ignore" });
+  const contentFor = (date, body = "Stable truth.") => `---\ncontext_room:\n  kind: canonical\n  scope: demo\n  status: current\n  canonical_for: guide\n  last_verified: ${date}\n  sources: []\n---\n\n# Guide\n\n${body}\n`;
+  fs.writeFileSync(path.join(root, "README.md"), contentFor("2026-07-07"));
+  initializeContextRoomProject(root, { allowedPaths: ["README.md"], watchAllow: ["README.md"] });
+  execFileSync("git", ["add", "."], { cwd: root, stdio: "ignore" });
+  execFileSync("git", ["commit", "-m", "initial"], { cwd: root, stdio: "ignore" });
+  writeDocReviewDecision(root, "README.md", { status: "verified" });
+
+  const reviewStatePath = path.join(root, ".context-room", "review-state.json");
+  const ledgerPath = path.join(root, ".context-room", "review-ledger.json");
+  const legacyState = JSON.parse(fs.readFileSync(reviewStatePath, "utf8"));
+  delete legacyState.reviews["README.md"].reviewHash;
+  delete legacyState.reviews["README.md"].baselineReviewHash;
+  fs.writeFileSync(reviewStatePath, JSON.stringify(legacyState, null, 2) + "\n");
+  const legacyLedger = JSON.parse(fs.readFileSync(ledgerPath, "utf8"));
+  for (const review of Object.values(legacyLedger.reviews)) delete review.reviewHash;
+  fs.writeFileSync(ledgerPath, JSON.stringify(legacyLedger, null, 2) + "\n");
+
+  fs.writeFileSync(path.join(root, "README.md"), contentFor("2026-07-09"));
+  assert.equal(buildDocQaReport(root).queue.some((item) => item.path === "README.md"), false);
+  const migratedState = JSON.parse(fs.readFileSync(reviewStatePath, "utf8"));
+  const migratedLedger = JSON.parse(fs.readFileSync(ledgerPath, "utf8"));
+  assert.match(migratedState.reviews["README.md"].reviewHash, /^[a-f0-9]{64}$/);
+  assert.ok(Object.values(migratedLedger.reviews).every((review) => /^[a-f0-9]{64}$/.test(review.reviewHash)));
+
+  fs.unlinkSync(reviewStatePath);
+  fs.writeFileSync(path.join(root, "README.md"), contentFor("2026-07-10"));
+  assert.equal(buildDocQaReport(root).queue.some((item) => item.path === "README.md"), false);
+
+  fs.writeFileSync(path.join(root, "README.md"), contentFor("2026-07-10", "Changed truth."));
+  assert.equal(buildDocQaReport(root).queue.some((item) => item.path === "README.md"), true);
+});
+
+test("last_verified-only Git edits do not require review without prior trust", () => {
+  const root = makeRoot();
+  execFileSync("git", ["init"], { cwd: root, stdio: "ignore" });
+  execFileSync("git", ["config", "user.email", "context-room@example.test"], { cwd: root, stdio: "ignore" });
+  execFileSync("git", ["config", "user.name", "Context Room Test"], { cwd: root, stdio: "ignore" });
+  const contentFor = (date, body = "Stable truth.") => `---\ncontext_room:\n  kind: canonical\n  scope: demo\n  status: current\n  canonical_for: guide\n  last_verified: ${date}\n  sources: []\n---\n\n# Guide\n\n${body}\n`;
+  fs.writeFileSync(path.join(root, "README.md"), contentFor("2026-07-07"));
+  initializeContextRoomProject(root, { allowedPaths: ["README.md"], watchAllow: ["README.md"] });
+  execFileSync("git", ["add", "."], { cwd: root, stdio: "ignore" });
+  execFileSync("git", ["commit", "-m", "initial"], { cwd: root, stdio: "ignore" });
+
+  fs.writeFileSync(path.join(root, "README.md"), contentFor("2026-07-09"));
+  assert.deepEqual(buildDocQaReport(root).queue, []);
+
+  const configPath = path.join(root, CONFIG_FILE);
+  const config = JSON.parse(fs.readFileSync(configPath, "utf8"));
+  config.reviewPaths = ["README.md"];
+  fs.writeFileSync(configPath, JSON.stringify(config, null, 2) + "\n");
+  const requiredReview = buildDocQaReport(root);
+  assert.equal(requiredReview.queue.length, 1);
+  assert.equal(requiredReview.queue[0].reviewRequired, true);
+  assert.equal(requiredReview.queue[0].gitStatus, "");
+  assert.equal(requiredReview.summary.changedDocs, 0);
+  assert.equal(requiredReview.summary.requiredReview, 1);
+
+  fs.writeFileSync(path.join(root, "README.md"), contentFor("2026-07-09", "Changed truth."));
+  assert.notEqual(buildDocQaReport(root).queue[0].gitStatus.trim(), "");
 });
 
 test("collaboration state, commands, annotations, and queue are agent-safe", () => {
@@ -549,6 +1017,92 @@ test("doc QA detects watched changes when context root is a git subdirectory", (
   assert.equal(report.summary.needsReview, 1);
   assert.equal(report.queue[0].path, "AGENTS.md");
   assert.equal(report.queue[0].gitStatus.trim(), "M");
+});
+
+test("doc QA reports Git renames as a single renamed review item", () => {
+  const root = makeRoot();
+  fs.mkdirSync(path.join(root, "docs"));
+  execFileSync("git", ["init"], { cwd: root, stdio: "ignore" });
+  execFileSync("git", ["config", "user.email", "context-room@example.test"], { cwd: root, stdio: "ignore" });
+  execFileSync("git", ["config", "user.name", "Context Room Test"], { cwd: root, stdio: "ignore" });
+  fs.writeFileSync(path.join(root, "docs", "agent-bridge.md"), "# Agent Bridge\n\nCLI contract.\n");
+  initializeContextRoomProject(root, { allowedPaths: ["docs/"], watchAllow: ["docs/"] });
+  execFileSync("git", ["add", "."], { cwd: root, stdio: "ignore" });
+  execFileSync("git", ["commit", "-m", "initial"], { cwd: root, stdio: "ignore" });
+  execFileSync("git", ["mv", "docs/agent-bridge.md", "docs/agent-cli.md"], { cwd: root, stdio: "ignore" });
+
+  const report = buildDocQaReport(root);
+  const item = report.queue[0];
+  const reviewBase = readReviewBaseFile(root, "docs/agent-cli.md");
+  const diff = readFileDiff(root, "docs/agent-cli.md");
+
+  assert.equal(report.summary.changedDocs, 1);
+  assert.equal(report.summary.needsReview, 1);
+  assert.equal(item.path, "docs/agent-cli.md");
+  assert.equal(item.oldPath, "docs/agent-bridge.md");
+  assert.equal(item.gitStatus.trim(), "R");
+  assert.equal(reviewBase.changeKind, "renamed");
+  assert.equal(reviewBase.oldPath, "docs/agent-bridge.md");
+  assert.equal(reviewBase.baseContent, "# Agent Bridge\n\nCLI contract.\n");
+  assert.match(diff.patch, /rename from docs\/agent-bridge\.md/);
+  assert.match(diff.patch, /rename to docs\/agent-cli\.md/);
+});
+
+test("doc QA infers unstaged filesystem renames before Git reports R status", () => {
+  const root = makeRoot();
+  fs.mkdirSync(path.join(root, "docs"));
+  execFileSync("git", ["init"], { cwd: root, stdio: "ignore" });
+  execFileSync("git", ["config", "user.email", "context-room@example.test"], { cwd: root, stdio: "ignore" });
+  execFileSync("git", ["config", "user.name", "Context Room Test"], { cwd: root, stdio: "ignore" });
+  fs.writeFileSync(path.join(root, "docs", "agent-bridge.md"), "# Agent Bridge\n\nThe agent bridge lets coding agents open docs through the CLI.\n\n## Rules\n\n- Agents can navigate and annotate.\n- Humans verify the review queue.\n");
+  initializeContextRoomProject(root, { allowedPaths: ["docs/"], watchAllow: ["docs/"] });
+  execFileSync("git", ["add", "."], { cwd: root, stdio: "ignore" });
+  execFileSync("git", ["commit", "-m", "initial"], { cwd: root, stdio: "ignore" });
+  fs.renameSync(path.join(root, "docs", "agent-bridge.md"), path.join(root, "docs", "agent-cli.md"));
+  fs.writeFileSync(path.join(root, "docs", "agent-cli.md"), "# Agent CLI\n\nThe agent CLI lets coding agents open docs through the CLI.\n\n## Rules\n\n- Agents can navigate and annotate.\n- Humans verify the review queue.\n");
+
+  const report = buildDocQaReport(root);
+  const reviewBase = readReviewBaseFile(root, "docs/agent-cli.md");
+  const diff = readFileDiff(root, "docs/agent-cli.md");
+
+  assert.equal(report.summary.changedDocs, 1);
+  assert.equal(report.summary.needsReview, 1);
+  assert.equal(report.queue[0].path, "docs/agent-cli.md");
+  assert.equal(report.queue[0].oldPath, "docs/agent-bridge.md");
+  assert.equal(report.queue[0].gitStatus.trim(), "R");
+  assert.equal(report.queue.some((item) => item.path === "docs/agent-bridge.md"), false);
+  assert.equal(reviewBase.changeKind, "renamed");
+  assert.equal(reviewBase.oldPath, "docs/agent-bridge.md");
+  assert.match(reviewBase.baseContent, /# Agent Bridge/);
+  assert.match(diff.patch, /rename from docs\/agent-bridge\.md/);
+  assert.match(diff.patch, /rename to docs\/agent-cli\.md/);
+});
+
+test("doc QA infers review-baseline renames for untracked verified docs", () => {
+  const root = makeRoot();
+  fs.mkdirSync(path.join(root, "docs"));
+  execFileSync("git", ["init"], { cwd: root, stdio: "ignore" });
+  fs.writeFileSync(path.join(root, "docs", "app-overview.md"), "---\ncontext_room:\n  kind: canonical\n  scope: context-room\n  status: current\n  canonical_for: app overview\n---\n\n# App Overview\n\nContext Room maps docs and source files.\n");
+  initializeContextRoomProject(root, { allowedPaths: ["docs/"], watchAllow: ["docs/"], reviewPaths: ["docs/"] });
+  writeDocReviewBaseline(root, "docs/app-overview.md", { note: "verified from Context Room review queue" });
+
+  fs.renameSync(path.join(root, "docs", "app-overview.md"), path.join(root, "docs", "product-overview.md"));
+  fs.writeFileSync(path.join(root, "docs", "product-overview.md"), "---\ncontext_room:\n  kind: canonical\n  scope: context-room\n  status: current\n  canonical_for: product overview\n---\n\n# Product Overview\n\nContext Room maps docs and source files.\n");
+
+  const report = buildDocQaReport(root);
+  const item = report.queue.find((entry) => entry.path === "docs/product-overview.md");
+  const reviewBase = readReviewBaseFile(root, "docs/product-overview.md");
+  const diff = readFileDiff(root, "docs/product-overview.md");
+
+  assert.ok(item);
+  assert.equal(item.oldPath, "docs/app-overview.md");
+  assert.equal(item.gitStatus.trim(), "R");
+  assert.equal(report.queue.some((entry) => entry.path === "docs/app-overview.md"), false);
+  assert.equal(reviewBase.changeKind, "renamed");
+  assert.equal(reviewBase.oldPath, "docs/app-overview.md");
+  assert.match(reviewBase.baseContent, /# App Overview/);
+  assert.match(diff.patch, /rename from docs\/app-overview\.md/);
+  assert.match(diff.patch, /rename to docs\/product-overview\.md/);
 });
 
 test("doc QA review queue follows a human docs verification order", () => {
@@ -736,6 +1290,7 @@ test("review base prefers the last inline review baseline over HEAD", () => {
 
   const baseline = writeDocReviewBaseline(root, "README.md", { note: "inline review applied" });
   const unchanged = readReviewBaseFile(root, "README.md");
+  const reportAfterInlineBaseline = buildDocQaReport(root);
   fs.writeFileSync(path.join(root, "README.md"), "# Demo\n\nAlready reviewed.\n\nNew small edit.\n");
   const next = readReviewBaseFile(root, "README.md");
 
@@ -743,6 +1298,7 @@ test("review base prefers the last inline review baseline over HEAD", () => {
   assert.equal(unchanged.baseline, "review");
   assert.equal(unchanged.changeKind, "unchanged");
   assert.equal(unchanged.baseContent, unchanged.currentContent);
+  assert.equal(reportAfterInlineBaseline.queue.some((item) => item.path === "README.md"), false);
   assert.equal(next.baseline, "review");
   assert.equal(next.changeKind, "modified");
   assert.equal(next.baseContent, "# Demo\n\nAlready reviewed.\n");
@@ -1002,7 +1558,34 @@ context_room:
   assert.equal(graph.nodes.find((node) => node.path === "docs/billing.md")?.metadata.present, true);
   assert.ok(graph.healthIssues.some((issue) => issue.type === "broken_source" && issue.path === "docs/billing-copy.md"));
   assert.ok(graph.healthIssues.some((issue) => issue.type === "duplicate_canonical" && issue.path === "docs/billing.md"));
-  assert.ok(graph.healthIssues.some((issue) => issue.type === "missing_metadata" && issue.path === "docs/plain.md"));
+  assert.equal(graph.summary.missingMetadata, 1);
+  assert.equal(graph.healthIssues.some((issue) => issue.type === "missing_metadata" && issue.path === "docs/plain.md"), false);
+});
+
+test("documentation graph resolves inline references from project sub-roots", () => {
+  const root = makeRoot();
+  fs.mkdirSync(path.join(root, "projects", "hicharlie", "website", "docs"), { recursive: true });
+  fs.writeFileSync(path.join(root, "projects", "hicharlie", "website", "docs", "PRODUCT.md"), "# Product\n");
+  fs.writeFileSync(path.join(root, "projects", "hicharlie", "website", "docs", "DEPLOYMENT.md"), `---
+context_room:
+  kind: procedure
+  scope: hicharlie
+  status: current
+  canonical_for: deployment
+  last_verified: 2026-06-26
+  sources: []
+---
+
+See \`docs/PRODUCT.md\`.
+`);
+  initializeContextRoomProject(root, {
+    allowedPaths: ["projects/hicharlie/website/docs/"],
+    watchAllow: ["projects/hicharlie/website/docs/"],
+  });
+
+  const graph = buildDocumentationGraph(root);
+
+  assert.equal(graph.healthIssues.some((issue) => issue.type === "broken_reference" && issue.path === "projects/hicharlie/website/docs/DEPLOYMENT.md"), false);
 });
 
 test("documentation graph ignores non-context-room YAML frontmatter", () => {
@@ -1073,6 +1656,40 @@ context_room:
   assert.match(brief, /No watched documentation changes are pending review/);
 });
 
+test("doctor report keeps acknowledged health issues visible but marked", () => {
+  const root = makeRoot();
+  fs.mkdirSync(path.join(root, "docs"), { recursive: true });
+  fs.writeFileSync(path.join(root, "docs", "plain.md"), `---
+context_room:
+  kind: canonical
+  scope: docs
+  status: current
+  canonical_for: plain
+  last_verified: 2026-06-26
+  sources: [missing.md]
+---
+
+# Plain
+`);
+  initializeContextRoomProject(root, { allowedPaths: ["docs/"], watchAllow: ["docs/"] });
+
+  const before = buildContextRoomDoctorReport(root);
+  const issue = before.issues.find((item) => item.type === "broken_source" && item.path === "docs/plain.md");
+  assert.ok(issue?.key);
+  assert.equal(issue.acknowledged, false);
+
+  const result = acknowledgeContextHealthIssue(root, { key: issue.key, note: "Known docs gap" });
+  const saved = readContextHealthAcknowledgements(root);
+  const after = buildContextRoomDoctorReport(root);
+  const acknowledged = after.issues.find((item) => item.key === issue.key);
+
+  assert.equal(result.issue.acknowledged, true);
+  assert.equal(saved.issues[issue.key].note, "Known docs gap");
+  assert.equal(acknowledged?.acknowledged, true);
+  assert.equal(after.acknowledgedIssues, 1);
+  assert.ok(after.issues.some((item) => item.type === "broken_source" && item.path === "docs/plain.md"));
+});
+
 test("explorer context menu renders action choices and keeps creation forms hidden", () => {
   const html = renderExplorerContextMenuMarkup({
     targetPath: "docs/guide.md",
@@ -1115,7 +1732,13 @@ test("explorer rendering uses a cache and delegated tree events", () => {
 
   assert.match(html, /explorerRenderKey:\s*""/);
   assert.match(html, /function explorerRenderKey\(files\)/);
+  assert.match(html, /function explorerWatchCounts\(\)/);
+  assert.match(html, /function renderExplorerEmptyState\(\)/);
+  assert.match(html, /data-watch-label="all"/);
+  assert.match(html, /data-watch-label="watched"/);
+  assert.match(html, /No not-watched files in this project\./);
   assert.match(html, /if \(!force && state\.explorerRenderKey === nextKey\)/);
+  assert.doesNotMatch(html, /if \(state\.explorerWatchFilter !== "all"\) expandExplorerFilterResults\(\);/);
   assert.match(html, /function wireExplorerTreeEvents\(\)/);
   assert.match(html, /holder\.dataset\.wired === "true"/);
   assert.match(html, /holder\.addEventListener\("click", \(event\) =>/);
@@ -1268,6 +1891,8 @@ test("card hover spotlight follows the pointer without intercepting clicks", () 
   assert.match(html, /const SPOTLIGHT_CARD_SELECTOR = ".*\.hub-folder-card.*\.startup-context-item:not\(\.startup-skill-folder\).*\.settings-section.*\.hub-card-editor/);
   assert.match(html, /function updateCardSpotlightAt\(x, y\)/);
   assert.match(html, /function scheduleCardSpotlightUpdate\(\)/);
+  assert.match(html, /const pointer = spotlightPointer;/);
+  assert.match(html, /if \(spotlightPointer !== pointer\) return;/);
   assert.match(html, /spotlightFrame = window\.requestAnimationFrame/);
   assert.match(html, /document\.elementFromPoint\(x, y\)/);
   assert.match(html, /function updateCardSpotlight\(event\)/);
@@ -1327,6 +1952,8 @@ test("rendered app supports selectable file themes and colored markdown reading"
   assert.match(html, /function autoOpenGitDiffEnabled\(\)/);
   assert.match(html, /function collapsedByGitDiffPreference\(diff\)/);
   assert.match(html, /autoOpenGitDiff:\s*el\("autoOpenGitDiff"\)\?\.checked !== false/);
+  assert.doesNotMatch(html, /autoAdvanceReview/);
+  assert.doesNotMatch(html, /Auto-open next review/);
   assert.match(html, /renderFileThemeOptions\(appearance\.fileTheme\)/);
   assert.match(html, /:root\[data-file-theme="dracula"\]\s*\{[\s\S]*--bg:\s*#282a36;[\s\S]*--panel:/);
   assert.match(html, /:root\[data-file-theme="light-plus"\]\s*\{[\s\S]*color-scheme:\s*light;[\s\S]*--bg:\s*#f6f8fa;[\s\S]*--on-accent:\s*#ffffff/);
@@ -1384,6 +2011,8 @@ test("rendered app supports selectable file themes and colored markdown reading"
   assert.match(html, /\.external-review-line \{[^}]*position:\s*relative/);
   assert.doesNotMatch(html, /\.external-review-line \{[^}]*grid-template-columns/);
   assert.match(html, /\.external-review-line::before \{[^}]*content:\s*attr\(data-review-marker\)/);
+  assert.match(html, /\.external-review-token\.add \{[^}]*background:\s*rgba\(48,215,111,0\.32\)/);
+  assert.match(html, /\.external-review-token\.del \{[^}]*background:\s*rgba\(255,86,117,0\.3\)/);
   assert.match(html, /\.external-review-block\.change \{[^}]*margin:\s*0;[^}]*padding:\s*0;[^}]*box-shadow:\s*inset 2px 0 0/);
   assert.match(html, /function isMarkdownPathToken\(value\)/);
   assert.match(html, /function resolveDocLinkPath\(rawTarget\)/);
@@ -1439,40 +2068,139 @@ test("normal and startup files open directly editable while review mode owns ver
   const html = renderAppHtml();
 
   assert.match(html, /async function selectFile\(path, options = \{\}\)[\s\S]*state\.dirty = false;\s*state\.mode = "edit";/);
-  assert.match(html, /async function selectStartupContextFile\(order\)[\s\S]*state\.dirty = false;\s*state\.mode = "edit";/);
-  assert.match(html, /async function selectStartupSkillFile\(folderOrder, skillName\)[\s\S]*state\.dirty = false;\s*state\.mode = "edit";/);
+  assert.match(html, /async function selectStartupContextFile\(order, options = \{\}\)[\s\S]*state\.dirty = false;\s*state\.mode = "edit";/);
+  assert.match(html, /async function selectStartupSkillFile\(folderOrder, skillName, options = \{\}\)[\s\S]*state\.dirty = false;\s*state\.mode = "edit";/);
   assert.match(html, /state\.mode === "edit"\s*\?\s*renderMarkdownEditor\(text\)/);
   assert.match(html, /writeSelectedDiskFile\(content\)/);
   assert.match(html, /api\("\/api\/startup-context\/file", \{/);
   assert.match(html, /api\("\/api\/startup-skills\/file", \{/);
-  assert.match(html, /reviewAction: isStartupFile \? null : reviewActionForSelectedFile\(\)/);
-  assert.match(html, /deletable: !isStartupFile/);
+  assert.match(html, /reviewAction: isStartupFile \|\| state\.selectedReadOnly \? null : reviewActionForSelectedFile\(\)/);
+  assert.match(html, /deletable: !isStartupFile && !state\.selectedReadOnly/);
   assert.match(html, /el\("viewer"\)\.hidden = false;\s*el\("editor"\)\.hidden = true;\s*renderPlanetSystem\(\);/);
   assert.doesNotMatch(html, /data-file-mode-toggle/);
 });
 
-test("verification actions are limited to files opened from the review queue and can be undone", () => {
+test("browser refresh restores the last Context Room page", () => {
+  const html = renderAppHtml();
+
+  assert.match(html, /NAVIGATION_STATE_STORAGE_PREFIX = "context-room:navigation:"/);
+  assert.match(html, /function navigationStorageKey\(root = state\.root\)/);
+  assert.match(html, /window\.localStorage\?\.setItem\(key, JSON\.stringify/);
+  assert.match(html, /searchText: el\("search"\)\?\.value \|\| ""/);
+  assert.match(html, /el\("search"\)\.value = persisted\.searchText \|\| folderFilterSearchQuery\(state\.pathFilters\);/);
+  assert.match(html, /state\.root = data\.root \|\| state\.root;/);
+  assert.match(html, /const restored = await restoreNavigationAfterInitialLoad\(\);/);
+  assert.match(html, /if \(restored\) \{[\s\S]*scheduleSessionStatePush\(\);[\s\S]*return;/);
+  assert.match(html, /await selectFile\(persisted\.selectedPath, options\);/);
+  assert.match(html, /await selectStartupContextFile\(startup\.order, options\);/);
+  assert.match(html, /showSettingsPage\(\);[\s\S]*return true;/);
+  assert.match(html, /restorePersistedViewState\(options\.restoreViewState\);/);
+  assert.match(html, /if \(typeof options\.diffCollapsed === "boolean"\) state\.diffCollapsed = options\.diffCollapsed;/);
+  assert.match(html, /window\.addEventListener\("beforeunload", \(event\) => \{[\s\S]*persistNavigationState\(\);/);
+  assert.match(html, /if \(!state\.dirty && !blockingChange && !state\.reviewFinalizationPromise\) return;/);
+});
+
+test("file opening renders loading and retry states instead of a blank document", () => {
+  const html = renderAppHtml();
+
+  assert.match(html, /fileLoadError: null/);
+  assert.match(html, /state\.fileLoadError = null;/);
+  assert.match(html, /const loadingFile = !isStartupFile && state\.openingFilePath === state\.selected;/);
+  assert.match(html, /const loadError = !isStartupFile && state\.fileLoadError\?\.path === state\.selected/);
+  assert.match(html, /function renderFileLoadingState\(file = \{\}\)/);
+  assert.match(html, /Opening file\.\.\./);
+  assert.match(html, /function renderFileLoadError\(error = \{\}\)/);
+  assert.match(html, /Could not open this file/);
+  assert.match(html, /data-file-retry/);
+  assert.match(html, /state\.fileLoadError = \{ path, message: error\.message \|\| "Failed to open file\." \};/);
+  assert.match(html, /updateExplorerSelectedFile\(previousSelected, path\)/);
+  assert.match(html, /function reconcileMissingSelectedFile\(\)/);
+  assert.match(html, /function clearMissingSelectedFile\(stalePath = state\.selected\)/);
+  assert.match(html, /function canReviewMissingFile\(path\)/);
+  assert.match(html, /return state\.files\.some\(\(file\) => file\.path === path\) \|\| canReviewMissingFile\(path\);/);
+  assert.match(html, /item\.path === path && !item\.oldPath/);
+  assert.match(html, /clearReviewSession\(stalePath\)/);
+  assert.match(html, /state\.page = "hub";/);
+  assert.match(html, /function showHome\(\) \{[\s\S]*setStatus\("ready"\);\s*scheduleSessionStatePush\(\);/);
+  assert.match(html, /function validSessionSelectedPath\(\)/);
+  assert.match(html, /function selectedFileExists\(path = state\.selected\)/);
+  assert.match(html, /if \(state\.selected && path !== state\.selected && !selectedFileExists\(\)\) reconcileMissingSelectedFile\(\);/);
+  assert.match(html, /if \(!data\.exists && !canReviewMissingFile\(previousSelected\)\) \{/);
+  assert.match(html, /if \(reconcileMissingSelectedFile\(\)\) \{/);
+  assert.match(html, /openFile: state\.selectedStartupContext \? state\.selectedStartupContext\.displayPath : validSelected/);
+  assert.match(html, /selectedPath: validSelected/);
+  assert.doesNotMatch(html, /renderFiles\(\);\s*if \(options\.revealInExplorer\)/);
+});
+
+test("verification actions are limited to files opened from the review queue", () => {
   const html = renderAppHtml();
 
   assert.match(html, /reviewModePath: null, reviewModeStatus: null/);
-  assert.match(html, /selectFile\(button\.dataset\.reviewPath, \{ revealInExplorer: !isNarrowLayout\(\), reviewMode: true \}\)/);
+  assert.match(html, /openReviewQueueItem\(item\)\.catch\(\(error\) => setStatus\(error\.message\)\)/);
+  assert.match(html, /await selectStartupContextFile\(item\.startupContext\.order, \{ reviewMode: true \}\);/);
+  assert.match(html, /await selectFile\(item\.path, \{ revealInExplorer: !isNarrowLayout\(\), reviewMode: true \}\);/);
   assert.match(html, /state\.reviewModePath = options\.reviewMode \? path : null;/);
+  assert.match(html, /state\.reviewModePath = options\.reviewMode \? finalPath : null;/);
   assert.match(html, /function reviewActionForSelectedFile\(\)/);
   assert.match(html, /if \(!state\.selected \|\| state\.reviewModePath !== state\.selected\) return null;/);
-  assert.match(html, /status: "unverified", label: "Mark unverified"/);
+  assert.match(html, /if \(state\.reviewModeStatus === "verified"\) return null;/);
+  assert.match(html, /const reviewItem = state\.docqa\?\.queue\?\.find\(\(item\) => item\.path === state\.selected\);/);
+  assert.match(html, /if \(!reviewItem\?\.reviewRequired \|\| String\(reviewItem\.gitStatus \|\| ""\)\.trim\(\)\) return null;/);
+  assert.doesNotMatch(html, /label: "Mark unverified"/);
+  assert.doesNotMatch(html, />Mark unverified</);
+  assert.match(html, /function nextReviewActionForSelectedFile\(\)/);
+  assert.match(html, /return nextReviewItemForManualAdvance\(\) \? \{ label: "Next review" \} : null;/);
+  assert.doesNotMatch(html, /state\.reviewModeStatus !== "verified"/);
   assert.match(html, /data-file-review-decision/);
-  assert.match(html, /applyReviewDecision\(state\.selected, event\.currentTarget\.dataset\.fileReviewDecision\)/);
+  assert.match(html, /data-next-review/);
+  assert.match(html, /openNextReviewManually\(\)\.catch\(\(error\) => setStatus\(error\.message\)\)/);
+  assert.match(html, /requestReviewDecision\(state\.selected, event\.currentTarget\.dataset\.fileReviewDecision\)/);
+  assert.match(html, /VERIFY_CONFIRM_STORAGE_KEY = "context-room:skip-mark-verified-confirm"/);
+  assert.match(html, /checkboxLabel: "Do not ask again"/);
+  assert.match(html, /confirmVariant: "primary"/);
+  assert.match(html, /body: "This marks the current content as trusted\. Use Next review when ready\."/);
+  assert.match(html, /if \(!reviewActionForSelectedFile\(\)\) return;/);
+  assert.match(html, /applyReviewDecision\(path, "verified"\)/);
+  assert.match(html, /const previousQueue = options\.previousQueue \|\| state\.docqa\?\.queue \|\| \[\];/);
+  assert.match(html, /function nextReviewItemAfter\(previousQueue = \[\], currentPath = null, nextQueue = \[\]\)/);
+  assert.match(html, /function nextReviewItemForManualAdvance\(\) \{[\s\S]*return nextReviewItemAfter\(queue, state\.reviewModePath \|\| state\.selected \|\| state\.selectedReview, queue\);/);
+  assert.match(html, /async function waitForReviewFinalizationBeforeNavigation\(\)/);
+  assert.match(html, /async function openNextReviewManually\(\) \{\s*await waitForReviewFinalizationBeforeNavigation\(\);/);
+  assert.match(html, /async function handleHubAction\(\)[\s\S]*await waitForReviewFinalizationBeforeNavigation\(\);\s*goHub\(\);/);
+  assert.match(html, /async function selectFile\(path, options = \{\}\) \{[\s\S]*await waitForReviewFinalizationBeforeNavigation\(\);/);
+  assert.match(html, /async function advanceAfterInlineReviewRemoval\(path, previousQueue, statusWhenDone\)/);
+  assert.doesNotMatch(html, /file verified · next doc open/);
+  assert.doesNotMatch(html, /review applied · next doc open/);
   assert.match(html, /status === "unverified"/);
   assert.doesNotMatch(html, /selectedFileNeedsReview/);
   assert.doesNotMatch(html, /data-file-verify/);
+});
+
+test("context health is a compact triggered-alert panel", () => {
+  const html = renderAppHtml();
+
+  assert.match(html, /id="contextHealthPanel" class="docqa-panel" hidden/);
+  assert.match(html, /shown only when checks need attention/);
+  assert.match(html, /\["critical", "high", "medium"\]\.includes\(issue\.severity\) && !issue\.acknowledged/);
+  assert.match(html, /if \(!issues\.length\) \{[\s\S]*panel\.hidden = true;[\s\S]*return;/);
+  assert.match(html, /panel\.hidden = false;/);
+  assert.match(html, /issue' \+ \(issues\.length > 1 \? 's' : ''\) \+ ' triggered/);
+  assert.match(html, /issues\.slice\(0, 5\)/);
+  assert.match(html, /data-health-ack/);
+  assert.match(html, /api\("\/api\/doctor\/ack"/);
+  assert.match(html, /function acknowledgeContextHealthIssueFromPanel\(key\)/);
+  assert.doesNotMatch(html, /<span>no metadata<\/span>/);
+  assert.doesNotMatch(html, /Context health is clean\./);
 });
 
 test("review queue opens changed files with the inline segment review engine", () => {
   const html = renderAppHtml();
 
   assert.match(html, /\/api\/file\/review-base\?path=/);
+  assert.match(html, /data-startup-review-order/);
   assert.match(html, /async function startChangedFileInlineReview\(path, diff, requestId = state\.selectionRequest\)/);
   assert.match(html, /if \(options\.reviewMode && diff\?\.changed\) await startChangedFileInlineReview\(path, diff, requestId\);/);
+  assert.match(html, /if \(options\.reviewMode\) await startChangedFileInlineReview\(finalPath, \{ changed: true \}, requestId\)/);
   assert.match(html, /source: "review"/);
   assert.match(html, /reviewSessions: \{\}/);
   assert.match(html, /const baseContent = typeof review\.baseContent === "string" \? review\.baseContent : "";/);
@@ -1487,20 +2215,35 @@ test("review queue opens changed files with the inline segment review engine", (
   assert.match(html, /function clearReviewSession\(path\)/);
   assert.match(html, /function resetExternalChangeState\(options = \{\}\)/);
   assert.match(html, /if \(options\.discardReview\) clearReviewSession\(path\);/);
+  assert.match(html, /const pathLine = item\.oldPath/);
+  assert.match(html, /escapeHtml\(item\.oldPath\) \+ " -> " \+ escapeHtml\(item\.path\)/);
   assert.match(html, /async function recordSelectedReviewBaseline\(path = state\.selected, note = ""\)/);
+  assert.match(html, /function selectedStartupContextReviewPath\(path = state\.selected\)/);
   assert.match(html, /\/api\/docqa\/review-baseline/);
-  assert.match(html, /if \(change\.source === "review"\) await recordSelectedReviewBaseline\(change\.path, "inline review applied"\);/);
+  assert.match(html, /const shouldRecordReviewBaseline = change\.source === "review" \|\| change\.source === "disk";/);
+  assert.match(html, /if \(shouldRecordReviewBaseline\) await recordSelectedReviewBaseline\(change\.path, "inline review applied"\);/);
+  assert.match(html, /const previousQueue = state\.docqa\?\.queue \|\| \[\];/);
+  assert.match(html, /await applyReviewDecision\(change\.path, "verified", \{ previousQueue \}\);/);
+  assert.match(html, /await advanceAfterInlineReviewRemoval\(change\.path, previousQueue, "new file rejected · no more docs to review"\);/);
+  assert.match(html, /nextReviewAction: nextReviewActionForSelectedFile\(\)/);
+  assert.match(html, /replaceExternalReviewActionsInPlace\(merged\);/);
   assert.match(html, /renderExternalReviewDocument\(externalReviewBaseContent\(externalChange\), externalChange\.diskContent \|\| ""\)/);
   assert.match(html, /buildExternalReviewBlocks\(externalReviewBaseContent\(change\), change\.diskContent \|\| "", change\.reviewDecisions/);
   assert.match(html, /computeExternalReviewContent\(blocks, externalReviewBaseContent\(change\), change\.diskContent \|\| ""\)/);
   assert.match(html, /const change = state\.externalChange;/);
-  assert.match(html, /if \(baseContent === diskContent\) \{/);
+  assert.match(html, /const ignoredMetadataOnly = onlyIgnoredReviewMetadataChanged\(baseContent, diskContent\);/);
+  assert.match(html, /if \(baseContent === diskContent \|\| ignoredMetadataOnly\) \{/);
+  assert.match(html, /last_verified synced · ready for verification/);
   assert.match(html, /changes already reviewed · mark verified when ready/);
-  assert.match(html, /review\.changeKind === "added" \? "new file waiting for review" : "changes waiting for review"/);
+  assert.match(html, /review\.changeKind === "renamed" \? "renamed file waiting for review"/);
   assert.match(html, /if \(activeExternalChange\(\)\?\.source === "review"\) \{[\s\S]*state\.selectedDiff = await readSelectedDiff\(previousSelected\);[\s\S]*return;[\s\S]*\}/);
   assert.match(html, /function activeBlockingExternalChange\(\)/);
   assert.match(html, /return change && change\.source !== "review" \? change : null;/);
   assert.match(html, /if \(change\.source === "review"\) return false;/);
+  assert.doesNotMatch(html, /shouldAutoReloadCleanStartupDiskChange/);
+  assert.doesNotMatch(html, /external startup file reloaded from disk/);
+  assert.match(html, /state\.externalChange = \{\s*path: previousSelected,\s*source: "disk",/);
+  assert.match(html, /setStatus\("file changed on disk · review before applying"\);/);
 });
 
 test("save preserves the editor scroll position after rerendering", () => {
@@ -1515,6 +2258,11 @@ test("save preserves the editor scroll position after rerendering", () => {
   assert.match(html, /if \(isScrollableY\(el\("viewer"\)\)\) return el\("viewer"\);/);
   assert.match(html, /function externalReviewBlockElement\(blockId\)/);
   assert.match(html, /function shiftScrollForElement\(element, delta\)/);
+  assert.match(html, /userScrollIntentAt: 0/);
+  assert.match(html, /function markUserScrollIntent\(\)/);
+  assert.match(html, /function isScrollIntentKey\(event\)/);
+  assert.match(html, /document\.addEventListener\("wheel", markUserScrollIntent/);
+  assert.match(html, /document\.addEventListener\("touchmove", markUserScrollIntent/);
   assert.match(html, /function setDiffCollapsed\(collapsed\)/);
   assert.match(html, /function wireFileActionButtons\(root = document\)/);
   assert.match(html, /setDiffCollapsed\(true\)/);
@@ -1522,11 +2270,14 @@ test("save preserves the editor scroll position after rerendering", () => {
   assert.match(html, /function updateExternalReviewBlockInPlace\(blocks, blockId, viewState\)/);
   assert.match(html, /function wireExternalReviewDecisionButtons\(root = document\)/);
   assert.match(html, /captureEditorViewState\(\{ anchorBlockId: blockId \}\)/);
+  assert.match(html, /viewState\.visualAnchor = captureMarkdownVisualAnchor\(\);/);
   assert.match(html, /event\.stopPropagation\(\)/);
   assert.match(html, /anchorTop/);
   assert.match(html, /document\.querySelector\("\.external-review-doc"\)/);
+  assert.match(html, /\.external-review-doc\s*\{[^}]*overflow-anchor:\s*none/);
   assert.match(html, /snapshot\.documentScrollTarget === "docReader"/);
   assert.match(html, /documentScrollTop/);
+  assert.match(html, /documentViewportTop/);
   assert.match(html, /editorScrollTop/);
   assert.match(html, /viewerScrollTop/);
   assert.match(html, /windowScrollY/);
@@ -1537,6 +2288,41 @@ test("save preserves the editor scroll position after rerendering", () => {
   assert.match(html, /window\.requestAnimationFrame\(apply\)/);
   assert.match(html, /window\.requestAnimationFrame\(\(\) => \{[\s\S]*window\.requestAnimationFrame\(apply\)/);
   assert.match(html, /window\.setTimeout\(apply, 0\)/);
+});
+
+test("inline review distinguishes layout scroll from user scroll", () => {
+  const script = extractInlineAppScript(renderAppHtml());
+  const source = script.slice(
+    script.indexOf("function captureInlineReviewScrollSnapshot"),
+    script.indexOf("function captureMarkdownVisualAnchor"),
+  );
+  const state = { userScrollIntentAt: 10 };
+  const currentScroll = {
+    path: "docs/guide.md",
+    documentScrollTop: 420,
+    documentScrollLeft: 0,
+    editorScrollTop: 420,
+    editorScrollLeft: 0,
+    viewerScrollTop: 420,
+    viewerScrollLeft: 0,
+    windowScrollX: 0,
+    windowScrollY: 0,
+  };
+  const helpers = Function(
+    "state",
+    "captureEditorViewState",
+    source + "; return { rememberInlineReviewLiveScrollIfChanged };",
+  )(state, () => ({ ...currentScroll }));
+  const transitionStart = { ...currentScroll, documentScrollTop: 240, editorScrollTop: 240, viewerScrollTop: 240, userScrollIntentAt: 10 };
+  const viewState = { path: "docs/guide.md", anchorBlockId: "change-1" };
+
+  assert.equal(helpers.rememberInlineReviewLiveScrollIfChanged(viewState, transitionStart), false);
+  assert.equal(viewState.userScrolledDuringInlineReview, undefined);
+
+  state.userScrollIntentAt = 11;
+  assert.equal(helpers.rememberInlineReviewLiveScrollIfChanged(viewState, transitionStart), true);
+  assert.equal(viewState.userScrolledDuringInlineReview, true);
+  assert.equal(viewState.liveScrollState.documentScrollTop, 420);
 });
 
 test("Ctrl or Cmd S saves the selected dirty file", () => {
@@ -1560,9 +2346,16 @@ test("rendered app exposes agent collaboration hooks without human review bypass
   assert.match(html, /function buildSessionStatePayload\(\)/);
   assert.match(html, /function activeEditorCaretLineIndex\(editor\)/);
   assert.match(html, /api\("\/api\/session-state"/);
+  assert.match(html, /AGENT_COMMAND_ACK_STORAGE_KEY = "context-room:last-agent-command-id"/);
+  assert.match(html, /AGENT_COMMAND_MAX_AGE_MS = 60_000/);
   assert.match(html, /function startAgentCommandPolling\(\)/);
   assert.match(html, /api\("\/api\/agent\/command"\)/);
+  assert.match(html, /state\.lastAgentCommandId = readLastAgentCommandId\(\);/);
+  assert.match(html, /if \(isStaleAgentCommand\(command\)\) \{[\s\S]*rememberAgentCommandId\(command\.id\);[\s\S]*return;[\s\S]*\}/);
+  assert.match(html, /function rememberAgentCommandId\(id\)/);
+  assert.match(html, /function isStaleAgentCommand\(command\)/);
   assert.match(html, /function executeAgentCommand\(command\)/);
+  assert.match(html, /if \(command\?\.id\) rememberAgentCommandId\(command\.id\);/);
   assert.match(html, /function applyAgentScrollTarget\(command\)/);
   assert.match(html, /function renderAgentAnnotations\(path\)/);
   assert.match(html, /api\("\/api\/agent\/annotations\?path="/);
@@ -1588,14 +2381,18 @@ test("disk changes stay pending for review instead of silently reloading the ope
   assert.match(html, /data-external-block-id/);
   assert.match(html, /data-external-review-all="accept"/);
   assert.match(html, /data-external-review-all="reject"/);
+  assert.match(html, /data-external-review-jump="first"/);
   assert.match(html, />OK<\/button>/);
   assert.match(html, />x<\/button>/);
+  assert.match(html, />First change<\/button>/);
   assert.match(html, />Accept all<\/button>/);
   assert.match(html, />Reject all<\/button>/);
   assert.match(html, /buildExternalReviewBlocks/);
   assert.match(html, /chooseExternalReviewBlock/);
   assert.match(html, /function chooseAllExternalReviewBlocks\(decision\)/);
   assert.match(html, /function wireExternalReviewAllButtons\(root = document\)/);
+  assert.match(html, /function wireExternalReviewJumpButtons\(root = document\)/);
+  assert.match(html, /if \(focusFirstExternalReviewChange\(\)\) setStatus\("showing first change"\);/);
   assert.match(html, /updateExternalReviewBlockInPlace\(blocks, blockId, viewState\)/);
   assert.match(html, /renderExternalReviewBlock\(block, \{ finalLineStart: externalReviewFinalLineStart\(blocks, blockId\) \}\)/);
   assert.match(html, /function updateExternalReviewDocumentInPlace\(blocks\)/);
@@ -1603,9 +2400,10 @@ test("disk changes stay pending for review instead of silently reloading the ope
   assert.match(html, /function refreshExternalReviewFinalLineIndexes\(blocks\)/);
   assert.match(html, /refreshExternalReviewFinalLineIndexes\(blocks\);/);
   assert.match(html, /const settlePromise = updatedInPlace[\s\S]*settleExternalReviewBlocks\(\[blockId\], viewState, \{ restoreScroll: false \}\)/);
-  assert.match(html, /if \(pending\.length\)[\s\S]*await waitForInlineReviewTransition\(settlePromise\);/);
-  assert.match(html, /const updatedInPlace = updateExternalReviewBlockInPlace\(blocks, blockId, viewState\);[\s\S]*if \(!updatedInPlace\) renderViewer\(\);\s*updateHeader\(\);/);
-  assert.doesNotMatch(html, /actions\.outerHTML = renderExternalReviewActions/);
+  assert.match(html, /if \(pending\.length\)[\s\S]*await finalizeExternalReview\(settlePromise, blocks, viewState\);/);
+  assert.match(html, /const updatedInPlace = updateExternalReviewBlockInPlace\(blocks, blockId, viewState\);[\s\S]*if \(!updatedInPlace\) renderViewer\(\);\s*else updateExternalReviewActionsInPlace\(change\);\s*updateHeader\(\);/);
+  assert.match(html, /actions\.outerHTML = renderExternalReviewActions\(change, \{ fileActionOptions: externalReviewFileActionOptions\(\) \}\);/);
+  assert.match(html, /wireExternalReviewJumpButtons\(document\.querySelector\("\.file-panel > header"\) \|\| document\);/);
   assert.match(html, /externalReviewRowsForDecision/);
   assert.match(html, /function renderExternalReviewFinalLines\(rows, options = \{\}\)/);
   assert.match(html, /function renderExternalReviewBlocks\(blocks\)/);
@@ -1618,6 +2416,13 @@ test("disk changes stay pending for review instead of silently reloading the ope
   assert.match(html, /external-review-lines markdown-view/);
   assert.doesNotMatch(html, /external-review-line-content markdown-view/);
   assert.match(html, /renderMarkdownLines\(text, \{ lineDecorations \}\)/);
+  assert.match(html, /function externalReviewIntralineRows\(rows\)/);
+  assert.match(html, /function buildIntralineTokenDiff\(beforeText, afterText\)/);
+  assert.match(html, /function renderIntralineSegments\(segments, changeType\)/);
+  assert.match(html, /intralineHtml:\s*intraline\?\.html \|\| ""/);
+  assert.match(html, /intraline-superseded/);
+  assert.match(html, /intraline-merged/);
+  assert.match(html, /if \(!decoration\.intralineHtml\) return decorated;/);
   assert.doesNotMatch(html, /external-review-resolved-label/);
   assert.doesNotMatch(html, /external-review-placeholder/);
   assert.doesNotMatch(html, /Change rejected/);
@@ -1627,21 +2432,30 @@ test("disk changes stay pending for review instead of silently reloading the ope
   assert.match(html, /const metricClass = " editor-metrics";/);
   assert.match(html, /doc-editor external-review-doc' \+ metricClass/);
   assert.match(html, /renderExternalReviewActions/);
+  assert.match(html, /const pendingLabel = summary\.pending \? summary\.pending \+ " left" : "saving\.\.\.";/);
+  assert.doesNotMatch(html, /const pendingLabel = summary\.pending \? summary\.pending \+ " left" : "reviewed";/);
+  assert.match(html, /const bulkActions = summary\.pending && \(summary\.pending > 1 \|\| summary\.pendingLines > 1\)/);
+  assert.match(html, /function updateExternalReviewActionsInPlace\(change = activeExternalChange\(\)\)/);
   assert.match(html, /function renderFileActionItems\(/);
   assert.match(html, /function externalReviewFileActionOptions\(\)/);
   assert.match(html, /renderExternalReviewActions\(externalChange, \{ fileActionOptions: externalReviewFileActionOptions\(\) \}\)/);
   assert.match(html, /blockedByConflict:\s*true/);
-  assert.match(html, /summary\.pending > 1 \|\| summary\.pendingLines > 1/);
+  assert.match(html, /summary\.pending && \(summary\.pending > 1 \|\| summary\.pendingLines > 1\)/);
   assert.match(html, /pendingBlock && \(row\.type === "add" \|\| row\.type === "del"\)/);
   assert.match(html, /state\.externalChange = \{[\s\S]*reviewDecisions: \{\},[\s\S]*\};\s*state\.selectedDiff = diff;\s*state\.diffCollapsed = true;/);
   assert.match(html, /state\.openingFilePath = path;[\s\S]*state\.savedHash = data\.contentHash;[\s\S]*state\.openingFilePath = null;/);
   assert.match(html, /if \(state\.openingFilePath === state\.selected \|\| state\.savedHash == null\) return;/);
-  assert.match(html, /if \(!state\.selected \|\| !state\.dirty \|\| state\.openingFilePath === state\.selected \|\| state\.savedHash == null\) return;/);
+  assert.match(html, /if \(!state\.selected \|\| state\.selectedReadOnly \|\| !state\.dirty \|\| state\.openingFilePath === state\.selected \|\| state\.savedHash == null\) return;/);
   assert.match(html, /const viewState = captureEditorViewState\(\);[\s\S]*state\.externalChange = \{[\s\S]*renderViewer\(\);\s*restoreEditorViewState\(viewState\);/);
   assert.match(html, /const previousHeight = current\.getBoundingClientRect\(\)\.height;/);
   assert.match(html, /next\.style\.minHeight = Math\.ceil\(previousHeight\) \+ "px"/);
   assert.match(html, /function waitForInlineReviewTransition\(settlePromise = null\)/);
   assert.match(html, /await waitForInlineReviewTransition\(settlePromise\)/);
+  assert.match(html, /reviewFinalizationPromise: null/);
+  assert.match(html, /async function finalizeExternalReview\(settlePromise, blocks, viewState\)/);
+  assert.match(html, /state\.reviewFinalizationPromise = finalization;/);
+  assert.match(html, /await saveExternalReviewDecision\(blocks, viewState\);/);
+  assert.match(html, /if \(state\.reviewFinalizationPromise === finalization\) \{\s*state\.reviewFinalizationPromise = null;/);
   assert.match(html, /function externalReviewTextAnchor\(blocks, blockId, mergedText\)/);
   assert.match(html, /viewState\.textAnchor = externalReviewTextAnchor\(blocks, viewState\.anchorBlockId, merged\);/);
   assert.match(html, /function textOffsetForLineIndex\(lines, lineIndex\)/);
@@ -1651,7 +2465,9 @@ test("disk changes stay pending for review instead of silently reloading the ope
   assert.match(html, /const visualAnchor = captureMarkdownVisualAnchor\(doc\);/);
   assert.match(html, /const restoreState = inlineReviewRestoreViewState\(viewState\);/);
   assert.match(html, /doc\.outerHTML = state\.mode === "edit" \? renderMarkdownEditor\(text\) : renderMarkdownLineView\(text\);/);
-  assert.match(html, /if \(!restoreMarkdownVisualAnchor\(visualAnchor\)\) restoreEditorViewState\(restoreState, \{ deferred: false \}\);/);
+  assert.match(html, /restoreFinalReviewViewport\(visualAnchor, restoreState\);/);
+  assert.match(html, /function restoreFinalReviewViewport\(visualAnchor, restoreState\)/);
+  assert.match(html, /window\.requestAnimationFrame\(\(\) => \{[\s\S]*window\.requestAnimationFrame\(apply\)/);
   assert.match(html, /function replaceExternalReviewActionsInPlace\(text = ""\)/);
   assert.match(html, /replaceExternalReviewActionsInPlace\(text\);/);
   assert.match(html, /function wireRenderedMarkdownEditor\(\)/);
@@ -1670,7 +2486,7 @@ test("disk changes stay pending for review instead of silently reloading the ope
   assert.match(html, /const parent = block\.parentElement \|\| document\.body;/);
   assert.match(html, /parent\.appendChild\(clone\);/);
   assert.doesNotMatch(html, /document\.body\.appendChild\(clone\);/);
-  assert.match(html, /const anchorTop = anchor \? anchor\.getBoundingClientRect\(\)\.top : null;/);
+  assert.match(html, /const anchorTop = typeof viewState\?\.anchorTop === "number" \? viewState\.anchorTop : anchor \? anchor\.getBoundingClientRect\(\)\.top : null;/);
   assert.match(html, /shiftScrollForElement\(anchor, anchor\.getBoundingClientRect\(\)\.top - anchorTop\);/);
   assert.match(html, /const transitionScrollStart = captureInlineReviewScrollSnapshot\(viewState\);/);
   assert.match(html, /const scrolledDuringTransition = rememberInlineReviewLiveScrollIfChanged\(viewState, transitionScrollStart\);/);
@@ -1678,11 +2494,19 @@ test("disk changes stay pending for review instead of silently reloading the ope
   assert.match(html, /function captureInlineReviewScrollSnapshot\(viewState = null\)/);
   assert.match(html, /function inlineReviewScrollChangedSince\(snapshot\)/);
   assert.match(html, /function rememberInlineReviewLiveScrollIfChanged\(viewState, snapshot\)/);
+  assert.match(html, /const userRequestedScroll = \(state\.userScrollIntentAt \|\| 0\) > \(snapshot\?\.userScrollIntentAt \|\| 0\);/);
+  assert.match(html, /!viewState \|\| !userRequestedScroll \|\| !inlineReviewScrollChangedSince\(snapshot\)/);
   assert.match(html, /viewState\.userScrolledDuringInlineReview = true;/);
   assert.match(html, /viewState\.liveScrollState = captureEditorViewState/);
   assert.match(html, /function inlineReviewRestoreViewState\(viewState\)/);
   assert.match(html, /viewState\.liveScrollState \|\| captureEditorViewState/);
   assert.match(html, /function captureMarkdownVisualAnchor\(root = null\)/);
+  assert.match(html, /visibleLines\.find\(\(line\) => line\.textContent\.trim\(\) && !line\.closest\("\.external-review-block\.change"\)\)/);
+  assert.match(html, /lineText: visibleLine\.textContent \|\| ""/);
+  assert.match(html, /function restoreExternalReviewVisualAnchor\(anchor\)/);
+  assert.match(html, /function restoreInlineReviewViewport\(viewState\)/);
+  assert.match(html, /scroller\.scrollTop = Math\.max\(0, \(viewState\.documentScrollTop \|\| 0\) \+ topDelta\)/);
+  assert.match(html, /data-final-line-index/);
   assert.match(html, /visibleLine\.dataset\.finalLineIndex \|\| visibleLine\.dataset\.lineIndex/);
   assert.match(html, /function restoreMarkdownVisualAnchor\(anchor\)/);
   assert.match(html, /root\.querySelector\('\.markdown-line\[data-line-index="/);
@@ -1696,6 +2520,9 @@ test("disk changes stay pending for review instead of silently reloading the ope
   assert.doesNotMatch(html, /\.external-review-doc\.settled \.external-review-block\.resolved/);
   assert.match(html, /\.external-review-block\.resolved\.settled\.empty\s*\{[^}]*min-height:\s*0/);
   assert.match(html, /resetExternalChangeState\(change\.source === "review" \? \{ discardReview: true \} : \{\}\);\s*\/\/ Returning from inline review should keep[\s\S]*state\.diffCollapsed = true;/);
+  assert.match(html, /applyReviewDecision\(change\.path, "verified", \{ previousQueue, viewState \}\)/);
+  assert.match(html, /const finalizedInPlace = options\.viewState \? finalizeExternalReviewPanelInPlace\(options\.viewState\) : false;/);
+  assert.match(html, /if \(!restoreInlineReviewViewport\(viewState\) && anchor && typeof anchorTop === "number"\)/);
   assert.match(html, /block\.decision === "accept"[\s\S]*row\.type !== "del"/);
   assert.match(html, /block\.decision === "reject"[\s\S]*row\.type !== "add"/);
   assert.doesNotMatch(html, /external-review-block\.accept \.external-review-line\.del/);
@@ -1710,16 +2537,106 @@ test("disk changes stay pending for review instead of silently reloading the ope
   assert.match(html, /const focus = \(\) => focusExternalReviewChange\(targetBlockId\) \|\| focusNearestExternalReviewChange\(\);/);
   assert.match(html, /review the highlighted change/);
   assert.match(html, /function focusNearestExternalReviewChange\(\)/);
+  assert.match(html, /function firstExternalReviewChangeBlockId\(\)/);
+  assert.match(html, /return externalReviewChangeElements\(\)\[0\]\?\.dataset\.externalReviewBlock \|\| "";/);
+  assert.match(html, /function focusFirstExternalReviewChange\(\)/);
   assert.match(html, /function focusExternalReviewChange\(blockId\)/);
   assert.match(html, /function closestExternalReviewChangeElement\(\)/);
   assert.match(html, /target\.scrollIntoView\(\{ behavior: "smooth", block: "center", inline: "nearest" \}\)/);
   assert.match(html, /\.external-review-block\.attention/);
   assert.match(html, /@keyframes externalReviewAttention/);
   assert.match(html, /const blockingChange = activeBlockingExternalChange\(\);/);
-  assert.match(html, /if \(!state\.dirty && !blockingChange\) return;/);
+  assert.match(html, /if \(!state\.dirty && !blockingChange && !state\.reviewFinalizationPromise\) return;/);
+  assert.match(html, /if \(onlyIgnoredReviewMetadataChanged\(state\.saved \|\| "", data\.content\)\) \{/);
+  assert.match(html, /setStatus\("last_verified synced"\);/);
   assert.match(html, /if \(blockingChange\) focusNearestExternalReviewChange\(\);/);
   assert.match(html, /apply or reject before saving/);
   assert.doesNotMatch(html, /setStatus\("reloaded from disk"\);\n  \} catch \(error\) \{\n    setStatus\(error\.message\);\n  \}\n\}/);
+});
+
+test("inline review highlights only changed paragraph fragments", () => {
+  const script = extractInlineAppScript(renderAppHtml());
+  const source = script.slice(
+    script.indexOf("function renderExternalReviewRows"),
+    script.indexOf("function renderExternalReviewFinalLines"),
+  );
+  const renderMarkdownInline = (text) => text.replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>");
+  const renderMarkdownLines = (text, { lineDecorations }) => text.split("\n").map((line, index) => {
+    const decoration = lineDecorations[index];
+    return '<div class="' + decoration.className + '">' + (decoration.intralineHtml || line) + "</div>";
+  }).join("");
+  const helpers = Function(
+    "renderMarkdownInline",
+    "renderMarkdownLines",
+    "finalLineIndexForRow",
+    source + "; return { renderExternalReviewRows, externalReviewIntralineRows, buildIntralineTokenDiff, renderIntralineSegments, renderMergedIntralineSegments };",
+  )(renderMarkdownInline, renderMarkdownLines, () => null);
+
+  const insertion = helpers.buildIntralineTokenDiff(
+    "The shared key is canonical.",
+    "The shared key is canonical. A date-only edit is omitted.",
+  );
+  assert.ok(insertion.similarity >= 0.34);
+  assert.equal(helpers.renderIntralineSegments(insertion.before, "del"), "The shared key is canonical.");
+  assert.match(
+    helpers.renderIntralineSegments(insertion.after, "add"),
+    /The shared key is canonical\.<span class="external-review-token add"> A date-only edit is omitted\.<\/span>/,
+  );
+  const insertionRows = helpers.externalReviewIntralineRows([
+    { type: "del", line: "The shared key is canonical." },
+    { type: "add", line: "The shared key is canonical. A date-only edit is omitted." },
+  ]);
+  assert.equal(insertionRows.get(0).hidden, true);
+  assert.equal(insertionRows.get(1).merged, true);
+  assert.equal(insertionRows.get(1).kind, "addition");
+  const insertionHtml = helpers.renderExternalReviewRows([
+    { type: "del", line: "The shared key is canonical." },
+    { type: "add", line: "The shared key is canonical. A date-only edit is omitted." },
+  ]);
+  assert.match(insertionHtml, /external-review-line del intraline-superseded/);
+  assert.match(insertionHtml, /external-review-line add intraline-merged/);
+  assert.match(insertionHtml, /<span class="external-review-token add"> A date-only edit is omitted\.<\/span>/);
+
+  const replacement = helpers.buildIntralineTokenDiff(
+    "Keep the **clear rule** here.",
+    "Keep the **short rule** here.",
+  );
+  assert.match(
+    helpers.renderIntralineSegments(replacement.before, "del"),
+    /<span class="external-review-token del"><strong>clear rule<\/strong><\/span>/,
+  );
+  assert.match(
+    helpers.renderIntralineSegments(replacement.after, "add"),
+    /<span class="external-review-token add"><strong>short rule<\/strong><\/span>/,
+  );
+  const replacementRows = helpers.externalReviewIntralineRows([
+    { type: "del", line: "Keep the **clear rule** here." },
+    { type: "add", line: "Keep the **short rule** here." },
+  ]);
+  assert.equal(replacementRows.get(0).hidden, true);
+  assert.equal(replacementRows.get(1).merged, true);
+  assert.equal(replacementRows.get(1).kind, "mixed");
+  const replacementHtml = helpers.renderExternalReviewRows([
+    { type: "del", line: "Keep the **clear rule** here." },
+    { type: "add", line: "Keep the **short rule** here." },
+  ]);
+  assert.match(replacementHtml, /external-review-line add intraline-merged intraline-mixed/);
+  assert.match(replacementHtml, /external-review-token del"><strong>clear rule<\/strong>/);
+  assert.match(replacementHtml, /external-review-token add"><strong>short rule<\/strong>/);
+
+  const deletionRows = helpers.externalReviewIntralineRows([
+    { type: "del", line: "Keep this obsolete detail here." },
+    { type: "add", line: "Keep this detail here." },
+  ]);
+  assert.equal(deletionRows.get(0).hidden, true);
+  assert.equal(deletionRows.get(1).merged, true);
+  assert.equal(deletionRows.get(1).kind, "removal");
+  const deletionHtml = helpers.renderExternalReviewRows([
+    { type: "del", line: "Keep this obsolete detail here." },
+    { type: "add", line: "Keep this detail here." },
+  ]);
+  assert.match(deletionHtml, /external-review-line add intraline-merged intraline-removal/);
+  assert.match(deletionHtml, /Keep this <span class="external-review-token del">obsolete <\/span>detail here\./);
 });
 
 test("hub child cards expand inline without replacing root sections", () => {

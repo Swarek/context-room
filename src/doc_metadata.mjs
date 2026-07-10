@@ -126,10 +126,27 @@ export function collectInlinePathReferences(content = "") {
   const text = String(content || "");
   for (const match of text.matchAll(/\[[^\]]+\]\(([^)\s]+)\)/g)) {
     const value = match[1].trim();
-    if (value && !value.startsWith("#")) refs.add(value);
+    if (isPlausibleInlinePathReference(value, { fromMarkdownLink: true })) refs.add(value);
   }
-  for (const match of text.matchAll(/`([^`]+\.(?:md|mjs|js|ts|tsx|jsx|py|json|yaml|yml|csv|sql))`/g)) refs.add(match[1].trim());
+  for (const match of text.matchAll(/`([^`]+\.(?:md|mdx|mjs|js|ts|tsx|jsx|py|json|yaml|yml|csv|sql))`/g)) {
+    const value = match[1].trim();
+    if (isPlausibleInlinePathReference(value, { fromMarkdownLink: false })) refs.add(value);
+  }
   return [...refs].slice(0, 80);
+}
+
+function isPlausibleInlinePathReference(value, { fromMarkdownLink = false } = {}) {
+  const clean = String(value || "").trim();
+  if (!clean || clean.startsWith("#")) return false;
+  if (/^[a-z]+:/i.test(clean)) return true;
+  if (/\s/.test(clean)) return false;
+  if (/[<>{}\[\]*]/.test(clean)) return false;
+  if (/[;&|`$]/.test(clean)) return false;
+  if (clean.includes("...")) return false;
+  if (!fromMarkdownLink && !clean.includes("/") && !clean.startsWith("~") && !clean.startsWith(".")) {
+    return /\.(?:md|mdx)$/i.test(clean);
+  }
+  return true;
 }
 
 function normalizeRelPath(relPath) {

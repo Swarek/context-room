@@ -58,6 +58,13 @@
           "items": { "type": "string", "minLength": 1 },
           "uniqueItems": true,
           "default": ["AGENTS.md", "CLAUDE.md"]
+        },
+        "globalPaths": {
+          "type": "array",
+          "description": "Explicit global agent instruction files outside the ancestor chain, such as ~/.codex/AGENTS.md.",
+          "items": { "$ref": "#/$defs/homePath" },
+          "uniqueItems": true,
+          "default": ["~/.codex/AGENTS.md"]
         }
       }
     },
@@ -72,6 +79,95 @@
           "items": { "type": "string", "minLength": 1 },
           "uniqueItems": true,
           "default": [".codex/skills", "skills"]
+        }
+      }
+    },
+    "startupHooks": {
+      "type": "object",
+      "description": "Optional scanner for hooks and hook-manager files that can affect agent work, commits, or validation.",
+      "additionalProperties": true,
+      "properties": {
+        "enabled": { "type": "boolean", "default": true },
+        "editable": {
+          "type": "boolean",
+          "description": "When true, Context Room can edit detected hook files. Off by default because hooks execute code.",
+          "default": false
+        },
+        "agentHooks": {
+          "type": "boolean",
+          "description": "Scan AI coding agent hook configuration and plugin files, including Codex, Claude Code, OpenCode, and compatible tools.",
+          "default": true
+        },
+        "agentHookSources": {
+          "type": "array",
+          "description": "Configurable AI coding systems to show in Startup hooks. Each source has a label and one or more project-relative config/plugin paths.",
+          "items": {
+            "type": "object",
+            "additionalProperties": true,
+            "required": ["label", "paths"],
+            "properties": {
+              "id": {
+                "type": "string",
+                "description": "Stable source id used for filtering."
+              },
+              "label": {
+                "type": "string",
+                "minLength": 1,
+                "description": "Human-readable agent system name, such as Codex or My Agent."
+              },
+              "paths": {
+                "type": "array",
+                "items": { "$ref": "#/$defs/projectPath" },
+                "minItems": 1,
+                "description": "Config files or plugin folders to scan for this agent system."
+              }
+            }
+          },
+          "default": [
+            { "id": "codex", "label": "Codex", "paths": [".codex/hooks.json"] },
+            { "id": "claude-code", "label": "Claude Code", "paths": [".claude/settings.json", ".claude/settings.local.json"] },
+            { "id": "opencode", "label": "OpenCode", "paths": [".config/opencode/opencode.json", ".opencode/plugins/"] }
+          ]
+        },
+        "codexHooks": {
+          "type": "boolean",
+          "description": "Legacy alias for agentHooks. Kept for existing Context Room configs.",
+          "default": true
+        },
+        "gitHooks": {
+          "type": "boolean",
+          "description": "Scan effective Git hook directories, including .git/hooks and core.hooksPath.",
+          "default": true
+        },
+        "hookManagers": {
+          "type": "boolean",
+          "description": "Scan common hook-manager files and folders such as Husky, Lefthook, pre-commit, lint-staged, and package.json hook config.",
+          "default": true
+        },
+        "fileNames": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 },
+          "uniqueItems": true,
+          "default": ["pre-commit", "pre-push", "commit-msg", "prepare-commit-msg"]
+        },
+        "agentHookPaths": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/projectPath" },
+          "uniqueItems": true,
+          "default": [".codex/hooks.json", ".claude/settings.json", ".claude/settings.local.json", ".config/opencode/opencode.json", ".config/opencode/plugin/", ".config/opencode/plugins/", ".opencode/plugin/", ".opencode/plugins/", "opencode.json", "opencode.jsonc"]
+        },
+        "codexPaths": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/projectPath" },
+          "uniqueItems": true,
+          "description": "Legacy alias paths for older configs. Prefer agentHookPaths.",
+          "default": [".codex/hooks.json"]
+        },
+        "managerPaths": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/projectPath" },
+          "uniqueItems": true,
+          "default": [".husky/", "lefthook.yml", ".pre-commit-config.yaml", "lint-staged.config.js", "package.json"]
         }
       }
     },
@@ -128,6 +224,13 @@
       "minLength": 1,
       "not": { "pattern": "(^/|^\\.\\.|/\\.\\./|\\u0000)" },
       "examples": ["README.md", "AGENTS.md", "docs/", "context/architecture.md", "skills/review.md"]
+    },
+    "homePath": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^~/",
+      "not": { "pattern": "(/\\.\\./|\\u0000)" },
+      "examples": ["~/.codex/AGENTS.md"]
     },
     "section": {
       "type": "object",

@@ -1,3 +1,13 @@
+---
+context_room:
+  kind: canonical
+  scope: context-room
+  status: current
+  canonical_for: agent configuration
+  last_verified: 2026-07-08
+  sources: [bin/context-room.mjs, src/context_room.mjs, schemas/config.schema.json]
+---
+
 # Agent configuration guide
 
 Context Room is intentionally configured with one JSON file:
@@ -8,27 +18,28 @@ Context Room is intentionally configured with one JSON file:
 
 That file is the contract between the project owner, the UI, and AI agents. If an agent needs to add a card, create a sub-card, change which folders are watched, or adjust the safe editable surface, it should edit this JSON file and then run `context-room doctor`.
 
-## Configuration model
+## Configuration intent checklist
 
-```json
-{
-  "$schema": "https://raw.githubusercontent.com/Swarek/context-room/main/schemas/config.schema.json",
-  "title": "My Project",
-  "allowedPaths": ["docs/", "skills/", "README.md", "AGENTS.md"],
-  "watchAllow": ["docs/", "skills/", "AGENTS.md"],
-  "startupContext": {
-    "enabled": true,
-    "fileNames": ["AGENTS.md", "CLAUDE.md"]
-  },
-  "hubSections": []
-}
-```
+Use this checklist to make the intended setup clear before checking field details. The schema and `context-room doctor` validate JSON syntax.
+
+Check intent:
+
+- `allowedPaths` exposes only safe editable text.
+- `watchAllow` contains the docs, skills, and agent instructions that must be reviewed after changes.
+- `reviewPaths` is used only for files that must be reviewed even without a Git diff.
+- `hubSections` matches the clearest project navigation path.
+- `startupContext`, `startupSkills`, and `startupHooks` show what can affect agent behavior before work starts.
+- Hook editing stays off unless the project owner explicitly wants Context Room to edit executable files.
+
+If those boundaries are right, the exact JSON shape is a mechanical concern.
+
+## Configuration fields
 
 ### `allowedPaths`
 
 Safety boundary.
 
-Context Room only reads and writes editable text files inside these files or folders. Agents should keep this list narrow and documentation-focused.
+Context Room only reads and writes editable text files inside these files or folders. Keep this list narrow and documentation-focused.
 
 Good examples:
 
@@ -42,7 +53,7 @@ Avoid secrets, dependency folders, build outputs, generated files, private expor
 
 Review boundary.
 
-Files and folders here appear in the review queue when they are changed or newly created. This is where you put the documentation and skills that must be human-verifiable after agent work.
+Files and folders here appear in the review queue when they are changed or newly created. This is where you put the documentation and skills that must be easy to review after agent work.
 
 Good examples:
 
@@ -52,9 +63,9 @@ Good examples:
 
 ### `reviewPaths`
 
-Required human verification boundary.
+Required verification boundary.
 
-Files and folders here appear in the review queue until the current content is marked verified, even when there is no Git diff. Use this for onboarding a new documentation set or forcing a periodic review of agent-critical files.
+Files and folders here appear in the review queue until the current content is marked verified, even when there is no Git diff. Use this for onboarding a documentation set or requiring explicit review of agent-critical files. Only unchanged entries from `reviewPaths` show `Mark verified`; Git changes are reviewed through their inline diff.
 
 Good examples:
 
@@ -62,50 +73,64 @@ Good examples:
 "reviewPaths": ["AGENTS.md", "docs/INDEX.md", "skills/docs-architect/SKILL.md"]
 ```
 
+### Shared review ledger
+
+Verified content is recorded in the local Context Room state and in a shared repo ledger:
+
+```text
+.context-room/review-ledger.json
+```
+
+The shared key is the canonical absolute file path. Trust stores the exact content hash plus a review hash that ignores only `context_room.last_verified`. A date-only edit is omitted from review queues and inline diffs. If two Context Rooms watch the same file, one verification is enough until meaningful content changes.
+
 ### `hubSections`
 
 Navigation model.
 
-A section contains cards. A card can point to one file/folder, multiple files/folders, or contain nested cards.
+Use hub sections for the paths that should be opened first. A card can point to one file or folder:
 
 ```json
 {
-  "id": "main",
-  "title": "Documentation",
-  "cards": [
-    {
-      "id": "docs",
-      "title": "Docs",
-      "path": "docs/",
-      "autoChildren": true,
-      "cards": [
-        { "id": "architecture", "title": "Architecture", "path": "docs/architecture/" },
-        { "id": "decisions", "title": "Decisions", "path": "docs/decisions/" }
-      ]
-    },
-    {
-      "id": "skills",
-      "title": "Skills",
-      "path": "skills/"
-    },
-    {
-      "id": "agent-context",
-      "title": "Agent context",
-      "paths": ["AGENTS.md", "CLAUDE.md", ".hermes.md"]
-    }
-  ]
+  "id": "docs",
+  "title": "Docs",
+  "path": "docs/",
+  "autoChildren": true
 }
 ```
 
-Use `autoChildren: true` when a folder should automatically expose its immediate files and subfolders as sub-cards. Explicit `cards` still win when you need a curated hierarchy.
+Use nested cards only when a folder needs a curated hierarchy. Use `autoChildren: true` when immediate children are enough.
 
 ### `startupContext`
 
 Startup context scanner.
 
-When enabled, Context Room lists matching files from the filesystem root down to the Context Room root. This is useful for checking which `AGENTS.md`, `CLAUDE.md`, or similar instruction files may be injected before an agent starts working.
+When enabled, Context Room lists matching files from the filesystem root down to the Context Room root. `globalPaths` adds explicit tool-level files such as `~/.codex/AGENTS.md`. This is useful for checking which instruction files may be injected before an agent starts working.
 
 These files are read-only in Context Room and do not appear in the explorer.
+
+Startup context files outside the Context Room root are not Git-reviewable from the project. Context Room therefore creates a local internal baseline the first time it sees them, then reports later edits in the Changed files to review queue. Opening one of those queue items shows the same inline accept/reject mini-diff flow, and accepting or rejecting the visible changes updates the Context Room baseline for future reviews.
+
+### `startupSkills`
+
+Startup skill scanner.
+
+When enabled, Context Room lists configured skill folders such as `.codex/skills` or `skills`. This helps users see which reusable instructions may affect future agent work.
+
+Startup skills can be opened in the explorer without making the whole project editable.
+
+### `startupHooks`
+
+Startup hook scanner.
+
+When enabled, Context Room lists hook files that can affect agent work, commits, or validation. It scans AI coding agent hook sources from `agentHookSources`, effective Git hook directories including `core.hooksPath`, and common hook managers such as Husky, Lefthook, pre-commit, lint-staged, and `package.json` hook config.
+
+Each `agentHookSources` entry names one agent system and the config/plugin paths to scan. This keeps Context Room usable with Codex, Claude Code, OpenCode, or any other coding agent without hard-coding one vendor as the default mental model.
+
+For JSON agent hook configs, Context Room lists both the hook config file and referenced local hook scripts so users can review the exact commands that may run around agent tool use, prompt submission, session start, stop, or other lifecycle events.
+
+Hook cards include a readable name, provider/source, a short description extracted from docstrings or comments, the file path, the event/source, tracking state, and a compact command summary when a command is known.
+
+Hooks are read-only by default because they execute code. Enable `startupHooks.editable` only when the project owner intentionally wants Context Room to edit hook files.
 
 ## Documentation metadata
 

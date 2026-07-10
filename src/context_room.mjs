@@ -5,6 +5,7 @@ import path from "node:path";
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
+import { Worker } from "node:worker_threads";
 import { collectInlinePathReferences, parseDocMetadata, renderDocMetadataTemplateValues } from "./doc_metadata.mjs";
 import { parseSimpleYaml, stringifyYaml } from "./yaml_utils.mjs";
 
@@ -13,11 +14,14 @@ export { DOC_METADATA_KINDS, DOC_METADATA_STATUSES, parseDocMetadata } from "./d
 const __filename = fileURLToPath(import.meta.url);
 const DEFAULT_PORT = 4317;
 const MAX_FILE_BYTES = 750_000;
+const PROJECT_EXPLORER_MAX_FILES = 20000;
 export const CONFIG_DIR = ".context-room";
 export const CONFIG_FILE = `${CONFIG_DIR}/config.json`;
 const CONFIG_SCHEMA_URL = "https://raw.githubusercontent.com/Swarek/context-room/main/schemas/config.schema.json";
 const DOCQA_REVIEW_STATE = `${CONFIG_DIR}/review-state.json`;
 const DOCQA_REVIEW_BASELINES = `${CONFIG_DIR}/review-baselines`;
+const DOCQA_GLOBAL_REVIEW_LEDGER = `${CONFIG_DIR}/review-ledger.json`;
+const CONTEXT_HEALTH_ACKNOWLEDGEMENTS = `${CONFIG_DIR}/health-acknowledgements.json`;
 const COLLAB_SESSION_STATE = `${CONFIG_DIR}/session-state.json`;
 const COLLAB_AGENT_COMMAND = `${CONFIG_DIR}/agent-command.json`;
 const COLLAB_AGENT_ANNOTATIONS = `${CONFIG_DIR}/agent-annotations.json`;
@@ -25,8 +29,42 @@ const MEMORY_WEBAPP_SETTINGS = CONFIG_FILE;
 const HERMES_CRON_JOBS_FILE = "~/.hermes/cron/jobs.json";
 const HERMES_CRON_JOBS_FOLDER = "~/.hermes/cron/jobs/";
 const HERMES_CRON_MD_FOLDER = "~/.hermes/cron/jobs-md/";
-const DEFAULT_STARTUP_CONTEXT = { enabled: false, fileNames: ["AGENTS.md", "CLAUDE.md"] };
+const DEFAULT_STARTUP_CONTEXT = { enabled: false, fileNames: ["AGENTS.md", "CLAUDE.md"], globalPaths: ["~/.codex/AGENTS.md"] };
 const DEFAULT_STARTUP_SKILLS = { enabled: true, folderNames: [".codex/skills", "skills"] };
+const DEFAULT_AGENT_HOOK_SOURCES = [
+  { id: "codex", label: "Codex", paths: [".codex/hooks.json"] },
+  { id: "claude-code", label: "Claude Code", paths: [".claude/settings.json", ".claude/settings.local.json"] },
+  { id: "opencode", label: "OpenCode", paths: [".config/opencode/opencode.json", ".config/opencode/plugin/", ".config/opencode/plugins/", ".opencode/plugin/", ".opencode/plugins/", "opencode.json", "opencode.jsonc"] },
+];
+const DEFAULT_STARTUP_HOOKS = {
+  enabled: true,
+  editable: false,
+  agentHooks: true,
+  codexHooks: true,
+  gitHooks: true,
+  hookManagers: true,
+  fileNames: ["pre-commit", "pre-push", "commit-msg", "prepare-commit-msg"],
+  agentHookSources: DEFAULT_AGENT_HOOK_SOURCES,
+  agentHookPaths: DEFAULT_AGENT_HOOK_SOURCES.flatMap((source) => source.paths),
+  codexPaths: [".codex/hooks.json"],
+  managerPaths: [
+    ".husky/",
+    "lefthook.yml",
+    ".lefthook.yml",
+    "lefthook.yaml",
+    ".lefthook.yaml",
+    ".pre-commit-config.yaml",
+    ".pre-commit-config.yml",
+    "lint-staged.config.js",
+    "lint-staged.config.mjs",
+    "lint-staged.config.cjs",
+    ".lintstagedrc",
+    ".lintstagedrc.json",
+    ".lintstagedrc.js",
+    ".lintstagedrc.cjs",
+    "package.json",
+  ],
+};
 export const FILE_THEME_OPTIONS = [
   { id: "context-room", label: "Context Room", description: "Default dark theme" },
   { id: "vscode-dark", label: "VS Code Dark", description: "Quiet editor contrast" },
@@ -36,6 +74,10 @@ export const FILE_THEME_OPTIONS = [
   { id: "light-plus", label: "Light Plus", description: "Bright document surface" },
 ];
 const DEFAULT_FILE_THEME = "context-room";
+const REPORT_CACHE_TTL_MS = 5_000;
+const gitTopLevelCache = new Map();
+const backgroundReportCache = new Map();
+const backgroundReportGenerations = new Map();
 export const DOCUMENTATION_BEST_PRACTICES = [
   "One file, one clear scope: name what this document is responsible for and what belongs elsewhere.",
   "Start with the goal, then the few durable facts that change decisions.",
@@ -288,6 +330,87 @@ const ALLOWED_PREFIXES = [
 ];
 const ALLOWED_EXTERNAL_PREFIXES = ["~/.hermes/skills/"];
 const SKIP_DIRS = new Set([".git", ".context-room", "node_modules", "__pycache__", ".pytest_cache", "dist", "build"]);
+const PROJECT_EXPLORER_SKIP_DIRS = new Set([
+  ".git",
+  ".context-room",
+  "node_modules",
+  "__pycache__",
+  ".pytest_cache",
+  ".mypy_cache",
+  ".ruff_cache",
+  ".tox",
+  ".venv",
+  "venv",
+  "env",
+  ".next",
+  ".nuxt",
+  ".svelte-kit",
+  ".turbo",
+  ".cache",
+  "coverage",
+  "dist",
+  "build",
+  "target",
+  ".DS_Store",
+]);
+const PROJECT_TEXT_EXTENSIONS = new Set([
+  ".md",
+  ".mdx",
+  ".csv",
+  ".tsv",
+  ".txt",
+  ".json",
+  ".jsonc",
+  ".jsonl",
+  ".yaml",
+  ".yml",
+  ".toml",
+  ".ini",
+  ".env.example",
+  ".mjs",
+  ".cjs",
+  ".js",
+  ".jsx",
+  ".ts",
+  ".tsx",
+  ".py",
+  ".sh",
+  ".bash",
+  ".zsh",
+  ".css",
+  ".scss",
+  ".sass",
+  ".html",
+  ".xml",
+  ".sql",
+  ".graphql",
+  ".gql",
+  ".rs",
+  ".go",
+  ".java",
+  ".kt",
+  ".swift",
+  ".rb",
+  ".php",
+  ".c",
+  ".cc",
+  ".cpp",
+  ".h",
+  ".hpp",
+  ".Dockerfile",
+]);
+const PROJECT_TEXT_FILENAMES = new Set([
+  "Dockerfile",
+  "Containerfile",
+  "Makefile",
+  "Rakefile",
+  "Gemfile",
+  "Procfile",
+  "README",
+  "LICENSE",
+  "CHANGELOG",
+]);
+const SAFE_ENV_SAMPLE_FILENAMES = new Set([".env.example", ".env.sample", ".env.template", ".env.defaults"]);
 
 export function isAllowedMemoryPath(relPath, settings = defaultMemoryWebappSettings()) {
   if (typeof relPath !== "string" || !relPath.trim()) return false;
@@ -420,31 +543,75 @@ export function listMemoryFiles(root = process.cwd(), { externalRoots = [] } = {
         bytes: stats?.size ?? 0,
         chars: content.length,
         updatedAt: stats ? stats.mtime.toISOString() : null,
-        kind: file.path.endsWith(".csv") ? "csv" : "markdown",
+        kind: fileKindForPath(file.path),
         summary: summarizeContent(content),
       };
     })
     .sort((a, b) => categoryRank(a.category) - categoryRank(b.category) || a.path.localeCompare(b.path, "fr"));
 }
 
+export function listExplorerFiles(root = process.cwd(), { externalRoots = [] } = {}) {
+  const settings = effectiveMemoryWebappSettings(root);
+  const byPath = new Map();
+  for (const file of listMemoryFiles(root, { externalRoots })) {
+    byPath.set(file.path, { ...file, readOnly: false, explorerScope: "allowed" });
+  }
+  for (const rel of walkProjectExplorerTextFiles(root)) {
+    if (byPath.has(rel)) continue;
+    const abs = path.join(root, rel);
+    const stats = fs.existsSync(abs) ? fs.statSync(abs) : null;
+    if (!stats?.isFile()) continue;
+    const canRead = isProjectReadableMemoryPath(rel, root);
+    const sensitive = isSensitiveProjectFile(rel);
+    if (!canRead && !sensitive) continue;
+    const allowed = isAllowedMemoryPath(rel, settings);
+    const safeContent = sensitive
+      ? redactedSensitiveFileContent(abs, rel)
+      : allowed && stats.size <= MAX_FILE_BYTES
+        ? fs.readFileSync(abs, "utf8")
+        : "";
+    byPath.set(rel, {
+      path: rel,
+      label: path.basename(rel),
+      category: categoryForPath(rel),
+      exists: true,
+      bytes: stats.size,
+      chars: safeContent.length,
+      updatedAt: stats.mtime.toISOString(),
+      kind: fileKindForPath(rel),
+      summary: sensitive ? sensitiveFileSummary(abs) : summarizeContent(safeContent),
+      readOnly: sensitive || !allowed,
+      sensitive,
+      redacted: sensitive,
+      explorerScope: allowed && !sensitive ? "allowed" : "project",
+    });
+  }
+  return [...byPath.values()]
+    .sort((a, b) => categoryRank(a.category) - categoryRank(b.category) || a.path.localeCompare(b.path, "fr"));
+}
+
 export function readMemoryFile(root, relPath) {
   if (isCronJobVirtualPath(relPath)) return readCronJobVirtualFile(relPath);
   if (isCronJobMarkdownPath(relPath)) return readCronJobMarkdownFile(relPath);
-  const abs = resolveMemoryPath(root, relPath);
+  const normalized = normalizeRelPath(relPath);
+  if (isSensitiveProjectFile(normalized)) return readSensitiveProjectFile(root, normalized);
+  const allowed = isAllowedMemoryPath(normalized, effectiveMemoryWebappSettings(root));
+  const abs = allowed ? resolveMemoryPath(root, normalized) : resolveProjectReadableMemoryPath(root, normalized);
   if (!fs.existsSync(abs)) {
-    return { path: normalizeRelPath(relPath), content: "", exists: false, updatedAt: null, chars: 0, contentHash: hashContent("") };
+    return { path: normalized, content: "", exists: false, updatedAt: null, chars: 0, contentHash: hashContent(""), readOnly: !allowed };
   }
   const stats = fs.statSync(abs);
   if (!stats.isFile()) throw new Error(`Not a file: ${relPath}`);
   if (stats.size > MAX_FILE_BYTES) throw new Error(`File too large for context room: ${relPath}`);
   const content = fs.readFileSync(abs, "utf8");
   return {
-    path: normalizeRelPath(relPath),
+    path: normalized,
     content,
     exists: true,
     updatedAt: stats.mtime.toISOString(),
     chars: content.length,
     contentHash: hashContent(content),
+    readOnly: !allowed,
   };
 }
 
@@ -452,20 +619,23 @@ export function listStartupContextFiles(root = process.cwd(), settings = readMem
   const config = normalizeStartupContextSettings(settings.startupContext);
   if (!config.enabled) return [];
   const resolvedRoot = path.resolve(root);
-  const dirs = [];
-  let current = resolvedRoot;
-  while (current && current !== path.dirname(current)) {
-    dirs.push(current);
-    current = path.dirname(current);
-  }
-  dirs.push(path.parse(resolvedRoot).root);
-  const seenDirs = [...new Set(dirs)].reverse();
   const found = [];
-  for (const dir of seenDirs) {
+  const seenAbs = new Set();
+  const addFound = (abs, fileName, dir, source = "ancestor") => {
+    const resolved = path.resolve(abs);
+    if (seenAbs.has(resolved) || !fs.existsSync(resolved) || !fs.statSync(resolved).isFile()) return;
+    seenAbs.add(resolved);
+    found.push({ abs: resolved, fileName, dir, source });
+  };
+  for (const relPath of config.globalPaths || []) {
+    const abs = resolveExternalPath(relPath);
+    if (!abs) continue;
+    addFound(abs, path.basename(abs), path.dirname(abs), "global");
+  }
+  for (const dir of ancestorDirsForRoot(resolvedRoot)) {
     for (const fileName of config.fileNames) {
       const abs = path.join(dir, fileName);
-      if (!fs.existsSync(abs) || !fs.statSync(abs).isFile()) continue;
-      found.push({ abs, fileName, dir });
+      addFound(abs, fileName, dir, "ancestor");
     }
   }
   return found.map((item, index) => {
@@ -481,6 +651,7 @@ export function listStartupContextFiles(root = process.cwd(), settings = readMem
         displayPath: displayPath(item.abs),
         explorerPath: memoryPathForAbsolutePath(root, item.abs),
         kind: "startup-context",
+        source: item.source,
       },
     };
   });
@@ -720,6 +891,464 @@ export function deleteStartupSkill(root = process.cwd(), folderOrder = 0, skillN
   return { folder: folder.order, skillName: requestedName, deleted: true, backupPath: backupRel };
 }
 
+export function listStartupHookFiles(root = process.cwd(), settings = readMemoryWebappSettings(root)) {
+  const config = normalizeStartupHookSettings(settings.startupHooks);
+  if (!config.enabled) return [];
+  const found = [];
+  const seen = new Set();
+  const pushHook = (abs, source, sourceLabel, metadata = {}) => {
+    const resolved = path.resolve(abs);
+    if (seen.has(resolved) || !fs.existsSync(resolved) || !fs.statSync(resolved).isFile()) return;
+    if (resolved.endsWith(".sample")) return;
+    if (path.basename(resolved) === "package.json" && !packageJsonHasHookConfig(resolved)) return;
+    const summary = summarizeStartupHook(resolved, source, sourceLabel, metadata);
+    seen.add(resolved);
+    found.push({
+      abs: resolved,
+      source,
+      sourceLabel,
+      provider: metadata.provider || "",
+      label: metadata.label || summary.name || path.basename(resolved),
+      description: metadata.description || summary.description || "",
+      commandSummary: summarizeHookCommand(metadata.command || ""),
+      event: metadata.event || "",
+      command: metadata.command || "",
+      fileName: path.basename(resolved),
+      executable: isExecutableFile(resolved),
+      readOnly: !config.editable,
+    });
+  };
+
+  if (config.agentHooks) {
+    for (const hook of agentHookCandidates(root, config)) {
+      pushHook(hook.abs, hook.source, hook.sourceLabel, hook);
+    }
+  }
+
+  if (config.gitHooks) {
+    for (const hookDir of gitHookDirectories(root)) {
+      for (const fileName of config.fileNames) pushHook(path.join(hookDir.abs, fileName), hookDir.source, hookDir.sourceLabel);
+    }
+  }
+
+  if (config.hookManagers) {
+    for (const manager of hookManagerCandidates(root, config)) {
+      if (manager.isDirectory) {
+        for (const fileName of config.fileNames) pushHook(path.join(manager.abs, fileName), manager.source, manager.sourceLabel);
+      } else {
+        pushHook(manager.abs, manager.source, manager.sourceLabel);
+      }
+    }
+  }
+
+  const trackedFiles = trackedGitFileSet(root, found.map((item) => item.abs));
+  return found.map((item, index) => ({
+    label: item.label || item.fileName,
+    category: "0 · startup hooks",
+    impact: `${item.sourceLabel} hook${item.event ? ` (${item.event})` : ""} from ${displayPath(item.abs)}`,
+    startupHook: {
+      order: index + 1,
+      fileName: item.fileName,
+      label: item.label || item.fileName,
+      description: item.description,
+      commandSummary: item.commandSummary,
+      absolutePath: item.abs,
+      displayPath: displayPath(item.abs),
+      explorerPath: memoryPathForAbsolutePath(root, item.abs),
+      kind: "startup-hook",
+      source: item.source,
+      sourceLabel: item.sourceLabel,
+      provider: item.provider || "",
+      event: item.event,
+      command: item.command,
+      executable: item.executable,
+      tracked: trackedFiles.has(safeRealPath(item.abs)),
+      readOnly: item.readOnly,
+    },
+  }));
+}
+
+export function readStartupHookFile(root = process.cwd(), order = 0, settings = readMemoryWebappSettings(root)) {
+  const found = resolveStartupHookFile(root, order, settings);
+  if (!found) throw new Error(`Startup hook file not found: ${order}`);
+  const abs = found.startupHook.absolutePath;
+  const stats = fs.statSync(abs);
+  if (!stats.isFile()) throw new Error(`Not a file: ${found.startupHook.displayPath}`);
+  if (stats.size > MAX_FILE_BYTES) throw new Error(`File too large for context room: ${found.startupHook.displayPath}`);
+  const content = fs.readFileSync(abs, "utf8");
+  if (content.includes("\u0000")) throw new Error(`Startup hook file is not text: ${found.startupHook.displayPath}`);
+  return {
+    label: found.label,
+    path: found.startupHook.displayPath,
+    content,
+    exists: true,
+    updatedAt: stats.mtime.toISOString(),
+    chars: content.length,
+    contentHash: hashContent(content),
+    startupContext: publicStartupHookFile(found).startupContext,
+  };
+}
+
+export function writeStartupHookFile(root = process.cwd(), order = 0, content = "", settings = readMemoryWebappSettings(root)) {
+  const found = resolveStartupHookFile(root, order, settings);
+  if (!found) throw new Error(`Startup hook file not found: ${order}`);
+  if (found.startupHook.readOnly) throw new Error(`Startup hook editing is disabled: ${found.startupHook.displayPath}`);
+  return writeAbsoluteStartupFile(found.startupHook.absolutePath, content, publicStartupHookFile(found).startupContext);
+}
+
+function gitHookDirectories(root) {
+  const dirs = [];
+  try {
+    const hookPath = execFileSync("git", ["rev-parse", "--path-format=absolute", "--git-path", "hooks"], { cwd: root, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).trim();
+    if (hookPath) dirs.push({ abs: path.resolve(hookPath), source: "git-hooks", sourceLabel: "Git hooks" });
+  } catch {}
+  try {
+    const configured = execFileSync("git", ["config", "--get", "core.hooksPath"], { cwd: root, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).trim();
+    if (configured) dirs.push({ abs: path.isAbsolute(configured) ? configured : path.resolve(root, configured), source: "core-hooks-path", sourceLabel: "Git core.hooksPath" });
+  } catch {}
+  const seen = new Set();
+  return dirs.filter((item) => {
+    const resolved = path.resolve(item.abs);
+    if (seen.has(resolved) || !fs.existsSync(resolved) || !fs.statSync(resolved).isDirectory()) return false;
+    seen.add(resolved);
+    return true;
+  });
+}
+
+function hookManagerCandidates(root, config) {
+  const resolvedRoot = path.resolve(root);
+  return config.managerPaths.flatMap((managerPath) => {
+    const clean = normalizeRelPath(managerPath);
+    if (!clean || clean.startsWith("../") || clean.includes("/../") || path.isAbsolute(clean) || isBlockedPath(clean)) return [];
+    const abs = path.resolve(resolvedRoot, clean.replace(/\/$/, ""));
+    if (abs !== resolvedRoot && !abs.startsWith(`${resolvedRoot}${path.sep}`)) return [];
+    if (!fs.existsSync(abs)) return [];
+    const stats = fs.statSync(abs);
+    return [{
+      abs,
+      isDirectory: stats.isDirectory(),
+      source: hookManagerSourceForPath(clean),
+      sourceLabel: hookManagerLabelForPath(clean),
+    }];
+  });
+}
+
+function agentHookCandidates(root, config) {
+  const hooks = [];
+  const seen = new Set();
+  const push = (hook) => {
+    const resolved = path.resolve(hook.abs);
+    const key = `${hook.source}:${hook.event || ""}:${resolved}`;
+    if (seen.has(key) || !fs.existsSync(resolved) || !fs.statSync(resolved).isFile()) return;
+    seen.add(key);
+    hooks.push({ ...hook, abs: resolved });
+  };
+  for (const base of ancestorDirsForRoot(root)) {
+    for (const source of config.agentHookSources || []) {
+      for (const relPath of source.paths || []) {
+        const clean = normalizeRelPath(relPath);
+        if (!clean || clean.startsWith("../") || clean.includes("/../") || path.isAbsolute(clean) || isBlockedPath(clean)) continue;
+        const hooksPath = path.resolve(base, clean.replace(/\/$/, ""));
+        if (hooksPath !== base && !hooksPath.startsWith(`${base}${path.sep}`)) continue;
+        if (!fs.existsSync(hooksPath)) continue;
+        const stats = fs.statSync(hooksPath);
+        if (stats.isDirectory()) {
+          for (const file of agentHookFilesInDirectory(hooksPath)) {
+            const provider = agentHookProviderForPath(file, source);
+            push({
+              abs: file,
+              source: `${provider.id}-agent-plugin`,
+              sourceLabel: provider.label,
+              label: `${provider.label} · ${path.basename(file)}`,
+              provider: provider.id,
+            });
+          }
+          continue;
+        }
+        if (!stats.isFile()) continue;
+        const provider = agentHookProviderForPath(hooksPath, source);
+        push({
+          abs: hooksPath,
+          source: `${provider.id}-agent-hooks`,
+          sourceLabel: provider.label,
+          label: `${provider.label} config`,
+          event: path.basename(hooksPath),
+          provider: provider.id,
+        });
+        for (const commandHook of parseAgentHooksConfig(hooksPath)) {
+          for (const target of agentHookCommandTargets(base, commandHook.command)) {
+            const targetProvider = agentHookProviderForPath(target, provider);
+            push({
+              abs: target,
+              source: `${targetProvider.id}-agent-hook-script`,
+              sourceLabel: `${targetProvider.label} ${commandHook.event}`,
+              label: `${commandHook.event} · ${path.basename(target)}`,
+              event: commandHook.event,
+              command: commandHook.command,
+              provider: targetProvider.id,
+            });
+          }
+        }
+      }
+    }
+  }
+  return hooks;
+}
+
+function agentHookFilesInDirectory(dir) {
+  const allowedExts = new Set([".js", ".mjs", ".cjs", ".ts", ".tsx", ".py", ".sh", ".bash", ".zsh", ".json", ".jsonc"]);
+  const files = [];
+  const walk = (current, depth = 0) => {
+    if (depth > 2 || files.length >= 80) return;
+    for (const entry of fs.readdirSync(current, { withFileTypes: true })) {
+      if (entry.name.startsWith(".") || entry.name === "node_modules") continue;
+      const abs = path.join(current, entry.name);
+      if (entry.isDirectory()) {
+        walk(abs, depth + 1);
+      } else if (entry.isFile() && allowedExts.has(path.extname(entry.name))) {
+        files.push(abs);
+      }
+    }
+  };
+  try {
+    walk(dir);
+  } catch {}
+  return files;
+}
+
+function parseAgentHooksConfig(abs) {
+  try {
+    const parsed = JSON.parse(stripJsonComments(fs.readFileSync(abs, "utf8")));
+    const hooks = [];
+    for (const [event, groups] of Object.entries(parsed.hooks || {})) {
+      for (const group of Array.isArray(groups) ? groups : []) {
+        for (const hook of Array.isArray(group?.hooks) ? group.hooks : []) {
+          if (hook?.type === "command" && typeof hook.command === "string" && hook.command.trim()) {
+            hooks.push({ event, command: hook.command.trim() });
+          }
+        }
+      }
+    }
+    return hooks;
+  } catch {
+    return [];
+  }
+}
+
+function stripJsonComments(content) {
+  return String(content || "")
+    .replace(/\/\*[\s\S]*?\*\//g, "")
+    .replace(/(^|[^:])\/\/.*$/gm, "$1");
+}
+
+function agentHookCommandTargets(repoRoot, command) {
+  const targets = new Set();
+  const addCandidate = (candidate) => {
+    const resolved = path.resolve(repoRoot, candidate);
+    if (resolved !== repoRoot && resolved.startsWith(`${path.resolve(repoRoot)}${path.sep}`) && fs.existsSync(resolved) && fs.statSync(resolved).isFile()) {
+      targets.add(resolved);
+    }
+  };
+  for (const match of String(command || "").matchAll(/\$repo_root\/([^"'\s]+)/g)) addCandidate(match[1]);
+  for (const match of String(command || "").matchAll(/(^|[\s"'])(\.[A-Za-z0-9_-]+\/[^"'\s]+)/g)) addCandidate(match[2]);
+  for (const match of String(command || "").matchAll(/(^|[\s"'])(\/[^"'\s]+\.(?:py|js|mjs|cjs|sh|bash|zsh))/g)) {
+    const resolved = path.resolve(match[2]);
+    const base = path.resolve(repoRoot);
+    if (resolved !== base && resolved.startsWith(`${base}${path.sep}`) && fs.existsSync(resolved) && fs.statSync(resolved).isFile()) {
+      targets.add(resolved);
+    }
+  }
+  return [...targets];
+}
+
+function agentHookProviderForPath(abs, fallback = null) {
+  const clean = displayPath(abs).toLowerCase();
+  if (clean.includes("/.claude/")) return { id: "claude", label: "Claude Code hooks" };
+  if (clean.includes("/.opencode/") || clean.includes("/.config/opencode/") || clean.endsWith("/opencode.json") || clean.endsWith("/opencode.jsonc")) {
+    return { id: "opencode", label: "OpenCode hooks" };
+  }
+  if (clean.includes("/.codex/")) return { id: "codex", label: "Codex hooks" };
+  if (fallback) return { id: sanitizeAgentHookSourceId(fallback.id || fallback.label), label: agentHookDisplayLabel(fallback.label || fallback.id || "Agent") };
+  return { id: "agent", label: "Agent hooks" };
+}
+
+function agentHookDisplayLabel(label) {
+  const clean = String(label || "Agent").trim() || "Agent";
+  return /\bhooks$/i.test(clean) ? clean : `${clean} hooks`;
+}
+
+function hookManagerSourceForPath(relPath) {
+  const clean = normalizeRelPath(relPath).replace(/\/$/, "");
+  if (clean === ".husky") return "husky";
+  if (clean.includes("lefthook")) return "lefthook";
+  if (clean.includes("pre-commit")) return "pre-commit";
+  if (clean.includes("lint-staged") || clean.includes("lintstaged")) return "lint-staged";
+  if (clean === "package.json") return "package-hooks";
+  return "hook-manager";
+}
+
+function hookManagerLabelForPath(relPath) {
+  const source = hookManagerSourceForPath(relPath);
+  if (source === "husky") return "Husky";
+  if (source === "lefthook") return "Lefthook";
+  if (source === "pre-commit") return "pre-commit";
+  if (source === "lint-staged") return "lint-staged";
+  if (source === "package-hooks") return "package.json hooks";
+  return "Hook manager";
+}
+
+function summarizeStartupHook(abs, source, sourceLabel, metadata = {}) {
+  const fileName = path.basename(abs);
+  const name = metadata.label || startupHookDisplayName(fileName, source, sourceLabel, metadata);
+  if (source.endsWith("-agent-hooks")) {
+    const owner = String(sourceLabel || "Agent").replace(/\s+hooks$/i, "");
+    return { name, description: `Defines ${owner} hook events and commands active for this workspace.` };
+  }
+  if (source === "package-hooks") {
+    return { name, description: summarizePackageHookConfig(abs) || "Defines package-level hook tooling such as lint-staged, Husky, or simple-git-hooks." };
+  }
+  const description = extractHookFileDescription(abs) || genericHookDescription(fileName, source, sourceLabel, metadata);
+  return { name, description };
+}
+
+function startupHookDisplayName(fileName, source, sourceLabel, metadata = {}) {
+  if (source.endsWith("-agent-hook-script") && metadata.event) return `${metadata.event} · ${fileName}`;
+  if (source.endsWith("-agent-hooks")) return `${sourceLabel || "Agent hooks"} config`;
+  if (source.endsWith("-agent-plugin")) return `${sourceLabel || "Agent"} plugin · ${fileName}`;
+  if (source === "git-hooks" || source === "core-hooks-path") return `Git ${fileName} hook`;
+  if (source === "package-hooks") return "package.json hook config";
+  if (source === "husky") return `Husky ${fileName}`;
+  return `${sourceLabel || "Hook"} · ${fileName}`;
+}
+
+function genericHookDescription(fileName, source, sourceLabel, metadata = {}) {
+  if (source.endsWith("-agent-hook-script")) {
+    return `${metadata.event || "Agent"} hook script run by ${sourceLabel || "the agent"} for this workspace.`;
+  }
+  if (source.endsWith("-agent-plugin")) {
+    return `${sourceLabel || "Agent"} plugin file that may register hooks or commands for this workspace.`;
+  }
+  if (source === "git-hooks" || source === "core-hooks-path" || source === "husky") {
+    return `${sourceLabel || "Git"} ${fileName} hook that may block or mutate commits.`;
+  }
+  return `${sourceLabel || "Hook"} file that may affect agent work, commits, or validation.`;
+}
+
+function extractHookFileDescription(abs) {
+  try {
+    const content = fs.readFileSync(abs, "utf8").slice(0, 32_000);
+    if (content.includes("\u0000")) return "";
+    return extractTripleQuotedDescription(content)
+      || extractJsDocDescription(content)
+      || extractCommentSectionDescription(content)
+      || "";
+  } catch {
+    return "";
+  }
+}
+
+function extractTripleQuotedDescription(content) {
+  const match = content.match(/^\s*(?:#![^\n]*\n)?(?:#.*\n|\s)*?(?:"""([\s\S]*?)"""|'''([\s\S]*?)''')/);
+  return cleanHookDescription(match?.[1] || match?.[2] || "");
+}
+
+function extractJsDocDescription(content) {
+  const match = content.match(/^\s*(?:#![^\n]*\n)?\s*\/\*\*([\s\S]*?)\*\//);
+  if (!match) return "";
+  return cleanHookDescription(match[1].split(/\r?\n/).map((line) => line.replace(/^\s*\*\s?/, "")).join(" "));
+}
+
+function extractCommentSectionDescription(content) {
+  const comments = [];
+  for (const line of content.split(/\r?\n/).slice(0, 120)) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith("#!")) continue;
+    if (trimmed.startsWith("#")) {
+      const clean = trimmed.replace(/^#+\s?/, "").trim();
+      if (clean && !/^shellcheck\b/i.test(clean)) comments.push(clean);
+    }
+  }
+  return cleanHookDescription(comments.slice(0, 6).join(" · "));
+}
+
+function cleanHookDescription(value) {
+  const normalized = String(value || "").replace(/\s+/g, " ").trim();
+  if (!normalized) return "";
+  return normalized.length > 220 ? normalized.slice(0, 217).trimEnd() + "..." : normalized;
+}
+
+function summarizeHookCommand(command) {
+  const clean = String(command || "").replace(/\s+/g, " ").trim();
+  if (!clean) return "";
+  const target = clean.match(/\$repo_root\/([^"'\s]+)/)?.[1] || clean.match(/\.[A-Za-z0-9_-]+\/[^"'\s]+/)?.[0] || "";
+  if (target) return `runs ${target}`;
+  return clean.length > 140 ? clean.slice(0, 137).trimEnd() + "..." : clean;
+}
+
+function summarizePackageHookConfig(abs) {
+  try {
+    const parsed = JSON.parse(fs.readFileSync(abs, "utf8"));
+    const parts = [];
+    if (parsed["lint-staged"]) parts.push("lint-staged rules");
+    if (parsed["simple-git-hooks"]) parts.push("simple-git-hooks commands");
+    if (parsed.husky) parts.push("Husky config");
+    const scripts = Object.entries(parsed.scripts || {})
+      .filter(([, script]) => /\b(husky|lint-staged|lefthook|pre-commit)\b/.test(String(script || "")))
+      .map(([name]) => `script:${name}`);
+    parts.push(...scripts.slice(0, 4));
+    return parts.length ? `Defines ${parts.join(", ")}.` : "";
+  } catch {
+    return "";
+  }
+}
+
+function packageJsonHasHookConfig(abs) {
+  try {
+    const parsed = JSON.parse(fs.readFileSync(abs, "utf8"));
+    if (parsed["lint-staged"] || parsed["simple-git-hooks"] || parsed.husky) return true;
+    const scripts = parsed.scripts || {};
+    return Object.values(scripts).some((script) => /\b(husky|lint-staged|lefthook|pre-commit)\b/.test(String(script || "")));
+  } catch {
+    return false;
+  }
+}
+
+function isExecutableFile(abs) {
+  try {
+    return Boolean(fs.statSync(abs).mode & 0o111);
+  } catch {
+    return false;
+  }
+}
+
+function trackedGitFileSet(root, absolutePaths = []) {
+  const resolvedRoot = safeRealPath(gitTopLevel(root) || path.resolve(root));
+  const relativePaths = absolutePaths.map((abs) => {
+    const resolved = safeRealPath(abs);
+    if (resolved !== resolvedRoot && !resolved.startsWith(`${resolvedRoot}${path.sep}`)) return "";
+    return path.relative(resolvedRoot, resolved).replaceAll(path.sep, "/");
+  }).filter(Boolean);
+  if (!relativePaths.length) return new Set();
+  try {
+    const output = execFileSync("git", ["ls-files", "--", ...relativePaths], { cwd: resolvedRoot, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] });
+    return new Set(output.split("\n").map((rel) => rel.trim()).filter(Boolean).map((rel) => safeRealPath(path.join(resolvedRoot, rel))));
+  } catch {
+    return new Set();
+  }
+}
+
+function safeRealPath(value) {
+  try {
+    return fs.realpathSync(path.resolve(value));
+  } catch {
+    return path.resolve(value);
+  }
+}
+
+function gitTopLevel(root) {
+  return cachedGitTopLevel(root);
+}
+
 function normalizeStartupSkillName(skillName) {
   const clean = String(skillName || "").toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "").replace(/[^a-z0-9_-]+/g, "-").replace(/^-+|-+$/g, "");
   if (!clean) throw new Error("Skill name is required");
@@ -752,6 +1381,11 @@ function resolveStartupSkillFile(root, folderOrder, skillName, settings = readMe
   });
   if (!abs) throw new Error(`Startup skill file not found: ${skillName}`);
   return { folder, requestedName, abs };
+}
+
+function resolveStartupHookFile(root, order, settings = readMemoryWebappSettings(root)) {
+  const normalizedOrder = Number(order);
+  return listStartupHookFiles(root, settings).find((file) => file.startupHook.order === normalizedOrder);
 }
 
 function writeAbsoluteStartupFile(absPath, content, startupContext) {
@@ -799,6 +1433,33 @@ function publicStartupContextFile(file) {
       displayPath: file.startupContext.displayPath,
       explorerPath: file.startupContext.explorerPath,
       kind: "startup-context",
+      source: file.startupContext.source || "ancestor",
+    },
+  };
+}
+
+function publicStartupHookFile(file) {
+  return {
+    label: file.label,
+    category: file.category,
+    impact: file.impact,
+    startupContext: {
+      order: file.startupHook.order,
+      fileName: file.startupHook.fileName,
+      label: file.startupHook.label,
+      description: file.startupHook.description,
+      commandSummary: file.startupHook.commandSummary,
+      displayPath: file.startupHook.displayPath,
+      explorerPath: file.startupHook.explorerPath,
+      kind: "startup-hook",
+      source: file.startupHook.source,
+      sourceLabel: file.startupHook.sourceLabel,
+      provider: file.startupHook.provider,
+      event: file.startupHook.event,
+      command: file.startupHook.command,
+      executable: Boolean(file.startupHook.executable),
+      tracked: Boolean(file.startupHook.tracked),
+      readOnly: Boolean(file.startupHook.readOnly),
     },
   };
 }
@@ -1066,22 +1727,76 @@ export function readFileDiff(root, relPath) {
     return { path: normalized, changed: false, additions: 0, deletions: 0, patch: "", available: false, reason: "Git diff is unavailable for files outside the repo."};
   }
   try {
-    const status = execFileSync("git", ["status", "--porcelain=v1", "--untracked-files=all", "--", normalized], { cwd: root, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).split("\n").find(Boolean) || "";
-    if (status.startsWith("?? ")) return buildNewFileDiff(root, normalized, abs);
-    const patch = execFileSync("git", ["diff", "HEAD", "--", normalized], { cwd: root, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] });
-    const numstat = execFileSync("git", ["diff", "HEAD", "--numstat", "--", normalized], { cwd: root, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).trim();
+    const statusEntry = readReviewGitStatusEntry(root, normalized);
+    const status = statusEntry?.status || "";
+    if (status === "??" && !statusEntry?.oldPath) return buildNewFileDiff(root, normalized, abs);
+    if (statusEntry?.baselineRename && statusEntry.oldPath) return buildReviewBaselineRenameDiff(root, statusEntry.oldPath, normalized);
+    if (statusEntry?.inferredRename && statusEntry.oldPath) return buildInferredRenameDiff(root, statusEntry.oldPath, normalized);
+    const diffPaths = statusEntry?.oldPath ? [statusEntry.oldPath, normalized] : [normalized];
+    const patch = execFileSync("git", ["diff", "HEAD", "--", ...diffPaths], { cwd: root, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] });
+    const numstat = execFileSync("git", ["diff", "HEAD", "--numstat", "--", ...diffPaths], { cwd: root, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).trim();
     const [rawAdditions = "0", rawDeletions = "0"] = numstat.split(/\s+/);
     const additions = Number.parseInt(rawAdditions, 10) || 0;
     const deletions = Number.parseInt(rawDeletions, 10) || 0;
-    return { path: normalized, changed: patch.trim().length > 0, additions, deletions, patch, available: true };
+    return { path: normalized, oldPath: statusEntry?.oldPath || null, changed: patch.trim().length > 0, additions, deletions, patch, available: true };
   } catch {
     return { path: normalized, changed: false, additions: 0, deletions: 0, patch: "", available: false, reason: "Git diff is unavailable for this file."};
   }
 }
 
+function buildReviewBaselineRenameDiff(root, oldPath, nextPath) {
+  const review = readDocReviewState(root).reviews[oldPath] || null;
+  const baseline = readDocReviewBaseline(root, oldPath, review);
+  const baseContent = baseline?.content || "";
+  const current = readMemoryFile(root, nextPath);
+  const sameContent = hashContent(baseContent) === hashContent(current.content);
+  const patch = [
+    `diff --git a/${oldPath} b/${nextPath}`,
+    `similarity index ${sameContent ? "100" : Math.round(renameSimilarityScore(baseContent, current.content, oldPath, nextPath) * 100)}%`,
+    `rename from ${oldPath}`,
+    `rename to ${nextPath}`,
+    "",
+  ].join("\n");
+  return {
+    path: nextPath,
+    oldPath,
+    changed: true,
+    additions: sameContent ? 0 : Math.max(0, current.content.split("\n").length - baseContent.split("\n").length),
+    deletions: sameContent ? 0 : Math.max(0, baseContent.split("\n").length - current.content.split("\n").length),
+    patch,
+    available: true,
+  };
+}
+
+function buildInferredRenameDiff(root, oldPath, nextPath) {
+  const baseContent = readGitHeadFileContent(root, oldPath);
+  const current = readMemoryFile(root, nextPath);
+  const baseLines = baseContent.split("\n");
+  const currentLines = current.content.split("\n");
+  const sameContent = hashContent(baseContent) === hashContent(current.content);
+  const patch = [
+    `diff --git a/${oldPath} b/${nextPath}`,
+    `similarity index ${sameContent ? "100" : Math.round(renameSimilarityScore(baseContent, current.content, oldPath, nextPath) * 100) + ""}%`,
+    `rename from ${oldPath}`,
+    `rename to ${nextPath}`,
+    "",
+  ].join("\n");
+  return {
+    path: nextPath,
+    oldPath,
+    changed: true,
+    additions: sameContent ? 0 : Math.max(0, currentLines.length - baseLines.length),
+    deletions: sameContent ? 0 : Math.max(0, baseLines.length - currentLines.length),
+    patch,
+    available: true,
+  };
+}
+
 export function readReviewBaseFile(root, relPath) {
   const normalized = normalizeRelPath(relPath);
   if (!normalized) throw new Error("Path is required");
+  const startupFile = readStartupContextReviewFile(root, normalized);
+  if (startupFile) return readInternalReviewBaseFile(root, startupFile);
   if (resolveExternalPath(normalized)) {
     const file = readMemoryFile(root, normalized);
     return {
@@ -1095,16 +1810,23 @@ export function readReviewBaseFile(root, relPath) {
     };
   }
   const current = readMemoryFile(root, normalized);
+  const internalBase = readInternalReviewBaseFile(root, { path: normalized, content: current.content, exists: current.exists, contentHash: current.contentHash });
+  if (internalBase.baseline === "review") return internalBase;
+  return readGitReviewBaseFile(root, normalized, current);
+}
+
+function readInternalReviewBaseFile(root, file) {
+  const normalized = normalizeRelPath(file.path);
   const review = readDocReviewState(root).reviews[normalized] || null;
   const reviewBaseline = readDocReviewBaseline(root, normalized, review);
   if (reviewBaseline) {
     const baselineHash = hashContent(reviewBaseline.content);
-    const currentHash = current.contentHash;
-    const changeKind = baselineHash === currentHash ? "unchanged" : current.exists ? "modified" : "deleted";
+    const currentHash = file.contentHash || hashContent(file.content || "");
+    const changeKind = baselineHash === currentHash ? "unchanged" : file.exists ? "modified" : "deleted";
     return {
       path: normalized,
       baseContent: reviewBaseline.content,
-      currentContent: current.content,
+      currentContent: file.content,
       currentHash,
       changeKind,
       available: true,
@@ -1112,15 +1834,33 @@ export function readReviewBaseFile(root, relPath) {
       baselineHash,
     };
   }
+  return {
+    path: normalized,
+    baseContent: file.content,
+    currentContent: file.content,
+    currentHash: file.contentHash || hashContent(file.content || ""),
+    changeKind: "unchanged",
+    available: true,
+  };
+}
+
+function readGitReviewBaseFile(root, normalized, current) {
   try {
     const statusLine = execFileSync("git", ["status", "--porcelain=v1", "--untracked-files=all", "--", normalized], { cwd: root, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).split("\n").find(Boolean) || "";
+    const gitEntry = readReviewGitStatusEntry(root, normalized) || (statusLine ? gitStatusEntryFromPorcelainLine(statusLine, gitRepoPrefixForRoot(root)) : null);
+    if (gitEntry?.baselineRename && gitEntry.oldPath) {
+      const review = readDocReviewState(root).reviews[gitEntry.oldPath] || null;
+      const baseline = readDocReviewBaseline(root, gitEntry.oldPath, review);
+      const baseContent = baseline?.content || "";
+      return { path: normalized, oldPath: gitEntry.oldPath, baseContent, currentContent: current.content, currentHash: current.contentHash, changeKind: "renamed", available: true, baseline: "review", baselineHash: baseline?.contentHash || hashContent(baseContent) };
+    }
     if (!statusLine) {
       return { path: normalized, baseContent: current.content, currentContent: current.content, currentHash: current.contentHash, changeKind: "unchanged", available: true };
     }
-    if (statusLine.startsWith("?? ")) {
+    if (statusLine.startsWith("?? ") && !gitEntry?.oldPath) {
       return { path: normalized, baseContent: "", currentContent: current.content, currentHash: current.contentHash, changeKind: "added", available: true };
     }
-    const treePath = gitTreePathForRootRelative(root, normalized);
+    const treePath = gitTreePathForRootRelative(root, gitEntry?.oldPath || normalized);
     let baseContent = "";
     let trackedInHead = true;
     try {
@@ -1128,9 +1868,11 @@ export function readReviewBaseFile(root, relPath) {
     } catch {
       trackedInHead = false;
     }
-    const statusCode = statusLine.slice(0, 2);
-    const changeKind = !trackedInHead ? "added" : statusCode.includes("D") && !current.exists ? "deleted" : "modified";
-    return { path: normalized, baseContent, currentContent: current.content, currentHash: current.contentHash, changeKind, available: true };
+    const statusCode = gitEntry?.status || statusLine.slice(0, 2);
+    const changeKind = statusCode.includes("R") && gitEntry?.oldPath
+      ? "renamed"
+      : !trackedInHead ? "added" : statusCode.includes("D") && !current.exists ? "deleted" : "modified";
+    return { path: normalized, oldPath: gitEntry?.oldPath || null, baseContent, currentContent: current.content, currentHash: current.contentHash, changeKind, available: true };
   } catch {
     return {
       path: normalized,
@@ -1142,6 +1884,56 @@ export function readReviewBaseFile(root, relPath) {
       reason: "Git base is unavailable for this file.",
     };
   }
+}
+
+function readReviewGitStatusEntry(root, normalized) {
+  const gitEntries = readGitStatusEntries(root);
+  const direct = gitEntries.get(normalized) || null;
+  if (direct?.oldPath) return direct;
+  if (direct && direct.status !== "??" && !direct.status.includes("A")) return direct;
+  const settings = readMemoryWebappSettings(root);
+  const files = listMemoryFiles(root);
+  const reviewState = readDocReviewState(root);
+  const gitRename = inferGitRenames(root, gitEntries, files, settings).inferredRenames.get(normalized) || null;
+  if (gitRename) return gitRename;
+  return inferReviewBaselineRenames(root, reviewState, gitEntries, files, settings).inferredRenames.get(normalized) || direct;
+}
+
+function readStartupContextReviewFile(root, relPath, settings = readMemoryWebappSettings(root)) {
+  const normalized = normalizeRelPath(relPath);
+  if (!normalized) return null;
+  for (const file of listStartupContextFiles(root, settings)) {
+    if (!isExternalStartupContextReviewFile(root, file)) continue;
+    const key = normalizeRelPath(file.startupContext.displayPath || file.startupContext.explorerPath || "");
+    const explorerPath = normalizeRelPath(file.startupContext.explorerPath || "");
+    if (normalized !== key && normalized !== explorerPath) continue;
+    const abs = path.resolve(file.startupContext.absolutePath);
+    if (!fs.existsSync(abs)) {
+      return { path: key, content: "", exists: false, updatedAt: null, chars: 0, contentHash: hashContent(""), startupContext: publicStartupContextFile(file).startupContext };
+    }
+    const stats = fs.statSync(abs);
+    if (!stats.isFile()) throw new Error(`Not a file: ${key}`);
+    if (stats.size > MAX_FILE_BYTES) throw new Error(`File too large for context room: ${key}`);
+    const content = fs.readFileSync(abs, "utf8");
+    return {
+      path: key,
+      content,
+      exists: true,
+      updatedAt: stats.mtime.toISOString(),
+      chars: content.length,
+      contentHash: hashContent(content),
+      startupContext: publicStartupContextFile(file).startupContext,
+      label: file.label,
+      summary: file.impact,
+    };
+  }
+  return null;
+}
+
+function isExternalStartupContextReviewFile(root, file) {
+  const abs = path.resolve(file?.startupContext?.absolutePath || "");
+  const resolvedRoot = path.resolve(root);
+  return abs && abs !== resolvedRoot && !abs.startsWith(`${resolvedRoot}${path.sep}`);
 }
 
 function gitTreePathForRootRelative(root, normalized) {
@@ -1208,6 +2000,96 @@ function writeDocReviewState(root, state) {
   fs.writeFileSync(statePath, JSON.stringify(state, null, 2) + "\n", "utf8");
 }
 
+export function readGlobalReviewLedger(root = process.cwd()) {
+  const ledgerPath = globalReviewLedgerPath(root);
+  if (!fs.existsSync(ledgerPath)) return { version: 1, reviews: {} };
+  try {
+    const parsed = JSON.parse(fs.readFileSync(ledgerPath, "utf8"));
+    return { version: 1, reviews: parsed.reviews && typeof parsed.reviews === "object" ? parsed.reviews : {} };
+  } catch {
+    return { version: 1, reviews: {} };
+  }
+}
+
+function writeGlobalReviewLedger(root, ledger) {
+  const ledgerPath = globalReviewLedgerPath(root);
+  fs.mkdirSync(path.dirname(ledgerPath), { recursive: true });
+  fs.writeFileSync(ledgerPath, JSON.stringify(ledger, null, 2) + "\n", "utf8");
+}
+
+function globalReviewLedgerPath(root = process.cwd()) {
+  return path.join(globalReviewLedgerRoot(root), DOCQA_GLOBAL_REVIEW_LEDGER);
+}
+
+function globalReviewLedgerRoot(root = process.cwd()) {
+  return gitTopLevelRoot(root) || path.resolve(root);
+}
+
+function globalReviewKeyFor(root, relPath) {
+  return hashContent(canonicalReviewAbsolutePath(root, relPath));
+}
+
+function canonicalReviewAbsolutePath(root, relPath) {
+  const normalized = normalizeRelPath(relPath);
+  const abs = resolveExternalPath(normalized) || path.resolve(root, normalized);
+  try {
+    return fs.existsSync(abs) ? fs.realpathSync(abs) : path.resolve(abs);
+  } catch {
+    return path.resolve(abs);
+  }
+}
+
+function writeGlobalReviewDecision(root, relPath, file, decision) {
+  const ledger = readGlobalReviewLedger(root);
+  const key = globalReviewKeyFor(root, relPath);
+  const contentHash = hashContent(file?.content || "");
+  const reviewHash = reviewContentHash(file?.content || "");
+  const existing = ledger.reviews[key];
+  if (decision.status !== "verified") {
+    if (existing?.contentHash === contentHash || existing?.reviewHash === reviewHash) {
+      delete ledger.reviews[key];
+      writeGlobalReviewLedger(root, ledger);
+    }
+    return null;
+  }
+  if (existing?.status === "verified" && (existing.contentHash === contentHash || existing.reviewHash === reviewHash)) {
+    const current = { ...existing, contentHash, reviewHash };
+    if (existing.contentHash !== contentHash || existing.reviewHash !== reviewHash) {
+      ledger.reviews[key] = current;
+      writeGlobalReviewLedger(root, ledger);
+    }
+    return current;
+  }
+  const reviewedAt = decision.reviewedAt || new Date().toISOString();
+  const entry = {
+    status: "verified",
+    reviewedAt,
+    contentHash,
+    reviewHash,
+    absolutePath: canonicalReviewAbsolutePath(root, relPath),
+    relPath: normalizeRelPath(relPath),
+    root: path.resolve(root),
+    note: String(decision.note || "").slice(0, 500),
+  };
+  ledger.reviews[key] = entry;
+  writeGlobalReviewLedger(root, ledger);
+  return entry;
+}
+
+function currentGlobalReviewFor(root, relPath, content) {
+  const ledger = readGlobalReviewLedger(root);
+  const entry = ledger.reviews[globalReviewKeyFor(root, relPath)];
+  const contentHash = hashContent(content);
+  const reviewHash = reviewContentHash(content);
+  if (!entry || entry.status !== "verified" || (entry.contentHash !== contentHash && entry.reviewHash !== reviewHash)) return null;
+  return {
+    ...entry,
+    status: "verified",
+    current: true,
+    global: true,
+  };
+}
+
 function reviewBaselinePathFor(relPath) {
   return path.posix.join(DOCQA_REVIEW_BASELINES, backupSafePath(normalizeRelPath(relPath)) + ".baseline");
 }
@@ -1220,6 +2102,7 @@ function writeDocReviewBaselineFile(root, relPath, content) {
   return {
     baselinePath,
     baselineHash: hashContent(content),
+    baselineReviewHash: reviewContentHash(content),
     baselineAt: new Date().toISOString(),
   };
 }
@@ -1232,19 +2115,20 @@ function readDocReviewBaseline(root, relPath, review = null) {
   const content = fs.readFileSync(abs, "utf8");
   const baselineHash = hashContent(content);
   if (review?.baselineHash && review.baselineHash !== baselineHash) return null;
-  return { path: baselinePath, content, contentHash: baselineHash };
+  return { path: baselinePath, content, contentHash: baselineHash, reviewHash: reviewContentHash(content) };
 }
 
 export function writeDocReviewBaseline(root, relPath, { note = "" } = {}) {
-  const normalized = normalizeRelPath(relPath);
+  const file = readReviewTrackedFile(root, relPath);
+  const normalized = file.path;
   const state = readDocReviewState(root);
-  const file = readMemoryFile(root, normalized);
   const existing = state.reviews[normalized] && typeof state.reviews[normalized] === "object" ? state.reviews[normalized] : {};
   const baseline = writeDocReviewBaselineFile(root, normalized, file.content);
   const next = {
     ...existing,
     baselinePath: baseline.baselinePath,
     baselineHash: baseline.baselineHash,
+    baselineReviewHash: baseline.baselineReviewHash,
     baselineAt: baseline.baselineAt,
   };
   if (note) next.note = String(note || "").slice(0, 500);
@@ -1254,14 +2138,15 @@ export function writeDocReviewBaseline(root, relPath, { note = "" } = {}) {
 }
 
 export function writeDocReviewDecision(root, relPath, { status, note = "" } = {}) {
-  const normalized = normalizeRelPath(relPath);
+  const file = readReviewTrackedFile(root, relPath);
+  const normalized = file.path;
   const allowedStatuses = new Set(["verified", "needs_changes", "snoozed"]);
   const state = readDocReviewState(root);
-  const file = readMemoryFile(root, normalized);
   if (status === "unverified") {
     delete state.reviews[normalized];
     writeDocReviewState(root, state);
-    return { path: normalized, status: "unverified", note: "", reviewedAt: new Date().toISOString(), contentHash: hashContent(file.content) };
+    writeGlobalReviewDecision(root, normalized, file, { status: "unverified" });
+    return { path: normalized, status: "unverified", note: "", reviewedAt: new Date().toISOString(), contentHash: hashContent(file.content), reviewHash: reviewContentHash(file.content) };
   }
   if (!allowedStatuses.has(status)) throw new Error(`Invalid review status: ${status}`);
   const baseline = writeDocReviewBaselineFile(root, normalized, file.content);
@@ -1270,13 +2155,23 @@ export function writeDocReviewDecision(root, relPath, { status, note = "" } = {}
     note: String(note || "").slice(0, 500),
     reviewedAt: new Date().toISOString(),
     contentHash: hashContent(file.content),
+    reviewHash: reviewContentHash(file.content),
     baselinePath: baseline.baselinePath,
     baselineHash: baseline.baselineHash,
+    baselineReviewHash: baseline.baselineReviewHash,
     baselineAt: baseline.baselineAt,
   };
   state.reviews[normalized] = decision;
   writeDocReviewState(root, state);
+  writeGlobalReviewDecision(root, normalized, file, decision);
   return { path: normalized, ...decision };
+}
+
+function readReviewTrackedFile(root, relPath) {
+  const normalized = normalizeRelPath(relPath);
+  const startupFile = readStartupContextReviewFile(root, normalized);
+  if (startupFile) return startupFile;
+  return readMemoryFile(root, normalized);
 }
 
 export function readCollaborationSessionState(root = process.cwd()) {
@@ -1378,6 +2273,7 @@ export function buildAgentReviewQueue(root = process.cwd()) {
     summary: report.summary,
     queue: report.queue.map((item) => ({
       path: item.path,
+      oldPath: item.oldPath || null,
       label: item.label,
       gitStatus: item.gitStatus,
       riskScore: item.riskScore,
@@ -1509,14 +2405,151 @@ function clampNumber(value, min, max) {
   return Math.max(min, Math.min(max, number));
 }
 
-function currentReviewFor(reviews, relPath, content) {
+function currentReviewFor(root, reviews, relPath, content) {
   const review = reviews[relPath] || null;
-  if (!review) return null;
-  return { ...review, current: review.contentHash === hashContent(content) };
+  const contentHash = hashContent(content);
+  const reviewHash = reviewContentHash(content);
+  if (review) {
+    const baseline = readDocReviewBaseline(root, relPath, review);
+    const baselineReviewHash = review.baselineReviewHash || baseline?.reviewHash || null;
+    const semanticCurrent = review.reviewHash === reviewHash || baselineReviewHash === reviewHash;
+    const explicitCurrent = review.contentHash === contentHash || semanticCurrent;
+    const inlineBaselineCurrent = !review.status && review.note === "inline review applied" && (review.baselineHash === contentHash || baselineReviewHash === reviewHash);
+    let local = {
+      ...review,
+      status: review.status || (inlineBaselineCurrent ? "verified" : undefined),
+      current: explicitCurrent || inlineBaselineCurrent,
+    };
+    if (local.current && local.status !== "verified") return local;
+    if (local.current && local.status === "verified") {
+      if (review.status === "verified" && (review.contentHash !== contentHash || review.reviewHash !== reviewHash || review.baselineReviewHash !== baselineReviewHash)) {
+        local = { ...local, contentHash, reviewHash, baselineReviewHash };
+        reviews[relPath] = { ...review, contentHash, reviewHash, baselineReviewHash };
+        try { writeDocReviewState(root, { version: 1, reviews }); } catch {}
+      }
+      try { writeGlobalReviewDecision(root, relPath, { content }, local); } catch {}
+      return local;
+    }
+  }
+  return currentGlobalReviewFor(root, relPath, content);
 }
 
 function hashContent(content) {
   return createHash("sha256").update(String(content), "utf8").digest("hex");
+}
+
+function reviewIdentityContent(content) {
+  const normalized = String(content || "").replace(/\r\n?/g, "\n");
+  const lines = normalized.split("\n");
+  if (lines[0]?.trim() !== "---") return normalized;
+  const frontmatterEnd = lines.slice(1).findIndex((line) => line.trim() === "---");
+  if (frontmatterEnd < 0) return normalized;
+  const endIndex = frontmatterEnd + 1;
+  let contextIndent = null;
+  const kept = lines.filter((line, index) => {
+    if (index < 1 || index >= endIndex) return true;
+    const match = line.match(/^(\s*)([^#\s][^:]*)\s*:/);
+    if (match && match[2].trim() === "context_room") {
+      contextIndent = match[1].length;
+      return true;
+    }
+    if (contextIndent == null) return true;
+    const indent = line.match(/^\s*/)?.[0].length || 0;
+    if (line.trim() && indent <= contextIndent) {
+      contextIndent = null;
+      return true;
+    }
+    return !/^\s+last_verified\s*:/.test(line);
+  });
+  return kept.join("\n");
+}
+
+function reviewContentHash(content) {
+  return hashContent(reviewIdentityContent(content));
+}
+
+function meaningfulGitStatusForReview(root, relPath, gitEntry, content, reviews = {}) {
+  const status = gitEntry?.status || "";
+  if (!status.trim()) return "";
+  if (gitEntry?.oldPath || gitEntry?.inferredRename || gitEntry?.baselineRename || !/^[ M]{2}$/.test(status) || !status.includes("M")) return status;
+  try {
+    const review = reviews[relPath] || null;
+    const baseline = readDocReviewBaseline(root, relPath, review);
+    const baseContent = baseline?.content ?? readGitHeadFileContent(root, relPath);
+    if (reviewContentHash(baseContent) === reviewContentHash(content)) return "";
+  } catch {}
+  return status;
+}
+
+function normalizeHealthIssueForKey(issue = {}) {
+  return {
+    severity: shortString(issue.severity, 40),
+    type: shortString(issue.type, 120),
+    path: nullablePath(issue.path) || "",
+    message: shortString(issue.message, 1000),
+  };
+}
+
+export function healthIssueKey(issue = {}) {
+  const normalized = normalizeHealthIssueForKey(issue);
+  return hashContent([normalized.severity, normalized.type, normalized.path, normalized.message].join("\n")).slice(0, 24);
+}
+
+function healthAcknowledgementsPath(root = process.cwd()) {
+  return path.join(root, CONTEXT_HEALTH_ACKNOWLEDGEMENTS);
+}
+
+export function readContextHealthAcknowledgements(root = process.cwd()) {
+  const state = readJsonFile(healthAcknowledgementsPath(root), { version: 1, issues: {} });
+  const issues = state && typeof state.issues === "object" && !Array.isArray(state.issues) ? state.issues : {};
+  return { version: 1, updatedAt: state?.updatedAt || null, issues };
+}
+
+function writeContextHealthAcknowledgements(root = process.cwd(), state = {}) {
+  const clean = { version: 1, updatedAt: new Date().toISOString(), issues: {} };
+  for (const [key, value] of Object.entries(state.issues || {})) {
+    const cleanKey = shortString(key, 128);
+    if (!cleanKey) continue;
+    clean.issues[cleanKey] = {
+      acknowledgedAt: value?.acknowledgedAt || new Date().toISOString(),
+      note: shortString(value?.note, 500),
+      issue: normalizeHealthIssueForKey(value?.issue || {}),
+    };
+  }
+  const statePath = healthAcknowledgementsPath(root);
+  fs.mkdirSync(path.dirname(statePath), { recursive: true });
+  fs.writeFileSync(statePath, JSON.stringify(clean, null, 2) + "\n", "utf8");
+  return clean;
+}
+
+function publicHealthIssue(issue, acknowledgements = readContextHealthAcknowledgements()) {
+  const normalized = normalizeHealthIssueForKey(issue);
+  const key = healthIssueKey(normalized);
+  const acknowledgement = acknowledgements.issues?.[key] || null;
+  return {
+    ...issue,
+    ...normalized,
+    key,
+    acknowledged: Boolean(acknowledgement),
+    acknowledgedAt: acknowledgement?.acknowledgedAt || null,
+    acknowledgementNote: acknowledgement?.note || "",
+  };
+}
+
+export function acknowledgeContextHealthIssue(root = process.cwd(), { key = "", note = "" } = {}) {
+  const cleanKey = shortString(key, 128);
+  if (!cleanKey) throw new Error("Health issue key is required.");
+  const currentIssues = buildDocumentationGraph(root).healthIssues.map((issue) => publicHealthIssue(issue, { version: 1, issues: {} }));
+  const issue = currentIssues.find((item) => item.key === cleanKey);
+  if (!issue) throw new Error("Health issue no longer exists.");
+  const acknowledgements = readContextHealthAcknowledgements(root);
+  acknowledgements.issues[cleanKey] = {
+    acknowledgedAt: new Date().toISOString(),
+    note: shortString(note, 500),
+    issue: normalizeHealthIssueForKey(issue),
+  };
+  const saved = writeContextHealthAcknowledgements(root, acknowledgements);
+  return { issue: publicHealthIssue(issue, saved), acknowledgements: saved };
 }
 
 function isCronJobVirtualPath(relPath) {
@@ -1865,6 +2898,16 @@ function resolveSourceReference(root, docPath, reference) {
   const candidate = path.resolve(root, normalized);
   if (fs.existsSync(candidate)) return candidate;
   const docRelative = path.resolve(root, path.dirname(normalizeRelPath(docPath)), normalized);
+  if (fs.existsSync(docRelative)) return docRelative;
+  const rootAbs = path.resolve(root);
+  let current = path.dirname(normalizeRelPath(docPath));
+  while (current && current !== ".") {
+    const ancestorRelative = path.resolve(rootAbs, current, normalized);
+    if (ancestorRelative.startsWith(`${rootAbs}${path.sep}`) && fs.existsSync(ancestorRelative)) return ancestorRelative;
+    const next = path.dirname(current);
+    if (next === current) break;
+    current = next;
+  }
   return docRelative;
 }
 
@@ -1902,11 +2945,12 @@ function startupRelPathsForRoot(root, startupFiles = []) {
   return rels;
 }
 
-export function buildDocumentationGraph(root = process.cwd()) {
-  const settings = readMemoryWebappSettings(root);
-  const files = listMemoryFiles(root);
-  const gitStatuses = readGitStatuses(root);
-  const startupFiles = listStartupContextFiles(root, settings);
+export function buildDocumentationGraph(root = process.cwd(), options = {}) {
+  const settings = options.settings || readMemoryWebappSettings(root);
+  const files = options.files || listMemoryFiles(root);
+  const gitStatuses = options.gitStatuses || readGitStatuses(root);
+  const startupFiles = options.startupFiles || listStartupContextFiles(root, settings);
+  const startupHooks = options.startupHooks || listStartupHookFiles(root, settings);
   const startupRelPaths = startupRelPathsForRoot(root, startupFiles);
   const hubInfo = collectHubPathMatchers(settings.hubSections || []);
   const nodes = [];
@@ -1966,7 +3010,7 @@ export function buildDocumentationGraph(root = process.cwd()) {
     }
   }
 
-  const configIssues = buildConfigDiagnostics(root, settings, files, startupFiles, hubInfo);
+  const configIssues = buildConfigDiagnostics(root, settings, files, startupFiles, hubInfo, startupHooks);
   healthIssues.push(...configIssues);
   return {
     generatedAt: new Date().toISOString(),
@@ -1976,6 +3020,7 @@ export function buildDocumentationGraph(root = process.cwd()) {
       watched: nodes.filter((node) => node.watched).length,
       inHub: nodes.filter((node) => node.inHub).length,
       startup: nodes.filter((node) => node.startup).length,
+      startupHooks: startupHooks.length,
       missingMetadata: nodes.filter((node) => !node.metadata.present).length,
       stale: healthIssues.filter((issue) => issue.type === "stale_last_verified").length,
       highOrCritical: healthIssues.filter((issue) => ["critical", "high"].includes(issue.severity)).length,
@@ -1984,38 +3029,36 @@ export function buildDocumentationGraph(root = process.cwd()) {
     edges,
     healthIssues: sortHealthIssues(healthIssues).slice(0, 200),
     startupContext: startupFiles.map(publicStartupContextFile),
+    startupHooks: startupHooks.map(publicStartupHookFile),
   };
 }
 
 function graphIssuesForDocument({ root, file, content, metadata, watched, inHub, startup, references }) {
   const issues = [];
   if (metadata.parseError) issues.push({ type: "metadata_parse_error", severity: "high", message: `Cannot parse context_room metadata: ${metadata.parseError}.` });
-  if (!metadata.present && watched) issues.push({ type: "missing_metadata", severity: "medium", message: "Watched Markdown doc has no context_room metadata." });
-  if (!metadata.present && (inHub || startup)) issues.push({ type: "missing_metadata", severity: "low", message: "Visible Markdown doc has no context_room metadata." });
-  if (["canonical", "procedure", "agents"].includes(metadata.kind) && metadata.status === "current" && !metadata.last_verified) {
+  if (metadata.present && ["canonical", "procedure", "agents"].includes(metadata.kind) && metadata.status === "current" && !metadata.last_verified) {
     issues.push({ type: "missing_last_verified", severity: watched ? "medium" : "low", message: "Current high-impact doc has no last_verified date." });
   }
-  if (metadata.last_verified && Date.parse(metadata.last_verified) < Date.now() - 1000 * 60 * 60 * 24 * 120) {
+  if (metadata.present && metadata.last_verified && Date.parse(metadata.last_verified) < Date.now() - 1000 * 60 * 60 * 24 * 120) {
     issues.push({ type: "stale_last_verified", severity: watched ? "medium" : "low", message: `last_verified is older than 120 days: ${metadata.last_verified}.` });
   }
-  if (metadata.kind === "canonical" && metadata.status === "current" && !metadata.canonical_for) {
+  if (metadata.present && metadata.kind === "canonical" && metadata.status === "current" && !metadata.canonical_for) {
     issues.push({ type: "missing_canonical_for", severity: "medium", message: "Current canonical doc should declare canonical_for." });
   }
-  if (["canonical", "procedure"].includes(metadata.kind) && metadata.status === "current" && metadata.sources.length === 0) {
+  if (metadata.present && ["canonical", "procedure"].includes(metadata.kind) && metadata.status === "current" && metadata.sources.length === 0) {
     issues.push({ type: "missing_sources", severity: "low", message: "Current doc has no source files or links." });
   }
   for (const source of metadata.sources) {
     if (!sourceReferenceExists(root, file.path, source)) issues.push({ type: "broken_source", severity: "high", message: `Declared source does not exist: ${source}.` });
   }
-  for (const reference of references) {
+  if (metadata.present) for (const reference of references) {
     if (!sourceReferenceExists(root, file.path, reference)) issues.push({ type: "broken_reference", severity: "medium", message: `Referenced file does not exist: ${reference}.` });
   }
-  if (!inHub && !startup && watched) issues.push({ type: "watched_not_in_hub", severity: "low", message: "Watched doc is not reachable from any hub card." });
-  if (!content.trim()) issues.push({ type: "empty_doc", severity: watched ? "medium" : "low", message: "Document is empty." });
+  if (metadata.present && !content.trim()) issues.push({ type: "empty_doc", severity: watched ? "medium" : "low", message: "Document is empty." });
   return issues;
 }
 
-export function buildConfigDiagnostics(root = process.cwd(), settings = readMemoryWebappSettings(root), files = listMemoryFiles(root), startupFiles = listStartupContextFiles(root, settings), hubInfo = collectHubPathMatchers(settings.hubSections || [])) {
+export function buildConfigDiagnostics(root = process.cwd(), settings = readMemoryWebappSettings(root), files = listMemoryFiles(root), startupFiles = listStartupContextFiles(root, settings), hubInfo = collectHubPathMatchers(settings.hubSections || []), startupHooks = listStartupHookFiles(root, settings)) {
   const issues = [];
   const configPath = path.join(root, CONFIG_FILE);
   if (!fs.existsSync(configPath)) issues.push({ type: "missing_config", severity: "critical", message: `${CONFIG_FILE} is missing.` });
@@ -2049,6 +3092,18 @@ export function buildConfigDiagnostics(root = process.cwd(), settings = readMemo
       issues.push({ type: "external_startup_context", severity: "low", message: `External startup context affects agents: ${display}.` });
     }
   }
+  for (const hookFile of startupHooks) {
+    const hook = hookFile.startupHook || {};
+    const rel = hook.absolutePath ? path.relative(path.resolve(root), path.resolve(hook.absolutePath)).replaceAll(path.sep, "/") : "";
+    if (!rel || rel.startsWith("../") || path.isAbsolute(rel)) {
+      issues.push({ type: "external_startup_hook", severity: "low", message: `External startup hook affects agents: ${hook.displayPath}.` });
+    } else if (!hook.tracked) {
+      issues.push({ type: "untracked_startup_hook", severity: "low", message: `Startup hook is active but not tracked by Git: ${rel}.` });
+    }
+    if (["git-hooks", "core-hooks-path", "husky"].includes(hook.source) && !hook.executable) {
+      issues.push({ type: "startup_hook_not_executable", severity: "low", message: `Startup hook may not run because it is not executable: ${hook.displayPath}.` });
+    }
+  }
   return issues;
 }
 
@@ -2057,10 +3112,12 @@ function sortHealthIssues(issues = []) {
   return [...issues].sort((a, b) => (rank[a.severity] ?? 9) - (rank[b.severity] ?? 9) || String(a.path || "").localeCompare(String(b.path || ""), "fr") || String(a.type || "").localeCompare(String(b.type || ""), "fr"));
 }
 
-export function buildContextRoomDoctorReport(root = process.cwd()) {
-  const settings = readMemoryWebappSettings(root);
-  const graph = buildDocumentationGraph(root);
-  const docqa = buildDocQaReport(root);
+export function buildContextRoomDoctorReport(root = process.cwd(), options = {}) {
+  const settings = options.settings || readMemoryWebappSettings(root);
+  const graph = options.graph || buildDocumentationGraph(root, { settings });
+  const docqa = options.docqa || buildDocQaReport(root, { settings });
+  const acknowledgements = readContextHealthAcknowledgements(root);
+  const issues = graph.healthIssues.map((issue) => publicHealthIssue(issue, acknowledgements));
   return {
     generatedAt: new Date().toISOString(),
     root: path.resolve(root),
@@ -2073,10 +3130,34 @@ export function buildContextRoomDoctorReport(root = process.cwd()) {
       markdownTemplates: settings.markdownTemplates.length,
       appearance: settings.appearance,
       startupContext: settings.startupContext,
+      startupHooks: settings.startupHooks,
     },
     docqa: docqa.summary,
     graph: graph.summary,
-    issues: graph.healthIssues,
+    issues,
+    acknowledgedIssues: issues.filter((issue) => issue.acknowledged).length,
+  };
+}
+
+export function buildContextRoomReports(root = process.cwd()) {
+  const settings = readMemoryWebappSettings(root);
+  const files = listMemoryFiles(root);
+  const gitEntries = readGitStatusEntries(root);
+  const gitStatuses = new Map([...gitEntries.entries()].map(([rel, entry]) => [rel, entry.status]));
+  const reviewState = readDocReviewState(root);
+  const startupFiles = listStartupContextFiles(root, settings);
+  const startupHooks = listStartupHookFiles(root, settings);
+  const startupSkills = listStartupSkillFolders(root, settings);
+  const docqa = buildDocQaReport(root, { settings, files, gitStatuses: gitEntries, reviewState, startupFiles });
+  const graph = buildDocumentationGraph(root, { settings, files, gitStatuses, startupFiles, startupHooks });
+  const doctor = buildContextRoomDoctorReport(root, { settings, graph, docqa });
+  return {
+    generatedAt: new Date().toISOString(),
+    docqa,
+    doctor,
+    startupContext: startupFiles.map(publicStartupContextFile),
+    startupSkills,
+    startupHooks: startupHooks.map(publicStartupHookFile),
   };
 }
 
@@ -2184,26 +3265,42 @@ export function computeDocIssues({ path: relPath, content = "", gitStatus = "", 
   return issues;
 }
 
-export function buildDocQaReport(root = process.cwd()) {
-  const gitStatuses = readGitStatuses(root);
-  const reviewState = readDocReviewState(root);
-  const settings = readMemoryWebappSettings(root);
-  const files = listMemoryFiles(root);
-  const queue = files.map((file) => {
+export function buildDocQaReport(root = process.cwd(), options = {}) {
+  const gitStatuses = options.gitStatuses || readGitStatusEntries(root);
+  const reviewState = options.reviewState || readDocReviewState(root);
+  const settings = options.settings || readMemoryWebappSettings(root);
+  const files = options.files || listMemoryFiles(root);
+  const startupFiles = options.startupFiles || listStartupContextFiles(root, settings);
+  const { inferredRenames, renamedDeletedPaths } = inferGitRenames(root, gitStatuses, files, settings);
+  const { inferredRenames: inferredBaselineRenames } = inferReviewBaselineRenames(root, reviewState, gitStatuses, files, settings);
+  const filePaths = new Set(files.map((file) => file.path));
+  const gitQueue = files.map((file) => {
     const classification = classifyDocPath(file.path);
-    const gitStatus = gitStatuses.get(file.path) || "";
+    const gitEntry = inferredRenames.get(file.path) || inferredBaselineRenames.get(file.path) || gitStatuses.get(file.path) || null;
+    const rawGitStatus = gitEntry?.status || "";
     const reviewRequired = isRequiredReviewPath(file.path, settings);
+    if (!rawGitStatus.trim() && !reviewRequired) return null;
     const abs = resolveExternalPath(file.path) || path.join(root, file.path);
     const content = file.exists && fs.existsSync(abs) && file.bytes <= MAX_FILE_BYTES ? fs.readFileSync(abs, "utf8") : "";
+    const gitStatus = meaningfulGitStatusForReview(root, file.path, gitEntry, content, reviewState.reviews);
+    const review = currentReviewFor(root, reviewState.reviews, file.path, content);
+    if (!gitStatus.trim() && !reviewRequired) return null;
     const metadata = parseDocMetadata(content, file.path);
     const issues = computeDocIssues({ path: file.path, content, gitStatus, metadata });
     const riskScore = riskScoreFor({ classification, issues, gitStatus });
-    const review = currentReviewFor(reviewState.reviews, file.path, content);
-    return { path: file.path, label: file.label, summary: file.summary, updatedAt: file.updatedAt, classification, metadata, gitStatus, reviewRequired, issues, riskScore, review };
-  }).filter((item) => item.gitStatus.trim() || item.reviewRequired
+    return { path: file.path, oldPath: gitEntry?.oldPath || null, inferredRename: Boolean(gitEntry?.inferredRename), label: file.label, summary: file.summary, updatedAt: file.updatedAt, classification, metadata, gitStatus, reviewRequired, issues, riskScore, review };
+  }).filter(Boolean
+  ).filter((item) => item.gitStatus.trim() || item.reviewRequired
   ).filter((item) => isWatchedPath(item.path, settings) || item.reviewRequired
-  ).filter((item) => !(item.review?.status === "verified" && item.review.current)
-  ).sort((a, b) => reviewSeverityRank(a) - reviewSeverityRank(b)
+  ).filter((item) => !(item.review?.status === "verified" && item.review.current));
+  const deletedQueue = [...gitStatuses.values()]
+    .filter((entry) => entry.status.includes("D") && !entry.status.includes("R"))
+    .filter((entry) => !filePaths.has(entry.path) && !renamedDeletedPaths.has(entry.path))
+    .filter((entry) => isWatchedPath(entry.path, settings) || isRequiredReviewPath(entry.path, settings))
+    .map((entry) => buildDeletedReviewQueueItem(root, entry, settings, reviewState))
+    .filter((item) => !(item.review?.status === "verified" && item.review.current));
+  const queue = [...gitQueue, ...deletedQueue, ...buildStartupContextReviewQueue(root, settings, reviewState, startupFiles)]
+  .sort((a, b) => reviewSeverityRank(a) - reviewSeverityRank(b)
     || reviewOrderRank(a.path) - reviewOrderRank(b.path)
     || b.riskScore - a.riskScore
     || a.path.localeCompare(b.path, "fr"));
@@ -2221,6 +3318,168 @@ export function buildDocQaReport(root = process.cwd()) {
     },
     queue: queue.slice(0, 80),
   };
+}
+
+function inferGitRenames(root, gitStatuses, files, settings) {
+  const inferredRenames = new Map();
+  const renamedDeletedPaths = new Set();
+  const filesByPath = new Map(files.map((file) => [file.path, file]));
+  const deleted = [...gitStatuses.values()].filter((entry) => entry.status.includes("D") && !entry.status.includes("R") && isWatchedPath(entry.path, settings));
+  const added = [...gitStatuses.values()].filter((entry) => (entry.status === "??" || entry.status.includes("A")) && filesByPath.has(entry.path) && isWatchedPath(entry.path, settings));
+  for (const entry of added) {
+    const file = filesByPath.get(entry.path);
+    if (!file?.exists || file.bytes > MAX_FILE_BYTES) continue;
+    const currentAbs = path.join(root, file.path);
+    if (!fs.existsSync(currentAbs) || !fs.statSync(currentAbs).isFile()) continue;
+    const currentContent = fs.readFileSync(currentAbs, "utf8");
+    let best = null;
+    for (const deletedEntry of deleted) {
+      if (renamedDeletedPaths.has(deletedEntry.path)) continue;
+      if (path.extname(deletedEntry.path).toLowerCase() !== path.extname(entry.path).toLowerCase()) continue;
+      const baseContent = readGitHeadFileContent(root, deletedEntry.path);
+      if (!baseContent) continue;
+      const score = renameSimilarityScore(baseContent, currentContent, deletedEntry.path, entry.path);
+      if (!best || score > best.score) best = { entry: deletedEntry, score };
+    }
+    if (!best || best.score < 0.72) continue;
+    inferredRenames.set(entry.path, { ...entry, status: "R ", oldPath: best.entry.path, inferredRename: true });
+    renamedDeletedPaths.add(best.entry.path);
+  }
+  return { inferredRenames, renamedDeletedPaths };
+}
+
+function inferReviewBaselineRenames(root, reviewState, gitStatuses, files, settings) {
+  const inferredRenames = new Map();
+  const usedOldPaths = new Set();
+  const filesByPath = new Map(files.map((file) => [file.path, file]));
+  const currentPaths = new Set(filesByPath.keys());
+  const candidates = files.filter((file) => {
+    if (!file.exists || file.bytes > MAX_FILE_BYTES) return false;
+    if (!isWatchedPath(file.path, settings) && !isRequiredReviewPath(file.path, settings)) return false;
+    const gitStatus = gitStatuses.get(file.path)?.status || "";
+    return gitStatus === "??" || gitStatus.includes("A") || isRequiredReviewPath(file.path, settings);
+  });
+
+  for (const file of candidates) {
+    const currentAbs = resolveExternalPath(file.path) || path.join(root, file.path);
+    if (!fs.existsSync(currentAbs) || !fs.statSync(currentAbs).isFile()) continue;
+    const currentContent = fs.readFileSync(currentAbs, "utf8");
+    let best = null;
+    for (const [oldPath, review] of Object.entries(reviewState.reviews || {})) {
+      const normalizedOldPath = normalizeRelPath(oldPath);
+      if (!normalizedOldPath || usedOldPaths.has(normalizedOldPath) || currentPaths.has(normalizedOldPath)) continue;
+      if (path.extname(normalizedOldPath).toLowerCase() !== path.extname(file.path).toLowerCase()) continue;
+      if (!isWatchedPath(normalizedOldPath, settings) && !isRequiredReviewPath(normalizedOldPath, settings)) continue;
+      const baseline = readDocReviewBaseline(root, normalizedOldPath, review);
+      if (!baseline?.content) continue;
+      const score = renameSimilarityScore(baseline.content, currentContent, normalizedOldPath, file.path);
+      if (!best || score > best.score) best = { oldPath: normalizedOldPath, score };
+    }
+    if (!best || best.score < 0.72) continue;
+    inferredRenames.set(file.path, { path: file.path, status: "R ", oldPath: best.oldPath, inferredRename: true, baselineRename: true });
+    usedOldPaths.add(best.oldPath);
+  }
+  return { inferredRenames };
+}
+
+function renameSimilarityScore(baseContent, currentContent, oldPath, nextPath) {
+  if (hashContent(baseContent) === hashContent(currentContent)) return 1;
+  const sameParent = path.dirname(oldPath) === path.dirname(nextPath);
+  const baseWords = wordSetForRenameSimilarity(baseContent);
+  const currentWords = wordSetForRenameSimilarity(currentContent);
+  if (baseWords.size < 3 || currentWords.size < 3) return 0;
+  let shared = 0;
+  for (const word of baseWords) if (currentWords.has(word)) shared += 1;
+  const union = new Set([...baseWords, ...currentWords]).size || 1;
+  const lengthRatio = Math.min(baseContent.length, currentContent.length) / Math.max(baseContent.length, currentContent.length, 1);
+  const score = (shared / union) * Math.min(1, lengthRatio * 1.2);
+  return sameParent ? score : score * 0.82;
+}
+
+function wordSetForRenameSimilarity(content) {
+  return new Set(String(content || "").toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "").match(/[a-z0-9_/-]{3,}/g) || []);
+}
+
+function buildDeletedReviewQueueItem(root, entry, settings, reviewState) {
+  const content = readGitHeadFileContent(root, entry.path);
+  const classification = classifyDocPath(entry.path);
+  const metadata = parseDocMetadata(content, entry.path);
+  const issues = computeDocIssues({ path: entry.path, content, gitStatus: entry.status, metadata });
+  const riskScore = riskScoreFor({ classification, issues, gitStatus: entry.status });
+  const reviewRequired = isRequiredReviewPath(entry.path, settings);
+  const review = currentReviewFor(root, reviewState.reviews, entry.path, "");
+  return {
+    path: entry.path,
+    oldPath: null,
+    label: path.basename(entry.path),
+    summary: "Deleted file.",
+    updatedAt: null,
+    classification,
+    metadata,
+    gitStatus: entry.status,
+    reviewRequired,
+    issues,
+    riskScore,
+    review,
+  };
+}
+
+function readGitHeadFileContent(root, relPath) {
+  try {
+    return execFileSync("git", ["show", "HEAD:" + gitTreePathForRootRelative(root, relPath)], { cwd: root, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"], maxBuffer: MAX_FILE_BYTES + 64_000 });
+  } catch {
+    return "";
+  }
+}
+
+function buildStartupContextReviewQueue(root, settings, reviewState, startupFiles = listStartupContextFiles(root, settings)) {
+  const queue = [];
+  let stateChanged = false;
+  for (const startupFile of startupFiles) {
+    if (!isExternalStartupContextReviewFile(root, startupFile)) continue;
+    const file = readStartupContextReviewFile(root, startupFile.startupContext.displayPath, settings);
+    if (!file) continue;
+    const existing = reviewState.reviews[file.path] && typeof reviewState.reviews[file.path] === "object" ? reviewState.reviews[file.path] : {};
+    const baseline = readDocReviewBaseline(root, file.path, existing);
+    if (!baseline) {
+      const nextBaseline = writeDocReviewBaselineFile(root, file.path, file.content);
+      reviewState.reviews[file.path] = {
+        ...existing,
+        baselinePath: nextBaseline.baselinePath,
+        baselineHash: nextBaseline.baselineHash,
+        baselineReviewHash: nextBaseline.baselineReviewHash,
+        baselineAt: nextBaseline.baselineAt,
+        note: existing.note || "startup context baseline",
+      };
+      stateChanged = true;
+      continue;
+    }
+    if (baseline.reviewHash === reviewContentHash(file.content)) continue;
+    const classification = { type: "startup-context", authority: "critical", sensitive: false };
+    const gitStatus = "M";
+    const metadata = parseDocMetadata(file.content, file.path);
+    const issues = computeDocIssues({ path: file.path, content: file.content, gitStatus, metadata });
+    issues.unshift({ type: "internal_context_changed", severity: "high", message: "Startup context changed outside the Git review baseline." });
+    const review = currentReviewFor(root, reviewState.reviews, file.path, file.content);
+    if (review?.status === "verified" && review.current) continue;
+    queue.push({
+      path: file.path,
+      label: file.label || file.startupContext?.fileName || path.basename(file.path),
+      summary: file.summary || "Startup context changed outside Git.",
+      updatedAt: file.updatedAt,
+      classification,
+      metadata,
+      gitStatus,
+      internalChange: true,
+      startupContext: file.startupContext,
+      reviewRequired: true,
+      issues,
+      riskScore: riskScoreFor({ classification, issues, gitStatus }) + 20,
+      review,
+    });
+  }
+  if (stateChanged) writeDocReviewState(root, reviewState);
+  return queue;
 }
 
 function reviewSeverityRank(item) {
@@ -2305,6 +3564,7 @@ export function createDefaultProjectConfig({ title = "Context Room", allowedPath
     appearance: { fileTheme: DEFAULT_FILE_THEME, autoOpenGitDiff: true },
     startupContext: { ...DEFAULT_STARTUP_CONTEXT },
     startupSkills: { ...DEFAULT_STARTUP_SKILLS },
+    startupHooks: defaultStartupHookSettings(),
     bestPractices: [...DOCUMENTATION_BEST_PRACTICES],
     markdownTemplates: DEFAULT_MARKDOWN_TEMPLATES.map(normalizeMarkdownTemplate).filter(Boolean),
     hubCards: { ...DEFAULT_HUB_CARD_VISIBILITY },
@@ -2332,14 +3592,16 @@ export function ensureRuntimeGitExcludes(root = process.cwd()) {
   const excludePath = gitInfoExcludePath(root);
   if (!excludePath) return { updated: false, path: null };
   const prefix = gitRootRelativePrefix(root);
-  const entries = [
+  const roomEntries = [
     ".context-room/review-state.json",
     ".context-room/session-state.json",
     ".context-room/agent-command.json",
     ".context-room/agent-annotations.json",
+    ".context-room/health-acknowledgements.json",
     ".context-room/review-baselines/",
     ".context-room/memory-webapp-backups/",
   ].map((entry) => prefix + entry);
+  const entries = [...new Set([".context-room/review-ledger.json", ...roomEntries])];
   const marker = "# Context Room runtime state";
   const existing = fs.existsSync(excludePath) ? fs.readFileSync(excludePath, "utf8") : "";
   const missing = entries.filter((entry) => !existing.split(/\r?\n/).includes(entry));
@@ -2360,14 +3622,29 @@ function gitInfoExcludePath(root) {
   }
 }
 
-function gitRootRelativePrefix(root) {
+function cachedGitTopLevel(root) {
+  const resolvedRoot = path.resolve(root);
+  const cached = gitTopLevelCache.get(resolvedRoot);
+  if (cached) return cached;
   try {
-    const topLevel = execFileSync("git", ["rev-parse", "--show-toplevel"], { cwd: root, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).trim();
-    const rel = normalizeRelPath(path.relative(topLevel, path.resolve(root)));
-    return rel && rel !== "." ? rel.replace(/\/$/, "") + "/" : "";
+    const topLevel = execFileSync("git", ["rev-parse", "--show-toplevel"], { cwd: resolvedRoot, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).trim();
+    const result = topLevel ? path.resolve(topLevel) : null;
+    if (result) gitTopLevelCache.set(resolvedRoot, result);
+    return result;
   } catch {
-    return "";
+    return null;
   }
+}
+
+function gitTopLevelRoot(root) {
+  return cachedGitTopLevel(root);
+}
+
+function gitRootRelativePrefix(root) {
+  const topLevel = cachedGitTopLevel(root);
+  if (!topLevel) return "";
+  const rel = normalizeRelPath(path.relative(safeRealPath(topLevel), safeRealPath(root)));
+  return rel && rel !== "." ? rel.replace(/\/$/, "") + "/" : "";
 }
 
 function inferAllowedPathsForRoot(root) {
@@ -2582,6 +3859,7 @@ function normalizeMemoryWebappSettings(raw = {}, base = defaultMemoryWebappSetti
     appearance: normalizeAppearanceSettings(raw.appearance ?? base.appearance),
     startupContext: normalizeStartupContextSettings(raw.startupContext ?? base.startupContext),
     startupSkills: normalizeStartupSkillSettings(raw.startupSkills ?? base.startupSkills),
+    startupHooks: normalizeStartupHookSettings(raw.startupHooks ?? base.startupHooks),
     bestPractices: sanitizeTextList(raw.bestPractices ?? base.bestPractices ?? DOCUMENTATION_BEST_PRACTICES),
     markdownTemplates: sanitizeMarkdownTemplates(raw.markdownTemplates ?? base.markdownTemplates ?? DEFAULT_MARKDOWN_TEMPLATES),
     hubCards,
@@ -2605,9 +3883,15 @@ function normalizeStartupContextSettings(value = {}) {
     .map((item) => path.basename(String(item || "").trim()))
     .filter((item) => item && !isBlockedPath(item) && isEditableTextFile(item))
   )];
+  const rawGlobalPaths = Array.isArray(value.globalPaths) ? value.globalPaths : [];
+  const globalPaths = [...new Set(rawGlobalPaths
+    .map((item) => normalizeRelPath(String(item || "")).replace(/\/$/, ""))
+    .filter((item) => item.startsWith("~/") && !item.includes("/../") && !isBlockedPath(item) && isEditableTextFile(item))
+  )];
   return {
     enabled: Boolean(value.enabled),
     fileNames: fileNames.length ? fileNames : [...DEFAULT_STARTUP_CONTEXT.fileNames],
+    globalPaths,
   };
 }
 
@@ -2621,6 +3905,114 @@ function normalizeStartupSkillSettings(value = {}) {
     enabled: value.enabled !== false,
     folderNames: folderNames.length ? folderNames : [...DEFAULT_STARTUP_SKILLS.folderNames],
   };
+}
+
+function defaultStartupHookSettings() {
+  return {
+    ...DEFAULT_STARTUP_HOOKS,
+    fileNames: [...DEFAULT_STARTUP_HOOKS.fileNames],
+    agentHookSources: defaultAgentHookSources(),
+    agentHookPaths: [...DEFAULT_STARTUP_HOOKS.agentHookPaths],
+    codexPaths: [...DEFAULT_STARTUP_HOOKS.codexPaths],
+    managerPaths: [...DEFAULT_STARTUP_HOOKS.managerPaths],
+  };
+}
+
+function defaultAgentHookSources() {
+  return DEFAULT_AGENT_HOOK_SOURCES.map((source) => ({ id: source.id, label: source.label, paths: [...source.paths] }));
+}
+
+function normalizeStartupHookSettings(value = {}) {
+  const rawFileNames = Array.isArray(value.fileNames) ? value.fileNames : DEFAULT_STARTUP_HOOKS.fileNames;
+  const fileNames = [...new Set(rawFileNames
+    .map((item) => path.basename(String(item || "").trim()))
+    .filter((item) => item && !isBlockedPath(item) && !item.endsWith(".sample"))
+  )];
+  const rawManagerPaths = Array.isArray(value.managerPaths) ? value.managerPaths : DEFAULT_STARTUP_HOOKS.managerPaths;
+  const managerPaths = [...new Set(rawManagerPaths
+    .map((item) => normalizeRelPath(String(item || "")))
+    .filter((item) => item && !item.startsWith("../") && !item.includes("/../") && !path.isAbsolute(item) && !isBlockedPath(item))
+  )];
+  const agentHookSources = normalizeAgentHookSources(value);
+  const agentHookPaths = [...new Set(agentHookSources.flatMap((source) => source.paths || []))];
+  const codexPaths = agentHookPaths.filter((item) => item.includes(".codex/"));
+  const agentHooks = value.agentHooks ?? value.codexHooks;
+  return {
+    enabled: value.enabled !== false,
+    editable: Boolean(value.editable),
+    agentHooks: agentHooks !== false,
+    codexHooks: agentHooks !== false,
+    gitHooks: value.gitHooks !== false,
+    hookManagers: value.hookManagers !== false,
+    fileNames: fileNames.length ? fileNames : [...DEFAULT_STARTUP_HOOKS.fileNames],
+    agentHookSources,
+    agentHookPaths: agentHookPaths.length ? agentHookPaths : [...DEFAULT_STARTUP_HOOKS.agentHookPaths],
+    codexPaths: codexPaths.length ? codexPaths : [...DEFAULT_STARTUP_HOOKS.codexPaths],
+    managerPaths: managerPaths.length ? managerPaths : [...DEFAULT_STARTUP_HOOKS.managerPaths],
+  };
+}
+
+function normalizeAgentHookSources(value = {}) {
+  const rawSources = Array.isArray(value.agentHookSources)
+    ? value.agentHookSources
+    : null;
+  if (rawSources) {
+    const byId = new Map();
+    for (const rawSource of rawSources) {
+      const label = String(rawSource?.label || rawSource?.name || rawSource?.id || "").trim();
+      const id = sanitizeAgentHookSourceId(rawSource?.id || label);
+      const paths = sanitizeAgentHookPathList(rawSource?.paths || rawSource?.path || []);
+      if (!id || !label || !paths.length) continue;
+      const existing = byId.get(id);
+      if (existing) {
+        existing.paths = [...new Set([...existing.paths, ...paths])];
+      } else {
+        byId.set(id, { id, label, paths });
+      }
+    }
+    if (byId.size) return [...byId.values()];
+  }
+
+  const rawPaths = Array.isArray(value.agentHookPaths)
+    ? value.agentHookPaths
+    : Array.isArray(value.codexPaths)
+      ? value.codexPaths
+      : DEFAULT_STARTUP_HOOKS.agentHookPaths;
+  return agentHookSourcesFromPaths(sanitizeAgentHookPathList(rawPaths));
+}
+
+function sanitizeAgentHookSourceId(value) {
+  return slugifyServer(String(value || "").trim()).replace(/[^a-z0-9-]/g, "").replace(/^-+|-+$/g, "") || "agent";
+}
+
+function sanitizeAgentHookPathList(value) {
+  const raw = Array.isArray(value) ? value : [value];
+  return [...new Set(raw
+    .map((item) => normalizeRelPath(String(item || "")))
+    .filter((item) => item && !item.startsWith("../") && !item.includes("/../") && !path.isAbsolute(item) && !isBlockedPath(item))
+  )];
+}
+
+function agentHookSourcesFromPaths(paths = []) {
+  const byId = new Map();
+  for (const relPath of paths) {
+    const source = defaultAgentHookSourceForPath(relPath);
+    const existing = byId.get(source.id);
+    if (existing) {
+      existing.paths.push(relPath);
+    } else {
+      byId.set(source.id, { id: source.id, label: source.label, paths: [relPath] });
+    }
+  }
+  return byId.size ? [...byId.values()].map((source) => ({ ...source, paths: [...new Set(source.paths)] })) : defaultAgentHookSources();
+}
+
+function defaultAgentHookSourceForPath(relPath) {
+  const clean = normalizeRelPath(relPath).toLowerCase();
+  if (clean.includes(".codex/")) return { id: "codex", label: "Codex" };
+  if (clean.includes(".claude/")) return { id: "claude-code", label: "Claude Code" };
+  if (clean.includes("opencode")) return { id: "opencode", label: "OpenCode" };
+  return { id: "agent", label: "Agent" };
 }
 
 function markdownTemplatesForSettings(settings = defaultMemoryWebappSettings()) {
@@ -2783,17 +4175,15 @@ function riskScoreFor({ classification, issues, gitStatus }) {
   return changeScore + issueScore + (issues.length ? authorityScore : 0);
 }
 
-function readGitStatuses(root) {
+function readGitStatusEntries(root) {
   const statuses = new Map();
   try {
     const rootPrefix = gitRepoPrefixForRoot(root);
     const output = execFileSync("git", ["status", "--porcelain=v1", "--untracked-files=all"], { cwd: root, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] });
     for (const line of output.split("\n")) {
       if (!line.trim()) continue;
-      const status = line.slice(0, 2);
-      const rawRel = gitStatusPathFromPorcelainLine(line);
-      const rel = normalizeGitStatusPathForRoot(rawRel, rootPrefix);
-      if (rel) statuses.set(rel, status);
+      const entry = gitStatusEntryFromPorcelainLine(line, rootPrefix);
+      if (entry?.path) statuses.set(entry.path, entry);
     }
   } catch {
     // Git is optional for temp test roots and non-repo launches.
@@ -2801,18 +4191,42 @@ function readGitStatuses(root) {
   return statuses;
 }
 
+function readGitStatuses(root) {
+  return new Map([...readGitStatusEntries(root).entries()].map(([rel, entry]) => [rel, entry.status]));
+}
+
 function gitRepoPrefixForRoot(root) {
-  try {
-    return normalizeRelPath(execFileSync("git", ["rev-parse", "--show-prefix"], { cwd: root, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).trim());
-  } catch {
-    return "";
-  }
+  const topLevel = cachedGitTopLevel(root);
+  if (!topLevel) return "";
+  const rel = normalizeRelPath(path.relative(safeRealPath(topLevel), safeRealPath(root)));
+  return rel && rel !== "." ? rel.replace(/\/$/, "") + "/" : "";
+}
+
+function gitStatusEntryFromPorcelainLine(line, rootPrefix = "") {
+  const status = line.slice(0, 2);
+  const { oldPath, path: nextPath } = gitStatusPathsFromPorcelainLine(line);
+  const rel = normalizeGitStatusPathForRoot(nextPath, rootPrefix);
+  const oldRel = oldPath ? normalizeGitStatusPathForRoot(oldPath, rootPrefix) : "";
+  if (!rel) return null;
+  return { path: rel, oldPath: oldRel || null, status };
+}
+
+function gitStatusPathsFromPorcelainLine(line) {
+  const raw = line.slice(3);
+  if (!raw.includes(" -> ")) return { path: cleanGitStatusPath(raw), oldPath: null };
+  const [oldRaw, ...nextParts] = raw.split(" -> ");
+  return {
+    oldPath: cleanGitStatusPath(oldRaw),
+    path: cleanGitStatusPath(nextParts.join(" -> ") || oldRaw),
+  };
 }
 
 function gitStatusPathFromPorcelainLine(line) {
-  const raw = line.slice(3).replace(/^"|"$/g, "").replaceAll("\\", "/");
-  if (!raw.includes(" -> ")) return raw;
-  return raw.split(" -> ").pop() || raw;
+  return gitStatusPathsFromPorcelainLine(line).path;
+}
+
+function cleanGitStatusPath(raw) {
+  return String(raw || "").trim().replace(/^"|"$/g, "").replaceAll("\\", "/");
 }
 
 function normalizeGitStatusPathForRoot(relPath, rootPrefix = "") {
@@ -2824,12 +4238,60 @@ function normalizeGitStatusPathForRoot(relPath, rootPrefix = "") {
   return normalizeRelPath(normalized.slice(prefix.length));
 }
 
+function runBackgroundTask(task, root, payload = {}) {
+  return new Promise((resolve, reject) => {
+    const worker = new Worker(new URL("./background_worker.mjs", import.meta.url), {
+      workerData: { task, root: path.resolve(root), payload },
+    });
+    let settled = false;
+    worker.once("message", (message) => {
+      settled = true;
+      if (message?.ok) resolve(message.value);
+      else reject(new Error(message?.error || `Background task failed: ${task}`));
+    });
+    worker.once("error", (error) => {
+      if (!settled) reject(error);
+    });
+    worker.once("exit", (code) => {
+      if (!settled && code !== 0) reject(new Error(`Background task stopped: ${task}`));
+    });
+  });
+}
+
+function invalidateBackgroundReports(root) {
+  const key = path.resolve(root);
+  backgroundReportGenerations.set(key, (backgroundReportGenerations.get(key) || 0) + 1);
+  backgroundReportCache.delete(key);
+}
+
+async function readBackgroundReports(root, { force = false } = {}) {
+  const key = path.resolve(root);
+  const now = Date.now();
+  const cached = backgroundReportCache.get(key);
+  if (!force && cached?.value && cached.expiresAt > now) return cached.value;
+  if (!force && cached?.promise) return cached.promise;
+  const generation = backgroundReportGenerations.get(key) || 0;
+  const promise = runBackgroundTask("reports", key);
+  backgroundReportCache.set(key, { promise, value: cached?.value || null, expiresAt: cached?.expiresAt || 0 });
+  try {
+    const value = await promise;
+    if ((backgroundReportGenerations.get(key) || 0) !== generation) return readBackgroundReports(key, { force: true });
+    backgroundReportCache.set(key, { value, expiresAt: Date.now() + REPORT_CACHE_TTL_MS, promise: null });
+    return value;
+  } catch (error) {
+    backgroundReportCache.delete(key);
+    throw error;
+  }
+}
+
 export function createMemoryServer({ root = process.cwd(), port = DEFAULT_PORT } = {}) {
   const server = http.createServer(async (req, res) => {
     try {
       await routeRequest(req, res, root);
     } catch (error) {
       sendJson(res, 500, { error: error.message });
+    } finally {
+      if (req.method !== "GET") invalidateBackgroundReports(root);
     }
   });
   return { server, root, port };
@@ -2849,7 +4311,7 @@ async function routeRequest(req, res, root) {
     const externalRoots = [];
     if (startupSkillFolder && startupSkill) externalRoots.push(startupSkillExplorerRootPath(root, startupSkillFolder, startupSkill));
     if (startupContextOrder) externalRoots.push(startupContextExplorerPath(root, startupContextOrder));
-    sendJson(res, 200, { files: listMemoryFiles(root, { externalRoots }), root });
+    sendJson(res, 200, { files: listExplorerFiles(root, { externalRoots }), root });
     return;
   }
   if (req.method === "GET" && url.pathname === "/api/startup-context") {
@@ -2858,6 +4320,10 @@ async function routeRequest(req, res, root) {
   }
   if (req.method === "GET" && url.pathname === "/api/startup-skills") {
     sendJson(res, 200, { folders: listStartupSkillFolders(root), root });
+    return;
+  }
+  if (req.method === "GET" && url.pathname === "/api/startup-hooks") {
+    sendJson(res, 200, { files: listStartupHookFiles(root).map(publicStartupHookFile), root });
     return;
   }
   if (req.method === "POST" && url.pathname === "/api/startup-skills/create") {
@@ -2896,6 +4362,16 @@ async function routeRequest(req, res, root) {
     sendJson(res, 200, deleteStartupContextFile(root, body.order));
     return;
   }
+  if (req.method === "GET" && url.pathname === "/api/startup-hooks/file") {
+    const order = url.searchParams.get("order") || "";
+    sendJson(res, 200, readStartupHookFile(root, order));
+    return;
+  }
+  if (req.method === "POST" && url.pathname === "/api/startup-hooks/file") {
+    const body = await readJsonBody(req);
+    sendJson(res, 200, writeStartupHookFile(root, body.order, body.content));
+    return;
+  }
   if (req.method === "GET" && url.pathname === "/api/settings") {
     const settings = readMemoryWebappSettings(root);
     sendJson(res, 200, { settings, hubCards: hubCardsForRoot(root, settings), hubSections: hubSectionsForRoot(root, settings), availableHubCards: settings.customHubCards });
@@ -2907,8 +4383,12 @@ async function routeRequest(req, res, root) {
     sendJson(res, 200, { settings, hubCards: hubCardsForRoot(root, settings), hubSections: hubSectionsForRoot(root, settings), availableHubCards: settings.customHubCards });
     return;
   }
+  if (req.method === "GET" && url.pathname === "/api/reports") {
+    sendJson(res, 200, await readBackgroundReports(root, { force: url.searchParams.get("fresh") === "1" }));
+    return;
+  }
   if (req.method === "GET" && url.pathname === "/api/docqa") {
-    sendJson(res, 200, buildDocQaReport(root));
+    sendJson(res, 200, (await readBackgroundReports(root)).docqa);
     return;
   }
   if (req.method === "GET" && url.pathname === "/api/graph") {
@@ -2916,7 +4396,12 @@ async function routeRequest(req, res, root) {
     return;
   }
   if (req.method === "GET" && url.pathname === "/api/doctor") {
-    sendJson(res, 200, buildContextRoomDoctorReport(root));
+    sendJson(res, 200, (await readBackgroundReports(root)).doctor);
+    return;
+  }
+  if (req.method === "POST" && url.pathname === "/api/doctor/ack") {
+    const body = await readJsonBody(req);
+    sendJson(res, 200, acknowledgeContextHealthIssue(root, { key: body.key, note: body.note }));
     return;
   }
   if (req.method === "GET" && url.pathname === "/api/brief") {
@@ -2976,12 +4461,12 @@ async function routeRequest(req, res, root) {
   }
   if (req.method === "GET" && url.pathname === "/api/file/diff") {
     const relPath = url.searchParams.get("path") || "";
-    sendJson(res, 200, readFileDiff(root, relPath));
+    sendJson(res, 200, await runBackgroundTask("file-diff", root, { path: relPath }));
     return;
   }
   if (req.method === "GET" && url.pathname === "/api/file/review-base") {
     const relPath = url.searchParams.get("path") || "";
-    sendJson(res, 200, readReviewBaseFile(root, relPath));
+    sendJson(res, 200, await runBackgroundTask("review-base", root, { path: relPath }));
     return;
   }
   if (req.method === "POST" && url.pathname === "/api/file/revert") {
@@ -3034,7 +4519,111 @@ function displayPath(absPath) {
 }
 
 function isEditableTextFile(relPath) {
-  return [".md", ".csv", ".txt", ".json", ".jsonl", ".yaml", ".yml", ".mjs", ".js", ".py"].includes(path.extname(relPath));
+  return isProjectTextFile(relPath);
+}
+
+function isProjectTextFile(relPath) {
+  const normalized = normalizeRelPath(String(relPath || ""));
+  const base = path.basename(normalized);
+  const ext = path.extname(base);
+  return isSensitiveProjectFile(normalized) || PROJECT_TEXT_EXTENSIONS.has(ext) || PROJECT_TEXT_FILENAMES.has(base);
+}
+
+function fileKindForPath(relPath) {
+  if (isSensitiveProjectFile(relPath)) return "secret";
+  const ext = path.extname(normalizeRelPath(String(relPath || ""))).toLowerCase();
+  if (ext === ".csv" || ext === ".tsv") return "csv";
+  if (ext === ".md" || ext === ".mdx" || ext === ".txt") return "markdown";
+  return "text";
+}
+
+function isProjectReadableMemoryPath(relPath, root = process.cwd()) {
+  const normalized = normalizeRelPath(String(relPath || ""));
+  if (!normalized || normalized.startsWith("../") || normalized.includes("/../") || path.isAbsolute(normalized)) return false;
+  if (normalized.startsWith("~") || isBlockedPath(normalized) || hasSkippedPathSegment(normalized)) return false;
+  if (!isProjectTextFile(normalized)) return false;
+  const resolvedRoot = path.resolve(root);
+  const abs = path.resolve(resolvedRoot, normalized);
+  if (abs === resolvedRoot || !abs.startsWith(`${resolvedRoot}${path.sep}`)) return false;
+  if (!fs.existsSync(abs) || !fs.statSync(abs).isFile()) return false;
+  return fs.statSync(abs).size <= MAX_FILE_BYTES;
+}
+
+function resolveProjectReadableMemoryPath(root, relPath) {
+  const normalized = normalizeRelPath(String(relPath || ""));
+  if (!isProjectReadableMemoryPath(normalized, root)) throw new Error(`Path not allowed in context room: ${relPath}`);
+  return path.resolve(root, normalized);
+}
+
+function isSensitiveProjectFile(relPath) {
+  const normalized = normalizeRelPath(String(relPath || ""));
+  const base = path.basename(normalized);
+  if (!base.startsWith(".env")) return false;
+  if (SAFE_ENV_SAMPLE_FILENAMES.has(base)) return false;
+  return base === ".env" || base.startsWith(".env.");
+}
+
+function readSensitiveProjectFile(root, relPath) {
+  const normalized = normalizeRelPath(String(relPath || ""));
+  if (!isSensitiveProjectFile(normalized)) throw new Error(`Not a sensitive project file: ${relPath}`);
+  const resolvedRoot = path.resolve(root);
+  const abs = path.resolve(resolvedRoot, normalized);
+  if (abs === resolvedRoot || !abs.startsWith(`${resolvedRoot}${path.sep}`)) throw new Error(`Path not allowed in context room: ${relPath}`);
+  if (!fs.existsSync(abs)) {
+    return { path: normalized, content: "", exists: false, updatedAt: null, chars: 0, contentHash: hashContent(""), readOnly: true, sensitive: true, redacted: true };
+  }
+  const stats = fs.statSync(abs);
+  if (!stats.isFile()) throw new Error(`Not a file: ${relPath}`);
+  if (stats.size > MAX_FILE_BYTES) throw new Error(`File too large for context room: ${relPath}`);
+  const content = redactedSensitiveFileContent(abs, normalized);
+  return {
+    path: normalized,
+    content,
+    exists: true,
+    updatedAt: stats.mtime.toISOString(),
+    chars: content.length,
+    contentHash: hashContent(content),
+    readOnly: true,
+    sensitive: true,
+    redacted: true,
+  };
+}
+
+function redactedSensitiveFileContent(abs, relPath) {
+  const raw = fs.existsSync(abs) && fs.statSync(abs).isFile() ? fs.readFileSync(abs, "utf8") : "";
+  const keys = envKeysFromContent(raw);
+  const keyLines = keys.length
+    ? keys.map((key) => `- \`${key}\`: [redacted]`).join("\n")
+    : "- No variable names detected.";
+  return `# Sensitive file: ${relPath}
+
+> Context Room intentionally never exposes raw secret values through its API.
+> This view lists variable names only, so agents cannot retrieve secret values from Context Room commands.
+
+## Variables
+
+${keyLines}
+`;
+}
+
+function sensitiveFileSummary(abs) {
+  const raw = fs.existsSync(abs) && fs.statSync(abs).isFile() ? fs.readFileSync(abs, "utf8") : "";
+  const count = envKeysFromContent(raw).length;
+  return `Sensitive env file · ${count} variable${count === 1 ? "" : "s"} · values redacted`;
+}
+
+function envKeysFromContent(content) {
+  const keys = [];
+  const seen = new Set();
+  for (const line of String(content || "").split(/\r?\n/)) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith("#")) continue;
+    const match = trimmed.match(/^(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=/);
+    if (!match || seen.has(match[1])) continue;
+    seen.add(match[1]);
+    keys.push(match[1]);
+  }
+  return keys;
 }
 
 function validateEditableContent(relPath, content) {
@@ -3065,6 +4654,38 @@ function walkTextFiles(dir, root, settings = defaultMemoryWebappSettings()) {
       if (isAllowedMemoryPath(rel, settings)) results.push(rel);
     }
   }
+  return results;
+}
+
+function walkProjectExplorerTextFiles(root) {
+  const resolvedRoot = path.resolve(root);
+  const results = [];
+  const walk = (dir) => {
+    if (results.length >= PROJECT_EXPLORER_MAX_FILES) return;
+    let entries = [];
+    try {
+      entries = fs.readdirSync(dir, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const entry of entries) {
+      if (results.length >= PROJECT_EXPLORER_MAX_FILES) return;
+      if (PROJECT_EXPLORER_SKIP_DIRS.has(entry.name)) continue;
+      const abs = path.join(dir, entry.name);
+      const rel = path.relative(resolvedRoot, abs).replaceAll(path.sep, "/");
+      if (!rel || rel.startsWith("../") || rel.includes("/../")) continue;
+      if (entry.name.startsWith(".") && entry.name !== ".github" && !isSensitiveProjectFile(rel)) continue;
+      if (isBlockedPath(rel) && !isSensitiveProjectFile(rel)) continue;
+      if (entry.isDirectory()) {
+        walk(abs);
+      } else if (entry.isFile() && isProjectTextFile(rel)) {
+        try {
+          if (fs.statSync(abs).size <= MAX_FILE_BYTES) results.push(rel);
+        } catch {}
+      }
+    }
+  };
+  walk(resolvedRoot);
   return results;
 }
 
@@ -3208,7 +4829,9 @@ function osHome() {
 }
 
 function backupSafePath(relPath) {
-  return relPath.replace(/^~\/\.hermes\//, "external/hermes/").replace(/^~\//, "external/home/");
+  const normalized = normalizeRelPath(String(relPath || ""));
+  if (path.isAbsolute(normalized)) return "external/absolute/" + normalized.replace(/^\/+/, "").replaceAll(":", "_");
+  return normalized.replace(/^~\/\.hermes\//, "external/hermes/").replace(/^~\//, "external/home/");
 }
 
 function isBlockedPath(relPath) {
@@ -3247,9 +4870,10 @@ function sendHtml(res, body) {
   res.end(body);
 }
 
-export function renderFileActionButtons({ reviewAction = null, dirty = false, deletable = true } = {}) {
+export function renderFileActionButtons({ reviewAction = null, nextReviewAction = null, dirty = false, deletable = true } = {}) {
   return '<div class="file-actions">' +
     (reviewAction ? '<button class="file-action" type="button" data-file-review-decision="' + escapeHtmlServer(reviewAction.status) + '">' + escapeHtmlServer(reviewAction.label) + '</button>' : '') +
+    (nextReviewAction ? '<button class="file-action" type="button" data-next-review>' + escapeHtmlServer(nextReviewAction.label) + '</button>' : '') +
     (deletable ? '<button class="file-action danger-action" type="button" data-file-delete>Delete</button>' : '') +
     '<button class="file-action primary" type="button" data-file-save ' + (!dirty ? 'disabled' : '') + '>Save</button>' +
   '</div>';
@@ -3608,9 +5232,15 @@ export function renderAppHtml() {
     .explorer-context-menu .explorer-context-actions button { padding: 8px 10px; border-radius: 10px; font-size: 12px; line-height: 1.2; }
     select option { color: #111827; background: #ffffff; }
     select option:checked { color: #07101e; background: #93c5fd; }
-    .empty-template-actions { display: grid; grid-template-columns: minmax(150px, 240px); gap: 8px; align-items: center; }
-    .empty-template-actions .file-template-select { min-width: 0; }
-    .explorer-title { color: var(--accent); font-size: 11px; font-weight: 850; text-transform: uppercase; letter-spacing: 0.12em; margin: 10px 0 6px; }
+	    .empty-template-actions { display: grid; grid-template-columns: minmax(150px, 240px); gap: 8px; align-items: center; }
+	    .empty-template-actions .file-template-select { min-width: 0; }
+	    .file-load-state { min-height: min(56vh, 520px); display: grid; place-items: center; padding: var(--space-6); color: var(--muted); background: var(--file-bg); }
+	    .file-load-state-inner { max-width: 520px; display: grid; gap: var(--space-3); text-align: center; }
+	    .file-load-state strong { color: var(--text); font-size: 15px; }
+	    .file-load-state code { color: var(--accent); font-family: ui-monospace, SFMono-Regular, Menlo, monospace; overflow-wrap: anywhere; }
+	    .file-load-state.error { color: #ffc0c8; }
+	    .file-load-state.error strong { color: #ffd9df; }
+	    .explorer-title { color: var(--accent); font-size: 11px; font-weight: 850; text-transform: uppercase; letter-spacing: 0.12em; margin: 10px 0 6px; }
     .tree { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; font-size: 13px; line-height: 1.35; overflow: visible; padding-right: 4px; min-height: 180px; }
     .tree-node { min-width: 0; }
     .tree-row { width: 100%; border: 1px solid transparent; border-radius: 8px; background: transparent; color: var(--text); text-align: left; padding: 5px 7px; cursor: pointer; display: flex; align-items: center; gap: 6px; min-width: 0; }
@@ -3675,11 +5305,17 @@ export function renderAppHtml() {
     .chip.high { border-color: rgba(255,196,107,0.55); color: #ffd79c; background: rgba(255,196,107,0.10); }
     .inspector-body { padding: var(--panel-body-padding); display: grid; gap: var(--space-4); }
     .inspector-path { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; color: var(--accent); overflow-wrap: anywhere; }
-    .issue-list { display: grid; gap: 8px; }
-    .issue { border-left: 3px solid color-mix(in srgb, var(--accent) 50%, transparent); padding: 8px 10px; background: var(--surface-card); border-radius: 10px; color: var(--text); font-size: 13px; }
-    .issue.critical { border-left-color: var(--danger); }
-    .issue.high { border-left-color: #ffc46b; }
-    .docqa-actions { display: flex; gap: 8px; flex-wrap: wrap; }
+	    .issue-list { display: grid; gap: 8px; }
+	    .issue { border-left: 3px solid color-mix(in srgb, var(--accent) 50%, transparent); padding: 8px 10px; background: var(--surface-card); border-radius: 10px; color: var(--text); font-size: 13px; }
+	    .issue.critical { border-left-color: var(--danger); }
+	    .issue.high { border-left-color: #ffc46b; }
+	    .context-health-alert { display: flex; align-items: center; justify-content: space-between; gap: 12px; border: 1px solid color-mix(in srgb, var(--accent) 24%, transparent); border-radius: 14px; background: color-mix(in srgb, var(--accent) 8%, transparent); padding: 10px 12px; color: var(--text); }
+	    .context-health-alert strong { font-size: 14px; line-height: 1.2; }
+	    .context-health-alert span { color: var(--muted); font-size: 12px; white-space: nowrap; }
+	    .context-health-issue { display: flex; align-items: flex-start; justify-content: space-between; gap: 10px; }
+	    .context-health-issue-copy { min-width: 0; line-height: 1.35; }
+	    .context-health-ok { min-height: 30px; padding: 6px 10px; border-radius: 10px; flex: 0 0 auto; }
+	    .docqa-actions { display: flex; gap: 8px; flex-wrap: wrap; }
     .markdown-tools { padding: var(--panel-body-padding); display: grid; gap: var(--space-4); }
     .best-practice-list { margin: 0; padding-left: var(--space-5); display: grid; gap: var(--space-2); color: var(--text); font-size: 13px; line-height: 1.45; }
     .markdown-create { max-width: 1120px; margin: 0 auto; display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); gap: var(--space-4); align-items: start; }
@@ -3820,6 +5456,32 @@ export function renderAppHtml() {
     .startup-context-item.readonly:hover { transform: none; border-color: color-mix(in srgb, var(--line) 88%, transparent); background: var(--surface-card); }
     .startup-context-item strong { min-width: 0; font-size: 13px; line-height: 1.25; overflow-wrap: anywhere; }
     .startup-context-item span { min-width: 0; color: var(--muted); font: 12px/1.35 ui-monospace, SFMono-Regular, Menlo, monospace; overflow-wrap: anywhere; }
+    .startup-hook-item > span { display: grid; gap: 6px; }
+    .startup-hook-meta { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+    .startup-hook-kind { width: fit-content; border: 1px solid color-mix(in srgb, var(--accent) 32%, transparent); border-radius: 999px; padding: 2px 7px; background: color-mix(in srgb, var(--accent) 12%, transparent); color: var(--accent); font-size: 10px; line-height: 1.2; font-weight: 950; letter-spacing: 0.08em; text-transform: uppercase; }
+    .startup-hook-kind.claude { border-color: color-mix(in srgb, #d19a66 36%, transparent); background: color-mix(in srgb, #d19a66 12%, transparent); color: #d19a66; }
+    .startup-hook-kind.opencode { border-color: color-mix(in srgb, #98c379 32%, transparent); background: color-mix(in srgb, #98c379 10%, transparent); color: #98c379; }
+    .startup-hook-kind.git { border-color: color-mix(in srgb, #d19a66 36%, transparent); background: color-mix(in srgb, #d19a66 12%, transparent); color: #d19a66; }
+    .startup-hook-kind.manager { border-color: color-mix(in srgb, var(--danger) 34%, transparent); background: color-mix(in srgb, var(--danger) 10%, transparent); color: var(--danger); }
+    .startup-hook-item code { color: var(--text); font: inherit; overflow-wrap: anywhere; }
+    .startup-hook-item p { margin: 0; color: var(--muted); font-size: 12px; line-height: 1.45; text-transform: none; letter-spacing: 0; }
+    .startup-hook-item em { color: var(--muted); font-style: normal; font-size: 11px; line-height: 1.35; }
+    .startup-hook-item small { color: var(--accent); font-size: 11px; line-height: 1.35; overflow-wrap: anywhere; }
+    .startup-hook-filters { display: flex; flex-wrap: wrap; gap: 7px; align-items: center; }
+    .startup-hook-filter { border: 1px solid color-mix(in srgb, var(--line) 88%, transparent); border-radius: 999px; padding: 6px 9px; background: var(--surface-card); color: var(--muted); cursor: pointer; font-size: 11px; font-weight: 900; line-height: 1; }
+    .startup-hook-filter:hover { border-color: color-mix(in srgb, var(--accent) 38%, transparent); color: var(--text); background: var(--surface-card-hover); }
+    .startup-hook-filter.active { border-color: color-mix(in srgb, var(--accent) 52%, transparent); background: color-mix(in srgb, var(--accent) 16%, var(--surface-card)); color: var(--accent); }
+    .startup-hooks-help { border: 1px solid color-mix(in srgb, var(--accent) 18%, transparent); border-radius: 14px; background: color-mix(in srgb, var(--surface-card) 88%, var(--accent) 6%); overflow: hidden; }
+    .startup-hooks-help summary { min-height: 34px; display: flex; align-items: center; gap: 8px; padding: 7px 10px; color: var(--muted); cursor: pointer; list-style: none; font-size: 12px; font-weight: 850; }
+    .startup-hooks-help summary::-webkit-details-marker { display: none; }
+    .startup-hooks-help summary::before { content: "i"; width: 18px; height: 18px; display: inline-grid; place-items: center; border-radius: 999px; border: 1px solid color-mix(in srgb, var(--accent) 42%, transparent); color: var(--accent); font: 900 12px/1 ui-sans-serif, system-ui, sans-serif; }
+    .startup-hooks-help[open] summary { color: var(--text); border-bottom: 1px solid color-mix(in srgb, var(--line) 86%, transparent); }
+    .startup-hooks-help > div { display: grid; gap: 10px; padding: 10px; color: var(--muted); font-size: 12px; line-height: 1.45; }
+    .startup-hooks-help-section { display: grid; gap: 6px; border: 1px solid color-mix(in srgb, var(--line) 78%, transparent); border-radius: 12px; padding: 9px; background: color-mix(in srgb, var(--surface-card) 82%, transparent); }
+    .startup-hooks-help-section h4 { margin: 0; color: var(--text); font-size: 12px; line-height: 1.25; }
+    .startup-hooks-help p { margin: 0; }
+    .startup-hooks-help strong { color: var(--text); font-weight: 900; }
+    .startup-hooks-help ul { margin: 0; padding-left: 18px; display: grid; gap: 4px; }
     .startup-skill-names { min-width: 0; display: grid; gap: 4px; }
     .startup-skill-names code { min-width: 0; color: var(--muted); font: 12px/1.35 ui-monospace, SFMono-Regular, Menlo, monospace; overflow-wrap: anywhere; }
     .startup-skill-names em { color: var(--muted); font-style: normal; font-size: 12px; line-height: 1.4; overflow-wrap: anywhere; }
@@ -3851,6 +5513,7 @@ export function renderAppHtml() {
     .selection-action { width: 28px; height: 28px; padding: 0; border: 1px solid rgba(148,163,184,0.18); border-radius: 999px; background: rgba(255,255,255,0.045); color: var(--muted); font-size: 13px; line-height: 1; cursor: pointer; display: grid; place-items: center; }
     .selection-action:hover { color: var(--text); background: rgba(139,211,255,0.10); transform: translateY(-1px); }
     .selection-action.danger-action { border-color: rgba(255,140,157,0.24) !important; color: #ffb5c0 !important; }
+    .tree-empty { margin: var(--space-3) 0; padding: var(--space-3); border: 1px solid color-mix(in srgb, var(--line) 88%, transparent); border-radius: 14px; background: var(--surface-card); color: var(--muted); font-size: 12px; line-height: 1.4; }
     .tree-entry { display: flex; align-items: stretch; gap: var(--space-1); }
     .tree-entry .tree-row { flex: 1; }
     .tree-entry.selected .tree-row { border-color: rgba(139,211,255,0.34); background: rgba(139,211,255,0.085); box-shadow: inset 2px 0 0 rgba(139,211,255,0.48); }
@@ -3985,7 +5648,7 @@ export function renderAppHtml() {
     .external-change-stats .add { color: #9cffbc; border-color: rgba(93,244,143,0.28); }
     .external-change-stats .del { color: #ffb2bf; border-color: rgba(255,140,157,0.32); }
     .external-change-stats .pending { color: #dbeafe; border-color: rgba(125,211,252,0.28); }
-    .external-review-doc { white-space: normal; background: var(--file-bg); }
+    .external-review-doc { white-space: normal; background: var(--file-bg); overflow-anchor: none; }
     .external-review-block { position: relative; min-width: 0; }
     .external-review-block.change { display: block; position: relative; margin: 0; padding: 0; border-radius: 0 10px 10px 0; background: linear-gradient(90deg, rgba(125,211,252,0.06), rgba(125,211,252,0.018) 72%, transparent); box-shadow: inset 2px 0 0 rgba(125,211,252,0.46); }
     .external-review-block.attention { outline: 2px solid rgba(139,211,255,0.82); outline-offset: 2px; animation: externalReviewAttention 1.4s ease; }
@@ -4001,10 +5664,17 @@ export function renderAppHtml() {
     .external-review-block.change:hover .external-review-block-controls, .external-review-block.change:focus-within .external-review-block-controls { opacity: 1; border-color: rgba(139,211,255,0.26); transform: translateY(-1px); }
     .external-review-line { position: relative; border-radius: 5px; }
     .external-review-line::before { content: attr(data-review-marker); position: absolute; left: -1.35em; top: 0; width: 1em; color: rgba(226,236,255,0.58); text-align: center; user-select: none; pointer-events: none; }
-    .external-review-line.add { background: rgba(48,215,111,0.12); }
+    .external-review-line.add { background: rgba(48,215,111,0.065); }
     .external-review-line.add::before { color: #8df0b4; }
-    .external-review-line.del { background: rgba(255,86,117,0.12); }
+    .external-review-line.del { background: rgba(255,86,117,0.065); }
     .external-review-line.del::before { color: #ff9cac; }
+    .external-review-token { border-radius: 3px; padding: 0 1px; box-decoration-break: clone; -webkit-box-decoration-break: clone; }
+    .external-review-token.add { background: rgba(48,215,111,0.32); box-shadow: inset 0 -1px 0 rgba(141,240,180,0.5); }
+    .external-review-token.del { background: rgba(255,86,117,0.3); box-shadow: inset 0 -1px 0 rgba(255,156,172,0.48); text-decoration: line-through; text-decoration-thickness: 1px; }
+    .external-review-line.intraline-superseded { display: none; }
+    .external-review-line.intraline-merged { background: transparent; }
+    .external-review-line.intraline-removal::before { color: #ff9cac; }
+    .external-review-line.intraline-mixed::before { color: #d8c4ff; }
     .external-review-block.resolved.empty { min-height: 32px; overflow: hidden; }
     .agent-annotations { display: grid; gap: var(--space-2); padding: var(--space-3) var(--space-4) 0; }
     .agent-annotation { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: var(--space-3); align-items: center; border-left: 2px solid rgba(182,156,255,0.62); border-radius: 0 10px 10px 0; background: rgba(182,156,255,0.075); padding: var(--space-2) var(--space-3); color: rgba(226,236,255,0.9); font: 12px/1.4 Inter, ui-sans-serif, system-ui, sans-serif; }
@@ -4048,8 +5718,10 @@ export function renderAppHtml() {
     .confirm-backdrop { position: fixed; inset: 0; z-index: 90; display: grid; place-items: center; padding: var(--space-5); background: rgba(2,6,23,0.72); backdrop-filter: blur(14px); }
     .confirm-dialog { width: min(420px, 100%); border: 1px solid var(--line); border-radius: 18px; background: var(--surface-floating); box-shadow: 0 22px 80px rgba(0,0,0,0.45); padding: var(--space-6); color: var(--text); }
     .confirm-dialog strong { display: block; font-size: 18px; line-height: 1.2; margin-bottom: 8px; }
-    .confirm-dialog p { margin: 0; color: var(--muted); font-size: 14px; line-height: 1.45; overflow-wrap: anywhere; }
-    .confirm-actions { display: flex; justify-content: flex-end; gap: 8px; flex-wrap: wrap; margin-top: 18px; }
+	    .confirm-dialog p { margin: 0; color: var(--muted); font-size: 14px; line-height: 1.45; overflow-wrap: anywhere; }
+	    .confirm-option { display: flex; align-items: flex-start; gap: 10px; margin-top: 16px; color: var(--text); font-size: 13px; line-height: 1.35; }
+	    .confirm-option input { margin-top: 2px; accent-color: var(--accent); }
+	    .confirm-actions { display: flex; justify-content: flex-end; gap: 8px; flex-wrap: wrap; margin-top: 18px; }
     @media (max-width: 1280px) { .review-workspace { grid-template-columns: 1fr; } .diff-code, .doc-content { max-height: none; } }
     .viewer a.path-link { color: var(--file-list); text-decoration: none; border-bottom: 1px solid color-mix(in srgb, var(--file-list) 36%, transparent); cursor: inherit; }
     .doc-link-modifier-active .viewer a.path-link:hover { color: var(--accent); border-bottom-color: color-mix(in srgb, var(--accent) 72%, transparent); cursor: pointer; }
@@ -4216,7 +5888,7 @@ export function renderAppHtml() {
       <div class="sidebar-head">
         <div class="sidebar-copy">
           <h1>Explorer</h1>
-          <div class="subtitle">Allowed files and folders.</div>
+        <div class="subtitle">Project files and watched documentation.</div>
         </div>
         <button id="sidebarToggle" class="sidebar-toggle" type="button" title="hide/show sidebar">☰</button>
       </div>
@@ -4224,7 +5896,7 @@ export function renderAppHtml() {
         <input id="search" class="search" placeholder="search explorer..." />
         <button id="clearSearch" class="clear-search" type="button" title="show full explorer">all</button>
       </div>
-      <div class="watch-filter-row" aria-label="Explorer watch filter"><button id="watchFilterAll" class="watch-filter active" type="button" data-watch-filter="all">all</button><button id="watchFilterWatched" class="watch-filter" type="button" data-watch-filter="watched">watched</button><button id="watchFilterUnwatched" class="watch-filter" type="button" data-watch-filter="unwatched">unwatched</button></div>
+                  <div class="watch-filter-row" aria-label="Explorer watch filter"><button id="watchFilterAll" class="watch-filter active" type="button" data-watch-filter="all" data-watch-label="all">all</button><button id="watchFilterWatched" class="watch-filter" type="button" data-watch-filter="watched" data-watch-label="watched">watched</button><button id="watchFilterUnwatched" class="watch-filter" type="button" data-watch-filter="unwatched" data-watch-label="not watched">not watched</button></div>
       <div id="selectionBar" class="selection-bar" hidden><span id="selectionCount" class="selection-summary">0 selected</span><div class="selection-actions"><button id="watchSelected" class="selection-action" type="button" title="Add selected to watch">👁+</button><button id="unwatchSelected" class="selection-action" type="button" title="Remove selected from watch">👁−</button><button id="clearSelection" class="selection-action" type="button" title="clear selection">×</button><button id="deleteSelected" class="selection-action danger-action" type="button" title="delete selection">⌫</button></div></div>
       <div class="explorer-title">explorer</div>
       <div id="files" class="tree"></div>
@@ -4259,11 +5931,11 @@ export function renderAppHtml() {
               </header>
               <div id="markdownTools" class="markdown-tools"></div>
             </section>
-            <section class="docqa-panel">
+            <section id="contextHealthPanel" class="docqa-panel" hidden>
               <header>
                 <div>
                   <h2>Context health</h2>
-                  <div class="muted">metadata, graph, links, startup context, and config checks</div>
+                  <div class="muted">shown only when checks need attention</div>
                 </div>
               </header>
               <div id="contextHealth" class="markdown-tools"></div>
@@ -4299,9 +5971,13 @@ export function renderAppHtml() {
     </main>
   </div>
   <div id="explorerContextMenu" class="explorer-context-menu" hidden></div>
-  <div id="agentToast" class="agent-toast" hidden></div>
-<script>
-const state = { files: [], startupContextFiles: [], startupSkillFolders: [], activeStartupSkillExplorer: null, activeStartupContextExplorer: null, startupSkillCreateFolder: null, startupContextContextTarget: null, selectedStartupContext: null, docqa: null, doctor: null, settings: null, settingsOpen: false, page: "hub", pendingMarkdown: null, availableHubCards: [], hubFolders: [], hubSections: [], rootHubSections: [], activeHubCardId: null, selectedReview: null, reviewModePath: null, reviewModeStatus: null, reviewSessions: {}, selected: null, selectedDiff: null, fileConflict: null, externalChange: null, conflictCompare: false, conflictMergeText: null, conflictMergeKey: "", conflictMergeMode: "auto", conflictCheckTimer: null, diffCollapsed: false, saved: "", savedHash: null, dirty: false, mode: "view", homeView: "root", planetStack: ["root"], filePanel: false, history: [], historyIndex: -1, pathFilters: [], explorerWatchFilter: "all", explorerRenderKey: "", selectedForDelete: new Set(), selectionRequest: 0, openingFilePath: null, mobileSidebarTouched: false, sessionStateTimer: null, agentCommandTimer: null, lastAgentCommandId: "", pendingAgentCommand: null, agentAnnotations: {}, userActiveAt: 0, markdownHighlightFrame: 0, markdownHighlightText: "", markdownHighlightLastText: "", docLinkModifierActive: false, expanded: new Set(["data", "automations", "integrations", "skills", "tools", "~", "~/.hermes", "~/.hermes/memories", "~/.hermes/skills"]) };
+	  <div id="agentToast" class="agent-toast" hidden></div>
+	<script>
+		const state = { root: null, files: [], startupContextFiles: [], startupSkillFolders: [], startupHookFiles: [], startupHooksHelpOpen: false, startupHookFilter: "all", activeStartupSkillExplorer: null, activeStartupContextExplorer: null, startupSkillCreateFolder: null, startupContextContextTarget: null, selectedStartupContext: null, docqa: null, doctor: null, settings: null, settingsOpen: false, page: "hub", pendingMarkdown: null, availableHubCards: [], hubFolders: [], hubSections: [], rootHubSections: [], activeHubCardId: null, selectedReview: null, reviewModePath: null, reviewModeStatus: null, reviewSessions: {}, reviewFinalizationPromise: null, selected: null, selectedReadOnly: false, selectedDiff: null, fileLoadError: null, fileConflict: null, externalChange: null, conflictCompare: false, conflictMergeText: null, conflictMergeKey: "", conflictMergeMode: "auto", diffCollapsed: false, saved: "", savedHash: null, dirty: false, mode: "view", homeView: "root", planetStack: ["root"], filePanel: false, history: [], historyIndex: -1, pathFilters: [], explorerWatchFilter: "all", explorerRenderKey: "", selectedForDelete: new Set(), selectionRequest: 0, openingFilePath: null, mobileSidebarTouched: false, sessionStateTimer: null, agentCommandTimer: null, lastAgentCommandId: "", pendingAgentCommand: null, agentAnnotations: {}, userActiveAt: 0, userScrollIntentAt: 0, refreshInFlight: false, reportsRefreshInFlight: false, backgroundRefreshTimer: null, filePrefetches: new Map(), lastDiffRefreshAt: 0, lastReportRefreshAt: 0, lastFullRefreshAt: 0, navigationRestoreAttempted: false, markdownHighlightFrame: 0, markdownHighlightText: "", markdownHighlightLastText: "", docLinkModifierActive: false, expanded: new Set(["data", "automations", "integrations", "skills", "tools", "~", "~/.hermes", "~/.hermes/memories", "~/.hermes/skills"]) };
+	const VERIFY_CONFIRM_STORAGE_KEY = "context-room:skip-mark-verified-confirm";
+const NAVIGATION_STATE_STORAGE_PREFIX = "context-room:navigation:";
+const AGENT_COMMAND_ACK_STORAGE_KEY = "context-room:last-agent-command-id";
+const AGENT_COMMAND_MAX_AGE_MS = 60_000;
 const FILE_THEMES = ${JSON.stringify(FILE_THEME_OPTIONS)};
 const DEFAULT_FILE_THEME = "${DEFAULT_FILE_THEME}";
 const MAIN_FILE_PATHS = new Set([
@@ -4353,6 +6029,33 @@ async function api(path, options) {
   throw lastError || new Error("request failed");
 }
 
+function prefetchFile(path) {
+  if (!path || state.filePrefetches.has(path)) return;
+  const promise = api("/api/file?path=" + encodeURIComponent(path));
+  const entry = { promise, expiresAt: Date.now() + 3_000 };
+  state.filePrefetches.set(path, entry);
+  promise.then(() => {
+    window.setTimeout(() => {
+      if (state.filePrefetches.get(path) === entry) state.filePrefetches.delete(path);
+    }, Math.max(0, entry.expiresAt - Date.now()));
+  }, () => {
+    if (state.filePrefetches.get(path) === entry) state.filePrefetches.delete(path);
+  });
+}
+
+function readFileForOpen(path, { force = false } = {}) {
+  const entry = state.filePrefetches.get(path);
+  if (!force && entry && entry.expiresAt > Date.now()) return entry.promise;
+  if (entry) state.filePrefetches.delete(path);
+  return api("/api/file?path=" + encodeURIComponent(path));
+}
+
+function prefetchPathFromTarget(target) {
+  const element = target instanceof Element ? target.closest("[data-file-path], [data-hub-file], [data-main-path], [data-home-file]") : null;
+  const path = element?.dataset.filePath || element?.dataset.hubFile || element?.dataset.mainPath || element?.dataset.homeFile || "";
+  if (path) prefetchFile(path);
+}
+
 function currentFileThemeId() {
   const wanted = state.settings?.appearance?.fileTheme || DEFAULT_FILE_THEME;
   return normalizeFileThemeId(wanted);
@@ -4393,7 +6096,10 @@ function renderFileThemeOptions(selected = currentFileThemeId()) {
 
 function scheduleSessionStatePush() {
   window.clearTimeout(state.sessionStateTimer);
-  state.sessionStateTimer = window.setTimeout(() => publishSessionState().catch(() => {}), 280);
+  state.sessionStateTimer = window.setTimeout(() => {
+    persistNavigationState();
+    publishSessionState().catch(() => {});
+  }, 280);
 }
 
 async function publishSessionState() {
@@ -4404,20 +6110,126 @@ async function publishSessionState() {
   });
 }
 
+function navigationStorageKey(root = state.root) {
+  return root ? NAVIGATION_STATE_STORAGE_PREFIX + root : "";
+}
+
+function readPersistedNavigationState(root = state.root) {
+  const key = navigationStorageKey(root);
+  if (!key) return null;
+  try {
+    const raw = JSON.parse(window.localStorage?.getItem(key) || "null");
+    if (!raw || raw.version !== 1) return null;
+    const page = ["hub", "file", "settings", "new-doc"].includes(raw.page) ? raw.page : "hub";
+    return {
+      version: 1,
+      page,
+      selectedPath: normalizeUiPath(raw.selectedPath || ""),
+      startup: raw.startup && typeof raw.startup === "object" ? raw.startup : null,
+      reviewMode: Boolean(raw.reviewMode),
+      diffCollapsed: typeof raw.diffCollapsed === "boolean" ? raw.diffCollapsed : null,
+      selectedReview: normalizeUiPath(raw.selectedReview || ""),
+      explorerFilter: ["all", "watched", "unwatched"].includes(raw.explorerFilter) ? raw.explorerFilter : "all",
+      searchText: typeof raw.searchText === "string" ? raw.searchText.slice(0, 300) : "",
+      pathFilters: Array.isArray(raw.pathFilters) ? raw.pathFilters.map(normalizeUiPath).filter(Boolean).slice(0, 20) : [],
+      activeHubCardId: typeof raw.activeHubCardId === "string" ? raw.activeHubCardId : null,
+      pendingMarkdown: raw.pendingMarkdown && typeof raw.pendingMarkdown === "object" ? raw.pendingMarkdown : null,
+      viewState: raw.viewState && typeof raw.viewState === "object" ? raw.viewState : null,
+    };
+  } catch {
+    return null;
+  }
+}
+
+function persistNavigationState() {
+  const key = navigationStorageKey();
+  if (!key) return;
+  try {
+    window.localStorage?.setItem(key, JSON.stringify({
+      version: 1,
+      page: state.page,
+      selectedPath: state.selected || null,
+      startup: startupSelectionRequest(),
+      reviewMode: Boolean(state.reviewModePath && state.reviewModePath === state.selected),
+      diffCollapsed: state.diffCollapsed,
+      selectedReview: state.selectedReview || null,
+      explorerFilter: state.explorerWatchFilter,
+      searchText: el("search")?.value || "",
+      pathFilters: state.pathFilters || [],
+      activeHubCardId: state.activeHubCardId || null,
+      pendingMarkdown: state.page === "new-doc" ? state.pendingMarkdown : null,
+      viewState: state.selected ? captureEditorViewState() : null,
+      updatedAt: new Date().toISOString(),
+    }));
+  } catch {}
+}
+
+async function restoreNavigationAfterInitialLoad() {
+  if (state.navigationRestoreAttempted || state.selected || state.openingFilePath) return false;
+  state.navigationRestoreAttempted = true;
+  const persisted = readPersistedNavigationState();
+  if (!persisted) return false;
+  state.selectedReview = persisted.selectedReview || state.selectedReview;
+  state.explorerWatchFilter = persisted.explorerFilter;
+  state.pathFilters = persisted.pathFilters;
+  state.activeHubCardId = persisted.activeHubCardId;
+  el("search").value = persisted.searchText || folderFilterSearchQuery(state.pathFilters);
+  if (el("search").value.trim()) expandSearchMatches();
+  renderFiles();
+
+  if (persisted.page === "settings") {
+    showSettingsPage();
+    return true;
+  }
+  if (persisted.page === "new-doc" && persisted.pendingMarkdown) {
+    showNewDocPage(persisted.pendingMarkdown);
+    return true;
+  }
+  if (persisted.page === "hub") {
+    showHome();
+    return true;
+  }
+  if (persisted.page !== "file" || !persisted.selectedPath) return false;
+
+  const options = {
+    pushHistory: true,
+    revealInExplorer: false,
+    reviewMode: persisted.reviewMode,
+    diffCollapsed: persisted.diffCollapsed,
+    restoreViewState: persisted.viewState,
+  };
+  const startup = persisted.startup || null;
+  if (startup?.type === "startup-context") await selectStartupContextFile(startup.order, options);
+  else if (startup?.type === "startup-skill") await selectStartupSkillFile(startup.folder, startup.skill, options);
+  else if (startup?.type === "startup-hook") await selectStartupHookFile(startup.order, options);
+  else if (selectedFileExists(persisted.selectedPath)) await selectFile(persisted.selectedPath, options);
+  else return false;
+  setStatus("restored");
+  return true;
+}
+
+function restorePersistedViewState(snapshot) {
+  if (!snapshot || snapshot.path !== state.selected) return;
+  restoreEditorViewState(snapshot);
+  window.setTimeout(() => restoreEditorViewState(snapshot), 120);
+  window.setTimeout(() => restoreEditorViewState(snapshot), 600);
+}
+
 function buildSessionStatePayload() {
+  const validSelected = validSessionSelectedPath();
   const externalChange = activeExternalChange();
-  const blocks = externalChange ? buildExternalReviewBlocks(externalReviewBaseContent(externalChange), externalChange.diskContent || "", externalChange.reviewDecisions || {}) : [];
+  const blocks = validSelected && externalChange ? buildExternalReviewBlocks(externalReviewBaseContent(externalChange), externalChange.diskContent || "", externalChange.reviewDecisions || {}) : [];
   const pendingMiniDiffs = blocks.filter((block) => block.kind === "change" && !block.decision).length;
   return {
     source: "webapp",
-    page: state.page,
-    view: state.page,
-    openFile: state.selectedStartupContext ? state.selectedStartupContext.displayPath : state.selected,
-    selectedPath: state.selected,
-    visibleHeading: currentVisibleHeading(),
-    scrollPercent: currentScrollPercent(),
+    page: validSelected ? state.page : "hub",
+    view: validSelected ? state.page : "hub",
+    openFile: state.selectedStartupContext ? state.selectedStartupContext.displayPath : validSelected,
+    selectedPath: validSelected,
+    visibleHeading: validSelected ? currentVisibleHeading() : null,
+    scrollPercent: validSelected ? currentScrollPercent() : 0,
     pendingMiniDiffs,
-    gitDiffOpen: Boolean(state.selectedDiff?.changed && !state.diffCollapsed),
+    gitDiffOpen: Boolean(validSelected && state.selectedDiff?.changed && !state.diffCollapsed),
     diffCollapsed: Boolean(state.diffCollapsed),
     explorerFilter: state.explorerWatchFilter,
     pathFilters: state.pathFilters || [],
@@ -4426,6 +6238,27 @@ function buildSessionStatePayload() {
     mode: state.mode,
     status: el("status")?.textContent || "",
   };
+}
+
+function validSessionSelectedPath() {
+  if (state.selectedStartupContext) return state.selected;
+  if (!state.selected) return null;
+  return selectedFileExists(state.selected) ? state.selected : null;
+}
+
+function selectedFileExists(path = state.selected) {
+  if (!path || state.selectedStartupContext) return Boolean(path);
+  return state.files.some((file) => file.path === path) || canReviewMissingFile(path);
+}
+
+function reviewQueueItemForPath(path) {
+  if (!path) return null;
+  return (state.docqa?.queue || []).find((item) => item.path === path || item.oldPath === path) || null;
+}
+
+function canReviewMissingFile(path) {
+  const item = reviewQueueItemForPath(path);
+  return Boolean(item && item.path === path && !item.oldPath);
 }
 
 function currentScrollPercent() {
@@ -4494,6 +6327,7 @@ function approximateVisibleLineIndex() {
 
 function startAgentCommandPolling() {
   if (state.agentCommandTimer) window.clearInterval(state.agentCommandTimer);
+  state.lastAgentCommandId = readLastAgentCommandId();
   state.agentCommandTimer = window.setInterval(() => pollAgentCommand().catch(() => {}), 1500);
   pollAgentCommand().catch(() => {});
 }
@@ -4502,8 +6336,29 @@ async function pollAgentCommand() {
   const data = await api("/api/agent/command");
   const command = data.command;
   if (!command?.id || command.id === state.lastAgentCommandId) return;
+  if (isStaleAgentCommand(command)) {
+    rememberAgentCommandId(command.id);
+    return;
+  }
   state.lastAgentCommandId = command.id;
   handleAgentCommand(command).catch((error) => setStatus(error.message));
+}
+
+function readLastAgentCommandId() {
+  try { return window.localStorage?.getItem(AGENT_COMMAND_ACK_STORAGE_KEY) || ""; }
+  catch { return ""; }
+}
+
+function rememberAgentCommandId(id) {
+  state.lastAgentCommandId = id || "";
+  try {
+    if (id) window.localStorage?.setItem(AGENT_COMMAND_ACK_STORAGE_KEY, id);
+  } catch {}
+}
+
+function isStaleAgentCommand(command) {
+  const createdAt = Date.parse(command?.createdAt || "");
+  return Number.isFinite(createdAt) && Date.now() - createdAt > AGENT_COMMAND_MAX_AGE_MS;
 }
 
 async function handleAgentCommand(command) {
@@ -4543,12 +6398,14 @@ function hideAgentToast() {
 
 async function executeAgentCommand(command) {
   hideAgentToast();
+  if (command?.id) rememberAgentCommandId(command.id);
   const view = command.view || (command.path ? "file" : "hub");
   if (view === "settings") {
     showSettingsPage();
   } else if (view === "hub" && !command.path) {
     goHub();
   } else if (command.path) {
+    if (!state.files.some((file) => file.path === command.path)) await loadFiles();
     await selectFile(command.path, { revealInExplorer: true, pushHistory: true });
     if (view === "diff" && state.selected === command.path) {
       state.selectedDiff = await api("/api/file/diff?path=" + encodeURIComponent(command.path)).catch(() => state.selectedDiff);
@@ -4688,6 +6545,15 @@ function markUserActive() {
   scheduleSessionStatePush();
 }
 
+function markUserScrollIntent() {
+  state.userScrollIntentAt = Date.now();
+  markUserActive();
+}
+
+function isScrollIntentKey(event) {
+  return ["ArrowUp", "ArrowDown", "PageUp", "PageDown", "Home", "End", " "].includes(event.key);
+}
+
 function renderStats(files) {
   const existing = files.filter((file) => file.exists).length;
   const chars = files.reduce((sum, file) => sum + (file.chars || 0), 0);
@@ -4774,9 +6640,10 @@ function visibleFiles() {
 
 function setExplorerWatchFilter(filter) {
   state.explorerWatchFilter = ["watched", "unwatched"].includes(filter) ? filter : "all";
-  if (state.explorerWatchFilter !== "all") expandExplorerFilterResults();
   renderFiles();
-  setStatus(state.explorerWatchFilter === "all" ? "showing all docs" : "showing " + state.explorerWatchFilter + " docs");
+  const counts = explorerWatchCounts();
+  const suffix = counts.all ? " (" + counts.watched + " watched, " + counts.unwatched + " not watched)" : "";
+  setStatus(state.explorerWatchFilter === "all" ? "showing all project files" + suffix : "showing " + state.explorerWatchFilter + " files" + suffix);
   scheduleSessionStatePush();
 }
 
@@ -4802,9 +6669,23 @@ function explorerExpansionPathsForFiles(files = []) {
 }
 
 function updateExplorerWatchFilterButtons() {
+  const counts = explorerWatchCounts();
   document.querySelectorAll("[data-watch-filter]").forEach((button) => {
-    button.classList.toggle("active", button.dataset.watchFilter === state.explorerWatchFilter);
+    const filter = button.dataset.watchFilter || "all";
+    const label = button.dataset.watchLabel || filter;
+    button.textContent = label + " " + (counts[filter] ?? 0);
+    button.classList.toggle("active", filter === state.explorerWatchFilter);
+    button.title = filter === "all"
+      ? counts.all + " project files visible in the explorer"
+      : (counts[filter] ?? 0) + " " + label + " project files visible in the explorer";
   });
+}
+
+function explorerWatchCounts() {
+  const watchAllow = state.settings?.watchAllow || [];
+  const files = (state.files || []).filter((file) => !file.startupContext);
+  const watched = files.filter((file) => Boolean(watchStateForPath(file.path, watchAllow))).length;
+  return { all: files.length, watched, unwatched: Math.max(0, files.length - watched) };
 }
 
 function explorerRenderKey(files) {
@@ -4833,9 +6714,19 @@ function renderFiles({ force = false } = {}) {
   }
   state.explorerRenderKey = nextKey;
   const tree = buildTree(files);
-  el("files").innerHTML = renderTreeChildren(tree, 0);
+  el("files").innerHTML = files.length ? renderTreeChildren(tree, 0) : renderExplorerEmptyState();
   updateExplorerWatchFilterButtons();
   updateSelectionBar();
+}
+
+function renderExplorerEmptyState() {
+  const counts = explorerWatchCounts();
+  const message = state.explorerWatchFilter === "unwatched" && counts.unwatched === 0
+    ? "No not-watched files in this project."
+    : state.explorerWatchFilter === "watched" && counts.watched === 0
+      ? "No watched files in this project."
+      : "No files match the current explorer filter.";
+  return '<div class="tree-empty">' + escapeHtml(message) + '</div>';
 }
 
 function wireExplorerTreeEvents() {
@@ -5205,6 +7096,7 @@ async function deletePaths(paths) {
   state.selectedForDelete.clear();
   if (selected.includes(state.selected) || result.deleted.includes(state.selected)) {
     state.selected = null;
+    state.selectedReadOnly = false;
     state.openingFilePath = null;
     state.selectedDiff = null;
     resetExternalChangeState();
@@ -5360,25 +7252,69 @@ function iconForPath(filePath) {
   return "◇";
 }
 
-async function loadFiles() {
-  setStatus("chargement...");
-  const [data, docqa, doctor, settingsData, startupData, startupSkillsData] = await Promise.all([api(filesApiPath()), api("/api/docqa"), api("/api/doctor"), api("/api/settings"), api("/api/startup-context"), api("/api/startup-skills")]);
-  state.files = data.files;
-  state.startupContextFiles = startupData.files || [];
-  state.startupSkillFolders = startupSkillsData.folders || [];
-  state.docqa = docqa;
-  state.doctor = doctor;
-  state.settings = settingsData.settings;
+function applySettingsPayload(settingsData = {}) {
+  state.settings = settingsData.settings || state.settings;
   applyFileTheme();
   state.availableHubCards = settingsData.availableHubCards || [];
   state.hubFolders = settingsData.hubCards || [];
   state.rootHubSections = settingsData.hubSections || [];
   state.hubSections = state.rootHubSections;
-  state.selectedReview = docqa.queue[0]?.path || null;
+}
+
+function applyBackgroundReportPayload(reports = {}) {
+  state.docqa = reports.docqa || state.docqa;
+  state.doctor = reports.doctor || state.doctor;
+  state.startupContextFiles = reports.startupContext || state.startupContextFiles;
+  state.startupSkillFolders = reports.startupSkills || state.startupSkillFolders;
+  state.startupHookFiles = reports.startupHooks || state.startupHookFiles;
+  const queue = state.docqa?.queue || [];
+  state.selectedReview = queue.find((item) => item.path === state.selectedReview)?.path || queue.find((item) => item.path === state.reviewModePath)?.path || queue[0]?.path || null;
+}
+
+async function loadFiles(options = {}) {
+  setStatus("chargement...");
+  const [data, settingsData] = await Promise.all([api(filesApiPath()), api("/api/settings")]);
+  state.root = data.root || state.root;
+  state.files = data.files;
+  applySettingsPayload(settingsData);
+  state.lastFullRefreshAt = Date.now();
+  const clearedMissingSelection = reconcileMissingSelectedFile();
   renderFiles();
-  if (!state.selected) showHome();
+  const restored = await restoreNavigationAfterInitialLoad();
+  if (options.waitForBackground) await refreshBackgroundReports({ forceReports: true });
+  else scheduleBackgroundRefresh({ forceReports: true });
+  if (restored) {
+    scheduleSessionStatePush();
+    return;
+  }
+  if (clearedMissingSelection || !state.selected) showHome();
   setStatus("ready");
   scheduleSessionStatePush();
+}
+
+function reconcileMissingSelectedFile() {
+  if (!state.selected || state.selectedStartupContext || state.openingFilePath) return false;
+  if (selectedFileExists(state.selected)) return false;
+  return clearMissingSelectedFile(state.selected);
+}
+
+function clearMissingSelectedFile(stalePath = state.selected) {
+  resetExternalChangeState({ discardReview: true });
+  resetConflictState();
+  clearReviewSession(stalePath);
+  state.selected = null;
+  state.selectedReadOnly = false;
+  state.reviewModePath = null;
+  state.reviewModeStatus = null;
+  state.selectedDiff = null;
+  state.fileLoadError = null;
+  state.saved = "";
+  state.savedHash = null;
+  state.dirty = false;
+  state.mode = "view";
+  state.page = "hub";
+  el("editor").value = "";
+  return true;
 }
 
 function filesApiPath() {
@@ -5396,16 +7332,21 @@ function filesApiPath() {
 
 async function selectFile(path, options = {}) {
   if (!path) return;
+  await waitForReviewFinalizationBeforeNavigation();
+  if (state.selected && path !== state.selected && !selectedFileExists()) reconcileMissingSelectedFile();
   if (state.selected && path !== state.selected && !options.forceReload && blockPendingExternalChange("before changing file")) return;
   if (state.dirty && !options.forceReload && !confirm("You have unsaved changes. Change file?")) return;
 
   const requestId = ++state.selectionRequest;
+  const previousSelected = state.selected;
   state.selected = path;
+  state.selectedReadOnly = Boolean(state.files.find((item) => item.path === path)?.readOnly);
   state.openingFilePath = path;
   state.selectedStartupContext = null;
   state.activeStartupContextExplorer = null;
   state.reviewModePath = options.reviewMode ? path : null;
   state.reviewModeStatus = options.reviewMode ? reviewStatusForPath(path) : null;
+  state.fileLoadError = null;
   state.page = "file";
   state.settingsOpen = false;
   state.pendingMarkdown = null;
@@ -5439,16 +7380,19 @@ async function selectFile(path, options = {}) {
   updateHistoryButtons();
   updateActionBanner();
   updatePreview();
-  renderFiles();
+  if (options.revealInExplorer || !document.querySelector('[data-file-path="' + cssEscape(path) + '"]')) renderFiles();
+  else updateExplorerSelectedFile(previousSelected, path);
   if (options.revealInExplorer) scrollExplorerToPath(path);
   renderViewer();
   setStatus("opening...");
 
   try {
-    const data = await api("/api/file?path=" + encodeURIComponent(path));
+    const data = await readFileForOpen(path, { force: options.forceReload });
     if (!isCurrentSelection(requestId, path)) return;
     state.saved = data.content;
     state.savedHash = data.contentHash;
+    state.selectedReadOnly = Boolean(data.readOnly);
+    state.fileLoadError = null;
     state.openingFilePath = null;
     el("editor").value = data.content;
     await loadAnnotationsForPath(path).catch(() => {});
@@ -5457,15 +7401,19 @@ async function selectFile(path, options = {}) {
     updateHistoryButtons();
     updatePreview();
     renderViewer();
+    restorePersistedViewState(options.restoreViewState);
     setStatus("open");
 
     const loadDiff = async () => {
       const diff = await readSelectedDiff(path);
       if (!isCurrentSelection(requestId, path)) return;
       state.selectedDiff = diff;
+      state.lastDiffRefreshAt = Date.now();
       state.diffCollapsed = collapsedByGitDiffPreference(diff);
+      if (typeof options.diffCollapsed === "boolean") state.diffCollapsed = options.diffCollapsed;
       if (options.reviewMode && diff?.changed) await startChangedFileInlineReview(path, diff, requestId);
       renderViewer();
+      restorePersistedViewState(options.restoreViewState);
     };
     if (options.reviewMode) await loadDiff().catch((error) => {
       if (isCurrentSelection(requestId, path)) setStatus(error.message);
@@ -5476,17 +7424,30 @@ async function selectFile(path, options = {}) {
   } catch (error) {
     if (isCurrentSelection(requestId, path)) {
       state.openingFilePath = null;
+      state.fileLoadError = { path, message: error.message || "Failed to open file." };
+      state.saved = "";
+      state.savedHash = null;
+      el("editor").value = "";
+      renderViewer();
+      updateHeader();
+      updatePreview();
       setStatus(error.message);
     }
   }
+}
+
+function updateExplorerSelectedFile(previousPath, nextPath) {
+  if (previousPath) document.querySelectorAll('[data-file-path="' + cssEscape(previousPath) + '"]').forEach((row) => row.classList.remove("active"));
+  if (nextPath) document.querySelectorAll('[data-file-path="' + cssEscape(nextPath) + '"]').forEach((row) => row.classList.add("active"));
 }
 
 function isCurrentSelection(requestId, path) {
   return state.selectionRequest === requestId && state.selected === path;
 }
 
-async function selectStartupContextFile(order) {
+async function selectStartupContextFile(order, options = {}) {
   if (!order) return;
+  await waitForReviewFinalizationBeforeNavigation();
   if (state.dirty && !confirm("You have unsaved changes. Change file?")) return;
   const requestId = ++state.selectionRequest;
   const selectedKey = "startup-context-" + order;
@@ -5497,6 +7458,7 @@ async function selectStartupContextFile(order) {
   state.reviewModePath = null;
   state.reviewModeStatus = null;
   state.selectedDiff = null;
+  state.selectedReadOnly = false;
   resetExternalChangeState();
   state.saved = "";
   state.savedHash = null;
@@ -5528,7 +7490,11 @@ async function selectStartupContextFile(order) {
     if (!isCurrentSelection(requestId, selectedKey)) return;
     state.selectedStartupContext = data.startupContext;
     const selectedPath = startupContextSelectedExplorerPath(data.startupContext);
-    state.selected = selectedPath || selectedKey;
+    const finalPath = selectedPath || selectedKey;
+    state.selected = finalPath;
+    state.reviewModePath = options.reviewMode ? finalPath : null;
+    state.reviewModeStatus = options.reviewMode ? reviewStatusForPath(finalPath) : null;
+    if (options.reviewMode) state.selectedReview = finalPath;
     activateStartupContextExplorer(data.startupContext);
     state.saved = data.content;
     state.savedHash = data.contentHash;
@@ -5538,8 +7504,12 @@ async function selectStartupContextFile(order) {
     revealActiveStartupContextExplorer();
     updateHeader();
     updatePreview();
+    if (options.reviewMode) await startChangedFileInlineReview(finalPath, { changed: true }, requestId).catch((error) => {
+      if (isCurrentSelection(requestId, finalPath)) setStatus(error.message);
+    });
     renderViewer();
-    setStatus("startup context open");
+    restorePersistedViewState(options.restoreViewState);
+    setStatus(options.reviewMode ? "startup context review open" : "startup context open");
     scheduleSessionStatePush();
   } catch (error) {
     if (isCurrentSelection(requestId, selectedKey)) {
@@ -5549,8 +7519,9 @@ async function selectStartupContextFile(order) {
   }
 }
 
-async function selectStartupSkillFile(folderOrder, skillName) {
+async function selectStartupSkillFile(folderOrder, skillName, options = {}) {
   if (!folderOrder || !skillName) return;
+  await waitForReviewFinalizationBeforeNavigation();
   if (state.dirty && !confirm("You have unsaved changes. Change file?")) return;
   const requestId = ++state.selectionRequest;
   const selectedKey = "startup-skill-" + folderOrder + "-" + skillName;
@@ -5561,6 +7532,7 @@ async function selectStartupSkillFile(folderOrder, skillName) {
   state.reviewModePath = null;
   state.reviewModeStatus = null;
   state.selectedDiff = null;
+  state.selectedReadOnly = false;
   resetExternalChangeState();
   state.saved = "";
   state.savedHash = null;
@@ -5602,7 +7574,72 @@ async function selectStartupSkillFile(folderOrder, skillName) {
     updateHeader();
     updatePreview();
     renderViewer();
+    restorePersistedViewState(options.restoreViewState);
     setStatus("startup skill open");
+    scheduleSessionStatePush();
+  } catch (error) {
+    if (isCurrentSelection(requestId, selectedKey)) {
+      state.openingFilePath = null;
+      setStatus(error.message);
+    }
+  }
+}
+
+async function selectStartupHookFile(order, options = {}) {
+  if (!order) return;
+  await waitForReviewFinalizationBeforeNavigation();
+  if (state.dirty && !confirm("You have unsaved changes. Change file?")) return;
+  const requestId = ++state.selectionRequest;
+  const selectedKey = "startup-hook-" + order;
+  const pendingFile = (state.startupHookFiles || []).find((file) => String(file.startupContext.order) === String(order));
+  state.selected = selectedKey;
+  state.openingFilePath = selectedKey;
+  state.activeStartupContextExplorer = null;
+  state.activeStartupSkillExplorer = null;
+  state.selectedStartupContext = pendingFile?.startupContext || { order, fileName: "Startup hook", displayPath: "", kind: "startup-hook", readOnly: true };
+  state.reviewModePath = null;
+  state.reviewModeStatus = null;
+  state.selectedDiff = null;
+  state.selectedReadOnly = false;
+  resetExternalChangeState();
+  state.saved = "";
+  state.savedHash = null;
+  state.dirty = false;
+  state.mode = "edit";
+  state.page = "file";
+  state.settingsOpen = false;
+  state.pendingMarkdown = null;
+  state.pathFilters = [];
+  el("search").value = "";
+  openSidebarIfCollapsed();
+  document.querySelector(".editor-shell").classList.remove("planet-file-open");
+  document.querySelector(".editor-shell").classList.add("file-open");
+  el("home").hidden = true;
+  el("settingsPage").hidden = true;
+  el("newDocPage").hidden = true;
+  el("viewer").hidden = false;
+  el("editor").hidden = true;
+  el("editor").value = "";
+  updateHeader();
+  updateHistoryButtons();
+  updateActionBanner();
+  updatePreview();
+  renderFiles();
+  renderViewer();
+  setStatus("opening startup hook...");
+  try {
+    const data = await api("/api/startup-hooks/file?order=" + encodeURIComponent(order));
+    if (!isCurrentSelection(requestId, selectedKey)) return;
+    state.selectedStartupContext = data.startupContext;
+    state.saved = data.content;
+    state.savedHash = data.contentHash;
+    state.openingFilePath = null;
+    el("editor").value = data.content;
+    updateHeader();
+    updatePreview();
+    renderViewer();
+    restorePersistedViewState(options.restoreViewState);
+    setStatus(data.startupContext?.readOnly ? "startup hook open · read only" : "startup hook open");
     scheduleSessionStatePush();
   } catch (error) {
     if (isCurrentSelection(requestId, selectedKey)) {
@@ -5773,6 +7810,7 @@ async function deleteStartupContextFromPanel(order) {
   if (isCurrent) {
     state.activeStartupContextExplorer = null;
     state.selected = null;
+    state.selectedReadOnly = false;
     state.selectedStartupContext = null;
     state.saved = "";
     state.savedHash = null;
@@ -5797,6 +7835,7 @@ async function deleteStartupSkillFromPanel(folderOrder, skillName) {
   if (state.selected === selectedKey) {
     state.activeStartupSkillExplorer = null;
     state.selected = null;
+    state.selectedReadOnly = false;
     state.selectedStartupContext = null;
     showHome();
   } else {
@@ -5835,6 +7874,7 @@ function showHome() {
   updateHistoryButtons();
   updateActionBanner();
   renderHubFolders();
+  setStatus("ready");
   scheduleSessionStatePush();
 }
 
@@ -5845,9 +7885,10 @@ function renderDocQaDashboard() {
   el("reviewSummary").innerHTML = renderReviewSummary(s);
   const queue = report.queue.length ? report.queue : [];
   el("reviewQueue").innerHTML = queue.length ? queue.map(renderReviewItem).join("") : '<div class="issue">No watched files changed or created in the current worktree.</div>';
-  document.querySelectorAll("[data-review-path]").forEach((button) => button.addEventListener("click", () => {
-    selectFile(button.dataset.reviewPath, { revealInExplorer: !isNarrowLayout(), reviewMode: true }).catch((error) => setStatus(error.message));
-  }));
+	  document.querySelectorAll("[data-review-path]").forEach((button) => button.addEventListener("click", () => {
+	    const item = state.docqa?.queue?.find((entry) => entry.path === button.dataset.reviewPath) || { path: button.dataset.reviewPath, startupContext: button.dataset.startupReviewOrder ? { order: button.dataset.startupReviewOrder } : null };
+	    openReviewQueueItem(item).catch((error) => setStatus(error.message));
+	  }));
   renderMarkdownTools();
   renderContextHealth();
   renderHubFolders();
@@ -5862,15 +7903,44 @@ function renderMarkdownTools() {
 
 function renderContextHealth() {
   const holder = el("contextHealth");
+  const panel = el("contextHealthPanel");
   if (!holder || !state.doctor) return;
-  const summary = state.doctor.graph || {};
-  const issues = state.doctor.issues || [];
-  holder.innerHTML = '<div class="review-summary">' +
-    '<div class="review-summary-item"><strong>' + Number(summary.docs || 0).toLocaleString("en-US") + '</strong><span>docs</span></div>' +
-    '<div class="review-summary-item"><strong>' + Number(summary.missingMetadata || 0).toLocaleString("en-US") + '</strong><span>no metadata</span></div>' +
-    '<div class="review-summary-item"><strong>' + Number(summary.highOrCritical || 0).toLocaleString("en-US") + '</strong><span>high risk</span></div>' +
-  '</div>' +
-  '<div class="issue-list">' + (issues.length ? issues.slice(0, 10).map((issue) => '<div class="issue ' + escapeHtml(issue.severity) + '"><strong>[' + escapeHtml(issue.severity) + ']</strong> ' + escapeHtml((issue.path ? issue.path + ": " : "") + issue.message) + '</div>').join("") : '<div class="issue">Context health is clean.</div>') + '</div>';
+  const issues = (state.doctor.issues || []).filter((issue) => ["critical", "high", "medium"].includes(issue.severity) && !issue.acknowledged);
+  if (!issues.length) {
+    holder.innerHTML = "";
+    if (panel) panel.hidden = true;
+    return;
+  }
+  if (panel) panel.hidden = false;
+  const counts = issues.reduce((acc, issue) => {
+    acc[issue.severity] = (acc[issue.severity] || 0) + 1;
+    return acc;
+  }, {});
+  const countLabel = ["critical", "high", "medium"].filter((severity) => counts[severity]).map((severity) => counts[severity] + " " + severity).join(" · ");
+  holder.innerHTML = '<div class="context-health-alert"><strong>' + issues.length + ' issue' + (issues.length > 1 ? 's' : '') + ' triggered</strong><span>' + escapeHtml(countLabel) + '</span></div>' +
+    '<div class="issue-list compact">' + issues.slice(0, 5).map(renderContextHealthIssue).join("") + (issues.length > 5 ? '<div class="issue">+' + (issues.length - 5) + ' more in doctor.</div>' : '') + '</div>';
+  holder.querySelectorAll("[data-health-ack]").forEach((button) => button.addEventListener("click", () => acknowledgeContextHealthIssueFromPanel(button.dataset.healthAck).catch((error) => setStatus(error.message))));
+}
+
+function renderContextHealthIssue(issue) {
+  const label = (issue.path ? issue.path + ": " : "") + issue.message;
+  return '<div class="issue context-health-issue ' + escapeHtml(issue.severity) + '">' +
+    '<div class="context-health-issue-copy"><strong>[' + escapeHtml(issue.severity) + ']</strong> ' + escapeHtml(label) + '</div>' +
+    '<button class="file-action context-health-ok" type="button" data-health-ack="' + escapeHtml(issue.key || "") + '" title="Hide this issue unless it changes">OK</button>' +
+    '</div>';
+}
+
+async function acknowledgeContextHealthIssueFromPanel(key) {
+  if (!key) return;
+  setStatus("marking health issue OK...");
+  await api("/api/doctor/ack", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ key }),
+  });
+  state.doctor = await api("/api/doctor");
+  renderContextHealth();
+  setStatus("health issue marked OK");
 }
 
 function showNewDocPage({ title = "New document", path = "docs/new-document.md", directory = "" } = {}) {
@@ -5880,6 +7950,7 @@ function showNewDocPage({ title = "New document", path = "docs/new-document.md",
   state.settingsOpen = false;
   state.pendingMarkdown = { title, path, directory };
   state.selected = null;
+  state.selectedReadOnly = false;
   state.openingFilePath = null;
   state.selectedStartupContext = null;
   state.selectedDiff = null;
@@ -6071,18 +8142,22 @@ function gitStatusLabel(status, reviewRequired = false) {
   if (!clean) return "modified";
   if (clean === "??") return "new";
   if (clean === "M" || clean === "M M" || clean.includes("M")) return "modified";
+  if (clean.includes("R")) return "renamed";
   if (clean.includes("A")) return "added";
   if (clean.includes("D")) return "deleted";
-  if (clean.includes("R")) return "renamed";
   if (clean.includes("U")) return "conflict";
   return clean;
 }
 
 function renderReviewItem(item) {
   const gitLabel = gitStatusLabel(item.gitStatus, item.reviewRequired);
-  return '<button class="review-item ' + (state.selectedReview === item.path ? "active" : "") + '" type="button" data-review-path="' + escapeHtml(item.path) + '">' +
+  const startupOrder = item.startupContext?.order ? ' data-startup-review-order="' + escapeHtml(item.startupContext.order) + '"' : "";
+  const pathLine = item.oldPath
+    ? escapeHtml(item.oldPath) + " -> " + escapeHtml(item.path)
+    : escapeHtml(item.path);
+  return '<button class="review-item ' + (state.selectedReview === item.path ? "active" : "") + '" type="button" data-review-path="' + escapeHtml(item.path) + '"' + startupOrder + '>' +
     '<div class="review-top"><div class="review-title">' + escapeHtml(item.label || item.path) + '</div><span class="chip high">' + escapeHtml(gitLabel) + '</span></div>' +
-    '<div class="review-path">' + escapeHtml(item.path) + '</div>' +
+    '<div class="review-path">' + pathLine + '</div>' +
     '<div class="chips"><span class="chip">' + escapeHtml(item.classification.type) + '</span><span class="chip">open to review</span></div>' +
   '</button>';
 }
@@ -6091,12 +8166,13 @@ function renderFileActionButtons(options = {}) {
   return '<div class="file-actions">' + renderFileActionItems(options) + '</div>';
 }
 
-function renderFileActionItems({ reviewAction = null, dirty = false, templateState = null, blockedByConflict = false, deletable = true } = {}) {
+function renderFileActionItems({ reviewAction = null, nextReviewAction = null, dirty = false, templateState = null, blockedByConflict = false, readOnly = false, deletable = true } = {}) {
   return '' +
     (templateState ? '<div class="empty-template-actions"><select class="file-template-select" data-empty-template-select aria-label="Template">' + renderFileTemplateOptions(templateState.selectedId) + '</select></div>' : '') +
     (reviewAction ? '<button class="file-action" type="button" data-file-review-decision="' + escapeHtml(reviewAction.status) + '">' + escapeHtml(reviewAction.label) + '</button>' : '') +
+    (nextReviewAction ? '<button class="file-action" type="button" data-next-review>' + escapeHtml(nextReviewAction.label) + '</button>' : '') +
     (deletable ? '<button class="file-action danger-action" type="button" data-file-delete>Delete</button>' : '') +
-    '<button class="file-action primary" type="button" data-file-save ' + (!dirty || blockedByConflict ? 'disabled' : '') + (blockedByConflict ? ' title="Resolve the disk change before saving"' : '') + '>Save</button>';
+    '<button class="file-action primary" type="button" data-file-save ' + (!dirty || blockedByConflict || readOnly ? 'disabled' : '') + (readOnly ? ' title="This file is read-only in Context Room"' : blockedByConflict ? ' title="Resolve the disk change before saving"' : '') + '>Save</button>';
 }
 
 function reviewStatusForPath(path) {
@@ -6106,8 +8182,63 @@ function reviewStatusForPath(path) {
 
 function reviewActionForSelectedFile() {
   if (!state.selected || state.reviewModePath !== state.selected) return null;
-  if (state.reviewModeStatus === "verified") return { status: "unverified", label: "Mark unverified" };
+  if (state.reviewModeStatus === "verified") return null;
+  const reviewItem = state.docqa?.queue?.find((item) => item.path === state.selected);
+  if (!reviewItem?.reviewRequired || String(reviewItem.gitStatus || "").trim()) return null;
   return { status: "verified", label: "Mark verified" };
+}
+
+function nextReviewActionForSelectedFile() {
+  if (!state.selected || state.reviewModePath !== state.selected) return null;
+  return nextReviewItemForManualAdvance() ? { label: "Next review" } : null;
+}
+
+function nextReviewItemAfter(previousQueue = [], currentPath = null, nextQueue = []) {
+  const nextItems = nextQueue.filter((item) => item?.path);
+  if (!nextItems.length) return null;
+  const byPath = new Map(nextItems.map((item) => [item.path, item]));
+  const previousPaths = previousQueue.map((item) => item?.path).filter(Boolean);
+  const index = previousPaths.indexOf(currentPath);
+  const ordered = index >= 0
+    ? [...previousPaths.slice(index + 1), ...previousPaths.slice(0, index)]
+    : previousPaths;
+  for (const path of ordered) {
+    if (path !== currentPath && byPath.has(path)) return byPath.get(path);
+  }
+  return nextItems.find((item) => item.path !== currentPath) || null;
+}
+
+function nextReviewItemForManualAdvance() {
+  const queue = state.docqa?.queue || [];
+  return nextReviewItemAfter(queue, state.reviewModePath || state.selected || state.selectedReview, queue);
+}
+
+async function waitForReviewFinalizationBeforeNavigation() {
+  const finalization = state.reviewFinalizationPromise;
+  if (!finalization) return;
+  setStatus("finishing review...");
+  await finalization;
+}
+
+async function openNextReviewManually() {
+  await waitForReviewFinalizationBeforeNavigation();
+  const nextItem = nextReviewItemForManualAdvance();
+  if (!nextItem) {
+    goHub();
+    setStatus("no more docs to review");
+    return;
+  }
+  await openReviewQueueItem(nextItem);
+  setStatus("next doc open");
+}
+
+async function openReviewQueueItem(item) {
+  if (!item?.path) return;
+  if (item.startupContext?.order) {
+    await selectStartupContextFile(item.startupContext.order, { reviewMode: true });
+    return;
+  }
+  await selectFile(item.path, { revealInExplorer: !isNarrowLayout(), reviewMode: true });
 }
 
 const SETTINGS_THEME_PREVIEW_DOC = "# Preview document\n\n> Scope: docs/\n\n## Read first\n\n- Start in docs/INDEX.md.\n- Keep website/docs/ current.\n\n### Paths\n\nUse AGENTS.md, website/docs/, and our_agentic_system/docs/.";
@@ -6135,18 +8266,26 @@ function renderSettingsPanel() {
   const watchAllow = (state.settings.watchAllow || []).join("\n");
   const reviewPaths = (state.settings.reviewPaths || []).join("\n");
   const bestPractices = (state.settings.bestPractices || []).join("\n");
-  const startupContext = state.settings.startupContext || { enabled: false, fileNames: ["AGENTS.md", "CLAUDE.md"] };
+  const startupContext = state.settings.startupContext || { enabled: false, fileNames: ["AGENTS.md", "CLAUDE.md"], globalPaths: [] };
   const startupFileNames = (startupContext.fileNames || []).join("\n");
+  const startupGlobalPaths = (startupContext.globalPaths || []).join("\n");
   const startupSkills = state.settings.startupSkills || { enabled: true, folderNames: [".codex/skills", "skills"] };
   const startupSkillFolderNames = (startupSkills.folderNames || []).join("\n");
+  const startupHooks = state.settings.startupHooks || { enabled: true, editable: false, agentHooks: true, codexHooks: true, gitHooks: true, hookManagers: true, fileNames: ["pre-commit", "pre-push", "commit-msg", "prepare-commit-msg"], agentHookSources: [{ id: "codex", label: "Codex", paths: [".codex/hooks.json"] }], agentHookPaths: [".codex/hooks.json"], codexPaths: [".codex/hooks.json"], managerPaths: [".husky/", "lefthook.yml", ".pre-commit-config.yaml", "lint-staged.config.js", "package.json"] };
+  const startupHookFileNames = (startupHooks.fileNames || []).join("\n");
+  const startupAgentHookSources = formatAgentHookSourcesForTextarea(startupHooks.agentHookSources, startupHooks.agentHookPaths || startupHooks.codexPaths || []);
+  const startupHookManagerPaths = (startupHooks.managerPaths || []).join("\n");
   const appearance = state.settings.appearance || { fileTheme: DEFAULT_FILE_THEME, autoOpenGitDiff: true };
   const markdownTemplates = state.settings.markdownTemplates || [];
   const sections = state.settings.hubSections?.length ? state.settings.hubSections : [{ id: "main", title: "Main", cards: state.settings.customHubCards || state.availableHubCards || [] }];
   const watchCount = (state.settings.watchAllow || []).length;
   const reviewPathCount = (state.settings.reviewPaths || []).length;
   const practiceCount = (state.settings.bestPractices || []).length;
-  const startupContextCount = (startupContext.fileNames || []).length;
+  const startupContextCount = (startupContext.fileNames || []).length + (startupContext.globalPaths || []).length;
   const startupSkillFolderCount = (startupSkills.folderNames || []).length;
+  const startupHookNameCount = (startupHooks.fileNames || []).length;
+  const startupAgentHookCount = (startupHooks.agentHookSources || []).length || (startupHooks.agentHookPaths || startupHooks.codexPaths || []).length;
+  const startupHookManagerCount = (startupHooks.managerPaths || []).length;
   holder.innerHTML = '<div class="settings-shell">' +
   renderSettingsSection({
     kicker: "Review",
@@ -6163,12 +8302,17 @@ function renderSettingsPanel() {
   renderSettingsSection({
     kicker: "Startup",
     title: "Injected context scanners",
-    copy: "Files and skill folders discovered above this Context Room root.",
-    pills: [startupContextCount + " names", startupSkillFolderCount + " folders"],
+    copy: "Files, skill folders, and hook files discovered around this Context Room root.",
+    pills: [startupContextCount + " names", startupSkillFolderCount + " folders", startupHookNameCount + " git names", startupAgentHookCount + " agent paths", startupHookManagerCount + " managers"],
     open: true,
     body: '<div class="settings-grid">' +
-      '<div class="settings-field"><label class="settings-toggle" for="startupContextEnabled"><input id="startupContextEnabled" type="checkbox" ' + (startupContext.enabled ? 'checked' : '') + ' /><span class="settings-switch" aria-hidden="true"></span><span class="settings-toggle-copy"><strong>Startup context</strong><em>List agent instruction files above the repo.</em></span></label><textarea id="startupContextFileNames" placeholder="one filename per line">' + escapeHtml(startupFileNames) + '</textarea></div>' +
+      '<div class="settings-field"><label class="settings-toggle" for="startupContextEnabled"><input id="startupContextEnabled" type="checkbox" ' + (startupContext.enabled ? 'checked' : '') + ' /><span class="settings-switch" aria-hidden="true"></span><span class="settings-toggle-copy"><strong>Startup context</strong><em>List ancestor and global agent instruction files.</em></span></label><textarea id="startupContextFileNames" placeholder="one ancestor filename per line">' + escapeHtml(startupFileNames) + '</textarea><textarea id="startupContextGlobalPaths" placeholder="one global path per line">' + escapeHtml(startupGlobalPaths) + '</textarea></div>' +
       '<div class="settings-field"><label class="settings-toggle" for="startupSkillsEnabled"><input id="startupSkillsEnabled" type="checkbox" ' + (startupSkills.enabled !== false ? 'checked' : '') + ' /><span class="settings-switch" aria-hidden="true"></span><span class="settings-toggle-copy"><strong>Startup skills</strong><em>List global skill folders visible to agents.</em></span></label><textarea id="startupSkillFolderNames" placeholder="one folder path per line">' + escapeHtml(startupSkillFolderNames) + '</textarea></div>' +
+      '<div class="settings-field"><label class="settings-toggle" for="startupHooksEnabled"><input id="startupHooksEnabled" type="checkbox" ' + (startupHooks.enabled !== false ? 'checked' : '') + ' /><span class="settings-switch" aria-hidden="true"></span><span class="settings-toggle-copy"><strong>Startup hooks</strong><em>List hook files that can affect agents and commits.</em></span></label><textarea id="startupHookFileNames" placeholder="one hook filename per line">' + escapeHtml(startupHookFileNames) + '</textarea></div>' +
+      '<div class="settings-field"><label class="settings-toggle" for="startupHooksEditable"><input id="startupHooksEditable" type="checkbox" ' + (startupHooks.editable ? 'checked' : '') + ' /><span class="settings-switch" aria-hidden="true"></span><span class="settings-toggle-copy"><strong>Edit hooks</strong><em>Off by default because hooks execute code.</em></span></label><textarea id="startupHookManagerPaths" placeholder="one hook manager path per line">' + escapeHtml(startupHookManagerPaths) + '</textarea></div>' +
+      '<div class="settings-field"><label class="settings-toggle" for="startupAgentHooks"><input id="startupAgentHooks" type="checkbox" ' + (startupHooks.agentHooks !== false && startupHooks.codexHooks !== false ? 'checked' : '') + ' /><span class="settings-switch" aria-hidden="true"></span><span class="settings-toggle-copy"><strong>Agent hook sources</strong><em>Choose which AI coding systems Context Room should show.</em></span></label><span class="settings-field-note">One source per line: <code>Name | config path | plugin folder</code>. Delete a line to hide that system.</span><textarea id="startupAgentHookSources" placeholder="Codex | .codex/hooks.json&#10;My Agent | .my-agent/hooks.json | .my-agent/plugins/">' + escapeHtml(startupAgentHookSources) + '</textarea></div>' +
+      '<div class="settings-field"><label class="settings-toggle" for="startupGitHooks"><input id="startupGitHooks" type="checkbox" ' + (startupHooks.gitHooks !== false ? 'checked' : '') + ' /><span class="settings-switch" aria-hidden="true"></span><span class="settings-toggle-copy"><strong>Git hooks</strong><em>Scan .git/hooks and core.hooksPath.</em></span></label></div>' +
+      '<div class="settings-field"><label class="settings-toggle" for="startupHookManagers"><input id="startupHookManagers" type="checkbox" ' + (startupHooks.hookManagers !== false ? 'checked' : '') + ' /><span class="settings-switch" aria-hidden="true"></span><span class="settings-toggle-copy"><strong>Hook managers</strong><em>Scan Husky, Lefthook, pre-commit, lint-staged, and package hooks.</em></span></label></div>' +
     '</div>',
   }) +
   renderSettingsSection({
@@ -6290,10 +8434,26 @@ async function saveSettings() {
   const startupContext = {
     enabled: Boolean(el("startupContextEnabled")?.checked),
     fileNames: linesFromTextarea("startupContextFileNames"),
+    globalPaths: linesFromTextarea("startupContextGlobalPaths"),
   };
   const startupSkills = {
     enabled: Boolean(el("startupSkillsEnabled")?.checked),
     folderNames: linesFromTextarea("startupSkillFolderNames"),
+  };
+  const agentHookSources = agentHookSourcesFromTextarea("startupAgentHookSources");
+  const agentHookPaths = agentHookSources.flatMap((source) => source.paths || []);
+  const startupHooks = {
+    enabled: Boolean(el("startupHooksEnabled")?.checked),
+    editable: Boolean(el("startupHooksEditable")?.checked),
+    agentHooks: Boolean(el("startupAgentHooks")?.checked),
+    codexHooks: Boolean(el("startupAgentHooks")?.checked),
+    gitHooks: Boolean(el("startupGitHooks")?.checked),
+    hookManagers: Boolean(el("startupHookManagers")?.checked),
+    fileNames: linesFromTextarea("startupHookFileNames"),
+    agentHookSources,
+    agentHookPaths,
+    codexPaths: agentHookPaths.filter((item) => item.includes(".codex/")),
+    managerPaths: linesFromTextarea("startupHookManagerPaths"),
   };
   const appearance = {
     fileTheme: el("fileTheme")?.value || DEFAULT_FILE_THEME,
@@ -6310,7 +8470,7 @@ async function saveSettings() {
     const result = await api("/api/settings", {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ settings: { watchAllow, reviewPaths, bestPractices, startupContext, startupSkills, appearance, markdownTemplates, hubCards, hubSections } }),
+      body: JSON.stringify({ settings: { watchAllow, reviewPaths, bestPractices, startupContext, startupSkills, startupHooks, appearance, markdownTemplates, hubCards, hubSections } }),
     });
     state.settings = result.settings;
     applyFileTheme();
@@ -6320,6 +8480,7 @@ async function saveSettings() {
     state.hubSections = state.rootHubSections;
     state.startupContextFiles = (await api("/api/startup-context")).files || [];
     state.startupSkillFolders = (await api("/api/startup-skills")).folders || [];
+    state.startupHookFiles = (await api("/api/startup-hooks")).files || [];
     const [docqa, doctor] = await Promise.all([api("/api/docqa"), api("/api/doctor")]);
     state.docqa = docqa;
     state.doctor = doctor;
@@ -6463,6 +8624,27 @@ function linesFromTextarea(id) {
   return el(id).value.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
 }
 
+function formatAgentHookSourcesForTextarea(sources = [], fallbackPaths = []) {
+  const usableSources = Array.isArray(sources) && sources.length
+    ? sources
+    : fallbackPaths.length
+      ? [{ label: "Agent", paths: fallbackPaths }]
+      : [{ label: "Codex", paths: [".codex/hooks.json"] }];
+  return usableSources
+    .map((source) => [source.label || source.id || "Agent", ...(source.paths || [])].filter(Boolean).join(" | "))
+    .join("\n");
+}
+
+function agentHookSourcesFromTextarea(id) {
+  return linesFromTextarea(id).map((line) => {
+    const parts = line.split("|").map((part) => part.trim()).filter(Boolean);
+    const label = parts.shift() || "";
+    const paths = parts.map(normalizeUiPath).filter(Boolean);
+    if (!label || !paths.length) return null;
+    return { id: slugifyUiId(label) || "agent", label, paths };
+  }).filter(Boolean);
+}
+
 function normalizeUiPath(value) {
   return String(value || "").replaceAll("\\", "/").replace(/^\.\//, "").trim();
 }
@@ -6474,6 +8656,7 @@ function showSettingsPage() {
   state.settingsOpen = true;
   state.pendingMarkdown = null;
   state.selected = null;
+  state.selectedReadOnly = false;
   state.openingFilePath = null;
   state.reviewModePath = null;
   state.reviewModeStatus = null;
@@ -6499,9 +8682,12 @@ function showSettingsPage() {
   scheduleSessionStatePush();
 }
 
-function handleHubAction() {
+async function handleHubAction() {
   if (state.page === "hub") showSettingsPage();
-  else goHub();
+  else {
+    await waitForReviewFinalizationBeforeNavigation();
+    goHub();
+  }
 }
 
 function updateActionBanner() {
@@ -6525,7 +8711,7 @@ function renderHubFolders() {
   if (!holder) return;
   const sections = state.rootHubSections?.length ? state.rootHubSections : state.hubSections?.length ? state.hubSections : [{ id: "main", title: "Main", cards: state.hubFolders || [] }];
   const activeIds = activeHubCardIds(sections);
-  holder.innerHTML = sections.map((section) => '<section class="hub-section"><div class="hub-section-title">' + escapeHtml(section.title || "Section") + '</div><div class="hub-section-grid">' + (section.cards || []).map((card) => renderHubFolderCard(card, activeIds)).join("") + '</div></section>').join("") + renderStartupContextPanel() + renderStartupSkillsPanel();
+  holder.innerHTML = sections.map((section) => '<section class="hub-section"><div class="hub-section-title">' + escapeHtml(section.title || "Section") + '</div><div class="hub-section-grid">' + (section.cards || []).map((card) => renderHubFolderCard(card, activeIds)).join("") + '</div></section>').join("") + renderStartupContextPanel() + renderStartupSkillsPanel() + renderStartupHooksPanel();
   document.querySelectorAll("[data-hub-file]").forEach((button) => button.addEventListener("click", () => selectFile(button.dataset.hubFile).catch((error) => setStatus(error.message))));
   document.querySelectorAll("[data-hub-folders]").forEach((button) => button.addEventListener("click", () => filterFolders(button.dataset.hubFolders.split('|'))));
   document.querySelectorAll("[data-hub-card-children]").forEach((button) => button.addEventListener("click", () => openHubChildren(button.dataset.hubCardChildren)));
@@ -6553,6 +8739,11 @@ function renderHubFolders() {
     event.stopPropagation();
     cancelStartupSkillCreate();
   }));
+  document.querySelector("[data-startup-hooks-help]")?.addEventListener("toggle", (event) => {
+    state.startupHooksHelpOpen = Boolean(event.currentTarget.open);
+  });
+  document.querySelectorAll("[data-startup-hook-filter]").forEach((button) => button.addEventListener("click", () => setStartupHookFilter(button.dataset.startupHookFilter)));
+  document.querySelectorAll("[data-startup-hook-order]").forEach((button) => button.addEventListener("click", () => selectStartupHookFile(button.dataset.startupHookOrder).catch((error) => setStatus(error.message))));
 }
 
 function renderHubBreadcrumb() {
@@ -6641,6 +8832,117 @@ function renderStartupSkillsPanel() {
   return '<section class="startup-context-panel"><div class="hub-section-title">Startup skills</div><div class="startup-context-copy">Skill folders found from the filesystem root down to this Context Room root.</div>' + body + '</section>';
 }
 
+function renderStartupHooksPanel() {
+  if (state.settings?.startupHooks?.enabled === false) return "";
+  const files = (state.startupHookFiles || []).sort((a, b) => (a.startupContext.order || 0) - (b.startupContext.order || 0));
+  if (!files.length) return "";
+  const counts = startupHookFilterCounts(files);
+  const activeFilter = startupHookFilterId(state.startupHookFilter);
+  const visibleFiles = activeFilter === "all"
+    ? files
+    : files.filter((file) => startupHookFilterMatches(file.startupContext || {}, activeFilter));
+  const filterControls = '<div class="startup-hook-filters" role="group" aria-label="Startup hook filters">' + startupHookFilterOptions(files, counts)
+    .map(([id, label, count]) => '<button class="startup-hook-filter ' + (activeFilter === id ? 'active' : '') + '" type="button" data-startup-hook-filter="' + escapeHtml(id) + '">' + escapeHtml(label) + ' · ' + escapeHtml(count) + '</button>').join("") + '</div>';
+  const body = visibleFiles.length
+    ? '<div class="startup-context-list">' + visibleFiles.map((file) => {
+    const hook = file.startupContext || {};
+    const kind = startupHookKind(hook);
+    const kindLabel = kind === "git" || kind === "manager" ? startupHookFilterLabel(kind, files) : startupHookProviderShortLabel(hook);
+    const flags = [
+      hook.sourceLabel || "hook",
+      hook.event || "",
+      hook.tracked ? "tracked" : "untracked",
+      hook.executable ? "executable" : "not executable",
+      hook.readOnly ? "read-only" : "editable",
+    ].filter(Boolean).join(" · ");
+    const commandLine = hook.commandSummary ? '<small>' + escapeHtml(hook.commandSummary) + '</small>' : '';
+    return '<button class="startup-context-item startup-hook-item" type="button" data-startup-hook-order="' + escapeHtml(hook.order) + '">' +
+      '<strong>' + escapeHtml((hook.order || "?") + ". " + (hook.label || hook.fileName || "hook")) + '</strong>' +
+      '<span><span class="startup-hook-meta"><b class="startup-hook-kind ' + escapeHtml(kind) + '">' + escapeHtml(kindLabel) + '</b><em>' + escapeHtml(flags) + '</em></span><p>' + escapeHtml(hook.description || "Hook file that can affect agent work, commits, or validation.") + '</p><code>' + escapeHtml(hook.displayPath || "") + '</code>' + commandLine + '</span>' +
+    '</button>';
+  }).join("") + '</div>'
+    : '<div class="issue">No ' + escapeHtml(startupHookFilterLabel(activeFilter, files).toLowerCase()) + ' found.</div>';
+  const help = '<details class="startup-hooks-help" data-startup-hooks-help ' + (state.startupHooksHelpOpen ? 'open' : '') + '><summary>Agent hook sources and related hooks</summary><div>' +
+    '<section class="startup-hooks-help-section"><h4>Agent hook sources</h4><p>Agent hooks are files owned by an AI coding tool or assistant runtime. Configure the systems to show in settings with lines like <code>Name | config path | plugin folder</code>. Context Room then groups them by that source name, whether the tool is Codex, Claude Code, OpenCode, or something custom.</p></section>' +
+    '<section class="startup-hooks-help-section"><h4>Common agent events</h4><p>Some tools expose JSON lifecycle hooks. Names vary by provider, but common events include:</p><ul><li><strong>Before tool use</strong>: runs before an agent command or tool call.</li><li><strong>After tool use</strong>: runs after an agent command or tool call.</li><li><strong>User prompt</strong>: runs when the user submits a message.</li><li><strong>Notification</strong>: runs when the agent app sends a notification.</li><li><strong>Session start/stop</strong>: runs around agent session boundaries.</li><li><strong>Subagent stop</strong>: runs when a delegated agent finishes.</li></ul></section>' +
+    '<section class="startup-hooks-help-section"><h4>Config and plugins</h4><p>Some systems store hooks in one config file. Others use plugin folders or scripts. Add every relevant config or folder path to that source in settings; remove a source line when you do not want that system shown.</p></section>' +
+    '<section class="startup-hooks-help-section"><h4>Git hooks</h4><p>Git-owned scripts from <code>.git/hooks</code> or <code>core.hooksPath</code>. They run on Git actions such as commit, push, or commit-message preparation.</p></section>' +
+    '<section class="startup-hooks-help-section"><h4>Hook managers</h4><p>Repo tools that install or orchestrate Git hooks. Examples include Husky, Lefthook, pre-commit, lint-staged, and package hook config.</p></section>' +
+    '<p>Hooks are read-only by default because they execute code. Enable editing only when you intentionally want Context Room to modify them.</p>' +
+  '</div></details>';
+  return '<section class="startup-context-panel"><div class="hub-section-title">Startup hooks</div><div class="startup-context-copy">Hooks and hook-manager files that can change or block agent work.</div>' + help + filterControls + body + '</section>';
+}
+
+function setStartupHookFilter(filter = "all") {
+  state.startupHookFilter = startupHookFilterId(filter);
+  renderHubFolders();
+  setStatus("showing " + startupHookFilterLabel(state.startupHookFilter, state.startupHookFiles || []).toLowerCase());
+}
+
+function startupHookFilterId(filter = "all") {
+  const clean = String(filter || "all").replace(/[^a-z0-9_-]/gi, "").toLowerCase();
+  return clean || "all";
+}
+
+function startupHookFilterCounts(files = []) {
+  const counts = { all: files.length, agent: 0, git: 0, manager: 0 };
+  for (const file of files) {
+    const kind = startupHookKind(file.startupContext || {});
+    counts[kind] = (counts[kind] || 0) + 1;
+    if (isAgentHookKind(kind)) counts.agent += 1;
+  }
+  return counts;
+}
+
+function startupHookFilterOptions(files = [], counts = startupHookFilterCounts(files)) {
+  const providerLabels = new Map();
+  for (const file of files) {
+    const hook = file.startupContext || {};
+    const kind = startupHookKind(hook);
+    if (isAgentHookKind(kind) && kind !== "agent" && !providerLabels.has(kind)) {
+      providerLabels.set(kind, startupHookProviderShortLabel(hook));
+    }
+  }
+  const options = [["all", "All", counts.all], ["agent", "Agent hooks", counts.agent]];
+  for (const [id, label] of providerLabels) options.push([id, label, counts[id] || 0]);
+  options.push(["git", "Git hooks", counts.git || 0], ["manager", "Hook managers", counts.manager || 0]);
+  return options;
+}
+
+function startupHookFilterMatches(hook = {}, filter = "all") {
+  const kind = startupHookKind(hook);
+  if (filter === "all") return true;
+  if (filter === "agent") return isAgentHookKind(kind);
+  return kind === filter;
+}
+
+function startupHookKind(hook = {}) {
+  if (hook.provider) return startupHookFilterId(hook.provider);
+  if (String(hook.source || "").includes("-agent-")) return "agent";
+  if (["git-hooks", "core-hooks-path"].includes(hook.source)) return "git";
+  return "manager";
+}
+
+function isAgentHookKind(kind = "") {
+  return !["all", "git", "manager"].includes(kind);
+}
+
+function startupHookProviderShortLabel(hook = {}) {
+  return String(hook.sourceLabel || hook.provider || "Agent hooks").replace(/\s+hooks$/i, "") || "Agent";
+}
+
+function startupHookFilterLabel(kind = "all", files = []) {
+  if (kind === "agent") return "Agent hooks";
+  if (kind === "git") return "Git hooks";
+  if (kind === "manager") return "Hook managers";
+  if (kind !== "all") {
+    const match = (files || []).find((file) => startupHookKind(file.startupContext || {}) === kind);
+    if (match) return startupHookProviderShortLabel(match.startupContext || {});
+    return kind.split(/[-_]+/).filter(Boolean).map((part) => part.charAt(0).toUpperCase() + part.slice(1)).join(" ");
+  }
+  return "All hooks";
+}
+
 function hubCardDirectFilePath(paths = [], children = []) {
   if (children.length || paths.length !== 1) return null;
   const clean = normalizeUiPath(paths[0]);
@@ -6719,9 +9021,10 @@ function countFolderFiles(folderPaths) {
 }
 
 
-async function applyReviewDecision(path, status) {
+async function applyReviewDecision(path, status, options = {}) {
   if (!path) return;
   const normalizedStatus = status === "unverified" ? "unverified" : status === "verified" ? "verified" : "needs_changes";
+  const previousQueue = options.previousQueue || state.docqa?.queue || [];
   const note = normalizedStatus === "verified"
     ? "verified from Context Room review queue"
     : normalizedStatus === "unverified"
@@ -6736,16 +9039,27 @@ async function applyReviewDecision(path, status) {
   const docqa = await api("/api/docqa");
   state.docqa = docqa;
   if (state.reviewModePath === path) state.reviewModeStatus = normalizedStatus === "verified" ? "verified" : null;
-  state.selectedReview = docqa.queue.find((item) => item.path === path)?.path || docqa.queue[0]?.path || null;
+  state.selectedReview = docqa.queue.find((item) => item.path === path)?.path || nextReviewItemAfter(previousQueue, path, docqa.queue || [])?.path || docqa.queue[0]?.path || null;
   if (state.selected === path) {
-    renderViewer();
     updateHeader();
     updatePreview();
+    const finalizedInPlace = options.viewState ? finalizeExternalReviewPanelInPlace(options.viewState) : false;
+    if (!finalizedInPlace) {
+      renderViewer();
+      if (options.viewState) restoreEditorViewState(options.viewState);
+    }
     setStatus(normalizedStatus === "verified" ? "file verified" : normalizedStatus === "unverified" ? "file marked unverified" : "needs changes");
   } else {
     renderDocQaDashboard();
     setStatus(normalizedStatus === "verified" ? "verified" : normalizedStatus === "unverified" ? "unverified" : "needs changes");
   }
+}
+
+async function advanceAfterInlineReviewRemoval(path, previousQueue, statusWhenDone) {
+  const nextItem = nextReviewItemAfter(previousQueue, path, state.docqa?.queue || []);
+  state.selectedReview = nextItem?.path || state.docqa?.queue?.[0]?.path || null;
+  goHub();
+  setStatus(nextItem ? "review applied · next review available" : statusWhenDone);
 }
 
 function nextReviewPath(queue = [], currentPath = null) {
@@ -6757,11 +9071,48 @@ function nextReviewPath(queue = [], currentPath = null) {
   return paths[(index + 1) % paths.length] || null;
 }
 
+function skipVerifyConfirmEnabled() {
+  try { return window.localStorage?.getItem(VERIFY_CONFIRM_STORAGE_KEY) === "1"; }
+  catch { return false; }
+}
+
+function setSkipVerifyConfirm(enabled) {
+  try {
+    if (enabled) window.localStorage?.setItem(VERIFY_CONFIRM_STORAGE_KEY, "1");
+    else window.localStorage?.removeItem(VERIFY_CONFIRM_STORAGE_KEY);
+  } catch {}
+}
+
+async function requestReviewDecision(path, status) {
+  const normalizedStatus = status === "unverified" ? "unverified" : status === "verified" ? "verified" : "needs_changes";
+  if (normalizedStatus !== "verified") {
+    await applyReviewDecision(path, normalizedStatus);
+    return;
+  }
+  if (!path || state.reviewModePath !== path) return;
+  if (!reviewActionForSelectedFile()) return;
+  if (state.dirty && !confirm("This file has unsaved changes. Mark verified without saving?")) return;
+  if (skipVerifyConfirmEnabled()) {
+    await applyReviewDecision(path, "verified");
+    return;
+  }
+  showConfirmDialog({
+    title: "Mark verified?",
+    body: "This marks the current content as trusted. Use Next review when ready.",
+    confirmLabel: "Mark verified",
+    confirmVariant: "primary",
+    checkboxLabel: "Do not ask again",
+    onConfirm: ({ checked } = {}) => {
+      if (checked) setSkipVerifyConfirm(true);
+      applyReviewDecision(path, "verified").catch((error) => setStatus(error.message));
+    },
+  });
+}
+
 async function verifyCurrentFile() {
   if (!state.selected) return;
   if (state.reviewModePath !== state.selected) return;
-  if (state.dirty && !confirm("This file has unsaved changes. Mark verified without saving?")) return;
-  await applyReviewDecision(state.selected, "verified");
+  await requestReviewDecision(state.selected, "verified");
 }
 
 function renderPlanetSystem() {
@@ -6902,6 +9253,7 @@ async function goHistory(delta) {
   const nextIndex = state.historyIndex + delta;
   if (nextIndex < 0 || nextIndex >= state.history.length) return;
   if (blockPendingExternalChange(delta < 0 ? "before going back" : "before going forward")) return;
+  await waitForReviewFinalizationBeforeNavigation();
   state.historyIndex = nextIndex;
   await selectFile(state.history[state.historyIndex], { pushHistory: false });
 }
@@ -6911,6 +9263,7 @@ function goHub() {
   if (state.dirty && !confirm("You have unsaved changes. Return to hub?")) return;
   collapseSidebarOnNarrow();
   state.selected = null;
+  state.selectedReadOnly = false;
   state.openingFilePath = null;
   state.selectedStartupContext = null;
   state.reviewModePath = null;
@@ -6937,9 +9290,10 @@ function updateHeader() {
   const conflict = activeFileConflict();
   const externalChange = activeExternalChange();
   const blockedByDiskChange = Boolean(conflict || externalChange);
-  el("save").disabled = blockedByDiskChange || !state.dirty || !state.selected;
+  const readOnlySelected = Boolean(state.selectedStartupContext?.readOnly || state.selectedReadOnly);
+  el("save").disabled = blockedByDiskChange || readOnlySelected || !state.dirty || !state.selected;
   const headerSave = document.querySelector("[data-file-save]");
-  if (headerSave) headerSave.disabled = blockedByDiskChange || !state.dirty || !state.selected;
+  if (headerSave) headerSave.disabled = blockedByDiskChange || readOnlySelected || !state.dirty || !state.selected;
   updateActionBanner();
 }
 
@@ -7069,6 +9423,8 @@ function renderViewer() {
   const text = el("editor").value;
   const diff = state.selectedDiff || { changed: false, additions: 0, deletions: 0, patch: "", available: false };
   const isStartupFile = Boolean(state.selectedStartupContext);
+  const loadingFile = !isStartupFile && state.openingFilePath === state.selected;
+  const loadError = !isStartupFile && state.fileLoadError?.path === state.selected ? state.fileLoadError : null;
   const conflict = activeFileConflict();
   const externalChange = activeExternalChange();
   const file = isStartupFile
@@ -7076,16 +9432,24 @@ function renderViewer() {
     : state.files.find((item) => item.path === state.selected) || { label: state.selected, path: state.selected };
   const hasDiff = !isStartupFile && diff.available !== false && diff.changed;
   const diffMarkup = hasDiff ? renderDiffPanel(diff) : "";
-  const templateState = !isStartupFile && !conflict && !externalChange ? templateStateForContent(text) : null;
-  const actionsMarkup = externalChange && !conflict
+  const templateState = !isStartupFile && !loadingFile && !loadError && !conflict && !externalChange ? templateStateForContent(text) : null;
+  const actionsMarkup = loadError
+    ? '<div class="file-actions"><button class="file-action primary" type="button" data-file-retry>Retry</button></div>'
+    : loadingFile
+      ? '<div class="file-actions"><span class="diff-meta">opening...</span></div>'
+      : externalChange && !conflict
       ? renderExternalReviewActions(externalChange, { fileActionOptions: externalReviewFileActionOptions() })
-      : renderFileActionButtons({ reviewAction: isStartupFile ? null : reviewActionForSelectedFile(), dirty: state.dirty, templateState, blockedByConflict: Boolean(conflict || externalChange), deletable: !isStartupFile });
+      : renderFileActionButtons({ reviewAction: isStartupFile || state.selectedReadOnly ? null : reviewActionForSelectedFile(), nextReviewAction: isStartupFile || state.selectedReadOnly ? null : nextReviewActionForSelectedFile(), dirty: state.dirty, templateState, blockedByConflict: Boolean(conflict || externalChange), readOnly: Boolean(state.selectedStartupContext?.readOnly || state.selectedReadOnly), deletable: !isStartupFile && !state.selectedReadOnly });
   const conflictMarkup = conflict ? renderConflictPanel(conflict, text) : "";
-  const editorMarkup = !conflict && externalChange
-    ? renderExternalReviewDocument(externalReviewBaseContent(externalChange), externalChange.diskContent || "")
-    : state.mode === "edit"
-      ? renderMarkdownEditor(text)
-      : renderMarkdownLineView(text);
+  const editorMarkup = loadError
+    ? renderFileLoadError(loadError)
+    : loadingFile
+      ? renderFileLoadingState(file)
+      : !conflict && externalChange
+        ? renderExternalReviewDocument(externalReviewBaseContent(externalChange), externalChange.diskContent || "")
+        : state.mode === "edit"
+          ? renderMarkdownEditor(text)
+          : renderMarkdownLineView(text);
   const annotationMarkup = !isStartupFile && !conflict ? renderAgentAnnotations(state.selected) : "";
   el("viewer").innerHTML = '<div class="review-workspace ' + (!hasDiff || state.diffCollapsed ? 'no-diff' : '') + '">' +
     (state.diffCollapsed ? "" : diffMarkup) +
@@ -7096,10 +9460,12 @@ function renderViewer() {
     setDiffCollapsed(true);
   });
   document.querySelector("[data-revert-diff]")?.addEventListener("click", () => promptRevertCurrentDiff());
+  document.querySelector("[data-file-retry]")?.addEventListener("click", () => selectFile(state.selected, { forceReload: true, pushHistory: false, revealInExplorer: false, reviewMode: state.reviewModePath === state.selected }).catch((error) => setStatus(error.message)));
   document.querySelector("[data-apply-external-change]")?.addEventListener("click", () => applyExternalChange().catch((error) => setStatus(error.message)));
   document.querySelector("[data-reject-external-change]")?.addEventListener("click", () => promptRejectExternalChange());
   wireExternalReviewDecisionButtons();
   wireExternalReviewAllButtons();
+  wireExternalReviewJumpButtons();
   wireAgentAnnotationButtons();
   wireMarkdownDocLinks();
   document.querySelector("[data-conflict-compare]")?.addEventListener("click", () => toggleConflictCompare());
@@ -7114,6 +9480,14 @@ function renderViewer() {
   wireRenderedMarkdownEditor();
   syncWorkspaceScroll();
   scheduleSessionStatePush();
+}
+
+function renderFileLoadingState(file = {}) {
+  return '<div class="file-load-state"><div class="file-load-state-inner"><strong>Opening file...</strong><span><code>' + escapeHtml(file.path || state.selected || "") + '</code></span></div></div>';
+}
+
+function renderFileLoadError(error = {}) {
+  return '<div class="file-load-state error"><div class="file-load-state-inner"><strong>Could not open this file</strong><span>' + escapeHtml(error.message || "Request failed.") + '</span><span><code>' + escapeHtml(error.path || state.selected || "") + '</code></span></div></div>';
 }
 
 function wireRenderedMarkdownEditor() {
@@ -7165,7 +9539,12 @@ function decorateMarkdownLine(rendered, decoration) {
   const extraClass = decoration.className ? " " + decoration.className : "";
   const markerAttr = decoration.marker ? ' data-review-marker="' + escapeHtml(decoration.marker) + '"' : "";
   const finalLineAttr = Number.isInteger(decoration.finalLineIndex) ? ' data-final-line-index="' + decoration.finalLineIndex + '"' : "";
-  return String(rendered).replace(/^<div class="markdown-line([^"]*)"/, '<div class="markdown-line' + extraClass + '$1"' + markerAttr + finalLineAttr);
+  const decorated = String(rendered).replace(/^<div class="markdown-line([^"]*)"/, '<div class="markdown-line' + extraClass + '$1"' + markerAttr + finalLineAttr);
+  if (!decoration.intralineHtml) return decorated;
+  const contentStart = decorated.indexOf(">");
+  const contentEnd = decorated.lastIndexOf("</div>");
+  if (contentStart < 0 || contentEnd <= contentStart) return decorated;
+  return decorated.slice(0, contentStart + 1) + decoration.intralineHtml + decorated.slice(contentEnd);
 }
 
 function updateMarkdownEditorHighlight(text, options = {}) {
@@ -7422,7 +9801,8 @@ function markdownDocLinkAtOffset(text, offset) {
 }
 
 function wireFileActionButtons(root = document) {
-  root.querySelector("[data-file-review-decision]")?.addEventListener("click", (event) => applyReviewDecision(state.selected, event.currentTarget.dataset.fileReviewDecision).catch((error) => setStatus(error.message)));
+  root.querySelector("[data-file-review-decision]")?.addEventListener("click", (event) => requestReviewDecision(state.selected, event.currentTarget.dataset.fileReviewDecision).catch((error) => setStatus(error.message)));
+  root.querySelector("[data-next-review]")?.addEventListener("click", () => openNextReviewManually().catch((error) => setStatus(error.message)));
   root.querySelector("[data-file-save]")?.addEventListener("click", () => saveCurrent().catch((error) => setStatus(error.message)));
   root.querySelector("[data-file-delete]")?.addEventListener("click", () => deletePaths([state.selected]).catch((error) => setStatus(error.message)));
   root.querySelector("[data-empty-template-select]")?.addEventListener("change", (event) => applySelectedTemplateToEditor(event.currentTarget.value));
@@ -7452,26 +9832,51 @@ function wireExternalReviewAllButtons(root = document) {
   }));
 }
 
+function wireExternalReviewJumpButtons(root = document) {
+  root.querySelectorAll("[data-external-review-jump]").forEach((button) => button.addEventListener("click", (event) => {
+    event.preventDefault();
+    event.stopPropagation();
+    if (focusFirstExternalReviewChange()) setStatus("showing first change");
+    else setStatus("no pending change to show");
+  }));
+}
+
 function renderExternalReviewActions(change, { fileActionOptions = null } = {}) {
   const beforeText = externalReviewBaseContent(change);
   const afterText = change.diskContent || "";
   const blocks = buildExternalReviewBlocks(beforeText, afterText, change.reviewDecisions || {});
   const summary = summarizeExternalReviewBlocks(blocks);
   const sourceLabel = change.source === "review" ? "Git changes waiting for review" : "File changed on disk";
-  const bulkActions = summary.pending > 1 || summary.pendingLines > 1
+  const pendingLabel = summary.pending ? summary.pending + " left" : "saving...";
+  const jumpAction = summary.pending
+    ? '<button class="file-action external-choice bulk" type="button" data-external-review-jump="first" title="Jump to the first pending change">First change</button>'
+    : "";
+  const bulkActions = summary.pending && (summary.pending > 1 || summary.pendingLines > 1)
     ? '<button class="file-action primary external-choice bulk" type="button" data-external-review-all="accept">Accept all</button>' +
       '<button class="file-action danger-action external-choice bulk" type="button" data-external-review-all="reject">Reject all</button>'
     : "";
   return '<div class="file-actions external-review-actions" aria-label="Review file changes">' +
-    '<div class="external-change-stats" title="' + escapeHtml(sourceLabel + ": " + (change.path || "This file")) + '"><span class="pending">' + summary.pending + ' left</span><span class="add">+' + summary.additions + '</span><span class="del">-' + summary.deletions + '</span></div>' +
+    '<div class="external-change-stats" title="' + escapeHtml(sourceLabel + ": " + (change.path || "This file")) + '"><span class="pending">' + pendingLabel + '</span><span class="add">+' + summary.additions + '</span><span class="del">-' + summary.deletions + '</span></div>' +
+    jumpAction +
     bulkActions +
     (fileActionOptions ? renderFileActionItems(fileActionOptions) : '') +
   '</div>';
 }
 
+function updateExternalReviewActionsInPlace(change = activeExternalChange()) {
+  const actions = document.querySelector(".file-panel > header .file-actions");
+  if (!actions || !change || activeFileConflict()) return false;
+  actions.outerHTML = renderExternalReviewActions(change, { fileActionOptions: externalReviewFileActionOptions() });
+  wireExternalReviewAllButtons(document.querySelector(".file-panel > header") || document);
+  wireExternalReviewJumpButtons(document.querySelector(".file-panel > header") || document);
+  wireFileActionButtons(document.querySelector(".file-panel > header") || document);
+  return true;
+}
+
 function externalReviewFileActionOptions() {
   return {
     reviewAction: null,
+    nextReviewAction: nextReviewActionForSelectedFile(),
     dirty: state.dirty,
     blockedByConflict: true,
     deletable: !Boolean(state.selectedStartupContext),
@@ -7521,13 +9926,134 @@ function renderExternalReviewBlock(block, options = {}) {
 
 function renderExternalReviewRows(rows, options = {}) {
   const text = rows.map((row) => row.line).join("\n");
-  const lineDecorations = rows.map((row) => {
+  const intralineRows = externalReviewIntralineRows(rows);
+  const lineDecorations = rows.map((row, index) => {
     const finalLineIndex = finalLineIndexForRow(row, rows, options.finalLineStart);
     if (row.type !== "add" && row.type !== "del") return null;
-    const marker = row.type === "add" ? "+" : row.type === "del" ? "-" : "";
-    return { className: "external-review-line " + row.type, marker, finalLineIndex };
+    const intraline = intralineRows.get(index);
+    const marker = intraline?.marker || (row.type === "add" ? "+" : row.type === "del" ? "-" : "");
+    const intralineClass = intraline?.hidden
+      ? " intraline-superseded"
+      : intraline?.merged
+        ? " intraline-merged intraline-" + intraline.kind
+        : "";
+    return { className: "external-review-line " + row.type + intralineClass, marker, finalLineIndex, intralineHtml: intraline?.html || "" };
   });
   return '<div class="external-review-lines markdown-view">' + renderMarkdownLines(text, { lineDecorations }) + '</div>';
+}
+
+function externalReviewIntralineRows(rows) {
+  const result = new Map();
+  const deleted = [];
+  const added = [];
+  rows.forEach((row, index) => {
+    if (row.type === "del" && isIntralineReviewCandidate(row.line)) deleted.push({ index, line: row.line });
+    if (row.type === "add" && isIntralineReviewCandidate(row.line)) added.push({ index, line: row.line });
+  });
+  if (!deleted.length || !added.length || deleted.length > 12 || added.length > 12) return result;
+  const candidates = [];
+  for (const before of deleted) {
+    for (const after of added) {
+      const diff = buildIntralineTokenDiff(before.line, after.line);
+      if (diff && diff.similarity >= 0.34) candidates.push({ before, after, diff });
+    }
+  }
+  candidates.sort((left, right) => right.diff.similarity - left.diff.similarity || Math.abs(left.before.index - left.after.index) - Math.abs(right.before.index - right.after.index));
+  const usedDeleted = new Set();
+  const usedAdded = new Set();
+  for (const candidate of candidates) {
+    if (usedDeleted.has(candidate.before.index) || usedAdded.has(candidate.after.index)) continue;
+    usedDeleted.add(candidate.before.index);
+    usedAdded.add(candidate.after.index);
+    const hasAddition = candidate.diff.merged.some((segment) => segment.type === "add");
+    const hasDeletion = candidate.diff.merged.some((segment) => segment.type === "del");
+    const kind = hasAddition && hasDeletion ? "mixed" : hasDeletion ? "removal" : "addition";
+    const marker = kind === "mixed" ? "±" : kind === "removal" ? "-" : "+";
+    result.set(candidate.before.index, { hidden: true });
+    result.set(candidate.after.index, { html: renderMergedIntralineSegments(candidate.diff.merged), merged: true, kind, marker });
+  }
+  return result;
+}
+
+function isIntralineReviewCandidate(line) {
+  const text = String(line || "");
+  if (!text.trim() || text.length > 4000) return false;
+  return !/^\s*(?:#{1,6}\s|>|[-*+]\s|\d+[.)]\s|\`\`\`|~~~)/.test(text);
+}
+
+function intralineTokens(value) {
+  return String(value || "").match(/\[[^\n]+?\]\([^\n)]+\)|\x60[^\x60\n]+\x60|\*\*[^*\n]+\*\*|__[^_\n]+__|~~[^~\n]+~~|\*[^*\n]+\*|_[^_\n]+_|\s+|[\p{L}\p{N}_]+|[^\s\p{L}\p{N}_]/gu) || [];
+}
+
+function appendIntralineSegment(segments, type, text) {
+  if (!text) return;
+  const previous = segments[segments.length - 1];
+  if (previous?.type === type) previous.text += text;
+  else segments.push({ type, text });
+}
+
+function buildIntralineTokenDiff(beforeText, afterText) {
+  const before = intralineTokens(beforeText);
+  const after = intralineTokens(afterText);
+  if (!before.length || !after.length || before.length * after.length > 40_000) return null;
+  const dp = Array.from({ length: before.length + 1 }, () => new Uint16Array(after.length + 1));
+  for (let i = before.length - 1; i >= 0; i -= 1) {
+    for (let j = after.length - 1; j >= 0; j -= 1) {
+      dp[i][j] = before[i] === after[j] ? dp[i + 1][j + 1] + 1 : Math.max(dp[i + 1][j], dp[i][j + 1]);
+    }
+  }
+  const beforeSegments = [];
+  const afterSegments = [];
+  const mergedSegments = [];
+  let commonMeaningful = 0;
+  let i = 0;
+  let j = 0;
+  while (i < before.length && j < after.length) {
+    if (before[i] === after[j]) {
+      appendIntralineSegment(beforeSegments, "same", before[i]);
+      appendIntralineSegment(afterSegments, "same", after[j]);
+      appendIntralineSegment(mergedSegments, "same", before[i]);
+      if (before[i].trim()) commonMeaningful += 1;
+      i += 1;
+      j += 1;
+    } else if (dp[i + 1][j] >= dp[i][j + 1]) {
+      appendIntralineSegment(beforeSegments, "del", before[i]);
+      appendIntralineSegment(mergedSegments, "del", before[i]);
+      i += 1;
+    } else {
+      appendIntralineSegment(afterSegments, "add", after[j]);
+      appendIntralineSegment(mergedSegments, "add", after[j]);
+      j += 1;
+    }
+  }
+  while (i < before.length) {
+    appendIntralineSegment(beforeSegments, "del", before[i]);
+    appendIntralineSegment(mergedSegments, "del", before[i]);
+    i += 1;
+  }
+  while (j < after.length) {
+    appendIntralineSegment(afterSegments, "add", after[j]);
+    appendIntralineSegment(mergedSegments, "add", after[j]);
+    j += 1;
+  }
+  const beforeMeaningful = before.filter((token) => token.trim()).length;
+  const afterMeaningful = after.filter((token) => token.trim()).length;
+  const similarity = commonMeaningful / Math.max(1, beforeMeaningful, afterMeaningful);
+  return { before: beforeSegments, after: afterSegments, merged: mergedSegments, similarity };
+}
+
+function renderIntralineSegments(segments, changeType) {
+  return segments.map((segment) => {
+    const rendered = renderMarkdownInline(segment.text);
+    return segment.type === "same" ? rendered : '<span class="external-review-token ' + changeType + '">' + rendered + '</span>';
+  }).join("");
+}
+
+function renderMergedIntralineSegments(segments) {
+  return segments.map((segment) => {
+    const rendered = renderMarkdownInline(segment.text);
+    return segment.type === "same" ? rendered : '<span class="external-review-token ' + segment.type + '">' + rendered + '</span>';
+  }).join("");
 }
 
 function renderExternalReviewFinalLines(rows, options = {}) {
@@ -7599,17 +10125,36 @@ function summarizeExternalReviewBlocks(blocks) {
   }, { pending: 0, pendingLines: 0, additions: 0, deletions: 0 });
 }
 
+async function finalizeExternalReview(settlePromise, blocks, viewState) {
+  if (state.reviewFinalizationPromise) return state.reviewFinalizationPromise;
+  const finalization = (async () => {
+    await waitForInlineReviewTransition(settlePromise);
+    await saveExternalReviewDecision(blocks, viewState);
+  })();
+  state.reviewFinalizationPromise = finalization;
+  try {
+    await finalization;
+  } finally {
+    if (state.reviewFinalizationPromise === finalization) {
+      state.reviewFinalizationPromise = null;
+    }
+  }
+}
+
 async function chooseExternalReviewBlock(decision, blockId) {
   const change = activeExternalChange();
   if (!change || !blockId || (decision !== "accept" && decision !== "reject")) return;
   const viewState = captureEditorViewState({ anchorBlockId: blockId });
+  viewState.visualAnchor = captureMarkdownVisualAnchor();
   change.reviewDecisions = { ...(change.reviewDecisions || {}), [blockId]: decision };
   const blocks = buildExternalReviewBlocks(externalReviewBaseContent(change), change.diskContent || "", change.reviewDecisions);
   const pending = blocks.filter((block) => block.kind === "change" && !block.decision);
   const updatedInPlace = updateExternalReviewBlockInPlace(blocks, blockId, viewState);
   if (!updatedInPlace) renderViewer();
+  else updateExternalReviewActionsInPlace(change);
   updateHeader();
   updatePreview();
+  restoreInlineReviewViewport(viewState);
   const settlePromise = updatedInPlace
     ? settleExternalReviewBlocks([blockId], viewState, { restoreScroll: false })
     : Promise.resolve();
@@ -7618,8 +10163,7 @@ async function chooseExternalReviewBlock(decision, blockId) {
     return;
   }
   setStatus("saving reviewed change...");
-  await waitForInlineReviewTransition(settlePromise);
-  await saveExternalReviewDecision(blocks, viewState);
+  await finalizeExternalReview(settlePromise, blocks, viewState);
 }
 
 async function chooseAllExternalReviewBlocks(decision) {
@@ -7630,21 +10174,23 @@ async function chooseAllExternalReviewBlocks(decision) {
   if (!pendingBlocks.length) return;
   const anchorBlockId = closestExternalReviewChangeBlockId() || pendingBlocks[0].id;
   const viewState = captureEditorViewState({ anchorBlockId });
+  viewState.visualAnchor = captureMarkdownVisualAnchor();
   const nextDecisions = { ...(change.reviewDecisions || {}) };
   for (const block of pendingBlocks) nextDecisions[block.id] = decision;
   change.reviewDecisions = nextDecisions;
   const blocks = buildExternalReviewBlocks(externalReviewBaseContent(change), change.diskContent || "", change.reviewDecisions);
   const updatedInPlace = updateExternalReviewDocumentInPlace(blocks);
   if (!updatedInPlace) renderViewer();
+  else updateExternalReviewActionsInPlace(change);
   restoreEditorViewState(viewState);
   updateHeader();
   updatePreview();
+  restoreInlineReviewViewport(viewState);
   setStatus("saving reviewed changes...");
   const settlePromise = updatedInPlace
     ? settleExternalReviewBlocks(pendingBlocks.map((block) => block.id), viewState, { restoreScroll: false })
     : Promise.resolve();
-  await waitForInlineReviewTransition(settlePromise);
-  await saveExternalReviewDecision(blocks, viewState);
+  await finalizeExternalReview(settlePromise, blocks, viewState);
 }
 
 function updateExternalReviewBlockInPlace(blocks, blockId, viewState) {
@@ -7721,6 +10267,7 @@ function externalReviewTextAnchor(blocks, blockId, mergedText) {
 async function saveExternalReviewDecision(blocks, viewState) {
   const change = activeExternalChange();
   if (!change || state.selected !== change.path) return;
+  const previousQueue = state.docqa?.queue || [];
   const merged = computeExternalReviewContent(blocks, externalReviewBaseContent(change), change.diskContent || "");
   viewState.textAnchor = externalReviewTextAnchor(blocks, viewState.anchorBlockId, merged);
   setStatus("saving reviewed changes...");
@@ -7737,8 +10284,7 @@ async function saveExternalReviewDecision(blocks, viewState) {
     state.dirty = false;
     el("editor").value = "";
     await loadFiles();
-    goHub();
-    setStatus("new file rejected · file removed");
+    await advanceAfterInlineReviewRemoval(change.path, previousQueue, "new file rejected · no more docs to review");
     return;
   }
   if (change.source === "review" && change.changeKind === "deleted" && merged.length === 0) {
@@ -7753,21 +10299,13 @@ async function saveExternalReviewDecision(blocks, viewState) {
     const docEditor = el("docEditor");
     if (docEditor) docEditor.value = "";
     await loadFiles();
-    if (state.selected === change.path) {
-      state.selectedDiff = await readSelectedDiff(change.path);
-      if (!finishExternalReviewPanelInPlace(viewState)) {
-        const restoreState = inlineReviewRestoreViewState(viewState);
-        renderViewer();
-        restoreEditorViewState(restoreState);
-      }
-      updateHeader();
-      updatePreview();
-      setStatus("deletion kept · mark verified when reviewed");
-    }
+    await applyReviewDecision(change.path, "verified", { previousQueue, viewState });
+    if (state.selected === change.path) goHub();
     return;
   }
   const result = await writeSelectedDiskFile(merged, change.path);
-  if (change.source === "review") await recordSelectedReviewBaseline(change.path, "inline review applied");
+  const shouldRecordReviewBaseline = change.source === "review" || change.source === "disk";
+  if (shouldRecordReviewBaseline) await recordSelectedReviewBaseline(change.path, "inline review applied");
   resetConflictState();
   resetExternalChangeState(change.source === "review" ? { discardReview: true } : {});
   // Returning from inline review should keep the reader in the document, not open the Git diff panel.
@@ -7779,8 +10317,13 @@ async function saveExternalReviewDecision(blocks, viewState) {
   const docEditor = el("docEditor");
   if (docEditor) docEditor.value = merged;
   await loadFiles();
+  if (change.source === "review") {
+    await applyReviewDecision(change.path, "verified", { previousQueue });
+    return;
+  }
   if (state.selected === change.path) {
     state.selectedDiff = await readSelectedDiff(change.path);
+    replaceExternalReviewActionsInPlace(merged);
     if (!finishExternalReviewPanelInPlace(viewState)) {
       const restoreState = inlineReviewRestoreViewState(viewState);
       renderViewer();
@@ -7815,9 +10358,21 @@ function finalizeExternalReviewPanelInPlace(viewState) {
   wireMarkdownDocLinks();
   wireRenderedMarkdownEditor();
   syncWorkspaceScroll();
-  if (!restoreMarkdownVisualAnchor(visualAnchor)) restoreEditorViewState(restoreState, { deferred: false });
+  restoreFinalReviewViewport(visualAnchor, restoreState);
   scheduleSessionStatePush();
   return true;
+}
+
+function restoreFinalReviewViewport(visualAnchor, restoreState) {
+  const apply = () => {
+    if (!restoreMarkdownVisualAnchor(visualAnchor)) restoreEditorViewState(restoreState, { deferred: false });
+  };
+  apply();
+  window.requestAnimationFrame(() => {
+    apply();
+    window.requestAnimationFrame(apply);
+  });
+  window.setTimeout(apply, 0);
 }
 
 function replaceExternalReviewActionsInPlace(text = "") {
@@ -7825,11 +10380,13 @@ function replaceExternalReviewActionsInPlace(text = "") {
   if (!actions) return;
   const templateState = !state.selectedStartupContext && !activeFileConflict() ? templateStateForContent(text) : null;
   actions.outerHTML = renderFileActionButtons({
-    reviewAction: state.selectedStartupContext ? null : reviewActionForSelectedFile(),
+    reviewAction: state.selectedStartupContext || state.selectedReadOnly ? null : reviewActionForSelectedFile(),
+    nextReviewAction: state.selectedStartupContext || state.selectedReadOnly ? null : nextReviewActionForSelectedFile(),
     dirty: state.dirty,
     templateState,
     blockedByConflict: Boolean(activeFileConflict()),
-    deletable: !Boolean(state.selectedStartupContext),
+    readOnly: Boolean(state.selectedStartupContext?.readOnly || state.selectedReadOnly),
+    deletable: !Boolean(state.selectedStartupContext || state.selectedReadOnly),
   });
   wireFileActionButtons(document.querySelector(".file-panel > header") || document);
 }
@@ -7847,7 +10404,7 @@ function settleExternalReviewBlocks(blocksOrIds, viewState, options = {}) {
     .filter((block) => block?.classList?.contains("resolved") && !block.classList.contains("settling") && !block.classList.contains("settled"));
   if (!blocks.length) return Promise.resolve();
   const anchor = viewState?.anchorBlockId ? externalReviewBlockElement(viewState.anchorBlockId) : null;
-  const anchorTop = anchor ? anchor.getBoundingClientRect().top : null;
+  const anchorTop = typeof viewState?.anchorTop === "number" ? viewState.anchorTop : anchor ? anchor.getBoundingClientRect().top : null;
   for (const block of blocks) {
     const startHeight = Math.ceil(block.getBoundingClientRect().height);
     block.classList.add("settling");
@@ -7862,7 +10419,7 @@ function settleExternalReviewBlocks(blocksOrIds, viewState, options = {}) {
     block.style.height = targetHeight + "px";
     block.style.minHeight = targetHeight + "px";
   }
-  if (anchor && typeof anchorTop === "number") shiftScrollForElement(anchor, anchor.getBoundingClientRect().top - anchorTop);
+  if (!restoreInlineReviewViewport(viewState) && anchor && typeof anchorTop === "number") shiftScrollForElement(anchor, anchor.getBoundingClientRect().top - anchorTop);
   if (restoreScroll) restoreEditorViewState(viewState);
   const transitionScrollStart = captureInlineReviewScrollSnapshot(viewState);
   return Promise.all(blocks.map(waitForExternalReviewBlockSettle)).then(() => {
@@ -7874,7 +10431,7 @@ function settleExternalReviewBlocks(blocksOrIds, viewState, options = {}) {
     }
     const scrolledDuringTransition = rememberInlineReviewLiveScrollIfChanged(viewState, transitionScrollStart);
     if (!scrolledDuringTransition) {
-      if (anchor && typeof anchorTop === "number") shiftScrollForElement(anchor, anchor.getBoundingClientRect().top - anchorTop);
+      if (!restoreInlineReviewViewport(viewState) && anchor && typeof anchorTop === "number") shiftScrollForElement(anchor, anchor.getBoundingClientRect().top - anchorTop);
       if (restoreScroll) restoreEditorViewState(viewState);
     }
   });
@@ -7882,7 +10439,10 @@ function settleExternalReviewBlocks(blocksOrIds, viewState, options = {}) {
 
 function captureInlineReviewScrollSnapshot(viewState = null) {
   if (!viewState) return null;
-  return captureEditorViewState({ anchorBlockId: viewState.anchorBlockId || "" });
+  return {
+    ...captureEditorViewState({ anchorBlockId: viewState.anchorBlockId || "" }),
+    userScrollIntentAt: state.userScrollIntentAt || 0,
+  };
 }
 
 function inlineReviewScrollChangedSince(snapshot) {
@@ -7903,7 +10463,8 @@ function inlineReviewScrollChangedSince(snapshot) {
 }
 
 function rememberInlineReviewLiveScrollIfChanged(viewState, snapshot) {
-  if (!viewState || !inlineReviewScrollChangedSince(snapshot)) return false;
+  const userRequestedScroll = (state.userScrollIntentAt || 0) > (snapshot?.userScrollIntentAt || 0);
+  if (!viewState || !userRequestedScroll || !inlineReviewScrollChangedSince(snapshot)) return false;
   viewState.userScrolledDuringInlineReview = true;
   viewState.liveScrollState = captureEditorViewState({ anchorBlockId: viewState.anchorBlockId || "" });
   viewState.liveScrollState.textAnchor = null;
@@ -7923,20 +10484,65 @@ function captureMarkdownVisualAnchor(root = null) {
     ? scroller.getBoundingClientRect()
     : { top: 0, bottom: window.innerHeight || document.documentElement.clientHeight || 0 };
   const lines = [...container.querySelectorAll(".markdown-line")];
-  const visibleLine = lines.find((line) => {
+  const visibleLines = lines.filter((line) => {
     const rect = line.getBoundingClientRect();
     return rect.bottom > scrollRect.top + 1 && rect.top < scrollRect.bottom - 1;
   });
+  const visibleLine = visibleLines.find((line) => line.textContent.trim() && !line.closest(".external-review-block.change")) ||
+    visibleLines.find((line) => line.textContent.trim()) ||
+    visibleLines[0];
   if (!visibleLine) return null;
   const lineIndex = visibleLine.dataset.finalLineIndex || visibleLine.dataset.lineIndex || "";
   if (!lineIndex) return null;
-  return { lineIndex, top: visibleLine.getBoundingClientRect().top };
+  return { lineIndex, lineText: visibleLine.textContent || "", top: visibleLine.getBoundingClientRect().top };
+}
+
+function restoreExternalReviewVisualAnchor(anchor) {
+  if (!anchor?.lineIndex && !anchor?.lineText) return false;
+  const root = document.querySelector(".external-review-doc");
+  if (!root) return false;
+  const targetIndex = Number(anchor.lineIndex);
+  const textMatches = anchor.lineText
+    ? [...root.querySelectorAll(".markdown-line")].filter((candidate) => candidate.textContent === anchor.lineText)
+    : [];
+  let line = textMatches.reduce((closest, candidate) => {
+    const index = Number(candidate.dataset.finalLineIndex);
+    const distance = Number.isFinite(targetIndex) && Number.isFinite(index) ? Math.abs(index - targetIndex) : 0;
+    return !closest || distance < closest.distance ? { candidate, distance } : closest;
+  }, null)?.candidate || null;
+  if (!line && anchor.lineIndex) line = root.querySelector('.markdown-line[data-final-line-index="' + cssEscape(anchor.lineIndex) + '"]');
+  if (!line) {
+    if (Number.isFinite(targetIndex)) {
+      line = [...root.querySelectorAll(".markdown-line[data-final-line-index]")].reduce((closest, candidate) => {
+        const distance = Math.abs(Number(candidate.dataset.finalLineIndex) - targetIndex);
+        return !closest || distance < closest.distance ? { candidate, distance } : closest;
+      }, null)?.candidate || null;
+    }
+  }
+  if (!line) return false;
+  shiftScrollForElement(line, line.getBoundingClientRect().top - anchor.top);
+  return true;
+}
+
+function restoreInlineReviewViewport(viewState) {
+  if (!viewState) return false;
+  const scroller = activeDocumentScrollTarget();
+  if (scroller && typeof viewState.documentViewportTop === "number") {
+    const currentTop = scroller.getBoundingClientRect?.().top;
+    const topDelta = typeof currentTop === "number" ? currentTop - viewState.documentViewportTop : 0;
+    scroller.scrollTop = Math.max(0, (viewState.documentScrollTop || 0) + topDelta);
+    scroller.scrollLeft = viewState.documentScrollLeft || 0;
+  }
+  return restoreExternalReviewVisualAnchor(viewState.visualAnchor) || Boolean(scroller);
 }
 
 function restoreMarkdownVisualAnchor(anchor) {
-  if (!anchor?.lineIndex) return false;
+  if (!anchor?.lineIndex && !anchor?.lineText) return false;
   const root = el("docHighlighter") || el("docReader") || document;
-  const line = root.querySelector('.markdown-line[data-line-index="' + cssEscape(anchor.lineIndex) + '"]');
+  const textLine = anchor.lineText
+    ? [...root.querySelectorAll(".markdown-line")].find((candidate) => candidate.textContent === anchor.lineText)
+    : null;
+  const line = textLine || root.querySelector('.markdown-line[data-line-index="' + cssEscape(anchor.lineIndex) + '"]');
   if (!line) return false;
   const delta = line.getBoundingClientRect().top - anchor.top;
   if (Math.abs(delta) < 0.5) return true;
@@ -8071,19 +10677,62 @@ function buildSimpleTextDiffRows(leftText, rightText) {
   return buildPrefixSuffixTextDiffRows(left, right);
 }
 
+function diffComparableLine(line) {
+  return String(line || "")
+    .replace(/^(\s*last_verified\s*:).*/, "$1 #")
+    .replace(/^(\s*)\d+([.)])(\s+)/, "$1#$2$3");
+}
+
+function diffLinesEqual(leftLine, rightLine) {
+  return leftLine === rightLine || diffComparableLine(leftLine) === diffComparableLine(rightLine);
+}
+
+function diffContextLine(leftLine, rightLine) {
+  return leftLine === rightLine ? leftLine : rightLine;
+}
+
+function reviewIdentityContentForUi(content) {
+  const normalized = String(content || "").replace(/\r\n?/g, "\n");
+  const lines = normalized.split("\n");
+  if (lines[0]?.trim() !== "---") return normalized;
+  const frontmatterEnd = lines.slice(1).findIndex((line) => line.trim() === "---");
+  if (frontmatterEnd < 0) return normalized;
+  const endIndex = frontmatterEnd + 1;
+  let contextIndent = null;
+  return lines.filter((line, index) => {
+    if (index < 1 || index >= endIndex) return true;
+    const match = line.match(/^(\s*)([^#\s][^:]*)\s*:/);
+    if (match && match[2].trim() === "context_room") {
+      contextIndent = match[1].length;
+      return true;
+    }
+    if (contextIndent == null) return true;
+    const indent = line.match(/^\s*/)?.[0].length || 0;
+    if (line.trim() && indent <= contextIndent) {
+      contextIndent = null;
+      return true;
+    }
+    return !/^\s+last_verified\s*:/.test(line);
+  }).join("\n");
+}
+
+function onlyIgnoredReviewMetadataChanged(leftContent, rightContent) {
+  return leftContent !== rightContent && reviewIdentityContentForUi(leftContent) === reviewIdentityContentForUi(rightContent);
+}
+
 function buildLcsTextDiffRows(left, right) {
   const dp = Array.from({ length: left.length + 1 }, () => new Uint32Array(right.length + 1));
   for (let i = left.length - 1; i >= 0; i -= 1) {
     for (let j = right.length - 1; j >= 0; j -= 1) {
-      dp[i][j] = left[i] === right[j] ? dp[i + 1][j + 1] + 1 : Math.max(dp[i + 1][j], dp[i][j + 1]);
+      dp[i][j] = diffLinesEqual(left[i], right[j]) ? dp[i + 1][j + 1] + 1 : Math.max(dp[i + 1][j], dp[i][j + 1]);
     }
   }
   const rows = [];
   let i = 0;
   let j = 0;
   while (i < left.length && j < right.length) {
-    if (left[i] === right[j]) {
-      rows.push({ type: "ctx", line: left[i] });
+    if (diffLinesEqual(left[i], right[j])) {
+      rows.push({ type: "ctx", line: diffContextLine(left[i], right[j]) });
       i += 1;
       j += 1;
     } else if (dp[i + 1][j] >= dp[i][j + 1]) {
@@ -8107,18 +10756,20 @@ function buildLcsTextDiffRows(left, right) {
 
 function buildPrefixSuffixTextDiffRows(left, right) {
   let prefix = 0;
-  while (prefix < left.length && prefix < right.length && left[prefix] === right[prefix]) prefix += 1;
+  while (prefix < left.length && prefix < right.length && diffLinesEqual(left[prefix], right[prefix])) prefix += 1;
   let leftEnd = left.length;
   let rightEnd = right.length;
-  while (leftEnd > prefix && rightEnd > prefix && left[leftEnd - 1] === right[rightEnd - 1]) {
+  while (leftEnd > prefix && rightEnd > prefix && diffLinesEqual(left[leftEnd - 1], right[rightEnd - 1])) {
     leftEnd -= 1;
     rightEnd -= 1;
   }
   const rows = [];
-  for (const line of left.slice(0, prefix)) rows.push({ type: "ctx", line });
+  for (let index = 0; index < prefix; index += 1) rows.push({ type: "ctx", line: diffContextLine(left[index], right[index]) });
   for (const line of left.slice(prefix, leftEnd)) rows.push({ type: "del", line });
   for (const line of right.slice(prefix, rightEnd)) rows.push({ type: "add", line });
-  for (const line of left.slice(leftEnd)) rows.push({ type: "ctx", line });
+  for (let leftIndex = leftEnd, rightIndex = rightEnd; leftIndex < left.length && rightIndex < right.length; leftIndex += 1, rightIndex += 1) {
+    rows.push({ type: "ctx", line: diffContextLine(left[leftIndex], right[rightIndex]) });
+  }
   return rows;
 }
 
@@ -8398,14 +11049,19 @@ function promptRevertCurrentDiff() {
   });
 }
 
-function showConfirmDialog({ title, body, confirmLabel = "Confirm", onConfirm }) {
+function showConfirmDialog({ title, body, confirmLabel = "Confirm", confirmVariant = "danger", checkboxLabel = "", onConfirm }) {
   document.querySelector(".confirm-backdrop")?.remove();
   const backdrop = document.createElement("div");
   backdrop.className = "confirm-backdrop";
+  const confirmClass = confirmVariant === "primary" ? "primary" : confirmVariant === "secondary" ? "" : "danger-action";
+  const checkboxMarkup = checkboxLabel
+    ? '<label class="confirm-option"><input type="checkbox" data-confirm-checkbox /><span>' + escapeHtml(checkboxLabel) + '</span></label>'
+    : "";
   backdrop.innerHTML = '<section class="confirm-dialog" role="dialog" aria-modal="true" aria-label="' + escapeHtml(title) + '">' +
     '<strong>' + escapeHtml(title) + '</strong>' +
     '<p>' + escapeHtml(body) + '</p>' +
-    '<div class="confirm-actions"><button class="file-action" type="button" data-confirm-cancel>Cancel</button><button class="file-action danger-action" type="button" data-confirm-accept>' + escapeHtml(confirmLabel) + '</button></div>' +
+    checkboxMarkup +
+    '<div class="confirm-actions"><button class="file-action" type="button" data-confirm-cancel>Cancel</button><button class="file-action ' + confirmClass + '" type="button" data-confirm-accept>' + escapeHtml(confirmLabel) + '</button></div>' +
   '</section>';
   const close = () => {
     backdrop.remove();
@@ -8419,15 +11075,17 @@ function showConfirmDialog({ title, body, confirmLabel = "Confirm", onConfirm })
   });
   backdrop.querySelector("[data-confirm-cancel]").addEventListener("click", close);
   backdrop.querySelector("[data-confirm-accept]").addEventListener("click", () => {
+    const checked = Boolean(backdrop.querySelector("[data-confirm-checkbox]")?.checked);
     close();
-    onConfirm?.();
+    onConfirm?.({ checked });
   });
   document.addEventListener("keydown", onKeydown);
   document.body.appendChild(backdrop);
+  backdrop.querySelector("[data-confirm-accept]")?.focus();
 }
 
 async function revertCurrentDiff(path = state.selected) {
-  if (state.selectedStartupContext) return;
+  if (state.selectedStartupContext || state.selectedReadOnly) return;
   if (!path || state.selected !== path || !state.selectedDiff?.changed || state.diffCollapsed) return;
   setStatus("reverting diff...");
   const result = await api("/api/file/revert", {
@@ -8452,7 +11110,9 @@ function activeFileConflict() {
 }
 
 function activeExternalChange() {
-  return state.externalChange && state.externalChange.path === state.selected ? state.externalChange : null;
+  if (!state.externalChange || state.externalChange.path !== state.selected) return null;
+  if (!selectedFileExists(state.externalChange.path)) return null;
+  return state.externalChange;
 }
 
 function activeBlockingExternalChange() {
@@ -8474,6 +11134,7 @@ function startupSelectionRequest() {
       skill: startup.skillName || String(startup.order || "").split(":").slice(1).join(":"),
     };
   }
+  if (startup.kind === "startup-hook") return { type: "startup-hook", order: startup.order };
   return { type: "startup-context", order: startup.order };
 }
 
@@ -8481,26 +11142,36 @@ async function readSelectedDiskFile(path = state.selected) {
   const startup = startupSelectionRequest();
   if (startup?.type === "startup-context") return api("/api/startup-context/file?order=" + encodeURIComponent(startup.order));
   if (startup?.type === "startup-skill") return api("/api/startup-skills/file?folder=" + encodeURIComponent(startup.folder) + "&skill=" + encodeURIComponent(startup.skill));
+  if (startup?.type === "startup-hook") return api("/api/startup-hooks/file?order=" + encodeURIComponent(startup.order));
   return api("/api/file?path=" + encodeURIComponent(path));
 }
 
 async function readSelectedDiff(path = state.selected) {
-  if (state.selectedStartupContext) return { path, available: false, changed: false, additions: 0, deletions: 0, patch: "" };
+  if (state.selectedStartupContext || state.selectedReadOnly) return { path, available: false, changed: false, additions: 0, deletions: 0, patch: "" };
   return api("/api/file/diff?path=" + encodeURIComponent(path));
 }
 
 async function readSelectedReviewBase(path = state.selected) {
-  if (state.selectedStartupContext) return null;
+  const startupReviewPath = selectedStartupContextReviewPath(path);
+  if (startupReviewPath) return api("/api/file/review-base?path=" + encodeURIComponent(startupReviewPath));
+  if (state.selectedStartupContext || state.selectedReadOnly) return null;
   return api("/api/file/review-base?path=" + encodeURIComponent(path));
 }
 
 async function recordSelectedReviewBaseline(path = state.selected, note = "") {
-  if (!path || state.selectedStartupContext) return null;
+  const startupReviewPath = selectedStartupContextReviewPath(path);
+  if (!path || (state.selectedStartupContext && !startupReviewPath) || state.selectedReadOnly) return null;
+  const reviewPath = startupReviewPath || path;
   return api("/api/docqa/review-baseline", {
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify({ path, note }),
+    body: JSON.stringify({ path: reviewPath, note }),
   });
+}
+
+function selectedStartupContextReviewPath(path = state.selected) {
+  if (state.selectedStartupContext?.kind !== "startup-context") return "";
+  return startupContextSelectedExplorerPath(state.selectedStartupContext) || path || "";
 }
 
 async function startChangedFileInlineReview(path, diff, requestId = state.selectionRequest) {
@@ -8509,14 +11180,16 @@ async function startChangedFileInlineReview(path, diff, requestId = state.select
   if (!isCurrentSelection(requestId, path) || !review?.available) return false;
   const baseContent = typeof review.baseContent === "string" ? review.baseContent : "";
   const diskContent = typeof review.currentContent === "string" ? review.currentContent : state.saved || "";
-  if (baseContent === diskContent) {
+  const ignoredMetadataOnly = onlyIgnoredReviewMetadataChanged(baseContent, diskContent);
+  if (baseContent === diskContent || ignoredMetadataOnly) {
     clearReviewSession(path);
     state.saved = typeof review.currentContent === "string" ? review.currentContent : state.saved || "";
     state.savedHash = review.currentHash || state.savedHash;
     state.dirty = false;
     state.diffCollapsed = true;
+    if (ignoredMetadataOnly && state.selectedDiff) state.selectedDiff = { ...state.selectedDiff, changed: false, additions: 0, deletions: 0, patch: "" };
     el("editor").value = state.saved;
-    setStatus("changes already reviewed · mark verified when ready");
+    setStatus(ignoredMetadataOnly ? "last_verified synced · ready for verification" : "changes already reviewed · mark verified when ready");
     return false;
   }
   const previousSession = state.reviewSessions?.[path] || null;
@@ -8540,7 +11213,7 @@ async function startChangedFileInlineReview(path, diff, requestId = state.select
   state.dirty = false;
   state.diffCollapsed = true;
   el("editor").value = state.saved;
-  setStatus(review.changeKind === "added" ? "new file waiting for review" : "changes waiting for review");
+  setStatus(review.changeKind === "added" ? "new file waiting for review" : review.changeKind === "renamed" ? "renamed file waiting for review" : "changes waiting for review");
   return true;
 }
 
@@ -8558,6 +11231,13 @@ async function writeSelectedDiskFile(content, path = state.selected) {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ folder: startup.folder, skill: startup.skill, content }),
+    });
+  }
+  if (startup?.type === "startup-hook") {
+    return api("/api/startup-hooks/file", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ order: startup.order, content }),
     });
   }
   return api("/api/file", {
@@ -8638,6 +11318,14 @@ function focusNearestExternalReviewChange() {
   return focusExternalReviewChange(closestExternalReviewChangeBlockId());
 }
 
+function firstExternalReviewChangeBlockId() {
+  return externalReviewChangeElements()[0]?.dataset.externalReviewBlock || "";
+}
+
+function focusFirstExternalReviewChange() {
+  return focusExternalReviewChange(firstExternalReviewChangeBlockId());
+}
+
 function focusExternalReviewChange(blockId) {
   let target = blockId ? externalReviewBlockElement(blockId) : closestExternalReviewChangeElement();
   if (!target && activeExternalChange()) {
@@ -8654,13 +11342,13 @@ function focusExternalReviewChange(blockId) {
 }
 
 function scheduleConflictCheck() {
-  if (!state.selected || !state.dirty || state.openingFilePath === state.selected || state.savedHash == null) return;
+  if (!state.selected || state.selectedReadOnly || !state.dirty || state.openingFilePath === state.selected || state.savedHash == null) return;
   window.clearTimeout(state.conflictCheckTimer);
   state.conflictCheckTimer = window.setTimeout(() => checkSelectedFileConflict().catch((error) => setStatus(error.message)), 250);
 }
 
 async function checkSelectedFileConflict() {
-  if (!state.selected || !state.dirty || state.openingFilePath === state.selected || state.savedHash == null) return false;
+  if (!state.selected || state.selectedReadOnly || !state.dirty || state.openingFilePath === state.selected || state.savedHash == null) return false;
   const path = state.selected;
   const [data, diff] = await Promise.all([
     readSelectedDiskFile(path),
@@ -8818,6 +11506,11 @@ async function saveConflictMerge(merged) {
 
 async function saveCurrent(options = {}) {
   if (!state.selected) return;
+  if (state.selectedReadOnly) {
+    setStatus("read-only file · add it to watched/allowed paths before editing");
+    updateHeader();
+    return;
+  }
   const conflict = activeFileConflict();
   if (conflict && !options.forceConflict) {
     state.conflictCompare = true;
@@ -8860,55 +11553,65 @@ async function saveCurrent(options = {}) {
 
 async function refreshFromDisk() {
   const previousSelected = state.selected;
+  if (document.hidden || state.refreshInFlight) return;
+  state.refreshInFlight = true;
   try {
-    const [filesData, docqa, doctor, settingsData, startupData, startupSkillsData] = await Promise.all([api(filesApiPath()), api("/api/docqa"), api("/api/doctor"), api("/api/settings"), api("/api/startup-context"), api("/api/startup-skills")]);
-    state.files = filesData.files;
-    state.startupContextFiles = startupData.files || [];
-    state.startupSkillFolders = startupSkillsData.folders || [];
-    state.docqa = docqa;
-    state.doctor = doctor;
-    if (!state.settingsOpen) {
-      state.settings = settingsData.settings;
-      applyFileTheme();
-      state.availableHubCards = settingsData.availableHubCards || [];
-      state.hubFolders = settingsData.hubCards || [];
-      state.rootHubSections = settingsData.hubSections || [];
-      state.hubSections = state.rootHubSections;
-    }
-    renderFiles();
-    if (state.settingsOpen) {
-      updateActionBanner();
-      return;
-    }
-    if (!state.selected) renderDocQaDashboard();
-    else updateHeader();
-
     if (!previousSelected || previousSelected !== state.selected) return;
     if (state.openingFilePath === state.selected || state.savedHash == null) return;
     if (activeExternalChange()?.source === "review") {
+      if (Date.now() - (state.lastDiffRefreshAt || 0) < 15_000) return;
       state.selectedDiff = await readSelectedDiff(previousSelected);
+      state.lastDiffRefreshAt = Date.now();
       updateHeader();
       updatePreview();
       return;
     }
-    const [data, diff] = await Promise.all([
-      readSelectedDiskFile(previousSelected),
-      readSelectedDiff(previousSelected),
-    ]);
+    const data = await readSelectedDiskFile(previousSelected);
+    if (previousSelected !== state.selected) return;
+    if (!data.exists && !canReviewMissingFile(previousSelected)) {
+      clearMissingSelectedFile(previousSelected);
+      renderFiles();
+      showHome();
+      scheduleSessionStatePush();
+      setStatus("file removed or renamed · returned to hub");
+      return;
+    }
     if (state.dirty) {
       await checkSelectedFileConflict();
       return;
     }
     if (data.contentHash === state.savedHash) {
       if (activeExternalChange()) {
+        const diff = await readSelectedDiff(previousSelected);
         resetExternalChangeState();
         state.selectedDiff = diff;
+        state.lastDiffRefreshAt = Date.now();
         renderViewer();
         updateHeader();
         updatePreview();
       }
       return;
     }
+    if (onlyIgnoredReviewMetadataChanged(state.saved || "", data.content)) {
+      const viewState = captureEditorViewState();
+      resetConflictState();
+      resetExternalChangeState();
+      state.saved = data.content;
+      state.savedHash = data.contentHash;
+      state.dirty = false;
+      el("editor").value = data.content;
+      const docEditor = el("docEditor");
+      if (docEditor) docEditor.value = data.content;
+      renderViewer();
+      restoreEditorViewState(viewState);
+      updateHeader();
+      updatePreview();
+      setStatus("last_verified synced");
+      return;
+    }
+    const diff = await readSelectedDiff(previousSelected);
+    if (previousSelected !== state.selected) return;
+    state.lastDiffRefreshAt = Date.now();
     const existingExternalChange = activeExternalChange();
     if (existingExternalChange && existingExternalChange.diskHash === data.contentHash && existingExternalChange.diskContent === data.content) {
       state.selectedDiff = diff;
@@ -8936,6 +11639,59 @@ async function refreshFromDisk() {
     setStatus("file changed on disk · review before applying");
   } catch (error) {
     setStatus(error.message);
+  } finally {
+    state.refreshInFlight = false;
+  }
+}
+
+function scheduleBackgroundRefresh(options = {}) {
+  if (document.hidden || state.backgroundRefreshTimer) return;
+  const run = () => {
+    state.backgroundRefreshTimer = null;
+    refreshBackgroundReports(options).catch((error) => setStatus(error.message));
+  };
+  if ("requestIdleCallback" in window) state.backgroundRefreshTimer = window.requestIdleCallback(run, { timeout: 800 });
+  else state.backgroundRefreshTimer = window.setTimeout(run, 120);
+}
+
+async function refreshBackgroundReports(options = {}) {
+  if (document.hidden || state.reportsRefreshInFlight) return;
+  const now = Date.now();
+  const reportInterval = state.selected ? 30_000 : 15_000;
+  const fullInterval = state.selected ? 60_000 : 30_000;
+  const shouldRefreshReports = options.forceReports || now - (state.lastReportRefreshAt || 0) >= reportInterval;
+  const shouldRefreshFull = options.forceFull || now - (state.lastFullRefreshAt || 0) >= fullInterval;
+  if (!shouldRefreshReports && !shouldRefreshFull) return;
+  state.reportsRefreshInFlight = true;
+  try {
+    const reportsPath = "/api/reports" + (options.forceReports ? "?fresh=1" : "");
+    const [reports, filesData, settingsData] = await Promise.all([
+      shouldRefreshReports ? api(reportsPath) : Promise.resolve(null),
+      shouldRefreshFull ? api(filesApiPath()) : Promise.resolve(null),
+      shouldRefreshFull ? api("/api/settings") : Promise.resolve(null),
+    ]);
+    if (reports) {
+      applyBackgroundReportPayload(reports);
+      state.lastReportRefreshAt = Date.now();
+    }
+    if (filesData) {
+      state.files = filesData.files;
+      state.root = filesData.root || state.root;
+      state.lastFullRefreshAt = Date.now();
+      if (!state.settingsOpen && settingsData) applySettingsPayload(settingsData);
+    }
+    renderFiles();
+    if (reconcileMissingSelectedFile()) {
+      showHome();
+      scheduleSessionStatePush();
+      setStatus("file removed or renamed · returned to hub");
+      return;
+    }
+    if (state.settingsOpen) updateActionBanner();
+    else if (!state.selected) renderDocQaDashboard();
+    else updateHeader();
+  } finally {
+    state.reportsRefreshInFlight = false;
   }
 }
 
@@ -9043,6 +11799,7 @@ function captureEditorViewState(options = {}) {
     anchorBlockId: options.anchorBlockId || "",
     anchorTop: anchor ? anchor.getBoundingClientRect().top : null,
     documentScrollTarget: documentScrollTarget?.classList?.contains("external-review-doc") ? "external-review-doc" : documentScrollTarget?.id || "",
+    documentViewportTop: documentScrollTarget?.getBoundingClientRect?.().top ?? null,
     documentScrollTop: documentScrollTarget?.scrollTop || 0,
     documentScrollLeft: documentScrollTarget?.scrollLeft || 0,
     editorScrollTop: editor?.scrollTop || 0,
@@ -9162,9 +11919,11 @@ function updateCardSpotlightAt(x, y) {
 }
 function scheduleCardSpotlightUpdate() {
   if (!spotlightPointer || spotlightFrame) return;
+  const pointer = spotlightPointer;
   spotlightFrame = window.requestAnimationFrame(() => {
     spotlightFrame = 0;
-    updateCardSpotlightAt(spotlightPointer.x, spotlightPointer.y);
+    if (spotlightPointer !== pointer) return;
+    updateCardSpotlightAt(pointer.x, pointer.y);
   });
 }
 function updateCardSpotlight(event) {
@@ -9228,6 +11987,7 @@ window.addEventListener("blur", () => {
   setDocLinkModifierActive(false);
 });
 document.addEventListener("keydown", (event) => {
+  if (isScrollIntentKey(event)) markUserScrollIntent();
   markUserActive();
   setDocLinkModifierActive(isDocLinkModifierEventActive(event));
   if (handleSaveShortcut(event)) return;
@@ -9237,7 +11997,12 @@ document.addEventListener("keydown", (event) => {
 });
 document.addEventListener("keyup", (event) => setDocLinkModifierActive(isDocLinkModifierEventActive(event)));
 document.addEventListener("visibilitychange", () => {
-  if (document.hidden) setDocLinkModifierActive(false);
+  if (document.hidden) {
+    setDocLinkModifierActive(false);
+    return;
+  }
+  refreshFromDisk();
+  scheduleBackgroundRefresh();
 });
 el("sidebarToggle").addEventListener("click", () => {
   state.mobileSidebarTouched = true;
@@ -9254,12 +12019,12 @@ el("explorerOpen")?.addEventListener("click", () => {
   if (window.matchMedia("(max-width: 640px)").matches) app.classList.add("explorer-expanded");
   syncSidebarToggleIcon();
 });
-el("refreshDocQa")?.addEventListener("click", () => loadFiles().catch((error) => setStatus(error.message)));
+el("refreshDocQa")?.addEventListener("click", () => loadFiles({ waitForBackground: true }).catch((error) => setStatus(error.message)));
 document.querySelectorAll("[data-home-action]").forEach((button) => button.addEventListener("click", () => homeAction(button.dataset.homeAction)));
 document.querySelectorAll("[data-home-file]").forEach((button) => button.addEventListener("click", () => selectFile(button.dataset.homeFile).catch((error) => setStatus(error.message))));
 el("back").addEventListener("click", () => goHistory(-1).catch((error) => setStatus(error.message)));
 el("forward").addEventListener("click", () => goHistory(1).catch((error) => setStatus(error.message)));
-el("hub").addEventListener("click", () => handleHubAction());
+el("hub").addEventListener("click", () => handleHubAction().catch((error) => setStatus(error.message)));
 el("gitDiffToggle").addEventListener("click", () => {
   if (!state.selectedDiff?.changed) return;
   setDiffCollapsed(!state.diffCollapsed);
@@ -9278,13 +12043,18 @@ el("reload").addEventListener("click", () => {
   selectFile(state.selected, { pushHistory: false, fromPlanet: state.filePanel, forceReload: true }).catch((error) => setStatus(error.message));
 });
 window.addEventListener("beforeunload", (event) => {
+  persistNavigationState();
   const blockingChange = activeBlockingExternalChange();
-  if (!state.dirty && !blockingChange) return;
+  if (!state.dirty && !blockingChange && !state.reviewFinalizationPromise) return;
   if (blockingChange) focusNearestExternalReviewChange();
   event.preventDefault();
   event.returnValue = "";
 });
 document.addEventListener("pointerdown", markUserActive, { passive: true });
+document.addEventListener("wheel", markUserScrollIntent, { capture: true, passive: true });
+document.addEventListener("touchmove", markUserScrollIntent, { capture: true, passive: true });
+document.addEventListener("pointerover", (event) => prefetchPathFromTarget(event.target), { passive: true });
+document.addEventListener("focusin", (event) => prefetchPathFromTarget(event.target));
 document.addEventListener("scroll", scheduleSessionStatePush, { capture: true, passive: true });
 syncResponsiveSidebar({ force: true });
 window.addEventListener("resize", () => syncResponsiveSidebar());
@@ -9292,6 +12062,7 @@ setMode("view");
 startAgentCommandPolling();
 loadFiles().catch((error) => setStatus(error.message));
 window.setInterval(() => refreshFromDisk(), 2200);
+window.setInterval(() => scheduleBackgroundRefresh(), 5_000);
 </script>
 </body>
 </html>`;
