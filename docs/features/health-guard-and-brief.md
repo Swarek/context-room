@@ -12,7 +12,7 @@ context_room:
 
 ## Purpose
 
-These commands turn project docs into local proof: health issues, commit blocking, and a deterministic read-first brief.
+These commands turn project docs into local proof: health issues, review signals, and a deterministic read-first brief.
 
 ## Example Flow
 
@@ -24,7 +24,7 @@ These commands turn project docs into local proof: health issues, commit blockin
 
 - `doctor` reports health; strict mode fails on high-impact issues.
 - The web UI can mark a triggered health issue `OK`; it hides from the panel until the issue changes, while `doctor` still reports it.
-- `guard` blocks when watched docs still need review.
+- `guard` and `review-only` report without blocking. Only explicit strict mode can fail.
 - `brief` ranks local docs only. It does not call an LLM.
 - Metadata improves ranking and health checks, but existing Markdown still works.
 - The web UI refreshes shared reports in the background and reuses one project scan.

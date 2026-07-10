@@ -11,7 +11,7 @@ Context Room gives a repository a browser UI to map important docs, edit safe te
 - Review important doc changes before they become trusted context.
 - Inspect startup context, startup skills, and hooks that can affect agents.
 - Run local checks with no LLM call.
-- Block commits until watched docs are reviewed.
+- Report watched doc changes before commits without blocking by default.
 
 ## Core Loop
 
@@ -50,6 +50,7 @@ http://127.0.0.1:4317
 ## Main Files
 
 - `.context-room/config.json`: project map, safe edit paths, watched paths, hub cards, startup scanners, templates.
+- `~/.context-room/preferences.json`: computer-wide appearance preferences shared by every Context Room.
 - Runtime review state and external baselines live under `.context-room/`.
 - `docs/agent-configuration.md`: full config guide for agents and humans.
 - `schemas/config.schema.json`: JSON Schema for config validation and editor autocomplete.
@@ -62,18 +63,34 @@ Runtime files under `.context-room/` are excluded from Git where possible. Commi
 context-room init [--title "My Project"] [--allow docs/,src/] [--watch docs/]
 context-room start [--root .] [--port 4317]
 context-room doctor [--root .] [--strict]
-context-room guard [--root .] [--profile review-only|strict|advisory]
+context-room guard [--root .] [--profile advisory|review-only|strict]
 context-room brief [--root .] [--task "change billing onboarding"] [--limit 12]
 context-room agent queue [--root .]
 context-room agent open [--root .] [--path docs/INDEX.md] [--view hub|settings|file|diff]
 context-room agent annotate --root . --path docs/INDEX.md --note "Human-facing note"
 context-room install-hook [--root .]
+context-room update-all [--dry-run] [--no-restart] [--exclude /path]
 ```
 
 - `doctor` reports config, graph, metadata, link, startup-context, startup-hook, and hub health.
-- `guard` blocks when watched docs need review. `strict` also blocks on high-impact health issues.
+- `guard` and `review-only` are non-blocking. Only `--profile strict` can fail the command.
 - `brief` ranks relevant docs locally and deterministically. It does not call an LLM.
 - `agent` commands let an agent open files, inspect the queue, and leave annotations for the human.
+- `update-all` installs the latest npm release globally and restarts every active room except a Context Room development checkout.
+
+Preview an update without changing installations or processes:
+
+```bash
+node scripts/update-context-rooms.mjs --dry-run
+```
+
+Run the update from this repository even when its code is ahead of npm:
+
+```bash
+node scripts/update-context-rooms.mjs
+```
+
+Project configuration and review state are preserved. Restarted rooms write logs to `~/.context-room/logs/`.
 
 ## Minimal Config
 

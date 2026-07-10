@@ -24,10 +24,6 @@
   "integrations": {
     "hermes": false
   },
-  "appearance": {
-    "fileTheme": "context-room",
-    "autoOpenGitDiff": true
-  },
   "startupContext": {
     "enabled": true,
     "fileNames": [
@@ -121,21 +117,7 @@
       "package.json"
     ]
   },
-  "bestPractices": [
-    "One file, one clear scope: name what this document is responsible for and what belongs elsewhere.",
-    "Start with the goal, then the few durable facts that change decisions.",
-    "Keep sections stable and short; prefer links to source files over copied truth.",
-    "Use explicit rules for agents and humans: what to do, avoid, verify, or ask.",
-    "Update or delete stale context instead of accumulating contradictory prose."
-  ],
   "markdownTemplates": [
-    {
-      "id": "blank",
-      "title": "Blank",
-      "description": "Start with an empty Markdown file.",
-      "content": "",
-      "enabled": true
-    },
     {
       "id": "agents",
       "title": "Agent instructions",

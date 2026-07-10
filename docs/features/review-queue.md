@@ -28,10 +28,11 @@ The review queue shows watched documentation that needs verification before it b
 - `watchAllow` follows changed tracked files and new untracked files.
 - `reviewPaths` keeps important docs in the queue until the current content is verified.
 - `Mark verified` appears only for unchanged `reviewPaths` files. Git changes must be completed through their inline diff.
-- Similar paragraphs appear once: proposed additions are green, and proposed removals are red and struck through.
+- Mixed paragraph edits stay inline when changed words are at most 25% of the combined before and after text. Larger rewrites use separate paragraphs; simple additions or removals stay inline.
 - Verified content is also recorded in the shared review ledger by canonical absolute path and content hash, so another Context Room watching the same file does not require a duplicate review.
 - Updating only `context_room.last_verified` is not a review change: it stays out of the queue and inline diff, and syncs silently when the file is open.
 - After the final inline decision, navigation waits until the review is saved.
+- Pending review changes never block Hub, history, settings, reload, or another file. Partial decisions remain available when the file is reopened in the same session.
 - Accepting or rejecting a change keeps the current reading position throughout the animation and final render.
 - Review navigation is manual: use `Next review` to open another queued doc.
 - Code and JSON should stay out of Markdown review unless the user explicitly wants them there.
@@ -42,4 +43,4 @@ The review queue shows watched documentation that needs verification before it b
 - `writeDocReviewDecision` records review decisions.
 - `readGlobalReviewLedger` lets multiple Context Rooms trust the same absolute path and content hash.
 - `readFileDiff`, `readReviewBaseFile`, and `startChangedFileInlineReview` power review diffs.
-- `context-room guard` blocks commits when review is pending.
+- `context-room guard` and `review-only` report pending review without blocking; only strict mode can fail.

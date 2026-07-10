@@ -20,6 +20,7 @@ This folder explains Context Room by user-facing feature. Read this when changin
 - [Startup context](startup-context.md)
 - [Startup skills](startup-skills.md)
 - [Startup hooks](startup-hooks.md)
+- [Settings](settings.md)
 - [Health, guard, and brief](health-guard-and-brief.md)
 - [Agent CLI](agent-cli.md)
 

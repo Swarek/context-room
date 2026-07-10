@@ -12,7 +12,7 @@ context_room:
 
 ## Purpose
 
-The explorer and editor expose safe text files from the project. They are not a full filesystem browser.
+The explorer and editor expose safe project text files in one compact workspace. They are not a full filesystem browser.
 
 ## Example Flow
 
@@ -24,6 +24,9 @@ The explorer and editor expose safe text files from the project. They are not a 
 ## Common Actions
 
 - Browse, search, expand folders, or filter by all, watched, and not watched files.
+- Use the workspace toolbar to return to the hub, navigate history, and act on the current file.
+- Collapsing the explorer expands the document without hiding the workspace toolbar; the desktop reopen control stays centered in the collapsed rail.
+- Opening a file never reopens a collapsed explorer; use the explorer control when the file tree is needed.
 - Open project text files; files outside `allowedPaths` stay read-only.
 - Edit and save allowed files.
 - Create Markdown files and folders from the explorer.
@@ -31,7 +34,7 @@ The explorer and editor expose safe text files from the project. They are not a 
 - Add selected paths to `watchAllow` or remove them from `watchAllow`.
 - Delete selected files or folders after confirmation.
 - Inspect Git diffs, hide them, or revert the current file diff.
-- Resolve disk conflicts before saving.
+- Keep navigating when Git diffs, pending reviews, or disk changes exist; resolve a disk conflict only before overwriting it.
 
 ## Rules
 
@@ -39,8 +42,12 @@ The explorer and editor expose safe text files from the project. They are not a 
 - `watchAllow` is the review boundary.
 - Secret-looking paths, dependency folders, build outputs, and binary files stay out.
 - External startup files are shown only through explicit startup surfaces.
-- Disk conflicts must block silent overwrite.
-- File content opens before Git diffs and background reports finish.
+- Pending changes never block navigation. A concurrent disk edit blocks only the save that would overwrite it silently.
+- File data, annotations, Git diff state, and review data load concurrently.
+- Intentional hover or keyboard focus preloads file content and Git diff; repeated opens reuse the result until the file changes.
+- The workspace toolbar and file actions replace one stable loading state together instead of appearing in stages.
+- Markdown keeps its rich line rendering; code, JSON, and large files use a lightweight text surface to keep opening fast.
+- Search rendering is frame-scheduled so typing stays responsive in large explorers.
 
 ## Source Map
 

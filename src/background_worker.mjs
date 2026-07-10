@@ -13,9 +13,18 @@ function runTask(task, root, payload = {}) {
   throw new Error(`Unknown background task: ${task}`);
 }
 
-try {
-  const value = runTask(workerData?.task, workerData?.root, workerData?.payload);
-  parentPort.postMessage({ ok: true, value });
-} catch (error) {
-  parentPort.postMessage({ ok: false, error: error?.message || "Background task failed" });
+function taskResult(task, root, payload = {}) {
+  try {
+    return { ok: true, value: runTask(task, root, payload) };
+  } catch (error) {
+    return { ok: false, error: error?.message || "Background task failed" };
+  }
+}
+
+if (workerData?.persistent) {
+  parentPort.on("message", (message = {}) => {
+    parentPort.postMessage({ id: message.id, ...taskResult(message.task, workerData.root, message.payload) });
+  });
+} else {
+  parentPort.postMessage(taskResult(workerData?.task, workerData?.root, workerData?.payload));
 }

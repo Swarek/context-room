@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import fs from "node:fs";
 import http from "node:http";
+import os from "node:os";
 import path from "node:path";
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
@@ -17,6 +18,7 @@ const MAX_FILE_BYTES = 750_000;
 const PROJECT_EXPLORER_MAX_FILES = 20000;
 export const CONFIG_DIR = ".context-room";
 export const CONFIG_FILE = `${CONFIG_DIR}/config.json`;
+export const GLOBAL_PREFERENCES_FILE = "~/.context-room/preferences.json";
 const CONFIG_SCHEMA_URL = "https://raw.githubusercontent.com/Swarek/context-room/main/schemas/config.schema.json";
 const DOCQA_REVIEW_STATE = `${CONFIG_DIR}/review-state.json`;
 const DOCQA_REVIEW_BASELINES = `${CONFIG_DIR}/review-baselines`;
@@ -74,17 +76,40 @@ export const FILE_THEME_OPTIONS = [
   { id: "light-plus", label: "Light Plus", description: "Bright document surface" },
 ];
 const DEFAULT_FILE_THEME = "context-room";
-const REPORT_CACHE_TTL_MS = 5_000;
+const DEFAULT_APPEARANCE = { fileTheme: DEFAULT_FILE_THEME, autoOpenGitDiff: true };
+const REPORT_CACHE_TTL_MS = 60_000;
+const FILE_TASK_CACHE_TTL_MS = 30_000;
+const BACKGROUND_REPORT_INVALIDATING_PATHS = new Set([
+  "/api/startup-skills/create",
+  "/api/startup-skills/delete",
+  "/api/startup-skills/file",
+  "/api/startup-context/file",
+  "/api/startup-context/delete",
+  "/api/startup-hooks/file",
+  "/api/settings",
+  "/api/doctor/ack",
+  "/api/docqa/review",
+  "/api/docqa/review-baseline",
+  "/api/file/revert",
+  "/api/file",
+  "/api/markdown/create",
+  "/api/folder/create",
+  "/api/markdown/apply-template",
+  "/api/files/delete",
+]);
+const BACKGROUND_WATCH_IGNORED_PATHS = new Set([
+  COLLAB_SESSION_STATE,
+  COLLAB_AGENT_COMMAND,
+  COLLAB_AGENT_ANNOTATIONS,
+]);
 const gitTopLevelCache = new Map();
 const backgroundReportCache = new Map();
 const backgroundReportGenerations = new Map();
-export const DOCUMENTATION_BEST_PRACTICES = [
-  "One file, one clear scope: name what this document is responsible for and what belongs elsewhere.",
-  "Start with the goal, then the few durable facts that change decisions.",
-  "Keep sections stable and short; prefer links to source files over copied truth.",
-  "Use explicit rules for agents and humans: what to do, avoid, verify, or ask.",
-  "Update or delete stale context instead of accumulating contradictory prose.",
-];
+const backgroundFileTaskCache = new Map();
+const backgroundFileTaskGenerations = new Map();
+const backgroundExplicitInvalidations = new Map();
+const backgroundWorkerPools = new Map();
+let backgroundWorkerRequestId = 0;
 export const DEFAULT_MARKDOWN_TEMPLATES = [
   {
     id: "blank",
@@ -1734,14 +1759,22 @@ export function readFileDiff(root, relPath) {
     if (statusEntry?.inferredRename && statusEntry.oldPath) return buildInferredRenameDiff(root, statusEntry.oldPath, normalized);
     const diffPaths = statusEntry?.oldPath ? [statusEntry.oldPath, normalized] : [normalized];
     const patch = execFileSync("git", ["diff", "HEAD", "--", ...diffPaths], { cwd: root, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] });
-    const numstat = execFileSync("git", ["diff", "HEAD", "--numstat", "--", ...diffPaths], { cwd: root, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).trim();
-    const [rawAdditions = "0", rawDeletions = "0"] = numstat.split(/\s+/);
-    const additions = Number.parseInt(rawAdditions, 10) || 0;
-    const deletions = Number.parseInt(rawDeletions, 10) || 0;
+    const { additions, deletions } = countPatchChanges(patch);
     return { path: normalized, oldPath: statusEntry?.oldPath || null, changed: patch.trim().length > 0, additions, deletions, patch, available: true };
   } catch {
     return { path: normalized, changed: false, additions: 0, deletions: 0, patch: "", available: false, reason: "Git diff is unavailable for this file."};
   }
+}
+
+function countPatchChanges(patch = "") {
+  let additions = 0;
+  let deletions = 0;
+  for (const line of String(patch).split("\n")) {
+    if (line.startsWith("+++ ") || line.startsWith("--- ")) continue;
+    if (line.startsWith("+")) additions += 1;
+    else if (line.startsWith("-")) deletions += 1;
+  }
+  return { additions, deletions };
 }
 
 function buildReviewBaselineRenameDiff(root, oldPath, nextPath) {
@@ -2468,14 +2501,14 @@ function reviewContentHash(content) {
   return hashContent(reviewIdentityContent(content));
 }
 
-function meaningfulGitStatusForReview(root, relPath, gitEntry, content, reviews = {}) {
+function meaningfulGitStatusForReview(root, relPath, gitEntry, content, reviews = {}, gitHeadContents = null) {
   const status = gitEntry?.status || "";
   if (!status.trim()) return "";
   if (gitEntry?.oldPath || gitEntry?.inferredRename || gitEntry?.baselineRename || !/^[ M]{2}$/.test(status) || !status.includes("M")) return status;
   try {
     const review = reviews[relPath] || null;
     const baseline = readDocReviewBaseline(root, relPath, review);
-    const baseContent = baseline?.content ?? readGitHeadFileContent(root, relPath);
+    const baseContent = baseline?.content ?? (gitHeadContents?.has(relPath) ? gitHeadContents.get(relPath) : readGitHeadFileContent(root, relPath));
     if (reviewContentHash(baseContent) === reviewContentHash(content)) return "";
   } catch {}
   return status;
@@ -3128,7 +3161,6 @@ export function buildContextRoomDoctorReport(root = process.cwd(), options = {})
       watchAllow: settings.watchAllow.length,
       hubSections: settings.hubSections.length,
       markdownTemplates: settings.markdownTemplates.length,
-      appearance: settings.appearance,
       startupContext: settings.startupContext,
       startupHooks: settings.startupHooks,
     },
@@ -3143,12 +3175,13 @@ export function buildContextRoomReports(root = process.cwd()) {
   const settings = readMemoryWebappSettings(root);
   const files = listMemoryFiles(root);
   const gitEntries = readGitStatusEntries(root);
+  const gitHeadContents = readGitHeadFileContents(root, [...gitEntries.values()].flatMap((entry) => [entry.path, entry.oldPath]).filter(Boolean));
   const gitStatuses = new Map([...gitEntries.entries()].map(([rel, entry]) => [rel, entry.status]));
   const reviewState = readDocReviewState(root);
   const startupFiles = listStartupContextFiles(root, settings);
   const startupHooks = listStartupHookFiles(root, settings);
   const startupSkills = listStartupSkillFolders(root, settings);
-  const docqa = buildDocQaReport(root, { settings, files, gitStatuses: gitEntries, reviewState, startupFiles });
+  const docqa = buildDocQaReport(root, { settings, files, gitStatuses: gitEntries, gitHeadContents, reviewState, startupFiles });
   const graph = buildDocumentationGraph(root, { settings, files, gitStatuses, startupFiles, startupHooks });
   const doctor = buildContextRoomDoctorReport(root, { settings, graph, docqa });
   return {
@@ -3267,11 +3300,12 @@ export function computeDocIssues({ path: relPath, content = "", gitStatus = "", 
 
 export function buildDocQaReport(root = process.cwd(), options = {}) {
   const gitStatuses = options.gitStatuses || readGitStatusEntries(root);
+  const gitHeadContents = options.gitHeadContents || null;
   const reviewState = options.reviewState || readDocReviewState(root);
   const settings = options.settings || readMemoryWebappSettings(root);
   const files = options.files || listMemoryFiles(root);
   const startupFiles = options.startupFiles || listStartupContextFiles(root, settings);
-  const { inferredRenames, renamedDeletedPaths } = inferGitRenames(root, gitStatuses, files, settings);
+  const { inferredRenames, renamedDeletedPaths } = inferGitRenames(root, gitStatuses, files, settings, gitHeadContents);
   const { inferredRenames: inferredBaselineRenames } = inferReviewBaselineRenames(root, reviewState, gitStatuses, files, settings);
   const filePaths = new Set(files.map((file) => file.path));
   const gitQueue = files.map((file) => {
@@ -3282,7 +3316,7 @@ export function buildDocQaReport(root = process.cwd(), options = {}) {
     if (!rawGitStatus.trim() && !reviewRequired) return null;
     const abs = resolveExternalPath(file.path) || path.join(root, file.path);
     const content = file.exists && fs.existsSync(abs) && file.bytes <= MAX_FILE_BYTES ? fs.readFileSync(abs, "utf8") : "";
-    const gitStatus = meaningfulGitStatusForReview(root, file.path, gitEntry, content, reviewState.reviews);
+    const gitStatus = meaningfulGitStatusForReview(root, file.path, gitEntry, content, reviewState.reviews, gitHeadContents);
     const review = currentReviewFor(root, reviewState.reviews, file.path, content);
     if (!gitStatus.trim() && !reviewRequired) return null;
     const metadata = parseDocMetadata(content, file.path);
@@ -3320,7 +3354,7 @@ export function buildDocQaReport(root = process.cwd(), options = {}) {
   };
 }
 
-function inferGitRenames(root, gitStatuses, files, settings) {
+function inferGitRenames(root, gitStatuses, files, settings, gitHeadContents = null) {
   const inferredRenames = new Map();
   const renamedDeletedPaths = new Set();
   const filesByPath = new Map(files.map((file) => [file.path, file]));
@@ -3336,7 +3370,9 @@ function inferGitRenames(root, gitStatuses, files, settings) {
     for (const deletedEntry of deleted) {
       if (renamedDeletedPaths.has(deletedEntry.path)) continue;
       if (path.extname(deletedEntry.path).toLowerCase() !== path.extname(entry.path).toLowerCase()) continue;
-      const baseContent = readGitHeadFileContent(root, deletedEntry.path);
+      const baseContent = gitHeadContents?.has(deletedEntry.path)
+        ? gitHeadContents.get(deletedEntry.path)
+        : readGitHeadFileContent(root, deletedEntry.path);
       if (!baseContent) continue;
       const score = renameSimilarityScore(baseContent, currentContent, deletedEntry.path, entry.path);
       if (!best || score > best.score) best = { entry: deletedEntry, score };
@@ -3429,6 +3465,37 @@ function readGitHeadFileContent(root, relPath) {
     return execFileSync("git", ["show", "HEAD:" + gitTreePathForRootRelative(root, relPath)], { cwd: root, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"], maxBuffer: MAX_FILE_BYTES + 64_000 });
   } catch {
     return "";
+  }
+}
+
+function readGitHeadFileContents(root, relPaths = []) {
+  const paths = [...new Set(relPaths.map(normalizeRelPath).filter(Boolean))];
+  if (!paths.length) return new Map();
+  try {
+    const specs = paths.map((relPath) => `HEAD:${gitTreePathForRootRelative(root, relPath)}`);
+    const output = execFileSync("git", ["cat-file", "--batch"], {
+      cwd: root,
+      input: specs.join("\n") + "\n",
+      encoding: null,
+      stdio: ["pipe", "pipe", "ignore"],
+      maxBuffer: Math.max(8_000_000, paths.length * (MAX_FILE_BYTES + 1024)),
+    });
+    const contents = new Map();
+    let offset = 0;
+    for (const relPath of paths) {
+      const headerEnd = output.indexOf(10, offset);
+      if (headerEnd < 0) break;
+      const header = output.subarray(offset, headerEnd).toString("utf8");
+      offset = headerEnd + 1;
+      if (header.endsWith(" missing")) continue;
+      const size = Number(header.split(" ").at(-1));
+      if (!Number.isFinite(size) || size < 0 || offset + size > output.length) break;
+      contents.set(relPath, output.subarray(offset, offset + size).toString("utf8"));
+      offset += size + 1;
+    }
+    return contents;
+  } catch {
+    return null;
   }
 }
 
@@ -3561,11 +3628,9 @@ export function createDefaultProjectConfig({ title = "Context Room", allowedPath
     watchAllow: sanitizePathList(watchAllow),
     reviewPaths: [],
     integrations: { hermes: false },
-    appearance: { fileTheme: DEFAULT_FILE_THEME, autoOpenGitDiff: true },
     startupContext: { ...DEFAULT_STARTUP_CONTEXT },
     startupSkills: { ...DEFAULT_STARTUP_SKILLS },
     startupHooks: defaultStartupHookSettings(),
-    bestPractices: [...DOCUMENTATION_BEST_PRACTICES],
     markdownTemplates: DEFAULT_MARKDOWN_TEMPLATES.map(normalizeMarkdownTemplate).filter(Boolean),
     hubCards: { ...DEFAULT_HUB_CARD_VISIBILITY },
     customHubCards: DEFAULT_HUB_CARDS.map(normalizeHubCardDefinition),
@@ -3674,6 +3739,36 @@ export function writeMemoryWebappSettings(root = process.cwd(), next = {}) {
   fs.mkdirSync(path.dirname(settingsPath), { recursive: true });
   fs.writeFileSync(settingsPath, JSON.stringify(settings, null, 2) + "\n", "utf8");
   return settings;
+}
+
+export function readGlobalContextRoomPreferences(preferencesPath = null) {
+  const target = resolveGlobalPreferencesPath(preferencesPath);
+  if (!fs.existsSync(target)) return { appearance: { ...DEFAULT_APPEARANCE } };
+  try {
+    const parsed = JSON.parse(fs.readFileSync(target, "utf8"));
+    return { appearance: normalizeAppearanceSettings(parsed.appearance) };
+  } catch {
+    return { appearance: { ...DEFAULT_APPEARANCE } };
+  }
+}
+
+export function writeGlobalContextRoomPreferences(next = {}, preferencesPath = null) {
+  const target = resolveGlobalPreferencesPath(preferencesPath);
+  const current = readGlobalContextRoomPreferences(target);
+  const preferences = { appearance: normalizeAppearanceSettings({ ...current.appearance, ...(next.appearance || {}) }) };
+  fs.mkdirSync(path.dirname(target), { recursive: true });
+  fs.writeFileSync(target, JSON.stringify(preferences, null, 2) + "\n", "utf8");
+  return preferences;
+}
+
+export function readResolvedContextRoomSettings(root = process.cwd(), { preferencesPath = null } = {}) {
+  const projectSettings = readMemoryWebappSettings(root);
+  const preferences = readGlobalContextRoomPreferences(preferencesPath);
+  return { ...projectSettings, appearance: preferences.appearance };
+}
+
+function resolveGlobalPreferencesPath(preferencesPath = null) {
+  return preferencesPath ? path.resolve(preferencesPath) : path.join(os.homedir(), ".context-room", "preferences.json");
 }
 
 export function hubCardsForSettings(settings = defaultMemoryWebappSettings()) {
@@ -3856,11 +3951,9 @@ function normalizeMemoryWebappSettings(raw = {}, base = defaultMemoryWebappSetti
     watchAllow: sanitizePathList(raw.watchAllow ?? base.watchAllow),
     reviewPaths: sanitizePathList(raw.reviewPaths ?? base.reviewPaths ?? []),
     integrations: { hermes: Boolean(raw.integrations?.hermes ?? base.integrations?.hermes ?? false) },
-    appearance: normalizeAppearanceSettings(raw.appearance ?? base.appearance),
     startupContext: normalizeStartupContextSettings(raw.startupContext ?? base.startupContext),
     startupSkills: normalizeStartupSkillSettings(raw.startupSkills ?? base.startupSkills),
     startupHooks: normalizeStartupHookSettings(raw.startupHooks ?? base.startupHooks),
-    bestPractices: sanitizeTextList(raw.bestPractices ?? base.bestPractices ?? DOCUMENTATION_BEST_PRACTICES),
     markdownTemplates: sanitizeMarkdownTemplates(raw.markdownTemplates ?? base.markdownTemplates ?? DEFAULT_MARKDOWN_TEMPLATES),
     hubCards,
     customHubCards,
@@ -4019,11 +4112,6 @@ function markdownTemplatesForSettings(settings = defaultMemoryWebappSettings()) 
   return sanitizeMarkdownTemplates(settings.markdownTemplates?.length ? settings.markdownTemplates : DEFAULT_MARKDOWN_TEMPLATES);
 }
 
-function sanitizeTextList(value) {
-  if (!Array.isArray(value)) return [];
-  return value.map((item) => String(item || "").trim()).filter(Boolean).slice(0, 12);
-}
-
 function sanitizeMarkdownTemplates(value) {
   if (!Array.isArray(value)) return [];
   const seen = new Set();
@@ -4179,7 +4267,7 @@ function readGitStatusEntries(root) {
   const statuses = new Map();
   try {
     const rootPrefix = gitRepoPrefixForRoot(root);
-    const output = execFileSync("git", ["status", "--porcelain=v1", "--untracked-files=all"], { cwd: root, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] });
+    const output = execFileSync("git", ["--no-optional-locks", "status", "--porcelain=v1", "--untracked-files=all"], { cwd: root, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] });
     for (const line of output.split("\n")) {
       if (!line.trim()) continue;
       const entry = gitStatusEntryFromPorcelainLine(line, rootPrefix);
@@ -4238,24 +4326,92 @@ function normalizeGitStatusPathForRoot(relPath, rootPrefix = "") {
   return normalizeRelPath(normalized.slice(prefix.length));
 }
 
-function runBackgroundTask(task, root, payload = {}) {
-  return new Promise((resolve, reject) => {
-    const worker = new Worker(new URL("./background_worker.mjs", import.meta.url), {
-      workerData: { task, root: path.resolve(root), payload },
-    });
-    let settled = false;
-    worker.once("message", (message) => {
-      settled = true;
-      if (message?.ok) resolve(message.value);
-      else reject(new Error(message?.error || `Background task failed: ${task}`));
-    });
-    worker.once("error", (error) => {
-      if (!settled) reject(error);
-    });
-    worker.once("exit", (code) => {
-      if (!settled && code !== 0) reject(new Error(`Background task stopped: ${task}`));
-    });
+function backgroundWorkerKey(root, group) {
+  return `${path.resolve(root)}\0${group}`;
+}
+
+function backgroundWorkerGroup(task) {
+  return task === "reports" ? "reports" : "files";
+}
+
+function ensureBackgroundWorker(root, group) {
+  const key = backgroundWorkerKey(root, group);
+  const existing = backgroundWorkerPools.get(key);
+  if (existing) return existing;
+  const worker = new Worker(new URL("./background_worker.mjs", import.meta.url), {
+    workerData: { persistent: true, root: path.resolve(root) },
   });
+  const entry = { key, worker, pending: new Map() };
+  const fail = (error) => {
+    if (backgroundWorkerPools.get(key) === entry) backgroundWorkerPools.delete(key);
+    for (const request of entry.pending.values()) request.reject(error);
+    entry.pending.clear();
+  };
+  worker.on("message", (message = {}) => {
+    const request = entry.pending.get(message.id);
+    if (!request) return;
+    entry.pending.delete(message.id);
+    if (message.ok) request.resolve(message.value);
+    else request.reject(new Error(message.error || "Background task failed"));
+  });
+  worker.once("error", fail);
+  worker.once("exit", (code) => {
+    if (entry.pending.size) fail(new Error(`Background worker stopped with code ${code}`));
+    else if (backgroundWorkerPools.get(key) === entry) backgroundWorkerPools.delete(key);
+  });
+  worker.unref();
+  backgroundWorkerPools.set(key, entry);
+  return entry;
+}
+
+function closeBackgroundWorkers(root) {
+  const prefix = `${path.resolve(root)}\0`;
+  for (const [key, entry] of backgroundWorkerPools) {
+    if (!key.startsWith(prefix)) continue;
+    backgroundWorkerPools.delete(key);
+    entry.worker.terminate().catch(() => {});
+  }
+}
+
+function runBackgroundTask(task, root, payload = {}) {
+  const entry = ensureBackgroundWorker(root, backgroundWorkerGroup(task));
+  const id = ++backgroundWorkerRequestId;
+  return new Promise((resolve, reject) => {
+    entry.pending.set(id, { resolve, reject });
+    entry.worker.postMessage({ id, task, payload });
+  });
+}
+
+function backgroundFileTaskKey(task, root, payload = {}) {
+  return `${path.resolve(root)}\0${task}\0${normalizeRelPath(payload.path || "")}`;
+}
+
+function readBackgroundFileTask(task, root, payload = {}) {
+  const rootKey = path.resolve(root);
+  const key = backgroundFileTaskKey(task, root, payload);
+  const cached = backgroundFileTaskCache.get(key);
+  if (cached?.value && cached.expiresAt > Date.now()) return Promise.resolve(cached.value);
+  if (cached?.promise) return cached.promise;
+  const generation = backgroundFileTaskGenerations.get(rootKey) || 0;
+  const promise = runBackgroundTask(task, root, payload);
+  backgroundFileTaskCache.set(key, { promise, value: cached?.value || null, expiresAt: cached?.expiresAt || 0 });
+  return promise.then((value) => {
+    if ((backgroundFileTaskGenerations.get(rootKey) || 0) !== generation) return readBackgroundFileTask(task, rootKey, payload);
+    backgroundFileTaskCache.set(key, { value, expiresAt: Date.now() + FILE_TASK_CACHE_TTL_MS, promise: null });
+    return value;
+  }, (error) => {
+    backgroundFileTaskCache.delete(key);
+    throw error;
+  });
+}
+
+function invalidateBackgroundFileTasks(root) {
+  const rootKey = path.resolve(root);
+  const prefix = `${rootKey}\0`;
+  backgroundFileTaskGenerations.set(rootKey, (backgroundFileTaskGenerations.get(rootKey) || 0) + 1);
+  for (const key of backgroundFileTaskCache.keys()) {
+    if (key.startsWith(prefix)) backgroundFileTaskCache.delete(key);
+  }
 }
 
 function invalidateBackgroundReports(root) {
@@ -4264,12 +4420,81 @@ function invalidateBackgroundReports(root) {
   backgroundReportCache.delete(key);
 }
 
+function invalidateBackgroundCaches(root, { explicit = false } = {}) {
+  const key = path.resolve(root);
+  if (explicit) backgroundExplicitInvalidations.set(key, Date.now());
+  invalidateBackgroundReports(key);
+  invalidateBackgroundFileTasks(key);
+}
+
+function clearBackgroundCacheState(root) {
+  const key = path.resolve(root);
+  const prefix = `${key}\0`;
+  backgroundReportCache.delete(key);
+  backgroundReportGenerations.delete(key);
+  backgroundFileTaskGenerations.delete(key);
+  backgroundExplicitInvalidations.delete(key);
+  for (const taskKey of backgroundFileTaskCache.keys()) {
+    if (taskKey.startsWith(prefix)) backgroundFileTaskCache.delete(taskKey);
+  }
+}
+
+function requestInvalidatesBackgroundCaches(req) {
+  if (!req || req.method === "GET") return false;
+  try {
+    return BACKGROUND_REPORT_INVALIDATING_PATHS.has(new URL(req.url, "http://localhost").pathname);
+  } catch {
+    return false;
+  }
+}
+
+function watchBackgroundInputs(root) {
+  const resolvedRoot = path.resolve(root);
+  const startedAt = Date.now();
+  let timer = null;
+  const watchers = [];
+  const scheduleInvalidation = (fileName) => {
+    if (Date.now() - startedAt < 250) return;
+    const relPath = fileName == null ? "" : normalizeRelPath(String(fileName));
+    if (BACKGROUND_WATCH_IGNORED_PATHS.has(relPath)) return;
+    if (relPath === path.basename(resolvedRoot)) return;
+    const watchedPath = relPath ? path.resolve(resolvedRoot, relPath) : "";
+    if (watchedPath && fs.existsSync(watchedPath) && fs.statSync(watchedPath).isDirectory()) return;
+    clearTimeout(timer);
+    timer = setTimeout(() => {
+      timer = null;
+      if (Date.now() - (backgroundExplicitInvalidations.get(resolvedRoot) || 0) < 250) return;
+      invalidateBackgroundCaches(resolvedRoot);
+    }, 80);
+    timer.unref?.();
+  };
+  const addWatcher = (target, options = {}) => {
+    try {
+      watchers.push(fs.watch(target, { persistent: false, ...options }, (_event, fileName) => scheduleInvalidation(fileName)));
+      return true;
+    } catch {
+      return false;
+    }
+  };
+  if (!addWatcher(resolvedRoot, { recursive: true })) addWatcher(resolvedRoot);
+  const startupContextFiles = listStartupContextFiles(resolvedRoot);
+  for (const file of startupContextFiles) {
+    const abs = path.resolve(file.startupContext?.absolutePath || "");
+    if (!abs || abs === resolvedRoot || abs.startsWith(`${resolvedRoot}${path.sep}`)) continue;
+    addWatcher(abs);
+  }
+  return () => {
+    clearTimeout(timer);
+    for (const watcher of watchers) watcher.close();
+  };
+}
+
 async function readBackgroundReports(root, { force = false } = {}) {
   const key = path.resolve(root);
   const now = Date.now();
   const cached = backgroundReportCache.get(key);
   if (!force && cached?.value && cached.expiresAt > now) return cached.value;
-  if (!force && cached?.promise) return cached.promise;
+  if (cached?.promise) return cached.promise;
   const generation = backgroundReportGenerations.get(key) || 0;
   const promise = runBackgroundTask("reports", key);
   backgroundReportCache.set(key, { promise, value: cached?.value || null, expiresAt: cached?.expiresAt || 0 });
@@ -4284,20 +4509,30 @@ async function readBackgroundReports(root, { force = false } = {}) {
   }
 }
 
-export function createMemoryServer({ root = process.cwd(), port = DEFAULT_PORT } = {}) {
+export function createMemoryServer({ root = process.cwd(), port = DEFAULT_PORT, globalPreferencesPath = null } = {}) {
+  ensureBackgroundWorker(root, "files");
+  void readBackgroundReports(root).catch(() => {});
+  const lastSelectedPath = normalizeRelPath(readCollaborationSessionState(root).selectedPath || "");
+  if (lastSelectedPath) void readBackgroundFileTask("file-diff", root, { path: lastSelectedPath }).catch(() => {});
+  const stopBackgroundWatch = watchBackgroundInputs(root);
   const server = http.createServer(async (req, res) => {
     try {
-      await routeRequest(req, res, root);
+      await routeRequest(req, res, root, globalPreferencesPath);
     } catch (error) {
       sendJson(res, 500, { error: error.message });
     } finally {
-      if (req.method !== "GET") invalidateBackgroundReports(root);
+      if (requestInvalidatesBackgroundCaches(req)) invalidateBackgroundCaches(root, { explicit: true });
     }
+  });
+  server.once("close", () => {
+    stopBackgroundWatch();
+    closeBackgroundWorkers(root);
+    clearBackgroundCacheState(root);
   });
   return { server, root, port };
 }
 
-async function routeRequest(req, res, root) {
+async function routeRequest(req, res, root, globalPreferencesPath = null) {
   const url = new URL(req.url, `http://${req.headers.host || "localhost"}`);
 
   if (req.method === "GET" && url.pathname === "/") {
@@ -4373,13 +4608,18 @@ async function routeRequest(req, res, root) {
     return;
   }
   if (req.method === "GET" && url.pathname === "/api/settings") {
-    const settings = readMemoryWebappSettings(root);
+    const settings = readResolvedContextRoomSettings(root, { preferencesPath: globalPreferencesPath });
     sendJson(res, 200, { settings, hubCards: hubCardsForRoot(root, settings), hubSections: hubSectionsForRoot(root, settings), availableHubCards: settings.customHubCards });
     return;
   }
   if (req.method === "POST" && url.pathname === "/api/settings") {
     const body = await readJsonBody(req);
-    const settings = writeMemoryWebappSettings(root, body.settings || body);
+    const incoming = body.settings || body;
+    const projectInput = { ...incoming };
+    delete projectInput.appearance;
+    const projectSettings = writeMemoryWebappSettings(root, projectInput);
+    const preferences = writeGlobalContextRoomPreferences({ appearance: incoming.appearance }, globalPreferencesPath);
+    const settings = { ...projectSettings, appearance: preferences.appearance };
     sendJson(res, 200, { settings, hubCards: hubCardsForRoot(root, settings), hubSections: hubSectionsForRoot(root, settings), availableHubCards: settings.customHubCards });
     return;
   }
@@ -4461,12 +4701,12 @@ async function routeRequest(req, res, root) {
   }
   if (req.method === "GET" && url.pathname === "/api/file/diff") {
     const relPath = url.searchParams.get("path") || "";
-    sendJson(res, 200, await runBackgroundTask("file-diff", root, { path: relPath }));
+    sendJson(res, 200, await readBackgroundFileTask("file-diff", root, { path: relPath }));
     return;
   }
   if (req.method === "GET" && url.pathname === "/api/file/review-base") {
     const relPath = url.searchParams.get("path") || "";
-    sendJson(res, 200, await runBackgroundTask("review-base", root, { path: relPath }));
+    sendJson(res, 200, await readBackgroundFileTask("review-base", root, { path: relPath }));
     return;
   }
   if (req.method === "POST" && url.pathname === "/api/file/revert") {
@@ -4882,8 +5122,8 @@ export function renderFileActionButtons({ reviewAction = null, nextReviewAction 
 export function renderReviewSummary(summary = {}) {
   const changed = Number(summary.changedDocs || 0).toLocaleString("en-US");
   const needsReview = Number(summary.needsReview || 0).toLocaleString("en-US");
-  return '<div class="review-summary-item"><strong>' + changed + '</strong><span>changed</span></div>' +
-    '<div class="review-summary-item"><strong>' + needsReview + '</strong><span>to review</span></div>';
+  return '<div class="review-summary-item"><strong>' + needsReview + '</strong><span>to review</span></div>' +
+    '<div class="review-summary-item"><strong>' + changed + '</strong><span>changed</span></div>';
 }
 
 export function renderAppHtml() {
@@ -4896,32 +5136,32 @@ export function renderAppHtml() {
   <style>
     :root {
       color-scheme: dark;
-      --bg: #0b1020;
-      --panel: rgba(18, 25, 46, 0.82);
-      --panel-strong: rgba(25, 35, 63, 0.96);
-      --line: rgba(148, 163, 184, 0.18);
-      --text: #eef4ff;
-      --muted: #98a6bd;
-      --accent: #8bd3ff;
-      --accent-2: #b69cff;
-      --good: #8df0b4;
-      --danger: #ff8c9d;
-      --on-accent: #07101e;
-      --shadow: 0 24px 80px rgba(0, 0, 0, 0.38);
-      --body-glow-1: rgba(139, 211, 255, 0.22);
-      --body-glow-2: rgba(182, 156, 255, 0.18);
-      --body-glow-3: rgba(139,211,255,0.16);
-      --body-glow-4: rgba(182,156,255,0.12);
-      --star-dot: rgba(255,255,255,0.42);
-      --star-opacity: 0.16;
-      --surface-wash: rgba(3, 7, 18, 0.36);
-      --surface-sidebar: rgba(8, 13, 27, 0.72);
-      --surface-floating: rgba(8,13,27,0.96);
-      --surface-floating-soft: rgba(8,13,27,0.82);
-      --surface-card: rgba(255,255,255,0.045);
-      --surface-card-hover: rgba(139,211,255,0.08);
-      --surface-reader: rgba(3, 7, 18, 0.42);
-      --label-strong: #dce8fb;
+      --bg: #101416;
+      --panel: rgba(21, 27, 29, 0.94);
+      --panel-strong: rgba(27, 34, 36, 0.98);
+      --line: rgba(207, 220, 217, 0.14);
+      --text: #edf2f0;
+      --muted: #96a39f;
+      --accent: #67c6d3;
+      --accent-2: #e2b866;
+      --good: #72d39a;
+      --danger: #ee8793;
+      --on-accent: #091315;
+      --shadow: 0 16px 42px rgba(0, 0, 0, 0.28);
+      --body-glow-1: rgba(103, 198, 211, 0.12);
+      --body-glow-2: rgba(226, 184, 102, 0.08);
+      --body-glow-3: rgba(103, 198, 211, 0.08);
+      --body-glow-4: rgba(114, 211, 154, 0.06);
+      --star-dot: rgba(237, 242, 240, 0.28);
+      --star-opacity: 0.08;
+      --surface-wash: rgba(13, 18, 20, 0.44);
+      --surface-sidebar: rgba(14, 19, 21, 0.96);
+      --surface-floating: rgba(22, 28, 30, 0.98);
+      --surface-floating-soft: rgba(22, 28, 30, 0.9);
+      --surface-card: rgba(237, 242, 240, 0.04);
+      --surface-card-hover: rgba(103, 198, 211, 0.09);
+      --surface-reader: rgba(12, 17, 19, 0.72);
+      --label-strong: #dbe5e2;
       --space-1: 4px;
       --space-2: 8px;
       --space-3: 12px;
@@ -4936,22 +5176,22 @@ export function renderAppHtml() {
       --compact-card-padding: var(--space-3);
       --control-height: 40px;
       --control-padding: var(--space-3) var(--space-4);
-      --file-panel-bg: rgba(8,13,27,0.72);
-      --file-header-bg: rgba(8,13,27,0.36);
-      --file-bg: rgba(3,7,18,0.16);
-      --file-fg: #eef4ff;
-      --file-muted: #98a6bd;
-      --file-line: rgba(148,163,184,0.16);
-      --file-h1: #8bd3ff;
-      --file-h2: #b69cff;
-      --file-h3: #8df0b4;
-      --file-h4: #ffd48f;
-      --file-code: #f8c37a;
-      --file-quote: #aab8cd;
-      --file-list: #8bd3ff;
-      --file-marker: #64748b;
-      --file-hr: rgba(139,211,255,0.35);
-      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      --file-panel-bg: rgba(16, 22, 24, 0.94);
+      --file-header-bg: rgba(24, 31, 33, 0.98);
+      --file-bg: rgba(11, 16, 18, 0.88);
+      --file-fg: #edf2f0;
+      --file-muted: #96a39f;
+      --file-line: rgba(207, 220, 217, 0.14);
+      --file-h1: #67c6d3;
+      --file-h2: #e2b866;
+      --file-h3: #72d39a;
+      --file-h4: #e7a5ad;
+      --file-code: #efbf76;
+      --file-quote: #a7b5b1;
+      --file-list: #75ccd7;
+      --file-marker: #697672;
+      --file-hr: rgba(103, 198, 211, 0.3);
+      font-family: "Avenir Next", Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
     }
     :root[data-file-theme="vscode-dark"] {
       color-scheme: dark;
@@ -5175,7 +5415,7 @@ export function renderAppHtml() {
     body::before, body::after { content: ""; position: fixed; inset: 0; pointer-events: none; z-index: 0; }
     body::before { background-image: radial-gradient(circle, var(--star-dot) 0 1px, transparent 1.6px); background-size: 86px 86px; opacity: var(--star-opacity); animation: starDrift 38s linear infinite; }
     body::after { background: radial-gradient(circle at 65% 48%, var(--body-glow-3), transparent 22rem), radial-gradient(circle at 30% 74%, var(--body-glow-4), transparent 26rem); animation: nebulaPulse 12s ease-in-out infinite alternate; }
-    .app { position: relative; z-index: 1; display: grid; grid-template-columns: 390px 1fr; height: 100vh; min-height: 0; overflow: hidden; transition: grid-template-columns 260ms ease; }
+    .app { position: relative; z-index: 1; display: grid; grid-template-columns: 390px 1fr; height: 100vh; min-height: 0; overflow: hidden; transition: grid-template-columns 260ms ease, opacity 120ms ease; }
     .app.sidebar-collapsed { grid-template-columns: 76px 1fr; }
     aside { border-right: 1px solid var(--line); padding: var(--space-4) var(--space-5); background: var(--surface-sidebar); backdrop-filter: blur(22px); height: 100vh; min-height: 0; overflow: auto; display: block; transition: padding 260ms ease, background 260ms ease; }
     .app.sidebar-collapsed aside { padding: var(--space-4) var(--space-2); overflow: visible; }
@@ -5185,7 +5425,7 @@ export function renderAppHtml() {
     .sidebar-toggle:hover { transform: translateY(-1px); background: rgba(139,211,255,0.12); }
     .explorer-open { display: none; border: 1px solid rgba(139,211,255,0.28); border-radius: 14px; background: rgba(255,255,255,0.06); color: var(--text); width: 42px; height: 42px; cursor: pointer; align-items: center; justify-content: center; box-shadow: 0 0 28px rgba(139,211,255,0.12); transition: transform 160ms ease, background 160ms ease; }
     .explorer-open:hover { transform: translateY(-1px); background: rgba(139,211,255,0.12); }
-    .app.sidebar-collapsed .sidebar-copy, .app.sidebar-collapsed .workspace-dock, .app.sidebar-collapsed .search-row, .app.sidebar-collapsed .watch-filter-row, .app.sidebar-collapsed .selection-bar, .app.sidebar-collapsed .explorer-title, .app.sidebar-collapsed .tree, .app.sidebar-collapsed .hint { opacity: 0; pointer-events: none; transform: translateX(-10px); }
+    .app.sidebar-collapsed .sidebar-copy, .app.sidebar-collapsed .search-row, .app.sidebar-collapsed .watch-filter-row, .app.sidebar-collapsed .selection-bar, .app.sidebar-collapsed .explorer-title, .app.sidebar-collapsed .tree, .app.sidebar-collapsed .hint { opacity: 0; pointer-events: none; transform: translateX(-10px); }
     .sidebar-copy, .workspace-dock, .search-row, .watch-filter-row, .selection-bar, .explorer-title, .tree, .hint { transition: opacity 180ms ease, transform 180ms ease; }
     main { padding: var(--page-padding); display: grid; grid-template-rows: 1fr; gap: var(--space-4); min-width: 0; min-height: 0; overflow: hidden; }
     h1 { font-size: 24px; margin: 0 0 6px; letter-spacing: -0.04em; }
@@ -5317,7 +5557,6 @@ export function renderAppHtml() {
 	    .context-health-ok { min-height: 30px; padding: 6px 10px; border-radius: 10px; flex: 0 0 auto; }
 	    .docqa-actions { display: flex; gap: 8px; flex-wrap: wrap; }
     .markdown-tools { padding: var(--panel-body-padding); display: grid; gap: var(--space-4); }
-    .best-practice-list { margin: 0; padding-left: var(--space-5); display: grid; gap: var(--space-2); color: var(--text); font-size: 13px; line-height: 1.45; }
     .markdown-create { max-width: 1120px; margin: 0 auto; display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); gap: var(--space-4); align-items: start; }
     .markdown-create .settings-field { min-width: 0; }
     .markdown-create .settings-field.paths { grid-column: 1 / -1; }
@@ -5342,25 +5581,32 @@ export function renderAppHtml() {
     .settings-card { box-shadow: var(--shadow); background: var(--panel); border: 1px solid var(--line); backdrop-filter: blur(18px); }
     .settings-card header { padding: var(--panel-header-padding); border-bottom: 1px solid var(--line); align-items: center; gap: var(--space-3); }
     .settings-card h2 { font-size: 22px; letter-spacing: -0.04em; }
-    .settings-panel { padding: 20px; display: grid; gap: 16px; }
-    .settings-shell { display: grid; gap: var(--space-4); }
-    .settings-section { border: 1px solid color-mix(in srgb, var(--line) 88%, transparent); border-radius: 22px; background: linear-gradient(145deg, color-mix(in srgb, var(--surface-card) 92%, var(--accent) 8%), var(--surface-card)); overflow: hidden; }
-    .settings-section summary { list-style: none; }
-    .settings-section summary::-webkit-details-marker { display: none; }
-    .settings-section.collapsible > .settings-section-head { cursor: pointer; }
-    .settings-section.collapsible:not([open]) > .settings-section-head { border-bottom: 0; }
-    .settings-section.collapsible:not([open]) > .settings-section-body { display: none; }
-    .settings-section-head { display: flex; justify-content: space-between; gap: var(--space-4); align-items: flex-start; padding: var(--space-4) var(--space-5); border-bottom: 1px solid color-mix(in srgb, var(--line) 84%, transparent); background: color-mix(in srgb, var(--surface-floating-soft) 78%, transparent); }
+    .settings-panel { padding: 20px; display: grid; gap: 0; }
+    .settings-shell { min-width: 0; min-height: calc(100dvh - 190px); border: 1px solid var(--line); border-radius: 10px; background: var(--panel); overflow: clip; }
+    .settings-tabs { position: sticky; top: 0; z-index: 10; display: flex; min-width: 0; overflow-x: auto; scrollbar-width: thin; border-bottom: 1px solid var(--line); background: var(--surface-floating); }
+    .settings-tab { flex: 1 0 128px; min-width: 0; min-height: 52px; display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 8px; align-items: center; padding: 9px 12px; border: 0; border-right: 1px solid var(--line); border-bottom: 2px solid transparent; border-radius: 0; background: transparent; color: var(--muted); text-align: left; cursor: pointer; }
+    .settings-tab:last-child { border-right: 0; }
+    .settings-tab:hover { color: var(--text); background: color-mix(in srgb, var(--accent) 7%, transparent); }
+    .settings-tab[aria-selected="true"] { color: var(--label-strong); border-bottom-color: var(--accent); background: color-mix(in srgb, var(--accent) 11%, transparent); }
+    .settings-tab strong { min-width: 0; font-size: 12px; line-height: 1.2; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .settings-tab small { border: 1px solid var(--line); border-radius: 4px; padding: 2px 4px; color: var(--muted); font-size: 8px; font-weight: 800; line-height: 1; text-transform: uppercase; }
+    .settings-tab[aria-selected="true"] small { border-color: color-mix(in srgb, var(--accent) 35%, transparent); color: var(--accent); }
+    .settings-content { min-width: 0; }
+    .settings-section { min-width: 0; background: transparent; animation: settingsPanelEnter 180ms ease both; }
+    .settings-section[hidden] { display: none; }
+    .settings-section-head { display: flex; justify-content: space-between; gap: var(--space-4); align-items: flex-start; padding: var(--space-4) var(--space-5); border-bottom: 1px solid color-mix(in srgb, var(--line) 84%, transparent); background: color-mix(in srgb, var(--surface-floating-soft) 58%, transparent); }
     .settings-section-title { display: grid; gap: var(--space-2); min-width: 0; }
     .settings-section-title h3 { margin: 0; color: var(--label-strong); font-size: 16px; line-height: 1.2; letter-spacing: 0; }
     .settings-kicker, .settings-title { color: var(--accent); font-size: 10px; font-weight: 900; text-transform: uppercase; letter-spacing: 0.12em; }
     .settings-section-copy { margin: 0; color: var(--muted); font-size: 13px; line-height: 1.4; }
     .settings-section-actions { display: flex; align-items: center; justify-content: flex-end; gap: 8px; flex-wrap: wrap; }
     .settings-pill { border: 1px solid color-mix(in srgb, var(--accent) 28%, transparent); border-radius: 999px; padding: var(--space-2) var(--space-3); color: var(--label-strong); background: color-mix(in srgb, var(--accent) 9%, transparent); font-size: 11px; font-weight: 850; line-height: 1; white-space: nowrap; }
-    .settings-section-toggle { border-color: color-mix(in srgb, var(--accent) 38%, transparent); color: var(--accent); min-width: 52px; text-align: center; }
-    .settings-section[open] .settings-section-toggle::after { content: "hide"; }
-    .settings-section:not([open]) .settings-section-toggle::after { content: "open"; }
     .settings-section-body { padding: var(--space-4) var(--space-5) var(--space-5); display: grid; gap: var(--space-4); }
+    .settings-group { display: grid; gap: var(--space-3); }
+    .settings-group + .settings-group { padding-top: var(--space-4); border-top: 1px solid var(--line); }
+    .settings-group-title { margin: 0; color: var(--label-strong); font-size: 13px; line-height: 1.2; }
+    .settings-input-label { color: var(--muted); font-size: 10px; font-weight: 800; text-transform: uppercase; }
+    @keyframes settingsPanelEnter { from { opacity: 0; transform: translateY(5px); } to { opacity: 1; transform: translateY(0); } }
     .settings-body-toolbar { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; color: var(--muted); font-size: 12px; }
     .settings-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: var(--space-4); align-items: start; }
     .settings-grid.compact { grid-template-columns: minmax(220px, 0.72fr) minmax(240px, 1fr); }
@@ -5504,7 +5750,7 @@ export function renderAppHtml() {
     .startup-skill-folder.spotlight-active::before, .startup-skill-folder:focus-within::before { opacity: 0; }
     .launch-card, .review-item, .hub-folder-card, .startup-context-item, .settings-section, .settings-toggle, .settings-theme-preview, .template-editor, .hub-section-editor, .hub-card-editor, .path-picker, .card, .conflict-card { position: relative; isolation: isolate; overflow: hidden; --spotlight-x: 50%; --spotlight-y: 50%; }
     .launch-card::before, .review-item::before, .hub-folder-card::before, .startup-context-item::before, .settings-section::before, .settings-toggle::before, .settings-theme-preview::before, .template-editor::before, .hub-section-editor::before, .hub-card-editor::before, .path-picker::before, .card::before, .conflict-card::before { content: ""; position: absolute; inset: 0; z-index: 0; border-radius: inherit; pointer-events: none; background: radial-gradient(360px circle at var(--spotlight-x) var(--spotlight-y), rgba(139,211,255,0.18), rgba(182,156,255,0.08) 30%, transparent 62%); opacity: 0; transition: opacity 180ms ease; }
-    .launch-card.spotlight-active::before, .launch-card:focus-within::before, .review-item.spotlight-active::before, .review-item:focus-within::before, .hub-folder-card.spotlight-active::before, .hub-folder-card:focus-within::before, .startup-context-item.spotlight-active::before, .startup-context-item:focus-within::before, .settings-section.spotlight-active::before, .settings-section:focus-within::before, .settings-toggle.spotlight-active::before, .settings-toggle:focus-within::before, .settings-theme-preview.spotlight-active::before, .settings-theme-preview:focus-within::before, .template-editor.spotlight-active::before, .template-editor:focus-within::before, .hub-section-editor.spotlight-active::before, .hub-section-editor:focus-within::before, .hub-card-editor.spotlight-active::before, .hub-card-editor:focus-within::before, .path-picker.spotlight-active::before, .path-picker:focus-within::before, .card.spotlight-active::before, .card:focus-within::before, .conflict-card.spotlight-active::before, .conflict-card:focus-within::before { opacity: 1; }
+    .launch-card.spotlight-active::before, .launch-card:focus-within::before, .review-item.spotlight-active::before, .review-item:focus-within::before, .hub-folder-card.spotlight-active::before, .hub-folder-card:focus-within::before, .startup-context-item.spotlight-active::before, .startup-context-item:focus-within::before, .settings-toggle.spotlight-active::before, .settings-toggle:focus-within::before, .settings-theme-preview.spotlight-active::before, .settings-theme-preview:focus-within::before, .template-editor.spotlight-active::before, .template-editor:focus-within::before, .hub-section-editor.spotlight-active::before, .hub-section-editor:focus-within::before, .hub-card-editor.spotlight-active::before, .hub-card-editor:focus-within::before, .path-picker.spotlight-active::before, .path-picker:focus-within::before, .card.spotlight-active::before, .card:focus-within::before, .conflict-card.spotlight-active::before, .conflict-card:focus-within::before { opacity: 1; }
     .launch-card > *, .review-item > *, .hub-folder-card > *, .startup-context-item > *, .settings-section > *, .settings-toggle > *, .settings-theme-preview > *, .template-editor > *, .hub-section-editor > *, .hub-card-editor > *, .path-picker > *, .card > *, .conflict-card > * { position: relative; z-index: 1; }
     .selection-bar { margin: 6px 0 8px; padding: 5px 6px 5px 10px; border: 1px solid color-mix(in srgb, var(--accent) 18%, transparent); border-radius: 999px; background: var(--surface-floating-soft); display: flex; gap: 8px; align-items: center; justify-content: space-between; box-shadow: 0 10px 28px rgba(0,0,0,0.18); }
     .selection-bar[hidden] { display: none; }
@@ -5600,6 +5846,8 @@ export function renderAppHtml() {
     .markdown-editor-highlight::-webkit-scrollbar { display: none; }
     .markdown-editor-input { position: absolute; inset: 0; width: 100%; height: 100%; z-index: 2; resize: none; overflow: auto; background: transparent !important; color: transparent !important; -webkit-text-fill-color: transparent !important; caret-color: var(--file-h1); text-shadow: none !important; }
     .markdown-editor-input.doc-link-hover { cursor: pointer; }
+    .plain-text-editor, .plain-text-view { margin: 0; white-space: pre; overflow: auto; tab-size: 2; font: 13px/1.55 ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; }
+    .plain-text-editor { display: block; width: 100%; min-height: 100%; resize: none; border: 0; outline: none; background: var(--file-bg); color: var(--file-fg); padding: 18px 22px; }
     .markdown-editor-input::selection { background: color-mix(in srgb, var(--file-h2) 34%, transparent); color: transparent !important; -webkit-text-fill-color: transparent !important; }
     .markdown-editor-highlight .markdown-line { margin: 0; padding: 0; border: 0; min-height: 1.7em; font-size: inherit; line-height: inherit; font-weight: inherit; letter-spacing: 0; }
     .markdown-editor-highlight .markdown-line.h1, .markdown-editor-highlight .markdown-line.h2, .markdown-editor-highlight .markdown-line.h3, .markdown-editor-highlight .markdown-line.h4 { margin: 0; padding: 0; border: 0; font-size: inherit; line-height: inherit; font-weight: inherit; }
@@ -5712,6 +5960,10 @@ export function renderAppHtml() {
     .file-header-copy { min-width: 0; display: grid; gap: var(--space-1); }
     .file-header-copy .diff-meta { white-space: normal; line-height: 1.35; }
     .file-actions { display: flex; gap: 8px; align-items: center; flex: 0 0 auto; }
+    .file-actions-loading { min-width: min(340px, 44vw); min-height: 36px; justify-content: flex-end; pointer-events: none; }
+    .file-action-placeholder { width: 82px; height: 32px; border: 1px solid color-mix(in srgb, var(--line) 82%, transparent); border-radius: 7px; background: color-mix(in srgb, var(--surface-card) 82%, transparent); animation: fileActionLoadingPulse 1.1s ease-in-out infinite alternate; }
+    .file-action-placeholder.wide { width: 112px; }
+    .file-action-placeholder.short { width: 60px; }
     .file-action { border: 1px solid rgba(148,163,184,0.18); border-radius: 12px; padding: var(--space-2) var(--space-3); min-height: 36px; background: rgba(255,255,255,0.06); color: var(--text); font-weight: 850; cursor: pointer; }
     .file-action:hover { transform: translateY(-1px); background: rgba(139,211,255,0.12); }
     .file-action.primary { color: var(--on-accent); border: 0; background: linear-gradient(135deg, var(--accent), var(--accent-2)); }
@@ -5737,6 +5989,7 @@ export function renderAppHtml() {
     @keyframes nebulaPulse { from { opacity: 0.65; transform: scale(1); } to { opacity: 1; transform: scale(1.04); } }
     @keyframes orbitSpin { to { transform: rotate(352deg); } }
     @keyframes orbFloat { from { transform: translateY(0); } to { transform: translateY(12px); } }
+    @keyframes fileActionLoadingPulse { from { opacity: 0.38; } to { opacity: 0.72; } }
     @media (prefers-reduced-motion: reduce) { *, *::before, *::after { animation: none !important; transition: none !important; } }
     @media (max-width: 980px) {
       body { overflow: hidden; }
@@ -5868,41 +6121,218 @@ export function renderAppHtml() {
       .editor-shell.planet-file-open .cosmos-home { padding-right: 12px; }
       .editor-shell.planet-file-open .viewer, .editor-shell.planet-file-open textarea { position: static; width: 100%; height: 100%; min-height: 100%; border-radius: 16px; box-shadow: none; }
     }
+
+    /* Compact documentation workbench */
+    *, *::before, *::after { letter-spacing: 0 !important; }
+    body { background: var(--bg); }
+    body::before {
+      background-image:
+        linear-gradient(to right, color-mix(in srgb, var(--line) 46%, transparent) 1px, transparent 1px),
+        linear-gradient(to bottom, color-mix(in srgb, var(--line) 38%, transparent) 1px, transparent 1px);
+      background-size: 32px 32px;
+      opacity: 0.24;
+      animation: workbenchGridDrift 28s linear infinite;
+    }
+    html.ui-scrolling body::before { animation-play-state: paused; }
+    body::after { display: none; }
+    @keyframes workbenchGridDrift { to { transform: translate(-32px, -32px); } }
+    .app { grid-template-columns: 320px minmax(0, 1fr); }
+    .app.sidebar-collapsed { grid-template-columns: 56px minmax(0, 1fr); }
+    aside { padding: 12px; background: var(--surface-sidebar); backdrop-filter: none; }
+    .app.sidebar-collapsed aside { padding: 10px 7px; }
+    .app.sidebar-collapsed .sidebar-copy,
+    .app.sidebar-collapsed .search-row,
+    .app.sidebar-collapsed .watch-filter-row,
+    .app.sidebar-collapsed .selection-bar,
+    .app.sidebar-collapsed .explorer-title,
+    .app.sidebar-collapsed .tree,
+    .app.sidebar-collapsed .hint { opacity: 0; pointer-events: none; transform: translateX(-8px); }
+    .sidebar-head { align-items: center; }
+    .sidebar-copy h1 { font-size: 18px; margin: 0; }
+    .sidebar-toggle, .explorer-open { width: 36px; height: 36px; border-radius: 7px; box-shadow: none; }
+    @media (min-width: 981px) {
+      .app.sidebar-collapsed .sidebar-head { width: 100%; display: flex; justify-content: center; align-items: center; }
+      .app.sidebar-collapsed .sidebar-copy { display: none; }
+      .app.sidebar-collapsed .sidebar-toggle { position: static; inset: auto; flex: 0 0 36px; margin: 0 auto; }
+    }
+    .search-row { margin: 12px 0 8px; }
+    .search, .clear-search { min-height: 36px; border-radius: 7px; padding: 8px 10px; }
+    .watch-filter { min-height: 24px; border-radius: 6px; padding: 4px 7px; }
+    .watch-filter.active { background: color-mix(in srgb, var(--accent) 22%, var(--surface-card)); color: var(--accent); border-color: color-mix(in srgb, var(--accent) 45%, transparent); }
+    .explorer-title { margin: 12px 7px 5px; color: var(--muted); }
+    .tree { font-size: 12px; }
+    .tree-row { min-height: 30px; border-radius: 5px; padding: 5px 7px; }
+    .tree-row:hover { transform: none; background: color-mix(in srgb, var(--accent) 8%, transparent); }
+    .tree-row.active { border-color: color-mix(in srgb, var(--accent) 36%, transparent); background: color-mix(in srgb, var(--accent) 13%, transparent); box-shadow: inset 2px 0 0 var(--accent); }
+    main { padding: 12px; grid-template-rows: auto minmax(0, 1fr); gap: 8px; }
+    .workspace-dock {
+      width: 100%; min-height: 44px; margin: 0; padding: 4px; gap: 4px; flex-wrap: nowrap;
+      border-radius: 8px; background: var(--surface-floating-soft); box-shadow: none;
+    }
+    .dock-button { min-width: 34px; min-height: 34px; border-radius: 6px; padding: 0 10px; font-size: 12px; }
+    .dock-button:hover { transform: none; background: color-mix(in srgb, var(--accent) 12%, transparent); }
+    .dock-button.primary, button.primary, .file-action.primary {
+      background: var(--accent); color: var(--on-accent); box-shadow: none;
+    }
+    .dock-button.diff-dock-button.active, .mode-toggle button.active { background: var(--accent); color: var(--on-accent); }
+    .workspace-title { min-width: 0; margin-left: auto; padding: 0 8px; color: var(--muted); font: 11px/1.2 ui-monospace, SFMono-Regular, Menlo, monospace; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .topbar { border-radius: 8px; box-shadow: none; backdrop-filter: none; }
+    .editor-shell { border: 0; border-radius: 0; background: transparent; box-shadow: none; backdrop-filter: none; }
+    .docqa-home, .settings-page { padding: 14px; border: 0; background: transparent; box-shadow: none; }
+    .docqa-grid { gap: 12px; }
+    .docqa-panel { border-radius: 8px; background: var(--panel); box-shadow: none; }
+    .docqa-panel header { padding: 12px 14px; align-items: center; }
+    .docqa-panel h2 { font-size: 15px; }
+    .review-summary { gap: 14px; flex-wrap: nowrap; }
+    .review-summary-item { min-width: 0; border: 0; border-radius: 0; background: transparent; padding: 0; display: flex; align-items: baseline; gap: 5px; }
+    .review-summary-item strong { font-size: 18px; color: var(--accent); }
+    .review-summary-item:first-child strong { color: var(--accent-2); }
+    .review-summary-item span { margin: 0; font-size: 11px; text-transform: none; color: var(--muted); }
+    .review-list { gap: 0; padding: 0; max-height: min(34vh, 300px); }
+    .review-item { border: 0; border-bottom: 1px solid var(--line); border-radius: 0; background: transparent; padding: 10px 14px; gap: 4px; }
+    .review-item:last-child { border-bottom: 0; }
+    .review-item:hover, .review-item.active { transform: none; background: color-mix(in srgb, var(--accent) 7%, transparent); box-shadow: inset 2px 0 0 var(--accent); }
+    .review-title { font-size: 13px; }
+    .review-path { font-size: 10px; }
+    .review-item .chip { border: 0; border-radius: 4px; padding: 2px 5px; background: transparent; color: var(--muted); }
+    .review-item .chip.high { color: var(--accent-2); background: color-mix(in srgb, var(--accent-2) 9%, transparent); }
+    .hub-folders { margin-top: 12px; gap: 12px; }
+    .hub-section { gap: 8px; padding-top: 12px; border-top-color: var(--line); }
+    .hub-section-title { color: var(--muted); font-size: 10px; }
+    .hub-section-grid { grid-template-columns: repeat(auto-fit, minmax(min(100%, 190px), 1fr)); gap: 8px; }
+    .hub-folder-card, .hub-folder-card.navigation, .hub-folder-card.expanded, .hub-folder-card.current {
+      min-height: 88px; border-radius: 8px; background: var(--surface-card); box-shadow: none;
+    }
+    .hub-folder-card:hover { transform: translateY(-1px); background: var(--surface-card-hover); }
+    .hub-folder-card-main, .hub-folder-card.expanded > .hub-folder-card-main { min-height: 88px; border-radius: 8px; padding: 13px; gap: 10px; }
+    .hub-folder-card strong { font-size: 15px; line-height: 1.2; }
+    .hub-folder-card span { font-size: 11px; line-height: 1.35; }
+    .hub-folder-card code, .hub-folder-meta { font-size: 10px; }
+    .hub-folder-children { padding: 0 8px 8px; gap: 8px; }
+    .hub-folder-children-grid { gap: 8px; }
+    .hub-folder-children .hub-folder-card, .hub-folder-children .hub-folder-card-main { min-height: 76px; }
+    .hub-breadcrumb { border-radius: 8px; background: var(--surface-card); }
+    .hub-crumb { border-radius: 5px; }
+    .hub-disclosure, .docqa-disclosure { border: 1px solid var(--line); border-radius: 8px; background: var(--panel); overflow: hidden; }
+    .hub-disclosure { display: block; padding: 0; }
+    .hub-disclosure summary, .docqa-disclosure summary {
+      min-height: 44px; display: flex; align-items: center; justify-content: space-between; gap: 12px;
+      padding: 10px 12px; cursor: pointer; list-style: none; color: var(--text);
+    }
+    .hub-disclosure summary::-webkit-details-marker, .docqa-disclosure summary::-webkit-details-marker { display: none; }
+    .hub-disclosure summary::before, .docqa-disclosure summary::before { content: "›"; color: var(--muted); font-size: 18px; transition: transform 160ms ease; }
+    .hub-disclosure[open] summary::before, .docqa-disclosure[open] summary::before { transform: rotate(90deg); }
+    .hub-disclosure-title { flex: 1; min-width: 0; font-size: 12px; font-weight: 800; }
+    .hub-disclosure-count, .docqa-disclosure-count { color: var(--muted); font-size: 11px; white-space: nowrap; }
+    .hub-disclosure-body { display: grid; gap: 10px; padding: 0 12px 12px; border-top: 1px solid var(--line); }
+    .hub-disclosure-body .startup-context-copy { padding-top: 10px; }
+    .startup-context-list { gap: 6px; }
+    .startup-context-item { border-radius: 6px; padding: 9px 10px; background: var(--surface-card); }
+    .startup-context-item:hover { transform: none; }
+    .markdown-tools { padding: 12px 14px; }
+    .launch-card::before, .review-item::before, .hub-folder-card::before, .startup-context-item::before,
+    .settings-toggle::before, .settings-theme-preview::before, .template-editor::before,
+    .hub-section-editor::before, .hub-card-editor::before, .path-picker::before, .card::before, .conflict-card::before { display: none; }
+    .settings-page .settings-card { max-width: 1160px; border: 0; background: transparent; }
+    .settings-page .settings-card > header { padding: 4px 0 12px; border: 0; }
+    .settings-card, .settings-toggle, .settings-theme-preview, .template-editor, .hub-section-editor, .hub-card-editor, .path-picker { border-radius: 8px; box-shadow: none; }
+    .settings-panel { padding: 0; gap: 10px; }
+    .settings-section-head, .settings-section-body { padding: 12px; }
+    .settings-toggle { border: 0; border-bottom: 1px solid var(--line); border-radius: 0; background: transparent; }
+    .settings-toggle:last-child { border-bottom: 0; }
+    .settings-field textarea, .settings-field input, .settings-field select, .markdown-create .settings-field select { border-radius: 6px; }
+    .viewer { padding: 0; min-height: 100%; background: transparent; }
+    .review-workspace { height: 100%; min-height: 0; gap: 8px; }
+    .diff-panel, .file-panel { border-radius: 8px; box-shadow: none; }
+    .diff-header, .file-panel header { padding: 10px 12px; gap: 10px; }
+    .diff-header strong, .file-panel strong { font-size: 13px; text-transform: none; }
+    .file-header-copy { flex: 1 1 auto; }
+    .file-actions { min-width: 0; flex-wrap: wrap; justify-content: flex-end; }
+    .file-actions-loading { min-width: min(340px, 44vw); flex-wrap: nowrap; }
+    .file-action { min-height: 32px; border-radius: 6px; padding: 6px 9px; font-size: 12px; }
+    .file-action:hover { transform: none; }
+    .diff-code, .doc-content, .doc-editor { padding: 18px 22px; }
+    .diff-panel, .file-panel { height: 100%; min-height: 0; display: flex; flex-direction: column; }
+    .diff-code, .doc-content, .doc-editor, .external-review-doc, .markdown-editor-shell { flex: 1 1 auto; min-height: 0; max-height: none; }
+    .doc-content { max-width: 1040px; margin: 0 auto; font-size: 14px; line-height: 1.68; }
+    .confirm-dialog, .mode-toggle, .card, .conflict-card { border-radius: 8px; }
+    button.primary, button.secondary { border-radius: 6px; }
+    @media (max-width: 1180px) {
+      .file-panel header { align-items: stretch; flex-direction: column; }
+      .file-header-copy { flex: 0 0 auto; }
+      .file-actions, .external-review-actions { justify-content: flex-start; width: 100%; }
+      .external-change-stats { margin-right: auto; }
+    }
+    @media (max-width: 980px) {
+      .app, .app.sidebar-collapsed { grid-template-columns: 1fr; }
+      .app.sidebar-collapsed .workspace-dock { width: 100%; margin: 0; opacity: 1; pointer-events: auto; transform: none; }
+      .workspace-dock { margin: 0; }
+      main { grid-template-rows: auto minmax(0, 1fr); }
+      .docqa-panel header { flex-direction: row; }
+      .hub-section-grid { grid-template-columns: repeat(auto-fit, minmax(min(100%, 170px), 1fr)); }
+    }
+    @media (max-width: 640px) {
+      main { grid-template-rows: minmax(0, 1fr); }
+      .workspace-title { display: none; }
+      .docqa-home, .settings-page { padding: 8px; }
+      .settings-shell { min-height: calc(100dvh - 126px); }
+      .settings-tab { flex-basis: 108px; min-height: 46px; padding: 8px 10px; }
+      .settings-tab small { display: none; }
+      .settings-section-head { flex-direction: column; gap: 10px; }
+      .settings-section-actions { justify-content: flex-start; }
+      .docqa-panel, .hub-disclosure, .docqa-disclosure, .editor-shell { border-radius: 7px; }
+      .docqa-panel header { align-items: flex-start; flex-direction: column; }
+      .review-summary { width: auto; }
+      .hub-section-grid { grid-template-columns: 1fr 1fr; }
+      .hub-folder-card, .hub-folder-card-main, .hub-folder-card.expanded > .hub-folder-card-main { min-height: 78px; }
+      .hub-folder-card-main { padding: 10px; }
+      .hub-folder-meta { align-items: start; flex-direction: column; gap: 2px; }
+      .startup-context-item { grid-template-columns: 1fr; }
+      .diff-code, .doc-content, .doc-editor { padding: 12px; }
+      .file-panel header { padding: 8px; }
+    }
+    .workspace-dock.file-opening { visibility: hidden; pointer-events: none; }
+    body.app-booting .app { visibility: hidden; opacity: 0; pointer-events: none; }
+    .boot-screen { position: fixed; inset: 0; z-index: 80; display: grid; place-items: center; background: var(--bg); color: var(--muted); }
+    .boot-screen-inner { display: flex; align-items: center; gap: 10px; font: 12px/1.2 ui-monospace, SFMono-Regular, Menlo, monospace; }
+    .boot-indicator { width: 16px; height: 16px; border: 2px solid color-mix(in srgb, var(--line) 82%, transparent); border-top-color: var(--accent); border-radius: 50%; animation: bootSpin 700ms linear infinite; }
+    body:not(.app-booting) .boot-screen { display: none; }
+    @keyframes bootSpin { to { transform: rotate(360deg); } }
   </style>
 </head>
-<body>
+<body class="app-booting">
+  <div id="bootScreen" class="boot-screen" role="status"><div class="boot-screen-inner"><span class="boot-indicator" aria-hidden="true"></span><span>Opening Context Room</span></div></div>
   <div class="app">
     <button id="explorerOpen" class="explorer-open" type="button" title="Open explorer" aria-label="Open explorer">☰</button>
     <aside>
-      <div class="workspace-dock">
-        <button id="hub" class="dock-button" type="button" title="Hub / settings">hub</button>
-        <button id="back" class="dock-button" type="button" title="Previous file">←</button>
-        <button id="forward" class="dock-button" type="button" title="Next file">→</button>
-        <button id="gitDiffToggle" class="dock-button diff-dock-button" type="button" title="Show Git diff" hidden>Show Git diff</button>
-        <button id="reload" class="dock-button" type="button" hidden>reload</button>
-        <button id="verifyCurrent" class="dock-button" type="button" hidden>verified</button>
-        <button id="deleteCurrent" class="dock-button danger-action" type="button" hidden>delete</button>
-        <button id="save" class="dock-button primary" hidden disabled>save</button>
-        <div id="status" class="dock-status" aria-live="polite">ready</div>
-      </div>
       <div class="sidebar-head">
         <div class="sidebar-copy">
           <h1>Explorer</h1>
-        <div class="subtitle">Project files and watched documentation.</div>
         </div>
-        <button id="sidebarToggle" class="sidebar-toggle" type="button" title="hide/show sidebar">☰</button>
+        <button id="sidebarToggle" class="sidebar-toggle" type="button" title="Collapse explorer" aria-label="Collapse explorer">☰</button>
       </div>
       <div class="search-row">
-        <input id="search" class="search" placeholder="search explorer..." />
-        <button id="clearSearch" class="clear-search" type="button" title="show full explorer">all</button>
+        <input id="search" class="search" placeholder="Search files..." aria-label="Search files" />
+        <button id="clearSearch" class="clear-search" type="button" title="Show all files">All</button>
       </div>
                   <div class="watch-filter-row" aria-label="Explorer watch filter"><button id="watchFilterAll" class="watch-filter active" type="button" data-watch-filter="all" data-watch-label="all">all</button><button id="watchFilterWatched" class="watch-filter" type="button" data-watch-filter="watched" data-watch-label="watched">watched</button><button id="watchFilterUnwatched" class="watch-filter" type="button" data-watch-filter="unwatched" data-watch-label="not watched">not watched</button></div>
       <div id="selectionBar" class="selection-bar" hidden><span id="selectionCount" class="selection-summary">0 selected</span><div class="selection-actions"><button id="watchSelected" class="selection-action" type="button" title="Add selected to watch">👁+</button><button id="unwatchSelected" class="selection-action" type="button" title="Remove selected from watch">👁−</button><button id="clearSelection" class="selection-action" type="button" title="clear selection">×</button><button id="deleteSelected" class="selection-action danger-action" type="button" title="delete selection">⌫</button></div></div>
-      <div class="explorer-title">explorer</div>
+      <div class="explorer-title">Files</div>
       <div id="files" class="tree"></div>
-      <div class="hint">Every save creates a copy in <code>.context-room/memory-webapp-backups/</code>. Secrets, credentials, and out-of-scope files are blocked.</div>
     </aside>
     <main>
+      <div class="workspace-dock" role="toolbar" aria-label="Workspace navigation">
+        <button id="hub" class="dock-button" type="button" title="Open settings">Settings</button>
+        <button id="back" class="dock-button" type="button" title="Previous file" aria-label="Previous file">←</button>
+        <button id="forward" class="dock-button" type="button" title="Next file" aria-label="Next file">→</button>
+        <button id="gitDiffToggle" class="dock-button diff-dock-button" type="button" title="Show Git diff" hidden>Show Git diff</button>
+        <button id="reload" class="dock-button" type="button" hidden>Reload</button>
+        <button id="verifyCurrent" class="dock-button" type="button" hidden>Verified</button>
+        <button id="deleteCurrent" class="dock-button danger-action" type="button" hidden>Delete</button>
+        <button id="save" class="dock-button primary" hidden disabled>Save</button>
+        <div id="workspaceTitle" class="workspace-title">Context Room</div>
+        <div id="status" class="dock-status" aria-live="polite">Ready</div>
+      </div>
       <section class="topbar" aria-hidden="true">
         <div id="title" class="selected-title">Loading...</div>
         <div id="path" class="selected-path"></div>
@@ -5915,27 +6345,16 @@ export function renderAppHtml() {
             <section class="docqa-panel">
               <header>
                 <div>
-                  <h2>Changed files to review</h2>
-                  <div class="muted">watched files changed or created in this Git worktree</div>
+                  <h2>Review queue</h2>
                 </div>
                 <div id="reviewSummary" class="review-summary" aria-label="review metrics"></div>
               </header>
               <div id="reviewQueue" class="review-list"></div>
             </section>
-            <section class="docqa-panel markdown-panel">
-              <header>
-                <div>
-                  <h2>Docs best practices</h2>
-                  <div class="muted">create scoped Markdown files from lightweight templates</div>
-                </div>
-              </header>
-              <div id="markdownTools" class="markdown-tools"></div>
-            </section>
             <section id="contextHealthPanel" class="docqa-panel" hidden>
               <header>
                 <div>
                   <h2>Context health</h2>
-                  <div class="muted">shown only when checks need attention</div>
                 </div>
               </header>
               <div id="contextHealth" class="markdown-tools"></div>
@@ -5948,7 +6367,7 @@ export function renderAppHtml() {
             <header>
               <div>
                 <h2>Settings</h2>
-                <div class="muted">watch scope, themes, sections, and hub cards</div>
+                <div class="muted">Project setup and global preferences</div>
               </div>
             </header>
             <div id="settingsPanel" class="settings-panel"></div>
@@ -5973,13 +6392,14 @@ export function renderAppHtml() {
   <div id="explorerContextMenu" class="explorer-context-menu" hidden></div>
 	  <div id="agentToast" class="agent-toast" hidden></div>
 	<script>
-		const state = { root: null, files: [], startupContextFiles: [], startupSkillFolders: [], startupHookFiles: [], startupHooksHelpOpen: false, startupHookFilter: "all", activeStartupSkillExplorer: null, activeStartupContextExplorer: null, startupSkillCreateFolder: null, startupContextContextTarget: null, selectedStartupContext: null, docqa: null, doctor: null, settings: null, settingsOpen: false, page: "hub", pendingMarkdown: null, availableHubCards: [], hubFolders: [], hubSections: [], rootHubSections: [], activeHubCardId: null, selectedReview: null, reviewModePath: null, reviewModeStatus: null, reviewSessions: {}, reviewFinalizationPromise: null, selected: null, selectedReadOnly: false, selectedDiff: null, fileLoadError: null, fileConflict: null, externalChange: null, conflictCompare: false, conflictMergeText: null, conflictMergeKey: "", conflictMergeMode: "auto", diffCollapsed: false, saved: "", savedHash: null, dirty: false, mode: "view", homeView: "root", planetStack: ["root"], filePanel: false, history: [], historyIndex: -1, pathFilters: [], explorerWatchFilter: "all", explorerRenderKey: "", selectedForDelete: new Set(), selectionRequest: 0, openingFilePath: null, mobileSidebarTouched: false, sessionStateTimer: null, agentCommandTimer: null, lastAgentCommandId: "", pendingAgentCommand: null, agentAnnotations: {}, userActiveAt: 0, userScrollIntentAt: 0, refreshInFlight: false, reportsRefreshInFlight: false, backgroundRefreshTimer: null, filePrefetches: new Map(), lastDiffRefreshAt: 0, lastReportRefreshAt: 0, lastFullRefreshAt: 0, navigationRestoreAttempted: false, markdownHighlightFrame: 0, markdownHighlightText: "", markdownHighlightLastText: "", docLinkModifierActive: false, expanded: new Set(["data", "automations", "integrations", "skills", "tools", "~", "~/.hermes", "~/.hermes/memories", "~/.hermes/skills"]) };
+		const state = { root: null, files: [], startupContextFiles: [], startupSkillFolders: [], startupHookFiles: [], startupHooksHelpOpen: false, startupHookFilter: "all", hubDisclosuresOpen: new Set(), activeStartupSkillExplorer: null, activeStartupContextExplorer: null, startupSkillCreateFolder: null, startupContextContextTarget: null, selectedStartupContext: null, docqa: null, doctor: null, backgroundReportRenderKey: "", settings: null, settingsOpen: false, settingsSection: "review", page: "hub", pendingMarkdown: null, availableHubCards: [], hubFolders: [], hubSections: [], rootHubSections: [], activeHubCardId: null, selectedReview: null, reviewModePath: null, reviewModeStatus: null, reviewSessions: {}, reviewFinalizationPromise: null, selected: null, selectedReadOnly: false, selectedDiff: null, fileLoadError: null, fileConflict: null, externalChange: null, conflictCompare: false, conflictMergeText: null, conflictMergeKey: "", conflictMergeMode: "auto", diffCollapsed: false, saved: "", savedHash: null, dirty: false, mode: "view", homeView: "root", planetStack: ["root"], filePanel: false, history: [], historyIndex: -1, pathFilters: [], explorerWatchFilter: "all", explorerRenderKey: "", explorerSearchFrame: 0, selectedForDelete: new Set(), selectionRequest: 0, openingFilePath: null, mobileSidebarTouched: false, sessionStateTimer: null, agentCommandTimer: null, lastAgentCommandId: "", pendingAgentCommand: null, agentAnnotations: {}, userActiveAt: 0, userScrollIntentAt: 0, refreshInFlight: false, reportsRefreshInFlight: false, backgroundRefreshTimer: null, filePrefetches: new Map(), prefetchTimer: null, prefetchPath: "", lastDiffRefreshAt: 0, lastReportRefreshAt: 0, lastFullRefreshAt: 0, navigationRestoreAttempted: false, bootStartedAt: Date.now(), bootMilestones: {}, markdownHighlightFrame: 0, markdownHighlightText: "", markdownHighlightLastText: "", docLinkModifierActive: false, expanded: new Set(["data", "automations", "integrations", "skills", "tools", "~", "~/.hermes", "~/.hermes/memories", "~/.hermes/skills"]) };
 	const VERIFY_CONFIRM_STORAGE_KEY = "context-room:skip-mark-verified-confirm";
 const NAVIGATION_STATE_STORAGE_PREFIX = "context-room:navigation:";
 const AGENT_COMMAND_ACK_STORAGE_KEY = "context-room:last-agent-command-id";
 const AGENT_COMMAND_MAX_AGE_MS = 60_000;
 const FILE_THEMES = ${JSON.stringify(FILE_THEME_OPTIONS)};
 const DEFAULT_FILE_THEME = "${DEFAULT_FILE_THEME}";
+const SETTINGS_SECTION_IDS = ["review", "startup", "appearance", "templates", "hub"];
 const MAIN_FILE_PATHS = new Set([
   "~/.hermes/memories/USER.md",
   "~/.hermes/memories/MEMORY.md",
@@ -6031,28 +6451,61 @@ async function api(path, options) {
 
 function prefetchFile(path) {
   if (!path || state.filePrefetches.has(path)) return;
-  const promise = api("/api/file?path=" + encodeURIComponent(path));
-  const entry = { promise, expiresAt: Date.now() + 3_000 };
+  const filePromise = api("/api/file?path=" + encodeURIComponent(path));
+  const diffPromise = api("/api/file/diff?path=" + encodeURIComponent(path));
+  const entry = { filePromise, diffPromise, expiresAt: Date.now() + 8_000 };
   state.filePrefetches.set(path, entry);
-  promise.then(() => {
+  Promise.allSettled([filePromise, diffPromise]).then(() => {
     window.setTimeout(() => {
       if (state.filePrefetches.get(path) === entry) state.filePrefetches.delete(path);
     }, Math.max(0, entry.expiresAt - Date.now()));
-  }, () => {
-    if (state.filePrefetches.get(path) === entry) state.filePrefetches.delete(path);
   });
 }
 
 function readFileForOpen(path, { force = false } = {}) {
   const entry = state.filePrefetches.get(path);
-  if (!force && entry && entry.expiresAt > Date.now()) return entry.promise;
+  if (!force && entry && entry.expiresAt > Date.now()) return entry.filePromise;
   if (entry) state.filePrefetches.delete(path);
   return api("/api/file?path=" + encodeURIComponent(path));
 }
 
+function readDiffForOpen(path, { force = false } = {}) {
+  const entry = state.filePrefetches.get(path);
+  if (!force && entry && entry.expiresAt > Date.now()) return entry.diffPromise;
+  return readSelectedDiff(path);
+}
+
+function settleUiRequest(promise) {
+  return promise.then(
+    (value) => ({ value, error: null }),
+    (error) => ({ value: null, error }),
+  );
+}
+
+function filePathFromPrefetchTarget(target) {
+  const element = target instanceof Element ? target.closest("[data-file-path], [data-review-path], [data-hub-file], [data-main-path], [data-home-file]") : null;
+  return element?.dataset.filePath || element?.dataset.reviewPath || element?.dataset.hubFile || element?.dataset.mainPath || element?.dataset.homeFile || "";
+}
+
+function schedulePrefetchPathFromTarget(target) {
+  const path = filePathFromPrefetchTarget(target);
+  if (!path) {
+    window.clearTimeout(state.prefetchTimer);
+    state.prefetchTimer = null;
+    state.prefetchPath = "";
+    return;
+  }
+  if (path === state.prefetchPath && (state.prefetchTimer || state.filePrefetches.has(path))) return;
+  window.clearTimeout(state.prefetchTimer);
+  state.prefetchPath = path;
+  state.prefetchTimer = window.setTimeout(() => {
+    state.prefetchTimer = null;
+    prefetchFile(path);
+  }, 80);
+}
+
 function prefetchPathFromTarget(target) {
-  const element = target instanceof Element ? target.closest("[data-file-path], [data-hub-file], [data-main-path], [data-home-file]") : null;
-  const path = element?.dataset.filePath || element?.dataset.hubFile || element?.dataset.mainPath || element?.dataset.homeFile || "";
+  const path = filePathFromPrefetchTarget(target);
   if (path) prefetchFile(path);
 }
 
@@ -6133,6 +6586,7 @@ function readPersistedNavigationState(root = state.root) {
       searchText: typeof raw.searchText === "string" ? raw.searchText.slice(0, 300) : "",
       pathFilters: Array.isArray(raw.pathFilters) ? raw.pathFilters.map(normalizeUiPath).filter(Boolean).slice(0, 20) : [],
       activeHubCardId: typeof raw.activeHubCardId === "string" ? raw.activeHubCardId : null,
+      settingsSection: SETTINGS_SECTION_IDS.includes(raw.settingsSection) ? raw.settingsSection : "review",
       pendingMarkdown: raw.pendingMarkdown && typeof raw.pendingMarkdown === "object" ? raw.pendingMarkdown : null,
       viewState: raw.viewState && typeof raw.viewState === "object" ? raw.viewState : null,
     };
@@ -6157,6 +6611,7 @@ function persistNavigationState() {
       searchText: el("search")?.value || "",
       pathFilters: state.pathFilters || [],
       activeHubCardId: state.activeHubCardId || null,
+      settingsSection: normalizeSettingsSectionId(state.settingsSection),
       pendingMarkdown: state.page === "new-doc" ? state.pendingMarkdown : null,
       viewState: state.selected ? captureEditorViewState() : null,
       updatedAt: new Date().toISOString(),
@@ -6173,6 +6628,7 @@ async function restoreNavigationAfterInitialLoad() {
   state.explorerWatchFilter = persisted.explorerFilter;
   state.pathFilters = persisted.pathFilters;
   state.activeHubCardId = persisted.activeHubCardId;
+  state.settingsSection = persisted.settingsSection;
   el("search").value = persisted.searchText || folderFilterSearchQuery(state.pathFilters);
   if (el("search").value.trim()) expandSearchMatches();
   renderFiles();
@@ -6371,7 +6827,7 @@ async function handleAgentCommand(command) {
 
 function shouldDeferAgentCommand(command) {
   if (!command) return false;
-  if (state.dirty || activeBlockingExternalChange() || activeFileConflict()) return true;
+  if (state.dirty || activeFileConflict()) return true;
   return Date.now() - (state.userActiveAt || 0) < 1200 && command.path && command.path !== state.selected;
 }
 
@@ -6546,6 +7002,7 @@ function markUserActive() {
 }
 
 function markUserScrollIntent() {
+  markInterfaceScrolling();
   state.userScrollIntentAt = Date.now();
   markUserActive();
 }
@@ -7053,10 +7510,6 @@ function collapseSidebarOnNarrow() {
   syncSidebarToggleIcon();
 }
 
-function isNarrowLayout() {
-  return window.matchMedia("(max-width: 980px)").matches;
-}
-
 function syncSidebarToggleIcon() {
   const toggle = el("sidebarToggle");
   if (toggle) toggle.textContent = window.matchMedia("(max-width: 640px)").matches ? "✕" : "☰";
@@ -7237,6 +7690,16 @@ function expandSearchMatches() {
   }
 }
 
+function scheduleExplorerSearchRender() {
+  if (state.explorerSearchFrame) return;
+  state.explorerSearchFrame = window.requestAnimationFrame(() => {
+    state.explorerSearchFrame = 0;
+    expandSearchMatches();
+    renderFiles();
+    scheduleSessionStatePush();
+  });
+}
+
 function parentFolders(target) {
   const clean = target.replace(/\/$/, "");
   const parts = clean.split("/");
@@ -7253,15 +7716,32 @@ function iconForPath(filePath) {
 }
 
 function applySettingsPayload(settingsData = {}) {
+  const previousKey = JSON.stringify([state.settings, state.availableHubCards, state.hubFolders, state.rootHubSections]);
   state.settings = settingsData.settings || state.settings;
   applyFileTheme();
   state.availableHubCards = settingsData.availableHubCards || [];
   state.hubFolders = settingsData.hubCards || [];
   state.rootHubSections = settingsData.hubSections || [];
   state.hubSections = state.rootHubSections;
+  return previousKey !== JSON.stringify([state.settings, state.availableHubCards, state.hubFolders, state.rootHubSections]);
+}
+
+function backgroundReportRenderKey(reports = {}) {
+  const { generatedAt: _docqaGeneratedAt, ...docqa } = reports.docqa || {};
+  const { generatedAt: _doctorGeneratedAt, ...doctor } = reports.doctor || {};
+  return JSON.stringify({
+    docqa,
+    doctor,
+    startupContext: reports.startupContext || [],
+    startupSkills: reports.startupSkills || [],
+    startupHooks: reports.startupHooks || [],
+  });
 }
 
 function applyBackgroundReportPayload(reports = {}) {
+  const nextRenderKey = backgroundReportRenderKey(reports);
+  const changed = nextRenderKey !== state.backgroundReportRenderKey;
+  state.backgroundReportRenderKey = nextRenderKey;
   state.docqa = reports.docqa || state.docqa;
   state.doctor = reports.doctor || state.doctor;
   state.startupContextFiles = reports.startupContext || state.startupContextFiles;
@@ -7269,20 +7749,52 @@ function applyBackgroundReportPayload(reports = {}) {
   state.startupHookFiles = reports.startupHooks || state.startupHookFiles;
   const queue = state.docqa?.queue || [];
   state.selectedReview = queue.find((item) => item.path === state.selectedReview)?.path || queue.find((item) => item.path === state.reviewModePath)?.path || queue[0]?.path || null;
+  return changed;
 }
 
 async function loadFiles(options = {}) {
   setStatus("chargement...");
+  if (options.initial) state.bootMilestones.requestsStarted = Date.now() - state.bootStartedAt;
+  const reportsRequest = options.initial ? api("/api/reports") : Promise.resolve(null);
   const [data, settingsData] = await Promise.all([api(filesApiPath()), api("/api/settings")]);
+  if (options.initial) state.bootMilestones.coreDataReady = Date.now() - state.bootStartedAt;
   state.root = data.root || state.root;
   state.files = data.files;
   applySettingsPayload(settingsData);
   state.lastFullRefreshAt = Date.now();
   const clearedMissingSelection = reconcileMissingSelectedFile();
   renderFiles();
-  const restored = await restoreNavigationAfterInitialLoad();
+
+  // File restoration and review reports use separate workers, so keep them concurrent.
+  const restoreRequest = restoreNavigationAfterInitialLoad();
+  const reports = await reportsRequest;
+  if (options.initial) state.bootMilestones.reportsReady = Date.now() - state.bootStartedAt;
+  if (reports) {
+    applyBackgroundReportPayload(reports);
+    state.lastReportRefreshAt = Date.now();
+  }
+  const restored = await restoreRequest;
+  if (options.initial) state.bootMilestones.initialDataReady = Date.now() - state.bootStartedAt;
+  if (options.initial) state.bootMilestones.navigationReady = Date.now() - state.bootStartedAt;
+
+  if (reports) {
+    renderFiles();
+    if (state.page === "file" && state.selected && !state.openingFilePath) {
+      const viewState = captureEditorViewState();
+      renderViewer();
+      updateHeader();
+      updatePreview();
+      restoreEditorViewState(viewState);
+    } else if (state.page === "hub") {
+      showHome();
+    } else if (state.page === "settings") {
+      renderSettingsPanel();
+      updateActionBanner();
+    }
+  }
+
   if (options.waitForBackground) await refreshBackgroundReports({ forceReports: true });
-  else scheduleBackgroundRefresh({ forceReports: true });
+  else if (!reports) scheduleBackgroundRefresh({ forceReports: true });
   if (restored) {
     scheduleSessionStatePush();
     return;
@@ -7290,6 +7802,14 @@ async function loadFiles(options = {}) {
   if (clearedMissingSelection || !state.selected) showHome();
   setStatus("ready");
   scheduleSessionStatePush();
+}
+
+function finishInitialBoot() {
+  state.bootMilestones.complete = Math.max(0, Date.now() - state.bootStartedAt);
+  document.body.dataset.bootMs = String(state.bootMilestones.complete);
+  document.body.dataset.bootMilestones = JSON.stringify(state.bootMilestones);
+  document.body.classList.remove("app-booting");
+  el("bootScreen")?.setAttribute("aria-hidden", "true");
 }
 
 function reconcileMissingSelectedFile() {
@@ -7334,11 +7854,14 @@ async function selectFile(path, options = {}) {
   if (!path) return;
   await waitForReviewFinalizationBeforeNavigation();
   if (state.selected && path !== state.selected && !selectedFileExists()) reconcileMissingSelectedFile();
-  if (state.selected && path !== state.selected && !options.forceReload && blockPendingExternalChange("before changing file")) return;
   if (state.dirty && !options.forceReload && !confirm("You have unsaved changes. Change file?")) return;
 
   const requestId = ++state.selectionRequest;
+  const fileOpenStartedAt = performance.now();
+  const profilingBoot = document.body.classList.contains("app-booting");
+  if (profilingBoot) state.bootMilestones.fileOpenStarted = Date.now() - state.bootStartedAt;
   const previousSelected = state.selected;
+  const explorerWasCollapsed = document.querySelector(".app")?.classList.contains("sidebar-collapsed");
   state.selected = path;
   state.selectedReadOnly = Boolean(state.files.find((item) => item.path === path)?.readOnly);
   state.openingFilePath = path;
@@ -7363,7 +7886,6 @@ async function selectFile(path, options = {}) {
   if (options.revealInExplorer) {
     state.pathFilters = [];
     el("search").value = "";
-    document.querySelector(".app").classList.remove("sidebar-collapsed");
   } else {
     collapseSidebarOnNarrow();
   }
@@ -7382,45 +7904,58 @@ async function selectFile(path, options = {}) {
   updatePreview();
   if (options.revealInExplorer || !document.querySelector('[data-file-path="' + cssEscape(path) + '"]')) renderFiles();
   else updateExplorerSelectedFile(previousSelected, path);
-  if (options.revealInExplorer) scrollExplorerToPath(path);
+  if (options.revealInExplorer && !explorerWasCollapsed) scrollExplorerToPath(path);
   renderViewer();
   setStatus("opening...");
 
+  const fileRequest = readFileForOpen(path, { force: options.forceReload });
+  const annotationsRequest = settleUiRequest(loadAnnotationsForPath(path));
+  const diffRequest = settleUiRequest(readDiffForOpen(path, { force: options.forceReload }));
+  const reviewBaseRequest = options.reviewMode
+    ? settleUiRequest(readSelectedReviewBase(path))
+    : Promise.resolve({ value: null, error: null });
+
   try {
-    const data = await readFileForOpen(path, { force: options.forceReload });
+    const data = await fileRequest;
+    if (profilingBoot) state.bootMilestones.fileDataReady = Date.now() - state.bootStartedAt;
     if (!isCurrentSelection(requestId, path)) return;
     state.saved = data.content;
     state.savedHash = data.contentHash;
     state.selectedReadOnly = Boolean(data.readOnly);
     state.fileLoadError = null;
-    state.openingFilePath = null;
     el("editor").value = data.content;
-    await loadAnnotationsForPath(path).catch(() => {});
-    if (options.pushHistory !== false) pushHistory(path);
-    updateHeader();
-    updateHistoryButtons();
-    updatePreview();
-    renderViewer();
-    restorePersistedViewState(options.restoreViewState);
-    setStatus("open");
+    await annotationsRequest;
+    if (!isCurrentSelection(requestId, path)) return;
 
-    const loadDiff = async () => {
-      const diff = await readSelectedDiff(path);
+    const finishOpen = (diffResult, reviewBaseResult) => {
       if (!isCurrentSelection(requestId, path)) return;
-      state.selectedDiff = diff;
-      state.lastDiffRefreshAt = Date.now();
-      state.diffCollapsed = collapsedByGitDiffPreference(diff);
-      if (typeof options.diffCollapsed === "boolean") state.diffCollapsed = options.diffCollapsed;
-      if (options.reviewMode && diff?.changed) await startChangedFileInlineReview(path, diff, requestId);
+      const diff = diffResult?.value;
+      setStatus(diffResult?.error?.message || reviewBaseResult?.error?.message || "open");
+      if (diff) {
+        state.selectedDiff = diff;
+        state.lastDiffRefreshAt = Date.now();
+        state.diffCollapsed = collapsedByGitDiffPreference(diff);
+        if (typeof options.diffCollapsed === "boolean") state.diffCollapsed = options.diffCollapsed;
+        if (options.reviewMode && diff.changed && reviewBaseResult?.value) {
+          applyChangedFileInlineReview(path, diff, reviewBaseResult.value, requestId);
+        }
+      }
+      state.openingFilePath = null;
+      if (options.pushHistory !== false) pushHistory(path);
+      updateHeader();
+      updateHistoryButtons();
+      updatePreview();
+      if (profilingBoot) state.bootMilestones.beforeFileRender = Date.now() - state.bootStartedAt;
       renderViewer();
+      if (profilingBoot) state.bootMilestones.fileRendered = Date.now() - state.bootStartedAt;
+      document.body.dataset.lastFileOpenPath = path;
+      document.body.dataset.lastFileOpenMs = String(Math.max(0, Math.round(performance.now() - fileOpenStartedAt)));
       restorePersistedViewState(options.restoreViewState);
     };
-    if (options.reviewMode) await loadDiff().catch((error) => {
-      if (isCurrentSelection(requestId, path)) setStatus(error.message);
-    });
-    else loadDiff().catch((error) => {
-      if (isCurrentSelection(requestId, path)) setStatus(error.message);
-    });
+
+    const [diffResult, reviewBaseResult] = await Promise.all([diffRequest, reviewBaseRequest]);
+    if (profilingBoot) state.bootMilestones.fileDependenciesReady = Date.now() - state.bootStartedAt;
+    finishOpen(diffResult, reviewBaseResult);
   } catch (error) {
     if (isCurrentSelection(requestId, path)) {
       state.openingFilePath = null;
@@ -7514,6 +8049,7 @@ async function selectStartupContextFile(order, options = {}) {
   } catch (error) {
     if (isCurrentSelection(requestId, selectedKey)) {
       state.openingFilePath = null;
+      updateActionBanner();
       setStatus(error.message);
     }
   }
@@ -7580,6 +8116,7 @@ async function selectStartupSkillFile(folderOrder, skillName, options = {}) {
   } catch (error) {
     if (isCurrentSelection(requestId, selectedKey)) {
       state.openingFilePath = null;
+      updateActionBanner();
       setStatus(error.message);
     }
   }
@@ -7644,6 +8181,7 @@ async function selectStartupHookFile(order, options = {}) {
   } catch (error) {
     if (isCurrentSelection(requestId, selectedKey)) {
       state.openingFilePath = null;
+      updateActionBanner();
       setStatus(error.message);
     }
   }
@@ -7889,16 +8427,8 @@ function renderDocQaDashboard() {
 	    const item = state.docqa?.queue?.find((entry) => entry.path === button.dataset.reviewPath) || { path: button.dataset.reviewPath, startupContext: button.dataset.startupReviewOrder ? { order: button.dataset.startupReviewOrder } : null };
 	    openReviewQueueItem(item).catch((error) => setStatus(error.message));
 	  }));
-  renderMarkdownTools();
   renderContextHealth();
   renderHubFolders();
-}
-
-function renderMarkdownTools() {
-  const holder = el("markdownTools");
-  if (!holder || !state.settings) return;
-  const bestPractices = state.settings.bestPractices || [];
-  holder.innerHTML = '<ol class="best-practice-list">' + bestPractices.map((item) => '<li>' + escapeHtml(item) + '</li>').join("") + '</ol>';
 }
 
 function renderContextHealth() {
@@ -7944,7 +8474,6 @@ async function acknowledgeContextHealthIssueFromPanel(key) {
 }
 
 function showNewDocPage({ title = "New document", path = "docs/new-document.md", directory = "" } = {}) {
-  if (blockPendingExternalChange("before creating a document")) return;
   if (state.dirty && !confirm("You have unsaved changes. Create a new document?")) return;
   state.page = "new-doc";
   state.settingsOpen = false;
@@ -8132,8 +8661,8 @@ function renderFileTemplateOptions(selectedId = "") {
 function renderReviewSummary(summary = {}) {
   const changed = Number(summary.changedDocs || 0).toLocaleString("en-US");
   const needsReview = Number(summary.needsReview || 0).toLocaleString("en-US");
-  return '<div class="review-summary-item"><strong>' + changed + '</strong><span>changed</span></div>' +
-    '<div class="review-summary-item"><strong>' + needsReview + '</strong><span>to review</span></div>';
+  return '<div class="review-summary-item"><strong>' + needsReview + '</strong><span>to review</span></div>' +
+    '<div class="review-summary-item"><strong>' + changed + '</strong><span>changed</span></div>';
 }
 
 function gitStatusLabel(status, reviewRequired = false) {
@@ -8158,7 +8687,6 @@ function renderReviewItem(item) {
   return '<button class="review-item ' + (state.selectedReview === item.path ? "active" : "") + '" type="button" data-review-path="' + escapeHtml(item.path) + '"' + startupOrder + '>' +
     '<div class="review-top"><div class="review-title">' + escapeHtml(item.label || item.path) + '</div><span class="chip high">' + escapeHtml(gitLabel) + '</span></div>' +
     '<div class="review-path">' + pathLine + '</div>' +
-    '<div class="chips"><span class="chip">' + escapeHtml(item.classification.type) + '</span><span class="chip">open to review</span></div>' +
   '</button>';
 }
 
@@ -8238,19 +8766,65 @@ async function openReviewQueueItem(item) {
     await selectStartupContextFile(item.startupContext.order, { reviewMode: true });
     return;
   }
-  await selectFile(item.path, { revealInExplorer: !isNarrowLayout(), reviewMode: true });
+  await selectFile(item.path, { reviewMode: true });
 }
 
 const SETTINGS_THEME_PREVIEW_DOC = "# Preview document\n\n> Scope: docs/\n\n## Read first\n\n- Start in docs/INDEX.md.\n- Keep website/docs/ current.\n\n### Paths\n\nUse AGENTS.md, website/docs/, and our_agentic_system/docs/.";
 
-function renderSettingsSection({ kicker, title, copy, pills = [], body = "", open = true } = {}) {
-  return '<details class="settings-section collapsible" ' + (open ? 'open' : '') + '>' +
-    '<summary class="settings-section-head">' +
-      '<div class="settings-section-title"><span class="settings-kicker">' + escapeHtml(kicker || "") + '</span><h3>' + escapeHtml(title || "") + '</h3>' + (copy ? '<p class="settings-section-copy">' + escapeHtml(copy) + '</p>' : '') + '</div>' +
-      '<div class="settings-section-actions">' + pills.map((pill) => '<span class="settings-pill">' + escapeHtml(pill) + '</span>').join("") + '<span class="settings-pill settings-section-toggle" aria-hidden="true"></span></div>' +
-    '</summary>' +
+function normalizeSettingsSectionId(value) {
+  return SETTINGS_SECTION_IDS.includes(value) ? value : "review";
+}
+
+function renderSettingsTabs(items = []) {
+  return '<nav class="settings-tabs" role="tablist" aria-label="Settings categories">' + items.map((item) =>
+    '<button id="settings-tab-' + escapeHtml(item.id) + '" class="settings-tab" type="button" role="tab" aria-selected="false" aria-controls="settings-section-' + escapeHtml(item.id) + '" tabindex="-1" data-settings-section-target="' + escapeHtml(item.id) + '">' +
+      '<strong>' + escapeHtml(item.label) + '</strong><small>' + escapeHtml(item.scope) + '</small>' +
+    '</button>'
+  ).join("") + '</nav>';
+}
+
+function renderSettingsSection({ id, kicker, title, copy, scope = "Project", pills = [], body = "" } = {}) {
+  const sectionId = normalizeSettingsSectionId(id);
+  return '<section id="settings-section-' + sectionId + '" class="settings-section" role="tabpanel" aria-labelledby="settings-tab-' + sectionId + '" data-settings-section-panel="' + sectionId + '" hidden>' +
+    '<div class="settings-section-head">' +
+      '<div class="settings-section-title"><span class="settings-kicker">Settings / ' + escapeHtml(kicker || "") + '</span><h3>' + escapeHtml(title || "") + '</h3>' + (copy ? '<p class="settings-section-copy">' + escapeHtml(copy) + '</p>' : '') + '</div>' +
+      '<div class="settings-section-actions"><span class="settings-pill">' + escapeHtml(scope) + '</span>' + pills.map((pill) => '<span class="settings-pill">' + escapeHtml(pill) + '</span>').join("") + '</div>' +
+    '</div>' +
     '<div class="settings-section-body">' + body + '</div>' +
-  '</details>';
+  '</section>';
+}
+
+function activateSettingsSection(sectionId, options = {}) {
+  const next = normalizeSettingsSectionId(sectionId);
+  state.settingsSection = next;
+  document.querySelectorAll("[data-settings-section-target]").forEach((tab) => {
+    const active = tab.dataset.settingsSectionTarget === next;
+    tab.setAttribute("aria-selected", String(active));
+    tab.tabIndex = active ? 0 : -1;
+  });
+  document.querySelectorAll("[data-settings-section-panel]").forEach((panel) => {
+    panel.hidden = panel.dataset.settingsSectionPanel !== next;
+  });
+  if (options.resetScroll !== false) el("settingsPage").scrollTop = 0;
+  if (options.focus) document.querySelector('[data-settings-section-target="' + next + '"]')?.focus();
+  scheduleSessionStatePush();
+}
+
+function wireSettingsTabs(root) {
+  const tabs = [...root.querySelectorAll("[data-settings-section-target]")];
+  tabs.forEach((tab, index) => {
+    tab.addEventListener("click", () => activateSettingsSection(tab.dataset.settingsSectionTarget));
+    tab.addEventListener("keydown", (event) => {
+      let targetIndex = null;
+      if (["ArrowRight", "ArrowDown"].includes(event.key)) targetIndex = (index + 1) % tabs.length;
+      if (["ArrowLeft", "ArrowUp"].includes(event.key)) targetIndex = (index - 1 + tabs.length) % tabs.length;
+      if (event.key === "Home") targetIndex = 0;
+      if (event.key === "End") targetIndex = tabs.length - 1;
+      if (targetIndex == null) return;
+      event.preventDefault();
+      activateSettingsSection(tabs[targetIndex].dataset.settingsSectionTarget, { focus: true });
+    });
+  });
 }
 
 function renderSettingsThemePreview(themeId = currentFileThemeId()) {
@@ -8265,7 +8839,6 @@ function renderSettingsPanel() {
   if (!holder || !state.settings) return;
   const watchAllow = (state.settings.watchAllow || []).join("\n");
   const reviewPaths = (state.settings.reviewPaths || []).join("\n");
-  const bestPractices = (state.settings.bestPractices || []).join("\n");
   const startupContext = state.settings.startupContext || { enabled: false, fileNames: ["AGENTS.md", "CLAUDE.md"], globalPaths: [] };
   const startupFileNames = (startupContext.fileNames || []).join("\n");
   const startupGlobalPaths = (startupContext.globalPaths || []).join("\n");
@@ -8280,71 +8853,80 @@ function renderSettingsPanel() {
   const sections = state.settings.hubSections?.length ? state.settings.hubSections : [{ id: "main", title: "Main", cards: state.settings.customHubCards || state.availableHubCards || [] }];
   const watchCount = (state.settings.watchAllow || []).length;
   const reviewPathCount = (state.settings.reviewPaths || []).length;
-  const practiceCount = (state.settings.bestPractices || []).length;
   const startupContextCount = (startupContext.fileNames || []).length + (startupContext.globalPaths || []).length;
   const startupSkillFolderCount = (startupSkills.folderNames || []).length;
   const startupHookNameCount = (startupHooks.fileNames || []).length;
   const startupAgentHookCount = (startupHooks.agentHookSources || []).length || (startupHooks.agentHookPaths || startupHooks.codexPaths || []).length;
   const startupHookManagerCount = (startupHooks.managerPaths || []).length;
   holder.innerHTML = '<div class="settings-shell">' +
+  renderSettingsTabs([
+    { id: "review", label: "Review", scope: "Project" },
+    { id: "startup", label: "Startup", scope: "Project" },
+    { id: "appearance", label: "Appearance", scope: "Global" },
+    { id: "templates", label: "Templates", scope: "Project" },
+    { id: "hub", label: "Hub", scope: "Project" },
+  ]) + '<div class="settings-content">' +
   renderSettingsSection({
+    id: "review",
     kicker: "Review",
     title: "Watched docs",
     copy: "Changed files listed here require human review before handoff.",
-    pills: [watchCount + " watched", reviewPathCount + " required", practiceCount + " rules"],
-    open: true,
+    pills: [watchCount + " watched", reviewPathCount + " required"],
     body: '<div class="settings-grid">' +
       '<div class="settings-field large"><label for="watchAllow">Watched folders/files</label><span class="settings-field-note">One path per line.</span><textarea id="watchAllow" placeholder="docs/&#10;website/docs/">' + escapeHtml(watchAllow) + '</textarea></div>' +
       '<div class="settings-field large"><label for="reviewPaths">Required review files</label><span class="settings-field-note">Important files that stay in review until verified, even without a Git diff.</span><textarea id="reviewPaths" placeholder="AGENTS.md&#10;docs/INDEX.md">' + escapeHtml(reviewPaths) + '</textarea></div>' +
-      '<div class="settings-field large"><label for="bestPractices">Docs best practices</label><span class="settings-field-note">Short rules shown on the hub.</span><textarea id="bestPractices" placeholder="one practice per line">' + escapeHtml(bestPractices) + '</textarea></div>' +
     '</div>',
   }) +
   renderSettingsSection({
+    id: "startup",
     kicker: "Startup",
     title: "Injected context scanners",
     copy: "Files, skill folders, and hook files discovered around this Context Room root.",
     pills: [startupContextCount + " names", startupSkillFolderCount + " folders", startupHookNameCount + " git names", startupAgentHookCount + " agent paths", startupHookManagerCount + " managers"],
-    open: true,
-    body: '<div class="settings-grid">' +
-      '<div class="settings-field"><label class="settings-toggle" for="startupContextEnabled"><input id="startupContextEnabled" type="checkbox" ' + (startupContext.enabled ? 'checked' : '') + ' /><span class="settings-switch" aria-hidden="true"></span><span class="settings-toggle-copy"><strong>Startup context</strong><em>List ancestor and global agent instruction files.</em></span></label><textarea id="startupContextFileNames" placeholder="one ancestor filename per line">' + escapeHtml(startupFileNames) + '</textarea><textarea id="startupContextGlobalPaths" placeholder="one global path per line">' + escapeHtml(startupGlobalPaths) + '</textarea></div>' +
-      '<div class="settings-field"><label class="settings-toggle" for="startupSkillsEnabled"><input id="startupSkillsEnabled" type="checkbox" ' + (startupSkills.enabled !== false ? 'checked' : '') + ' /><span class="settings-switch" aria-hidden="true"></span><span class="settings-toggle-copy"><strong>Startup skills</strong><em>List global skill folders visible to agents.</em></span></label><textarea id="startupSkillFolderNames" placeholder="one folder path per line">' + escapeHtml(startupSkillFolderNames) + '</textarea></div>' +
-      '<div class="settings-field"><label class="settings-toggle" for="startupHooksEnabled"><input id="startupHooksEnabled" type="checkbox" ' + (startupHooks.enabled !== false ? 'checked' : '') + ' /><span class="settings-switch" aria-hidden="true"></span><span class="settings-toggle-copy"><strong>Startup hooks</strong><em>List hook files that can affect agents and commits.</em></span></label><textarea id="startupHookFileNames" placeholder="one hook filename per line">' + escapeHtml(startupHookFileNames) + '</textarea></div>' +
-      '<div class="settings-field"><label class="settings-toggle" for="startupHooksEditable"><input id="startupHooksEditable" type="checkbox" ' + (startupHooks.editable ? 'checked' : '') + ' /><span class="settings-switch" aria-hidden="true"></span><span class="settings-toggle-copy"><strong>Edit hooks</strong><em>Off by default because hooks execute code.</em></span></label><textarea id="startupHookManagerPaths" placeholder="one hook manager path per line">' + escapeHtml(startupHookManagerPaths) + '</textarea></div>' +
+    body: '<div class="settings-group"><h4 class="settings-group-title">Agent context</h4><div class="settings-grid">' +
+      '<div class="settings-field"><label class="settings-toggle" for="startupContextEnabled"><input id="startupContextEnabled" type="checkbox" ' + (startupContext.enabled ? 'checked' : '') + ' /><span class="settings-switch" aria-hidden="true"></span><span class="settings-toggle-copy"><strong>Startup context</strong><em>List ancestor and global agent instruction files.</em></span></label><span class="settings-input-label">Ancestor filenames</span><textarea id="startupContextFileNames" placeholder="one ancestor filename per line">' + escapeHtml(startupFileNames) + '</textarea><span class="settings-input-label">Global instruction paths</span><textarea id="startupContextGlobalPaths" placeholder="one global path per line">' + escapeHtml(startupGlobalPaths) + '</textarea></div>' +
+      '<div class="settings-field"><label class="settings-toggle" for="startupSkillsEnabled"><input id="startupSkillsEnabled" type="checkbox" ' + (startupSkills.enabled !== false ? 'checked' : '') + ' /><span class="settings-switch" aria-hidden="true"></span><span class="settings-toggle-copy"><strong>Startup skills</strong><em>List global skill folders visible to agents.</em></span></label><span class="settings-input-label">Skill folder names</span><textarea id="startupSkillFolderNames" placeholder="one folder path per line">' + escapeHtml(startupSkillFolderNames) + '</textarea></div>' +
+    '</div></div><div class="settings-group"><h4 class="settings-group-title">Hooks</h4><div class="settings-grid">' +
+      '<div class="settings-field"><label class="settings-toggle" for="startupHooksEnabled"><input id="startupHooksEnabled" type="checkbox" ' + (startupHooks.enabled !== false ? 'checked' : '') + ' /><span class="settings-switch" aria-hidden="true"></span><span class="settings-toggle-copy"><strong>Startup hooks</strong><em>List hook files that can affect agents and commits.</em></span></label><span class="settings-input-label">Git hook filenames</span><textarea id="startupHookFileNames" placeholder="one hook filename per line">' + escapeHtml(startupHookFileNames) + '</textarea></div>' +
+      '<div class="settings-field"><label class="settings-toggle" for="startupHooksEditable"><input id="startupHooksEditable" type="checkbox" ' + (startupHooks.editable ? 'checked' : '') + ' /><span class="settings-switch" aria-hidden="true"></span><span class="settings-toggle-copy"><strong>Edit hooks</strong><em>Off by default because hooks execute code.</em></span></label><span class="settings-input-label">Hook manager paths</span><textarea id="startupHookManagerPaths" placeholder="one hook manager path per line">' + escapeHtml(startupHookManagerPaths) + '</textarea></div>' +
       '<div class="settings-field"><label class="settings-toggle" for="startupAgentHooks"><input id="startupAgentHooks" type="checkbox" ' + (startupHooks.agentHooks !== false && startupHooks.codexHooks !== false ? 'checked' : '') + ' /><span class="settings-switch" aria-hidden="true"></span><span class="settings-toggle-copy"><strong>Agent hook sources</strong><em>Choose which AI coding systems Context Room should show.</em></span></label><span class="settings-field-note">One source per line: <code>Name | config path | plugin folder</code>. Delete a line to hide that system.</span><textarea id="startupAgentHookSources" placeholder="Codex | .codex/hooks.json&#10;My Agent | .my-agent/hooks.json | .my-agent/plugins/">' + escapeHtml(startupAgentHookSources) + '</textarea></div>' +
       '<div class="settings-field"><label class="settings-toggle" for="startupGitHooks"><input id="startupGitHooks" type="checkbox" ' + (startupHooks.gitHooks !== false ? 'checked' : '') + ' /><span class="settings-switch" aria-hidden="true"></span><span class="settings-toggle-copy"><strong>Git hooks</strong><em>Scan .git/hooks and core.hooksPath.</em></span></label></div>' +
       '<div class="settings-field"><label class="settings-toggle" for="startupHookManagers"><input id="startupHookManagers" type="checkbox" ' + (startupHooks.hookManagers !== false ? 'checked' : '') + ' /><span class="settings-switch" aria-hidden="true"></span><span class="settings-toggle-copy"><strong>Hook managers</strong><em>Scan Husky, Lefthook, pre-commit, lint-staged, and package hooks.</em></span></label></div>' +
-    '</div>',
+    '</div></div>',
   }) +
   renderSettingsSection({
+    id: "appearance",
     kicker: "Appearance",
     title: "Theme and diff behavior",
-    copy: "Theme changes preview instantly; Save keeps them in the project config.",
-    open: true,
+    copy: "Shared by every Context Room on this computer.",
+    scope: "All rooms",
     body: '<div class="settings-grid compact">' +
       '<div class="settings-field"><label for="fileTheme">App theme</label><select id="fileTheme">' + renderFileThemeOptions(appearance.fileTheme) + '</select></div>' +
       '<div class="settings-field"><label class="settings-toggle" for="autoOpenGitDiff"><input id="autoOpenGitDiff" type="checkbox" ' + (appearance.autoOpenGitDiff !== false ? 'checked' : '') + ' /><span class="settings-switch" aria-hidden="true"></span><span class="settings-toggle-copy"><strong>Auto-open Git diff</strong><em>Leave off to open the diff manually.</em></span></label></div>' +
     '</div>' + renderSettingsThemePreview(appearance.fileTheme),
   }) +
   renderSettingsSection({
+    id: "templates",
     kicker: "Templates",
     title: "Markdown document templates",
     copy: "Reusable shapes for new documentation files.",
     pills: [markdownTemplates.length + " templates"],
-    open: false,
     body: '<div class="settings-body-toolbar"><span>Open a template only when you need to edit its fields.</span><button id="addMarkdownTemplate" class="secondary" type="button">+ template</button></div>' +
       '<div class="hub-card-options settings-editor-list" id="markdownTemplateEditors">' + markdownTemplates.map((template) => renderMarkdownTemplateEditor(template, false)).join("") + '</div>',
   }) +
   renderSettingsSection({
+    id: "hub",
     kicker: "Hub",
     title: "Sections and cards",
     copy: "Controls the cards shown on the first screen.",
     pills: [sections.length + " sections"],
-    open: false,
     body: '<div class="settings-body-toolbar"><span>Open a section or card only when changing its routing.</span><button id="addHubSection" class="secondary" type="button">+ section</button></div>' +
       '<div class="hub-card-options settings-editor-list" id="hubSectionEditors">' + sections.map((section) => renderHubSectionEditor(section, false)).join("") + '</div>',
   }) +
-  '</div>' +
-  '<div class="settings-footer"><span>Saved in <code>.context-room/config.json</code></span><div class="docqa-actions"><button id="saveSettings" class="primary" type="button">Save settings</button></div></div>';
+  '</div></div>' +
+  '<div class="settings-footer"><span>Project setup stays in this room. Appearance applies to all rooms.</span><div class="docqa-actions"><button id="saveSettings" class="primary" type="button">Save settings</button></div></div>';
+  wireSettingsTabs(holder);
+  activateSettingsSection(state.settingsSection, { resetScroll: false });
   wireHubSettingsButtons(holder);
   wireMarkdownTemplateButtons(holder);
   el("addMarkdownTemplate")?.addEventListener("click", addMarkdownTemplateEditor);
@@ -8430,7 +9012,6 @@ function addHubCardEditor(holder) {
 async function saveSettings() {
   const watchAllow = linesFromTextarea("watchAllow");
   const reviewPaths = linesFromTextarea("reviewPaths");
-  const bestPractices = linesFromTextarea("bestPractices");
   const startupContext = {
     enabled: Boolean(el("startupContextEnabled")?.checked),
     fileNames: linesFromTextarea("startupContextFileNames"),
@@ -8470,7 +9051,7 @@ async function saveSettings() {
     const result = await api("/api/settings", {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ settings: { watchAllow, reviewPaths, bestPractices, startupContext, startupSkills, startupHooks, appearance, markdownTemplates, hubCards, hubSections } }),
+      body: JSON.stringify({ settings: { watchAllow, reviewPaths, startupContext, startupSkills, startupHooks, appearance, markdownTemplates, hubCards, hubSections } }),
     });
     state.settings = result.settings;
     applyFileTheme();
@@ -8650,7 +9231,6 @@ function normalizeUiPath(value) {
 }
 
 function showSettingsPage() {
-  if (blockPendingExternalChange("before opening settings")) return;
   if (state.dirty && !confirm("You have unsaved changes. Open settings?")) return;
   state.page = "settings";
   state.settingsOpen = true;
@@ -8665,8 +9245,8 @@ function showSettingsPage() {
   state.savedHash = null;
   state.dirty = false;
   el("title").textContent = "Settings";
-  el("path").textContent = "watch scope · sections · hub cards";
-  el("impact").textContent = "Full page for managing the hub tree comfortably.";
+  el("path").textContent = "review · startup · appearance · templates · hub";
+  el("impact").textContent = "Choose one category, make the change, then save once.";
   el("meta").textContent = "settings open";
   el("home").hidden = true;
   el("settingsPage").hidden = false;
@@ -8692,9 +9272,24 @@ async function handleHubAction() {
 
 function updateActionBanner() {
   const onFile = state.page === "file" && Boolean(state.selected);
+  const workspaceDock = document.querySelector(".workspace-dock");
+  const fileOpening = onFile && Boolean(state.openingFilePath);
+  workspaceDock?.classList.toggle("file-opening", fileOpening);
+  workspaceDock?.setAttribute("aria-busy", fileOpening ? "true" : "false");
   const hasGitDiff = onFile && !state.selectedStartupContext && state.selectedDiff?.available !== false && Boolean(state.selectedDiff?.changed);
-  el("hub").textContent = state.page === "hub" ? "settings" : "hub";
+  el("hub").textContent = state.page === "hub" ? "Settings" : "Hub";
   el("hub").title = state.page === "hub" ? "Open settings" : "Back to hub";
+  const workspaceTitle = el("workspaceTitle");
+  if (workspaceTitle) {
+    workspaceTitle.textContent = onFile
+      ? state.selected
+      : state.page === "settings"
+        ? "Settings"
+        : state.page === "new-doc"
+          ? "New document"
+          : "Context Room";
+    workspaceTitle.title = workspaceTitle.textContent;
+  }
   ["back", "forward"].forEach((id) => { el(id).hidden = !onFile; });
   const gitDiffButton = el("gitDiffToggle");
   if (gitDiffButton) {
@@ -8712,6 +9307,12 @@ function renderHubFolders() {
   const sections = state.rootHubSections?.length ? state.rootHubSections : state.hubSections?.length ? state.hubSections : [{ id: "main", title: "Main", cards: state.hubFolders || [] }];
   const activeIds = activeHubCardIds(sections);
   holder.innerHTML = sections.map((section) => '<section class="hub-section"><div class="hub-section-title">' + escapeHtml(section.title || "Section") + '</div><div class="hub-section-grid">' + (section.cards || []).map((card) => renderHubFolderCard(card, activeIds)).join("") + '</div></section>').join("") + renderStartupContextPanel() + renderStartupSkillsPanel() + renderStartupHooksPanel();
+  document.querySelectorAll("[data-hub-disclosure]").forEach((details) => details.addEventListener("toggle", () => {
+    const id = details.dataset.hubDisclosure;
+    if (!id) return;
+    if (details.open) state.hubDisclosuresOpen.add(id);
+    else state.hubDisclosuresOpen.delete(id);
+  }));
   document.querySelectorAll("[data-hub-file]").forEach((button) => button.addEventListener("click", () => selectFile(button.dataset.hubFile).catch((error) => setStatus(error.message))));
   document.querySelectorAll("[data-hub-folders]").forEach((button) => button.addEventListener("click", () => filterFolders(button.dataset.hubFolders.split('|'))));
   document.querySelectorAll("[data-hub-card-children]").forEach((button) => button.addEventListener("click", () => openHubChildren(button.dataset.hubCardChildren)));
@@ -8799,7 +9400,13 @@ function renderStartupContextPanel() {
   const body = files.length
     ? '<div class="startup-context-list">' + files.map((file) => '<button class="startup-context-item" type="button" data-startup-order="' + escapeHtml(file.startupContext.order) + '"><strong>' + escapeHtml(file.startupContext.order + ". " + file.startupContext.fileName) + '</strong><span>' + escapeHtml(file.startupContext.displayPath) + '</span></button>').join("") + '</div>'
     : '<div class="issue">No startup context files found for: ' + escapeHtml(fileNames || "AGENTS.md, CLAUDE.md") + '</div>';
-  return '<section class="startup-context-panel"><div class="hub-section-title">Startup context</div><div class="startup-context-copy">Agent instruction files found from the filesystem root down to this Context Room root.</div>' + body + '</section>';
+  return renderHubDisclosure({
+    id: "startup-context",
+    title: "Startup context",
+    count: files.length + " file" + (files.length === 1 ? "" : "s"),
+    copy: "Agent instruction files found from the filesystem root down to this Context Room root.",
+    body,
+  });
 }
 
 function renderStartupSkillsPanel() {
@@ -8829,7 +9436,14 @@ function renderStartupSkillsPanel() {
       '<div class="startup-skill-names"><code>' + escapeHtml(folder.displayPath || folder.folderName || "skills") + '</code>' + buttons + '</div>' +
     '</div>';
   }).join("") + '</div>';
-  return '<section class="startup-context-panel"><div class="hub-section-title">Startup skills</div><div class="startup-context-copy">Skill folders found from the filesystem root down to this Context Room root.</div>' + body + '</section>';
+  const skillCount = folders.reduce((sum, folder) => sum + Number(folder.skillCount || 0), 0);
+  return renderHubDisclosure({
+    id: "startup-skills",
+    title: "Startup skills",
+    count: skillCount + " skill" + (skillCount === 1 ? "" : "s"),
+    copy: "Skill folders found from the filesystem root down to this Context Room root.",
+    body,
+  });
 }
 
 function renderStartupHooksPanel() {
@@ -8870,7 +9484,21 @@ function renderStartupHooksPanel() {
     '<section class="startup-hooks-help-section"><h4>Hook managers</h4><p>Repo tools that install or orchestrate Git hooks. Examples include Husky, Lefthook, pre-commit, lint-staged, and package hook config.</p></section>' +
     '<p>Hooks are read-only by default because they execute code. Enable editing only when you intentionally want Context Room to modify them.</p>' +
   '</div></details>';
-  return '<section class="startup-context-panel"><div class="hub-section-title">Startup hooks</div><div class="startup-context-copy">Hooks and hook-manager files that can change or block agent work.</div>' + help + filterControls + body + '</section>';
+  return renderHubDisclosure({
+    id: "startup-hooks",
+    title: "Startup hooks",
+    count: files.length + " hook" + (files.length === 1 ? "" : "s"),
+    copy: "Hooks and hook-manager files that can change or block agent work.",
+    body: help + filterControls + body,
+  });
+}
+
+function renderHubDisclosure({ id, title, count, copy, body }) {
+  const open = state.hubDisclosuresOpen.has(id) ? " open" : "";
+  return '<details class="startup-context-panel hub-disclosure" data-hub-disclosure="' + escapeHtml(id) + '"' + open + '>' +
+    '<summary><span class="hub-disclosure-title">' + escapeHtml(title) + '</span><span class="hub-disclosure-count">' + escapeHtml(count) + '</span></summary>' +
+    '<div class="hub-disclosure-body"><div class="startup-context-copy">' + escapeHtml(copy) + '</div>' + body + '</div>' +
+  '</details>';
 }
 
 function setStartupHookFilter(filter = "all") {
@@ -9252,14 +9880,12 @@ function updateHistoryButtons() {
 async function goHistory(delta) {
   const nextIndex = state.historyIndex + delta;
   if (nextIndex < 0 || nextIndex >= state.history.length) return;
-  if (blockPendingExternalChange(delta < 0 ? "before going back" : "before going forward")) return;
   await waitForReviewFinalizationBeforeNavigation();
   state.historyIndex = nextIndex;
   await selectFile(state.history[state.historyIndex], { pushHistory: false });
 }
 
 function goHub() {
-  if (blockPendingExternalChange("before returning to hub")) return;
   if (state.dirty && !confirm("You have unsaved changes. Return to hub?")) return;
   collapseSidebarOnNarrow();
   state.selected = null;
@@ -9423,7 +10049,7 @@ function renderViewer() {
   const text = el("editor").value;
   const diff = state.selectedDiff || { changed: false, additions: 0, deletions: 0, patch: "", available: false };
   const isStartupFile = Boolean(state.selectedStartupContext);
-  const loadingFile = !isStartupFile && state.openingFilePath === state.selected;
+  const loadingFile = state.openingFilePath === state.selected;
   const loadError = !isStartupFile && state.fileLoadError?.path === state.selected ? state.fileLoadError : null;
   const conflict = activeFileConflict();
   const externalChange = activeExternalChange();
@@ -9436,7 +10062,7 @@ function renderViewer() {
   const actionsMarkup = loadError
     ? '<div class="file-actions"><button class="file-action primary" type="button" data-file-retry>Retry</button></div>'
     : loadingFile
-      ? '<div class="file-actions"><span class="diff-meta">opening...</span></div>'
+      ? renderFileActionsLoading()
       : externalChange && !conflict
       ? renderExternalReviewActions(externalChange, { fileActionOptions: externalReviewFileActionOptions() })
       : renderFileActionButtons({ reviewAction: isStartupFile || state.selectedReadOnly ? null : reviewActionForSelectedFile(), nextReviewAction: isStartupFile || state.selectedReadOnly ? null : nextReviewActionForSelectedFile(), dirty: state.dirty, templateState, blockedByConflict: Boolean(conflict || externalChange), readOnly: Boolean(state.selectedStartupContext?.readOnly || state.selectedReadOnly), deletable: !isStartupFile && !state.selectedReadOnly });
@@ -9448,8 +10074,8 @@ function renderViewer() {
       : !conflict && externalChange
         ? renderExternalReviewDocument(externalReviewBaseContent(externalChange), externalChange.diskContent || "")
         : state.mode === "edit"
-          ? renderMarkdownEditor(text)
-          : renderMarkdownLineView(text);
+          ? renderDocumentEditor(text, file.path)
+          : renderDocumentView(text, file.path);
   const annotationMarkup = !isStartupFile && !conflict ? renderAgentAnnotations(state.selected) : "";
   el("viewer").innerHTML = '<div class="review-workspace ' + (!hasDiff || state.diffCollapsed ? 'no-diff' : '') + '">' +
     (state.diffCollapsed ? "" : diffMarkup) +
@@ -9486,6 +10112,14 @@ function renderFileLoadingState(file = {}) {
   return '<div class="file-load-state"><div class="file-load-state-inner"><strong>Opening file...</strong><span><code>' + escapeHtml(file.path || state.selected || "") + '</code></span></div></div>';
 }
 
+function renderFileActionsLoading() {
+  return '<div class="file-actions file-actions-loading" aria-hidden="true">' +
+    '<span class="file-action-placeholder wide"></span>' +
+    '<span class="file-action-placeholder"></span>' +
+    '<span class="file-action-placeholder short"></span>' +
+  '</div>';
+}
+
 function renderFileLoadError(error = {}) {
   return '<div class="file-load-state error"><div class="file-load-state-inner"><strong>Could not open this file</strong><span>' + escapeHtml(error.message || "Request failed.") + '</span><span><code>' + escapeHtml(error.path || state.selected || "") + '</code></span></div></div>';
 }
@@ -9513,6 +10147,21 @@ function renderMarkdownLineView(text, options = {}) {
   return '<div id="docReader" class="doc-editor markdown-view" role="document" tabindex="0" aria-label="' + (options.readOnly ? "Read-only document" : "Document preview") + '">' +
     renderMarkdownLines(text) +
   '</div>';
+}
+
+function usePlainTextSurface(filePath, text) {
+  const value = String(text || "");
+  return !String(filePath || "").toLowerCase().endsWith(".md") || value.length > 120_000 || value.split("\n", 2_501).length > 2_500;
+}
+
+function renderDocumentView(text, filePath = state.selected) {
+  if (!usePlainTextSurface(filePath, text)) return renderMarkdownLineView(text);
+  return '<pre id="docReader" class="doc-editor plain-text-view" role="document" tabindex="0" aria-label="Text file">' + escapeHtml(text) + '</pre>';
+}
+
+function renderDocumentEditor(text, filePath = state.selected) {
+  if (!usePlainTextSurface(filePath, text)) return renderMarkdownEditor(text);
+  return '<textarea id="docEditor" class="doc-editor plain-text-editor" spellcheck="false">' + escapeHtml(text) + '</textarea>';
 }
 
 function renderMarkdownEditor(text) {
@@ -9936,7 +10585,9 @@ function renderExternalReviewRows(rows, options = {}) {
       ? " intraline-superseded"
       : intraline?.merged
         ? " intraline-merged intraline-" + intraline.kind
-        : "";
+        : intraline?.split
+          ? " intraline-split"
+          : "";
     return { className: "external-review-line " + row.type + intralineClass, marker, finalLineIndex, intralineHtml: intraline?.html || "" };
   });
   return '<div class="external-review-lines markdown-view">' + renderMarkdownLines(text, { lineDecorations }) + '</div>';
@@ -9969,10 +10620,19 @@ function externalReviewIntralineRows(rows) {
     const hasDeletion = candidate.diff.merged.some((segment) => segment.type === "del");
     const kind = hasAddition && hasDeletion ? "mixed" : hasDeletion ? "removal" : "addition";
     const marker = kind === "mixed" ? "±" : kind === "removal" ? "-" : "+";
-    result.set(candidate.before.index, { hidden: true });
-    result.set(candidate.after.index, { html: renderMergedIntralineSegments(candidate.diff.merged), merged: true, kind, marker });
+    if (shouldMergeIntralineDiff(candidate.diff)) {
+      result.set(candidate.before.index, { hidden: true });
+      result.set(candidate.after.index, { html: renderMergedIntralineSegments(candidate.diff.merged), merged: true, kind, marker });
+      continue;
+    }
+    result.set(candidate.before.index, { html: renderIntralineSegments(candidate.diff.before, "del"), split: true });
+    result.set(candidate.after.index, { html: renderIntralineSegments(candidate.diff.after, "add"), split: true });
   }
   return result;
+}
+
+function shouldMergeIntralineDiff(diff) {
+  return Boolean(diff && (diff.deletedWords === 0 || diff.addedWords === 0 || diff.changeRatio <= 0.25));
 }
 
 function isIntralineReviewCandidate(line) {
@@ -10039,7 +10699,24 @@ function buildIntralineTokenDiff(beforeText, afterText) {
   const beforeMeaningful = before.filter((token) => token.trim()).length;
   const afterMeaningful = after.filter((token) => token.trim()).length;
   const similarity = commonMeaningful / Math.max(1, beforeMeaningful, afterMeaningful);
-  return { before: beforeSegments, after: afterSegments, merged: mergedSegments, similarity };
+  const wordChange = buildIntralineWordChange(beforeText, afterText);
+  return { before: beforeSegments, after: afterSegments, merged: mergedSegments, similarity, ...wordChange };
+}
+
+function buildIntralineWordChange(beforeText, afterText) {
+  const beforeWords = String(beforeText || "").match(/[\p{L}\p{N}_]+/gu) || [];
+  const afterWords = String(afterText || "").match(/[\p{L}\p{N}_]+/gu) || [];
+  const dp = Array.from({ length: beforeWords.length + 1 }, () => new Uint16Array(afterWords.length + 1));
+  for (let i = beforeWords.length - 1; i >= 0; i -= 1) {
+    for (let j = afterWords.length - 1; j >= 0; j -= 1) {
+      dp[i][j] = beforeWords[i] === afterWords[j] ? dp[i + 1][j + 1] + 1 : Math.max(dp[i + 1][j], dp[i][j + 1]);
+    }
+  }
+  const commonWords = dp[0][0];
+  const deletedWords = beforeWords.length - commonWords;
+  const addedWords = afterWords.length - commonWords;
+  const changeRatio = (deletedWords + addedWords) / Math.max(1, beforeWords.length + afterWords.length);
+  return { beforeWords: beforeWords.length, afterWords: afterWords.length, deletedWords, addedWords, changeRatio };
 }
 
 function renderIntralineSegments(segments, changeType) {
@@ -11115,11 +11792,6 @@ function activeExternalChange() {
   return state.externalChange;
 }
 
-function activeBlockingExternalChange() {
-  const change = activeExternalChange();
-  return change && change.source !== "review" ? change : null;
-}
-
 function externalReviewBaseContent(change = activeExternalChange()) {
   return typeof change?.baseContent === "string" ? change.baseContent : state.saved || "";
 }
@@ -11174,9 +11846,8 @@ function selectedStartupContextReviewPath(path = state.selected) {
   return startupContextSelectedExplorerPath(state.selectedStartupContext) || path || "";
 }
 
-async function startChangedFileInlineReview(path, diff, requestId = state.selectionRequest) {
+function applyChangedFileInlineReview(path, diff, review, requestId = state.selectionRequest) {
   if (!path || state.reviewModePath !== path || !diff?.changed) return false;
-  const review = await readSelectedReviewBase(path);
   if (!isCurrentSelection(requestId, path) || !review?.available) return false;
   const baseContent = typeof review.baseContent === "string" ? review.baseContent : "";
   const diskContent = typeof review.currentContent === "string" ? review.currentContent : state.saved || "";
@@ -11215,6 +11886,12 @@ async function startChangedFileInlineReview(path, diff, requestId = state.select
   el("editor").value = state.saved;
   setStatus(review.changeKind === "added" ? "new file waiting for review" : review.changeKind === "renamed" ? "renamed file waiting for review" : "changes waiting for review");
   return true;
+}
+
+async function startChangedFileInlineReview(path, diff, requestId = state.selectionRequest) {
+  if (!path || state.reviewModePath !== path || !diff?.changed) return false;
+  const review = await readSelectedReviewBase(path);
+  return applyChangedFileInlineReview(path, diff, review, requestId);
 }
 
 async function writeSelectedDiskFile(content, path = state.selected) {
@@ -11279,20 +11956,6 @@ function resetExternalChangeState(options = {}) {
   state.externalChange = null;
 }
 
-function blockPendingExternalChange(action = "before leaving") {
-  const change = activeExternalChange();
-  if (!change) return false;
-  if (change.source === "review") return false;
-  const targetBlockId = closestExternalReviewChangeBlockId();
-  setStatus("file changed on disk · review the highlighted change " + action);
-  if (state.mode !== "view") setMode("view");
-  else renderViewer();
-  updateHeader();
-  const focus = () => focusExternalReviewChange(targetBlockId) || focusNearestExternalReviewChange();
-  if (!focus()) window.requestAnimationFrame(focus);
-  return true;
-}
-
 function externalReviewChangeElements() {
   return [...document.querySelectorAll(".external-review-block.change[data-external-review-block]")];
 }
@@ -11312,10 +11975,6 @@ function closestExternalReviewChangeElement() {
 
 function closestExternalReviewChangeBlockId() {
   return closestExternalReviewChangeElement()?.dataset.externalReviewBlock || "";
-}
-
-function focusNearestExternalReviewChange() {
-  return focusExternalReviewChange(closestExternalReviewChangeBlockId());
 }
 
 function firstExternalReviewChangeBlockId() {
@@ -11670,26 +12329,31 @@ async function refreshBackgroundReports(options = {}) {
       shouldRefreshFull ? api(filesApiPath()) : Promise.resolve(null),
       shouldRefreshFull ? api("/api/settings") : Promise.resolve(null),
     ]);
+    const reportsChanged = reports ? applyBackgroundReportPayload(reports) : false;
     if (reports) {
-      applyBackgroundReportPayload(reports);
       state.lastReportRefreshAt = Date.now();
     }
+    let settingsChanged = false;
     if (filesData) {
       state.files = filesData.files;
       state.root = filesData.root || state.root;
       state.lastFullRefreshAt = Date.now();
-      if (!state.settingsOpen && settingsData) applySettingsPayload(settingsData);
+      if (!state.settingsOpen && settingsData) settingsChanged = applySettingsPayload(settingsData);
     }
-    renderFiles();
+    if (filesData) renderFiles();
     if (reconcileMissingSelectedFile()) {
       showHome();
       scheduleSessionStatePush();
       setStatus("file removed or renamed · returned to hub");
       return;
     }
-    if (state.settingsOpen) updateActionBanner();
-    else if (!state.selected) renderDocQaDashboard();
-    else updateHeader();
+    if (state.settingsOpen) {
+      if (reportsChanged || settingsChanged) updateActionBanner();
+    } else if (!state.selected) {
+      if (reportsChanged || settingsChanged) renderDocQaDashboard();
+    } else if (reportsChanged || settingsChanged) {
+      updateHeader();
+    }
   } finally {
     state.reportsRefreshInFlight = false;
   }
@@ -11891,10 +12555,11 @@ function escapeHtml(value) { return String(value).replace(/[&<>"]/g, (ch) => ({"
 function escapeRegExp(value) { return String(value).replace(/[-/\\^$*+?.()|[\]{}]/g, "\\$&"); }
 function cssEscape(value) { return window.CSS && CSS.escape ? CSS.escape(value) : String(value).replace(/(["\\])/g, "\\$1"); }
 
-const SPOTLIGHT_CARD_SELECTOR = ".launch-card, .review-item, .hub-folder-card, .startup-context-item:not(.startup-skill-folder), .settings-section, .settings-toggle, .settings-theme-preview, .template-editor, .hub-section-editor, .hub-card-editor, .path-picker, .card, .conflict-card";
+const SPOTLIGHT_CARD_SELECTOR = ".launch-card, .review-item, .hub-folder-card, .startup-context-item:not(.startup-skill-folder), .settings-toggle, .settings-theme-preview, .template-editor, .hub-section-editor, .hub-card-editor, .path-picker, .card, .conflict-card";
 let spotlightCard = null;
 let spotlightPointer = null;
 let spotlightFrame = 0;
+let interfaceScrollEndTimer = 0;
 function clearCardSpotlight() {
   if (spotlightCard) spotlightCard.classList.remove("spotlight-active");
   spotlightCard = null;
@@ -11918,7 +12583,7 @@ function updateCardSpotlightAt(x, y) {
   setCardSpotlight(card, x, y);
 }
 function scheduleCardSpotlightUpdate() {
-  if (!spotlightPointer || spotlightFrame) return;
+  if (!spotlightPointer || spotlightFrame || document.documentElement.classList.contains("ui-scrolling")) return;
   const pointer = spotlightPointer;
   spotlightFrame = window.requestAnimationFrame(() => {
     spotlightFrame = 0;
@@ -11931,7 +12596,18 @@ function updateCardSpotlight(event) {
   scheduleCardSpotlightUpdate();
 }
 function refreshCardSpotlightAfterScroll() {
+  markInterfaceScrolling();
   scheduleCardSpotlightUpdate();
+}
+
+function markInterfaceScrolling() {
+  document.documentElement.classList.add("ui-scrolling");
+  clearCardSpotlight();
+  window.clearTimeout(interfaceScrollEndTimer);
+  interfaceScrollEndTimer = window.setTimeout(() => {
+    document.documentElement.classList.remove("ui-scrolling");
+    scheduleCardSpotlightUpdate();
+  }, 140);
 }
 
 function setDocLinkModifierActive(active) {
@@ -11958,7 +12634,7 @@ el("editor").addEventListener("input", () => {
   updatePreview();
   if (state.mode === "view") renderViewer();
 });
-el("search").addEventListener("input", () => { markUserActive(); state.pathFilters = []; expandSearchMatches(); renderFiles(); scheduleSessionStatePush(); });
+el("search").addEventListener("input", () => { markUserActive(); state.pathFilters = []; scheduleExplorerSearchRender(); });
 el("clearSearch").addEventListener("click", () => clearExplorerFilter());
 document.querySelectorAll("[data-watch-filter]").forEach((button) => button.addEventListener("click", () => setExplorerWatchFilter(button.dataset.watchFilter)));
 document.querySelector("aside")?.addEventListener("contextmenu", openExplorerEmptyContextMenu);
@@ -12037,30 +12713,29 @@ el("clearSelection").addEventListener("click", () => clearDeleteSelection());
 el("deleteSelected").addEventListener("click", () => deletePaths([...state.selectedForDelete]).catch((error) => setStatus(error.message)));
 el("save").addEventListener("click", () => saveCurrent().catch((error) => setStatus(error.message)));
 el("reload").addEventListener("click", () => {
-  if (blockPendingExternalChange("before reloading")) return;
   if (state.dirty && !confirm("Discard unsaved editor changes and reload this file from disk?")) return;
   state.dirty = false;
   selectFile(state.selected, { pushHistory: false, fromPlanet: state.filePanel, forceReload: true }).catch((error) => setStatus(error.message));
 });
 window.addEventListener("beforeunload", (event) => {
   persistNavigationState();
-  const blockingChange = activeBlockingExternalChange();
-  if (!state.dirty && !blockingChange && !state.reviewFinalizationPromise) return;
-  if (blockingChange) focusNearestExternalReviewChange();
+  if (!state.dirty) return;
   event.preventDefault();
   event.returnValue = "";
 });
 document.addEventListener("pointerdown", markUserActive, { passive: true });
 document.addEventListener("wheel", markUserScrollIntent, { capture: true, passive: true });
 document.addEventListener("touchmove", markUserScrollIntent, { capture: true, passive: true });
-document.addEventListener("pointerover", (event) => prefetchPathFromTarget(event.target), { passive: true });
+document.addEventListener("pointerover", (event) => schedulePrefetchPathFromTarget(event.target), { passive: true });
 document.addEventListener("focusin", (event) => prefetchPathFromTarget(event.target));
 document.addEventListener("scroll", scheduleSessionStatePush, { capture: true, passive: true });
 syncResponsiveSidebar({ force: true });
 window.addEventListener("resize", () => syncResponsiveSidebar());
 setMode("view");
 startAgentCommandPolling();
-loadFiles().catch((error) => setStatus(error.message));
+loadFiles({ initial: true })
+  .catch((error) => setStatus(error.message))
+  .finally(() => window.requestAnimationFrame(finishInitialBoot));
 window.setInterval(() => refreshFromDisk(), 2200);
 window.setInterval(() => scheduleBackgroundRefresh(), 5_000);
 </script>

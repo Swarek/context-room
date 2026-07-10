@@ -35,12 +35,6 @@
       "uniqueItems": true,
       "default": []
     },
-    "bestPractices": {
-      "type": "array",
-      "description": "Short documentation best practices shown in the Context Room hub.",
-      "items": { "type": "string", "minLength": 1 },
-      "default": []
-    },
     "markdownTemplates": {
       "type": "array",
       "description": "Markdown templates available when creating new .md files from the site. Supports {{title}}, {{path}}, and metadata placeholders such as {{scope_yaml}}, {{status_yaml}}, {{canonical_for_yaml}}, {{last_verified_yaml}}, {{sources_inline}}, and {{sources_list}}.",
@@ -168,24 +162,6 @@
           "items": { "$ref": "#/$defs/projectPath" },
           "uniqueItems": true,
           "default": [".husky/", "lefthook.yml", ".pre-commit-config.yaml", "lint-staged.config.js", "package.json"]
-        }
-      }
-    },
-    "appearance": {
-      "type": "object",
-      "description": "Visual preferences for the Context Room webapp.",
-      "additionalProperties": true,
-      "properties": {
-        "fileTheme": {
-          "type": "string",
-          "description": "Theme used for file reading and editing surfaces.",
-          "enum": ["context-room", "vscode-dark", "github-dark", "dracula", "solarized-dark", "light-plus"],
-          "default": "context-room"
-        },
-        "autoOpenGitDiff": {
-          "type": "boolean",
-          "description": "When true, files with a Git diff open with the diff panel visible. When false, the diff stays collapsed until the user opens it manually.",
-          "default": true
         }
       }
     },

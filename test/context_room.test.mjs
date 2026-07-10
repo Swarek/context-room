@@ -9,6 +9,7 @@ import test from "node:test";
 import {
   CONFIG_DIR,
   CONFIG_FILE,
+  GLOBAL_PREFERENCES_FILE,
   DEFAULT_MARKDOWN_TEMPLATES,
   FILE_THEME_OPTIONS,
   acknowledgeContextHealthIssue,
@@ -44,14 +45,17 @@ import {
   readContextHealthAcknowledgements,
   readFileDiff,
   readGlobalReviewLedger,
+  readGlobalContextRoomPreferences,
   readMemoryFile,
   readMemoryWebappSettings,
+  readResolvedContextRoomSettings,
   readReviewBaseFile,
   readStartupContextFile,
   readStartupHookFile,
   readStartupSkillFile,
   renderAppHtml,
   renderExplorerContextMenuMarkup,
+  renderReviewSummary,
   renderTemplateOptionsMarkup,
   revertMemoryFile,
   writeDocReviewBaseline,
@@ -61,6 +65,7 @@ import {
   writeAgentCommand,
   writeCollaborationSessionState,
   writeDocReviewDecision,
+  writeGlobalContextRoomPreferences,
 } from "../src/context_room.mjs";
 
 function makeRoot() {
@@ -92,14 +97,41 @@ test("rendered app inline script parses before the browser boots it", () => {
   assert.match(script, /function onlyIgnoredReviewMetadataChanged\(leftContent, rightContent\)/);
 });
 
-test("app keeps heavy reports and Git diffs off the critical refresh path", () => {
-  const script = extractInlineAppScript(renderAppHtml());
+test("app presents a compact review-first workspace", () => {
+  const html = renderAppHtml();
+  const asideEnd = html.indexOf("</aside>");
+  const mainStart = html.indexOf("<main>", asideEnd);
+  const dockStart = html.indexOf('class="workspace-dock"', mainStart);
+
+  assert.ok(asideEnd >= 0 && mainStart > asideEnd && dockStart > mainStart);
+  assert.match(html, /id="workspaceTitle" class="workspace-title">Context Room<\/div>/);
+  assert.match(html, /<h2>Review queue<\/h2>/);
+  assert.match(html, /hubDisclosuresOpen:\s*new Set\(\)/);
+  assert.match(html, /data-hub-disclosure=/);
+  assert.match(html, /@keyframes workbenchGridDrift/);
+  assert.equal(
+    renderReviewSummary({ changedDocs: 9, needsReview: 2 }),
+    '<div class="review-summary-item"><strong>2</strong><span>to review</span></div>' +
+      '<div class="review-summary-item"><strong>9</strong><span>changed</span></div>',
+  );
+});
+
+test("app reveals one complete initial frame and keeps recurring refreshes in the background", () => {
+  const html = renderAppHtml();
+  const script = extractInlineAppScript(html);
   const loadFilesSource = script.slice(script.indexOf("async function loadFiles"), script.indexOf("function reconcileMissingSelectedFile"));
   const diskRefreshSource = script.slice(script.indexOf("async function refreshFromDisk"), script.indexOf("function scheduleBackgroundRefresh"));
 
+  assert.match(loadFilesSource, /const reportsRequest = options\.initial \? api\("\/api\/reports"\) : Promise\.resolve\(null\);/);
   assert.match(loadFilesSource, /Promise\.all\(\[api\(filesApiPath\(\)\), api\("\/api\/settings"\)\]\)/);
-  assert.doesNotMatch(loadFilesSource, /\/api\/(?:docqa|doctor|startup-context|startup-skills|startup-hooks)/);
-  assert.match(loadFilesSource, /scheduleBackgroundRefresh\(\{ forceReports: true \}\)/);
+  assert.match(loadFilesSource, /const restoreRequest = restoreNavigationAfterInitialLoad\(\);\s*const reports = await reportsRequest;/);
+  assert.match(loadFilesSource, /const restored = await restoreRequest;/);
+  assert.match(loadFilesSource, /applyBackgroundReportPayload\(reports\);/);
+  assert.match(loadFilesSource, /if \(state\.page === "file" && state\.selected && !state\.openingFilePath\) \{[\s\S]*renderViewer\(\);[\s\S]*restoreEditorViewState\(viewState\);/);
+  assert.match(loadFilesSource, /else if \(!reports\) scheduleBackgroundRefresh\(\{ forceReports: true \}\);/);
+  assert.match(html, /<body class="app-booting">/);
+  assert.match(script, /loadFiles\(\{ initial: true \}\)[\s\S]*requestAnimationFrame\(finishInitialBoot\)/);
+  assert.match(html, /body\.app-booting \.app \{ visibility: hidden; opacity: 0; pointer-events: none; \}/);
   assert.match(script, /const reportsPath = "\/api\/reports"/);
   assert.match(script, /readFileForOpen\(path, \{ force: options\.forceReload \}\)/);
   assert.match(diskRefreshSource, /const data = await readSelectedDiskFile\(previousSelected\)/);
@@ -145,6 +177,27 @@ test("background report and diff endpoints preserve complete results", async (t)
   assert.equal(diffResponse.status, 200);
   assert.equal(diff.changed, true);
   assert.match(diff.patch, /Updated\./);
+
+  const sessionResponse = await fetch(baseUrl + "/api/session-state", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ page: "hub", view: "hub" }),
+  });
+  assert.equal(sessionResponse.status, 200);
+  const cachedReports = await (await fetch(baseUrl + "/api/reports")).json();
+  assert.equal(cachedReports.generatedAt, reports.generatedAt);
+
+  const writeResponse = await fetch(baseUrl + "/api/file", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ path: "docs/guide.md", content: "# Guide\n\nUpdated through the API.\n" }),
+  });
+  assert.equal(writeResponse.status, 200);
+  const refreshedReports = await (await fetch(baseUrl + "/api/reports")).json();
+  assert.notEqual(refreshedReports.generatedAt, cachedReports.generatedAt);
+  assert.equal(refreshedReports.docqa.queue[0].path, "docs/guide.md");
+  const refreshedDiff = await (await fetch(baseUrl + "/api/file/diff?path=" + encodeURIComponent("docs/guide.md"))).json();
+  assert.match(refreshedDiff.patch, /Updated through the API\./);
 });
 
 test("default config is project-agnostic and supports cards, nested cards, allowed paths, and watched paths", () => {
@@ -156,8 +209,7 @@ test("default config is project-agnostic and supports cards, nested cards, allow
   assert.match(config.$schema, /schemas\/config\.schema\.json$/);
   assert.deepEqual(config.watchAllow, []);
   assert.deepEqual(config.reviewPaths, []);
-  assert.equal(config.appearance.fileTheme, "context-room");
-  assert.equal(config.appearance.autoOpenGitDiff, true);
+  assert.equal("appearance" in config, false);
   assert.deepEqual(config.startupSkills.folderNames, [".codex/skills", "skills"]);
   assert.equal(config.startupHooks.enabled, true);
   assert.equal(config.startupHooks.editable, false);
@@ -171,7 +223,7 @@ test("default config is project-agnostic and supports cards, nested cards, allow
   assert.ok(config.startupHooks.agentHookPaths.includes(".opencode/plugins/"));
   assert.ok(config.startupHooks.codexPaths.includes(".codex/hooks.json"));
   assert.ok(config.startupHooks.managerPaths.includes(".husky/"));
-  assert.ok(FILE_THEME_OPTIONS.some((theme) => theme.id === config.appearance.fileTheme));
+  assert.ok(FILE_THEME_OPTIONS.some((theme) => theme.id === "context-room"));
   assert.ok(config.allowedPaths.includes("docs/"));
   assert.ok(config.allowedPaths.includes("src/"));
   assert.ok(config.hubSections[0].cards.some((card) => card.id === "docs"));
@@ -193,7 +245,7 @@ test("init writes a reusable project config without LifeOS-specific paths", () =
   assert.match(saved.$schema, /schemas\/config\.schema\.json$/);
   assert.ok(saved.allowedPaths.includes("docs/"));
   assert.ok(saved.allowedPaths.includes("src/"));
-  assert.equal(saved.appearance.autoOpenGitDiff, true);
+  assert.equal("appearance" in saved, false);
   assert.equal(JSON.stringify(saved).includes("Life OS"), false);
   assert.equal(JSON.stringify(saved).includes(".lifeos"), false);
 });
@@ -209,17 +261,34 @@ test("allowed paths are driven by project config", () => {
   assert.equal(isAllowedMemoryPath("../secret.md", settings), false);
 });
 
-test("appearance settings preserve manual Git diff opening preference", () => {
-  const root = makeRoot();
-  initializeContextRoomProject(root, { allowedPaths: ["docs/"] });
-  const configPath = path.join(root, CONFIG_FILE);
-  const config = JSON.parse(fs.readFileSync(configPath, "utf8"));
-  config.appearance = { ...config.appearance, autoOpenGitDiff: false };
-  fs.writeFileSync(configPath, JSON.stringify(config, null, 2) + "\n");
+test("appearance preferences are shared across Context Rooms and stay out of project config", async (t) => {
+  const firstRoot = makeRoot();
+  const secondRoot = makeRoot();
+  const preferencesPath = path.join(makeRoot(), "preferences.json");
+  initializeContextRoomProject(firstRoot, { allowedPaths: ["docs/"] });
+  initializeContextRoomProject(secondRoot, { allowedPaths: ["docs/"] });
 
-  const settings = readMemoryWebappSettings(root);
-  assert.equal(settings.appearance.fileTheme, "context-room");
-  assert.equal(settings.appearance.autoOpenGitDiff, false);
+  assert.equal(GLOBAL_PREFERENCES_FILE, "~/.context-room/preferences.json");
+  assert.equal(readGlobalContextRoomPreferences(preferencesPath).appearance.autoOpenGitDiff, true);
+  writeGlobalContextRoomPreferences({ appearance: { fileTheme: "dracula", autoOpenGitDiff: false } }, preferencesPath);
+  assert.deepEqual(readResolvedContextRoomSettings(firstRoot, { preferencesPath }).appearance, { fileTheme: "dracula", autoOpenGitDiff: false });
+  assert.deepEqual(readResolvedContextRoomSettings(secondRoot, { preferencesPath }).appearance, { fileTheme: "dracula", autoOpenGitDiff: false });
+
+  const { server } = createMemoryServer({ root: firstRoot, globalPreferencesPath: preferencesPath });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  t.after(() => new Promise((resolve, reject) => server.close((error) => error ? reject(error) : resolve())));
+  const response = await fetch(`http://127.0.0.1:${server.address().port}/api/settings`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ settings: { ...readMemoryWebappSettings(firstRoot), appearance: { fileTheme: "github-dark", autoOpenGitDiff: false } } }),
+  });
+  const payload = await response.json();
+  const savedProject = JSON.parse(fs.readFileSync(path.join(firstRoot, CONFIG_FILE), "utf8"));
+
+  assert.equal(response.status, 200);
+  assert.deepEqual(payload.settings.appearance, { fileTheme: "github-dark", autoOpenGitDiff: false });
+  assert.deepEqual(readResolvedContextRoomSettings(secondRoot, { preferencesPath }).appearance, { fileTheme: "github-dark", autoOpenGitDiff: false });
+  assert.equal("appearance" in savedProject, false);
 });
 
 test("file listing follows project config and does not inject Hermes/LifeOS files by default", () => {
@@ -799,7 +868,7 @@ test("runtime Git excludes are scoped when Context Room root is a Git subdirecto
   assert.match(exclude, /project\/\.context-room\/memory-webapp-backups\//);
 });
 
-test("CLI guard blocks commits when watched docs changed without review", () => {
+test("CLI guard is non-blocking unless strict mode is explicit", () => {
   const root = makeRoot();
   execFileSync("git", ["init"], { cwd: root, stdio: "ignore" });
   execFileSync("git", ["config", "user.email", "context-room@example.test"], { cwd: root, stdio: "ignore" });
@@ -811,8 +880,19 @@ test("CLI guard blocks commits when watched docs changed without review", () => 
   fs.writeFileSync(path.join(root, "README.md"), "# Demo\n\nAgent change.\n");
 
   const cli = path.resolve("bin/context-room.mjs");
+  const advisoryOutput = execFileSync(process.execPath, [cli, "guard"], { cwd: root, encoding: "utf8" });
+  assert.match(advisoryOutput, /found watched documentation changes/);
+  assert.match(advisoryOutput, /did not block/);
+  assert.doesNotMatch(advisoryOutput, /blocked this commit/);
+  assert.match(advisoryOutput, /README\.md/);
+
+  const reviewOnlyOutput = execFileSync(process.execPath, [cli, "guard", "--profile", "review-only"], { cwd: root, encoding: "utf8" });
+  assert.match(reviewOnlyOutput, /found watched documentation changes/);
+  assert.match(reviewOnlyOutput, /review-only guard found issues but did not block/);
+  assert.doesNotMatch(reviewOnlyOutput, /blocked this commit/);
+
   assert.throws(
-    () => execFileSync(process.execPath, [cli, "guard"], { cwd: root, encoding: "utf8", stdio: "pipe" }),
+    () => execFileSync(process.execPath, [cli, "guard", "--profile", "strict"], { cwd: root, encoding: "utf8", stdio: "pipe" }),
     (error) => {
       const output = `${error.stdout || ""}${error.stderr || ""}`;
       assert.match(output, /Context Room guard blocked this commit/);
@@ -826,13 +906,13 @@ test("CLI guard blocks commits when watched docs changed without review", () => 
   );
 
   writeDocReviewDecision(root, "README.md", { status: "verified", note: "test baseline" });
-  const output = execFileSync(process.execPath, [cli, "guard"], { cwd: root, encoding: "utf8" });
+  const output = execFileSync(process.execPath, [cli, "guard", "--profile", "review-only"], { cwd: root, encoding: "utf8" });
   assert.match(output, /No unverified watched documentation changes/);
 
   const unverified = writeDocReviewDecision(root, "README.md", { status: "unverified", note: "undo" });
   assert.equal(unverified.status, "unverified");
   assert.throws(
-    () => execFileSync(process.execPath, [cli, "guard"], { cwd: root, encoding: "utf8", stdio: "pipe" }),
+    () => execFileSync(process.execPath, [cli, "guard", "--profile", "strict"], { cwd: root, encoding: "utf8", stdio: "pipe" }),
     (error) => {
       const output = `${error.stdout || ""}${error.stderr || ""}`;
       assert.match(output, /Context Room guard blocked this commit/);
@@ -840,6 +920,12 @@ test("CLI guard blocks commits when watched docs changed without review", () => 
       return true;
     },
   );
+
+  execFileSync(process.execPath, [cli, "install-hook"], { cwd: root, encoding: "utf8" });
+  const hook = fs.readFileSync(path.join(root, ".git", "hooks", "pre-commit"), "utf8");
+  assert.match(hook, /Reports watched documentation changes without blocking commits/);
+  assert.match(hook, /--profile advisory/);
+  assert.doesNotMatch(hook, /--profile review-only/);
 });
 
 test("shared review ledger verifies the same absolute path and content across rooms", () => {
@@ -1243,6 +1329,25 @@ test("file diff renders new untracked watched docs as a Git new-file patch", () 
   assert.match(diff.patch, /\+Agent-written docs\./);
 });
 
+test("file diff counts tracked patch lines without a second Git diff", () => {
+  const root = makeRoot();
+  execFileSync("git", ["init"], { cwd: root, stdio: "ignore" });
+  execFileSync("git", ["config", "user.email", "context-room@example.test"], { cwd: root, stdio: "ignore" });
+  execFileSync("git", ["config", "user.name", "Context Room Test"], { cwd: root, stdio: "ignore" });
+  fs.mkdirSync(path.join(root, "docs"));
+  fs.writeFileSync(path.join(root, "docs", "guide.md"), "# Guide\n\nOld.\n");
+  initializeContextRoomProject(root, { allowedPaths: ["docs/"], watchAllow: ["docs/"] });
+  execFileSync("git", ["add", "."], { cwd: root, stdio: "ignore" });
+  execFileSync("git", ["commit", "-m", "initial"], { cwd: root, stdio: "ignore" });
+  fs.writeFileSync(path.join(root, "docs", "guide.md"), "# Guide\n\nNew.\n\nExtra.\n");
+
+  const diff = readFileDiff(root, "docs/guide.md");
+
+  assert.equal(diff.additions, 3);
+  assert.equal(diff.deletions, 1);
+  assert.match(diff.patch, /\+Extra\./);
+});
+
 test("review base reads HEAD content for changed files from a git subdirectory", () => {
   const repo = makeRoot();
   const root = path.join(repo, "hicharlie.fr");
@@ -1305,11 +1410,12 @@ test("review base prefers the last inline review baseline over HEAD", () => {
   assert.equal(next.currentContent, "# Demo\n\nAlready reviewed.\n\nNew small edit.\n");
 });
 
-test("default config exposes scoped-context best practices and simple markdown templates", () => {
+test("default config exposes scoped context and simple markdown templates without a writing guide", () => {
   const config = createDefaultProjectConfig({ title: "Docs Demo" });
 
   assert.ok(config.allowedPaths.includes("context/"));
   assert.ok(config.hubSections[0].cards.some((card) => card.id === "context"));
+  assert.equal("bestPractices" in config, false);
   assert.ok(Array.isArray(config.markdownTemplates));
   assert.equal(config.markdownTemplates[0]?.id, "blank");
   assert.ok(config.markdownTemplates.some((template) => template.id === "context-golden"));
@@ -1328,6 +1434,11 @@ test("default config exposes scoped-context best practices and simple markdown t
   assert.match(golden.content, /## Key facts/);
   assert.match(golden.content, /## References/);
   assert.ok(golden.content.length < 1100, "golden template should stay simple enough to read quickly");
+
+  const html = renderAppHtml();
+  assert.doesNotMatch(html, /Writing guide/i);
+  assert.doesNotMatch(html, /Docs best practices/i);
+  assert.doesNotMatch(html, /bestPractices/);
 });
 
 test("createMarkdownFile writes a new empty allowed markdown file", () => {
@@ -1743,6 +1854,8 @@ test("explorer rendering uses a cache and delegated tree events", () => {
   assert.match(html, /holder\.dataset\.wired === "true"/);
   assert.match(html, /holder\.addEventListener\("click", \(event\) =>/);
   assert.match(html, /holder\.addEventListener\("contextmenu", \(event\) =>/);
+  assert.match(html, /function scheduleExplorerSearchRender\(\)[\s\S]*requestAnimationFrame/);
+  assert.match(html, /addEventListener\("input", \(\) => \{ markUserActive\(\); state\.pathFilters = \[\]; scheduleExplorerSearchRender\(\); \}\)/);
   assert.doesNotMatch(html, /document\.querySelectorAll\("\\[data-file-path\\]"\)\.forEach\(\(button\) => \{\s*button\.addEventListener\("click"/);
 });
 
@@ -1862,6 +1975,8 @@ test("app CSS keeps hidden context menu forms hidden despite form display rules"
   assert.match(html, /\.locked-folder-display code\s*\{[^}]*text-overflow:\s*ellipsis/);
   assert.match(html, /\.path-picker-preview\s*\{[^}]*background:\s*rgba\(139,211,255,0\.06\)/);
   assert.match(html, /\.app\.sidebar-collapsed \.sidebar-copy,[^}]*\.app\.sidebar-collapsed \.watch-filter-row,[^}]*\.app\.sidebar-collapsed \.selection-bar,[^}]*opacity:\s*0/);
+  assert.doesNotMatch(html, /\.app\.sidebar-collapsed \.sidebar-copy,\s*\.app\.sidebar-collapsed \.workspace-dock/);
+  assert.match(html, /@media \(min-width: 981px\) \{[\s\S]*\.app\.sidebar-collapsed \.sidebar-head\s*\{[^}]*justify-content:\s*center[^}]*\}[\s\S]*\.app\.sidebar-collapsed \.sidebar-copy\s*\{\s*display:\s*none;\s*\}[\s\S]*\.app\.sidebar-collapsed \.sidebar-toggle\s*\{[^}]*position:\s*static[^}]*margin:\s*0 auto/);
   assert.match(html, /@media \(max-width: 980px\) \{[\s\S]*\.app\.sidebar-collapsed \.sidebar-copy,[^}]*\.app\.sidebar-collapsed \.watch-filter-row,[^}]*\.app\.sidebar-collapsed \.selection-bar,[^}]*opacity:\s*0/);
 });
 
@@ -1885,10 +2000,10 @@ test("card hover spotlight follows the pointer without intercepting clicks", () 
   assert.match(html, /radial-gradient\(360px circle at var\(--spotlight-x\) var\(--spotlight-y\)/);
   assert.match(html, /pointer-events:\s*none/);
   assert.match(html, /\.hub-folder-card\.spotlight-active::before/);
-  assert.match(html, /\.settings-section\.spotlight-active::before/);
   assert.match(html, /\.hub-card-editor\.spotlight-active::before/);
   assert.match(html, /\.startup-skill-folder::before\s*\{\s*display:\s*none/);
-  assert.match(html, /const SPOTLIGHT_CARD_SELECTOR = ".*\.hub-folder-card.*\.startup-context-item:not\(\.startup-skill-folder\).*\.settings-section.*\.hub-card-editor/);
+  assert.match(html, /const SPOTLIGHT_CARD_SELECTOR = ".*\.hub-folder-card.*\.startup-context-item:not\(\.startup-skill-folder\).*\.settings-toggle.*\.hub-card-editor/);
+  assert.doesNotMatch(html, /SPOTLIGHT_CARD_SELECTOR = "[^"]*\.settings-section/);
   assert.match(html, /function updateCardSpotlightAt\(x, y\)/);
   assert.match(html, /function scheduleCardSpotlightUpdate\(\)/);
   assert.match(html, /const pointer = spotlightPointer;/);
@@ -1900,6 +2015,11 @@ test("card hover spotlight follows the pointer without intercepting clicks", () 
   assert.match(html, /function refreshCardSpotlightAfterScroll\(\)/);
   assert.match(html, /document\.addEventListener\("pointermove", \(event\) => \{[\s\S]*updateCardSpotlight\(event\);[\s\S]*setDocLinkModifierActive\(isDocLinkModifierEventActive\(event\)\);[\s\S]*\}, \{ passive: true \}\)/);
   assert.match(html, /document\.addEventListener\("scroll", refreshCardSpotlightAfterScroll, \{ capture: true, passive: true \}\)/);
+  assert.match(html, /html\.ui-scrolling body::before\s*\{\s*animation-play-state:\s*paused/);
+  assert.match(html, /function markInterfaceScrolling\(\)\s*\{[\s\S]*classList\.add\("ui-scrolling"\)[\s\S]*clearCardSpotlight\(\)[\s\S]*classList\.remove\("ui-scrolling"\)/);
+  assert.match(html, /classList\.contains\("ui-scrolling"\)/);
+  assert.doesNotMatch(html, /will-change:\s*transform/);
+  assert.doesNotMatch(html, /backface-visibility:\s*hidden/);
 });
 
 test("rendered app supports selectable file themes and colored markdown reading", () => {
@@ -1914,20 +2034,33 @@ test("rendered app supports selectable file themes and colored markdown reading"
   assert.match(html, /id="autoOpenGitDiff"/);
   assert.match(html, /<strong>Auto-open Git diff<\/strong>/);
   assert.match(html, /class="settings-shell"/);
-  assert.match(html, /function renderSettingsSection\(\{ kicker, title, copy/);
-  assert.match(html, /'<details class="settings-section collapsible" '/);
-  assert.match(html, /kicker:\s*"Review"[\s\S]*title:\s*"Watched docs"/);
-  assert.match(html, /kicker:\s*"Startup"[\s\S]*title:\s*"Injected context scanners"/);
-  assert.match(html, /kicker:\s*"Appearance"[\s\S]*title:\s*"Theme and diff behavior"/);
-  assert.match(html, /kicker:\s*"Templates"[\s\S]*title:\s*"Markdown document templates"[\s\S]*open:\s*false/);
-  assert.match(html, /kicker:\s*"Hub"[\s\S]*title:\s*"Sections and cards"[\s\S]*open:\s*false/);
+  assert.match(html, /function renderSettingsTabs\(items = \[\]\)/);
+  assert.match(html, /role="tablist" aria-label="Settings categories"/);
+  assert.match(html, /data-settings-section-target="' \+ escapeHtml\(item\.id\)/);
+  assert.match(html, /function renderSettingsSection\(\{ id, kicker, title, copy, scope/);
+  assert.match(html, /'<section id="settings-section-' \+ sectionId/);
+  assert.match(html, /id:\s*"review"[\s\S]*kicker:\s*"Review"[\s\S]*title:\s*"Watched docs"/);
+  assert.match(html, /id:\s*"startup"[\s\S]*kicker:\s*"Startup"[\s\S]*title:\s*"Injected context scanners"/);
+  assert.match(html, /id:\s*"appearance"[\s\S]*kicker:\s*"Appearance"[\s\S]*title:\s*"Theme and diff behavior"/);
+  assert.match(html, /copy:\s*"Shared by every Context Room on this computer\."/);
+  assert.match(html, /scope:\s*"All rooms"/);
+  assert.match(html, /id:\s*"templates"[\s\S]*kicker:\s*"Templates"[\s\S]*title:\s*"Markdown document templates"/);
+  assert.match(html, /id:\s*"hub"[\s\S]*kicker:\s*"Hub"[\s\S]*title:\s*"Sections and cards"/);
   assert.match(html, /\.settings-section-head\s*\{[^}]*display:\s*flex/);
-  assert.match(html, /\.settings-section\.collapsible:not\(\[open\]\) > \.settings-section-head/);
-  assert.match(html, /\.settings-section\.collapsible:not\(\[open\]\) > \.settings-section-body\s*\{\s*display:\s*none;\s*\}/);
+  assert.match(html, /\.settings-tabs\s*\{[^}]*position:\s*sticky/);
+  assert.match(html, /\.settings-tab\[aria-selected="true"\]/);
+  assert.match(html, /\.settings-section\[hidden\]\s*\{\s*display:\s*none;/);
+  assert.doesNotMatch(html, /settings-section collapsible/);
   assert.match(html, /\.template-editor:not\(\[open\]\) > :not\(summary\)\s*\{\s*display:\s*none;\s*\}/);
   assert.match(html, /\.hub-section-editor:not\(\[open\]\) > :not\(summary\)\s*\{\s*display:\s*none;\s*\}/);
   assert.match(html, /\.hub-card-editor:not\(\[open\]\) > :not\(summary\)\s*\{\s*display:\s*none;\s*\}/);
-  assert.match(html, /\.settings-section-toggle/);
+  assert.match(html, /function activateSettingsSection\(sectionId, options = \{\}\)/);
+  assert.match(html, /function wireSettingsTabs\(root\)/);
+  assert.match(html, /\["ArrowRight", "ArrowDown"\]/);
+  assert.match(html, /settingsSection: normalizeSettingsSectionId\(state\.settingsSection\)/);
+  assert.match(html, /state\.settingsSection = persisted\.settingsSection/);
+  assert.match(html, /activateSettingsSection\(state\.settingsSection, \{ resetScroll: false \}\)/);
+  assert.match(html, /Project setup stays in this room\. Appearance applies to all rooms\./);
   assert.match(html, /\.settings-toggle\s*\{[^}]*grid-template-columns:\s*auto minmax\(0, 1fr\)/);
   assert.match(html, /\.settings-footer\s*\{[^}]*position:\s*sticky/);
   assert.match(html, /button\.save-pending, \.file-action\.save-pending/);
@@ -1974,6 +2107,12 @@ test("rendered app supports selectable file themes and colored markdown reading"
   assert.match(html, /id="docReader" class="doc-editor markdown-view"/);
   assert.match(html, /function renderMarkdownEditor\(text\)/);
   assert.match(html, /id="docHighlighter" class="doc-editor markdown-view markdown-editor-highlight"/);
+  assert.match(html, /function usePlainTextSurface\(filePath, text\)/);
+  assert.match(html, /!String\(filePath \|\| ""\)\.toLowerCase\(\)\.endsWith\("\.md"\)/);
+  assert.match(html, /value\.length > 120_000/);
+  assert.match(html, /function renderDocumentEditor\(text, filePath = state\.selected\)/);
+  assert.match(html, /id="docEditor" class="doc-editor plain-text-editor"/);
+  assert.match(html, /\.plain-text-editor\s*\{[^}]*display:\s*block/);
   assert.match(html, /data-heading-text/);
   assert.match(html, /\.markdown-line\.h1\s*\{[^}]*color:\s*var\(--file-h1\)/);
   assert.match(html, /\.markdown-inline-code/);
@@ -2089,7 +2228,8 @@ test("browser refresh restores the last Context Room page", () => {
   assert.match(html, /searchText: el\("search"\)\?\.value \|\| ""/);
   assert.match(html, /el\("search"\)\.value = persisted\.searchText \|\| folderFilterSearchQuery\(state\.pathFilters\);/);
   assert.match(html, /state\.root = data\.root \|\| state\.root;/);
-  assert.match(html, /const restored = await restoreNavigationAfterInitialLoad\(\);/);
+  assert.match(html, /const restoreRequest = restoreNavigationAfterInitialLoad\(\);/);
+  assert.match(html, /const restored = await restoreRequest;/);
   assert.match(html, /if \(restored\) \{[\s\S]*scheduleSessionStatePush\(\);[\s\S]*return;/);
   assert.match(html, /await selectFile\(persisted\.selectedPath, options\);/);
   assert.match(html, /await selectStartupContextFile\(startup\.order, options\);/);
@@ -2097,7 +2237,7 @@ test("browser refresh restores the last Context Room page", () => {
   assert.match(html, /restorePersistedViewState\(options\.restoreViewState\);/);
   assert.match(html, /if \(typeof options\.diffCollapsed === "boolean"\) state\.diffCollapsed = options\.diffCollapsed;/);
   assert.match(html, /window\.addEventListener\("beforeunload", \(event\) => \{[\s\S]*persistNavigationState\(\);/);
-  assert.match(html, /if \(!state\.dirty && !blockingChange && !state\.reviewFinalizationPromise\) return;/);
+  assert.match(html, /window\.addEventListener\("beforeunload", \(event\) => \{[\s\S]*if \(!state\.dirty\) return;[\s\S]*event\.preventDefault\(\);/);
 });
 
 test("file opening renders loading and retry states instead of a blank document", () => {
@@ -2105,9 +2245,12 @@ test("file opening renders loading and retry states instead of a blank document"
 
   assert.match(html, /fileLoadError: null/);
   assert.match(html, /state\.fileLoadError = null;/);
-  assert.match(html, /const loadingFile = !isStartupFile && state\.openingFilePath === state\.selected;/);
+  assert.match(html, /const loadingFile = state\.openingFilePath === state\.selected;/);
   assert.match(html, /const loadError = !isStartupFile && state\.fileLoadError\?\.path === state\.selected/);
   assert.match(html, /function renderFileLoadingState\(file = \{\}\)/);
+  assert.match(html, /function renderFileActionsLoading\(\)/);
+  assert.match(html, /file-actions file-actions-loading/);
+  assert.match(html, /@keyframes fileActionLoadingPulse/);
   assert.match(html, /Opening file\.\.\./);
   assert.match(html, /function renderFileLoadError\(error = \{\}\)/);
   assert.match(html, /Could not open this file/);
@@ -2132,13 +2275,37 @@ test("file opening renders loading and retry states instead of a blank document"
   assert.doesNotMatch(html, /renderFiles\(\);\s*if \(options\.revealInExplorer\)/);
 });
 
+test("file opening loads dependencies in parallel and renders stable actions once", () => {
+  const html = renderAppHtml();
+  const selectFileFn = html.match(/async function selectFile\(path, options = \{\}\) \{[\s\S]*?\n\}\n\nasync function selectStartupContextFile/)?.[0] || "";
+
+  assert.match(selectFileFn, /const fileRequest = readFileForOpen\(path, \{ force: options\.forceReload \}\);/);
+  assert.match(selectFileFn, /const annotationsRequest = settleUiRequest\(loadAnnotationsForPath\(path\)\);/);
+  assert.match(selectFileFn, /const diffRequest = settleUiRequest\(readDiffForOpen\(path, \{ force: options\.forceReload \}\)\);/);
+  assert.match(selectFileFn, /const reviewBaseRequest = options\.reviewMode[\s\S]*settleUiRequest\(readSelectedReviewBase\(path\)\)/);
+  assert.match(selectFileFn, /const data = await fileRequest;[\s\S]*await annotationsRequest;/);
+  assert.match(selectFileFn, /const \[diffResult, reviewBaseResult\] = await Promise\.all\(\[diffRequest, reviewBaseRequest\]\);/);
+  assert.match(selectFileFn, /const \[diffResult, reviewBaseResult\] = await Promise\.all\(\[diffRequest, reviewBaseRequest\]\);[\s\S]*?finishOpen\(diffResult, reviewBaseResult\);/);
+  assert.doesNotMatch(selectFileFn, /finishOpen\(null, null\)/);
+  assert.doesNotMatch(selectFileFn, /diffRequest\.then/);
+  assert.doesNotMatch(selectFileFn, /await loadAnnotationsForPath\(path\)[\s\S]*renderViewer\(\);[\s\S]*const loadDiff/);
+  assert.match(html, /function applyChangedFileInlineReview\(path, diff, review, requestId = state\.selectionRequest\)/);
+  assert.match(html, /return applyChangedFileInlineReview\(path, diff, review, requestId\);/);
+  assert.match(html, /\[data-file-path\], \[data-review-path\], \[data-hub-file\]/);
+  assert.match(html, /const diffPromise = api\("\/api\/file\/diff\?path=" \+ encodeURIComponent\(path\)\);/);
+  assert.match(html, /document\.addEventListener\("pointerover", \(event\) => schedulePrefetchPathFromTarget\(event\.target\)/);
+  assert.match(html, /workspaceDock\?\.classList\.toggle\("file-opening", fileOpening\);/);
+  assert.match(html, /workspaceDock\?\.setAttribute\("aria-busy", fileOpening \? "true" : "false"\);/);
+  assert.match(html, /\.workspace-dock\.file-opening\s*\{\s*visibility:\s*hidden;\s*pointer-events:\s*none;/);
+});
+
 test("verification actions are limited to files opened from the review queue", () => {
   const html = renderAppHtml();
 
   assert.match(html, /reviewModePath: null, reviewModeStatus: null/);
   assert.match(html, /openReviewQueueItem\(item\)\.catch\(\(error\) => setStatus\(error\.message\)\)/);
   assert.match(html, /await selectStartupContextFile\(item\.startupContext\.order, \{ reviewMode: true \}\);/);
-  assert.match(html, /await selectFile\(item\.path, \{ revealInExplorer: !isNarrowLayout\(\), reviewMode: true \}\);/);
+  assert.match(html, /await selectFile\(item\.path, \{ reviewMode: true \}\);/);
   assert.match(html, /state\.reviewModePath = options\.reviewMode \? path : null;/);
   assert.match(html, /state\.reviewModePath = options\.reviewMode \? finalPath : null;/);
   assert.match(html, /function reviewActionForSelectedFile\(\)/);
@@ -2176,11 +2343,19 @@ test("verification actions are limited to files opened from the review queue", (
   assert.doesNotMatch(html, /data-file-verify/);
 });
 
+test("opening a file never reopens a collapsed explorer", () => {
+  const html = renderAppHtml();
+
+  assert.match(html, /const explorerWasCollapsed = document\.querySelector\("\.app"\)\?\.classList\.contains\("sidebar-collapsed"\);/);
+  assert.doesNotMatch(html, /if \(options\.revealInExplorer\) \{[\s\S]{0,180}classList\.remove\("sidebar-collapsed"\)/);
+  assert.match(html, /if \(options\.revealInExplorer && !explorerWasCollapsed\) scrollExplorerToPath\(path\);/);
+});
+
 test("context health is a compact triggered-alert panel", () => {
   const html = renderAppHtml();
 
   assert.match(html, /id="contextHealthPanel" class="docqa-panel" hidden/);
-  assert.match(html, /shown only when checks need attention/);
+  assert.doesNotMatch(html, /shown only when checks need attention/);
   assert.match(html, /\["critical", "high", "medium"\]\.includes\(issue\.severity\) && !issue\.acknowledged/);
   assert.match(html, /if \(!issues\.length\) \{[\s\S]*panel\.hidden = true;[\s\S]*return;/);
   assert.match(html, /panel\.hidden = false;/);
@@ -2199,7 +2374,7 @@ test("review queue opens changed files with the inline segment review engine", (
   assert.match(html, /\/api\/file\/review-base\?path=/);
   assert.match(html, /data-startup-review-order/);
   assert.match(html, /async function startChangedFileInlineReview\(path, diff, requestId = state\.selectionRequest\)/);
-  assert.match(html, /if \(options\.reviewMode && diff\?\.changed\) await startChangedFileInlineReview\(path, diff, requestId\);/);
+  assert.match(html, /if \(options\.reviewMode && diff\.changed && reviewBaseResult\?\.value\) \{\s*applyChangedFileInlineReview\(path, diff, reviewBaseResult\.value, requestId\);/);
   assert.match(html, /if \(options\.reviewMode\) await startChangedFileInlineReview\(finalPath, \{ changed: true \}, requestId\)/);
   assert.match(html, /source: "review"/);
   assert.match(html, /reviewSessions: \{\}/);
@@ -2237,9 +2412,8 @@ test("review queue opens changed files with the inline segment review engine", (
   assert.match(html, /changes already reviewed · mark verified when ready/);
   assert.match(html, /review\.changeKind === "renamed" \? "renamed file waiting for review"/);
   assert.match(html, /if \(activeExternalChange\(\)\?\.source === "review"\) \{[\s\S]*state\.selectedDiff = await readSelectedDiff\(previousSelected\);[\s\S]*return;[\s\S]*\}/);
-  assert.match(html, /function activeBlockingExternalChange\(\)/);
-  assert.match(html, /return change && change\.source !== "review" \? change : null;/);
-  assert.match(html, /if \(change\.source === "review"\) return false;/);
+  assert.doesNotMatch(html, /function activeBlockingExternalChange\(\)/);
+  assert.doesNotMatch(html, /function blockPendingExternalChange\(/);
   assert.doesNotMatch(html, /shouldAutoReloadCleanStartupDiskChange/);
   assert.doesNotMatch(html, /external startup file reloaded from disk/);
   assert.match(html, /state\.externalChange = \{\s*path: previousSelected,\s*source: "disk",/);
@@ -2531,12 +2705,9 @@ test("disk changes stay pending for review instead of silently reloading the ope
   assert.doesNotMatch(html, /external-review-line-content markdown-view/);
   assert.doesNotMatch(html, /external-change-panel/);
   assert.match(html, /file changed on disk · review before applying/);
-  assert.match(html, /function blockPendingExternalChange/);
-  assert.match(html, /if \(blockPendingExternalChange\(delta < 0 \? "before going back" : "before going forward"\)\) return;/);
-  assert.match(html, /const targetBlockId = closestExternalReviewChangeBlockId\(\);/);
-  assert.match(html, /const focus = \(\) => focusExternalReviewChange\(targetBlockId\) \|\| focusNearestExternalReviewChange\(\);/);
-  assert.match(html, /review the highlighted change/);
-  assert.match(html, /function focusNearestExternalReviewChange\(\)/);
+  assert.doesNotMatch(html, /blockPendingExternalChange/);
+  assert.match(html, /async function goHistory\(delta\) \{[\s\S]*await waitForReviewFinalizationBeforeNavigation\(\);[\s\S]*await selectFile/);
+  assert.match(html, /function goHub\(\) \{[\s\S]*resetExternalChangeState\(\);[\s\S]*showHome\(\);/);
   assert.match(html, /function firstExternalReviewChangeBlockId\(\)/);
   assert.match(html, /return externalReviewChangeElements\(\)\[0\]\?\.dataset\.externalReviewBlock \|\| "";/);
   assert.match(html, /function focusFirstExternalReviewChange\(\)/);
@@ -2545,11 +2716,10 @@ test("disk changes stay pending for review instead of silently reloading the ope
   assert.match(html, /target\.scrollIntoView\(\{ behavior: "smooth", block: "center", inline: "nearest" \}\)/);
   assert.match(html, /\.external-review-block\.attention/);
   assert.match(html, /@keyframes externalReviewAttention/);
-  assert.match(html, /const blockingChange = activeBlockingExternalChange\(\);/);
-  assert.match(html, /if \(!state\.dirty && !blockingChange && !state\.reviewFinalizationPromise\) return;/);
+  assert.match(html, /if \(!state\.dirty\) return;/);
   assert.match(html, /if \(onlyIgnoredReviewMetadataChanged\(state\.saved \|\| "", data\.content\)\) \{/);
   assert.match(html, /setStatus\("last_verified synced"\);/);
-  assert.match(html, /if \(blockingChange\) focusNearestExternalReviewChange\(\);/);
+  assert.doesNotMatch(html, /activeBlockingExternalChange/);
   assert.match(html, /apply or reject before saving/);
   assert.doesNotMatch(html, /setStatus\("reloaded from disk"\);\n  \} catch \(error\) \{\n    setStatus\(error\.message\);\n  \}\n\}/);
 });
@@ -2569,7 +2739,7 @@ test("inline review highlights only changed paragraph fragments", () => {
     "renderMarkdownInline",
     "renderMarkdownLines",
     "finalLineIndexForRow",
-    source + "; return { renderExternalReviewRows, externalReviewIntralineRows, buildIntralineTokenDiff, renderIntralineSegments, renderMergedIntralineSegments };",
+    source + "; return { renderExternalReviewRows, externalReviewIntralineRows, buildIntralineTokenDiff, renderIntralineSegments, renderMergedIntralineSegments, shouldMergeIntralineDiff };",
   )(renderMarkdownInline, renderMarkdownLines, () => null);
 
   const insertion = helpers.buildIntralineTokenDiff(
@@ -2577,6 +2747,9 @@ test("inline review highlights only changed paragraph fragments", () => {
     "The shared key is canonical. A date-only edit is omitted.",
   );
   assert.ok(insertion.similarity >= 0.34);
+  assert.equal(insertion.deletedWords, 0);
+  assert.ok(insertion.changeRatio > 0.25);
+  assert.equal(helpers.shouldMergeIntralineDiff(insertion), true);
   assert.equal(helpers.renderIntralineSegments(insertion.before, "del"), "The shared key is canonical.");
   assert.match(
     helpers.renderIntralineSegments(insertion.after, "add"),
@@ -2637,6 +2810,44 @@ test("inline review highlights only changed paragraph fragments", () => {
   ]);
   assert.match(deletionHtml, /external-review-line add intraline-merged intraline-removal/);
   assert.match(deletionHtml, /Keep this <span class="external-review-token del">obsolete <\/span>detail here\./);
+
+  const shared = "Clear reviews keep the reader oriented while preserving enough surrounding context to understand every proposed documentation change";
+  const largeBefore = shared + " with many old words that make the previous paragraph needlessly long and difficult to scan for a reviewer.";
+  const largeAfter = shared + " with several new terms that make the revised paragraph direct and much easier to verify during review.";
+  const largeDiff = helpers.buildIntralineTokenDiff(largeBefore, largeAfter);
+  assert.ok(largeDiff.similarity >= 0.34);
+  assert.ok(largeDiff.changeRatio > 0.25);
+  assert.ok(largeDiff.deletedWords > 0);
+  assert.ok(largeDiff.addedWords > 0);
+  assert.equal(helpers.shouldMergeIntralineDiff(largeDiff), false);
+  const largeRows = helpers.externalReviewIntralineRows([
+    { type: "del", line: largeBefore },
+    { type: "add", line: largeAfter },
+  ]);
+  assert.equal(largeRows.get(0).hidden, undefined);
+  assert.equal(largeRows.get(0).split, true);
+  assert.equal(largeRows.get(1).split, true);
+  const largeHtml = helpers.renderExternalReviewRows([
+    { type: "del", line: largeBefore },
+    { type: "add", line: largeAfter },
+  ]);
+  assert.equal((largeHtml.match(/intraline-split/g) || []).length, 2);
+  assert.match(largeHtml, /external-review-token del/);
+  assert.match(largeHtml, /external-review-token add/);
+
+  const longShared = Array.from({ length: 75 }, (_item, index) => "stable" + index).join(" ");
+  const longBefore = longShared + " " + Array.from({ length: 12 }, (_item, index) => "old" + index).join(" ");
+  const longAfter = longShared + " " + Array.from({ length: 12 }, (_item, index) => "new" + index).join(" ");
+  const longDiff = helpers.buildIntralineTokenDiff(longBefore, longAfter);
+  assert.ok(longDiff.deletedWords + longDiff.addedWords > 20);
+  assert.ok(longDiff.changeRatio < 0.25);
+  assert.equal(helpers.shouldMergeIntralineDiff(longDiff), true);
+  const longRows = helpers.externalReviewIntralineRows([
+    { type: "del", line: longBefore },
+    { type: "add", line: longAfter },
+  ]);
+  assert.equal(longRows.get(0).hidden, true);
+  assert.equal(longRows.get(1).merged, true);
 });
 
 test("hub child cards expand inline without replacing root sections", () => {

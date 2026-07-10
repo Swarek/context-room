@@ -30,7 +30,7 @@ Context Room is a local browser UI for keeping project context visible, editable
 - Startup context: ancestor agent instruction files from configured filenames.
 - Startup skills: discovered skill folders from configured roots.
 - Startup hooks: AI agent hooks, Git hooks, and hook-manager files.
-- Settings: UI editor for `.context-room/config.json`.
+- Settings: tabbed editor for project configuration plus computer-wide appearance preferences.
 - Agent CLI: queue inspection, navigation, and annotations for coding agents.
 
 Feature-level docs live in [Features](features/index.md).

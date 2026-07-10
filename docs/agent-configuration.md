@@ -10,13 +10,21 @@ context_room:
 
 # Agent configuration guide
 
-Context Room is intentionally configured with one JSON file:
+Project behavior is configured with one JSON file:
 
 ```text
 .context-room/config.json
 ```
 
 That file is the contract between the project owner, the UI, and AI agents. If an agent needs to add a card, create a sub-card, change which folders are watched, or adjust the safe editable surface, it should edit this JSON file and then run `context-room doctor`.
+
+Appearance preferences are shared across every Context Room on the computer and stored separately:
+
+```text
+~/.context-room/preferences.json
+```
+
+Use the Settings screen to change the app theme or `Auto-open Git diff`. Project paths, review rules, scanners, templates, and hub cards remain local to `.context-room/config.json`.
 
 ## Configuration intent checklist
 
@@ -34,6 +42,10 @@ Check intent:
 If those boundaries are right, the exact JSON shape is a mechanical concern.
 
 ## Configuration fields
+
+### Global appearance preferences
+
+`fileTheme` and `autoOpenGitDiff` apply to every Context Room on the computer. The Settings screen writes them to `~/.context-room/preferences.json`; they do not belong in project configuration.
 
 ### `allowedPaths`
 
@@ -200,13 +212,13 @@ context-room brief --task "change billing onboarding"
 context-room start --port 4317
 ```
 
-11. If commits should be blocked until watched docs are verified, install the local Git hook:
+11. To report watched doc changes before commits without blocking, install the local Git hook:
 
 ```bash
 context-room install-hook
 ```
 
-The hook writes `.git/hooks/pre-commit` in the current clone. Git hooks are local and are not committed to the repository, so each developer or agent environment must run this once after cloning.
+The hook writes `.git/hooks/pre-commit` in the current clone and runs the advisory guard. Git hooks are local and are not committed to the repository, so each developer or agent environment must run this once after cloning.
 
 To check what the hook will enforce without committing, run:
 
@@ -214,7 +226,7 @@ To check what the hook will enforce without committing, run:
 context-room guard
 ```
 
-`guard` exits with status `1` when the watched docs review queue is not empty. A blocked commit means someone must open Context Room, inspect the watched-document diffs, and mark the changes verified before committing.
+`guard` is advisory by default and exits with status `0` even when review is pending. `review-only` also reports without blocking; only an explicit `--profile strict` invocation can fail.
 
 ## Agent setup prompt
 
@@ -233,8 +245,8 @@ Goal: make the documentation and agent skills easy to navigate, maintain, and ve
 6. Keep IDs stable and lowercase with dashes.
 7. Prefer structured Markdown templates with `context_room` metadata.
 8. Run `context-room doctor`.
-9. If the project wants commit protection, run `context-room install-hook`.
-10. Run `context-room guard` to verify the watched docs queue is clean or correctly blocking.
+9. If the project wants advisory pre-commit reporting, run `context-room install-hook`.
+10. Run `context-room guard` to inspect the watched docs queue without blocking work.
 11. Optionally run `context-room brief --task "..."` before an agent starts a focused change.
 12. Do not include secrets, .env files, build outputs, node_modules, private exports, or generated artifacts.
 ```

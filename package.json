@@ -1,6 +1,6 @@
 {
   "name": "context-room",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "description": "Local-first documentation control room for AI-assisted projects.",
   "type": "module",
   "homepage": "https://github.com/Swarek/context-room#readme",
@@ -19,6 +19,7 @@
   },
   "files": [
     "bin/",
+    "scripts/",
     "src/",
     "docs/",
     "examples/",
@@ -30,7 +31,8 @@
     "start": "node bin/context-room.mjs start",
     "init": "node bin/context-room.mjs init",
     "doctor": "node bin/context-room.mjs doctor",
-    "test": "node --check src/context_room.mjs && node --check bin/context-room.mjs && node --test test/*.test.mjs",
+    "test": "node --check src/context_room.mjs && node --check bin/context-room.mjs && node --check scripts/update-context-rooms.mjs && node --test test/*.test.mjs",
+    "update:rooms": "node scripts/update-context-rooms.mjs",
     "pack:dry-run": "npm pack --dry-run"
   },
   "keywords": [
