@@ -25,6 +25,9 @@ const MAX_RENAME_SIMILARITY_TOKEN_CHECKS = 2_000_000;
 const UNMERGED_GIT_STATUSES = new Set(["DD", "AU", "UD", "UA", "DU", "AA", "UU"]);
 export const CONFIG_DIR = ".context-room";
 export const CONFIG_FILE = `${CONFIG_DIR}/config.json`;
+export const AGENT_CONTEXT_DIR = `${CONFIG_DIR}/agent-context`;
+export const AGENT_CONTEXT_FILE = `${CONFIG_DIR}/README.md`;
+const LEGACY_AGENT_CONTEXT_FILE = `${AGENT_CONTEXT_DIR}/README.md`;
 export const GLOBAL_PREFERENCES_FILE = "~/.context-room/preferences.json";
 const CONFIG_SCHEMA_URL = "https://raw.githubusercontent.com/Swarek/context-room/main/schemas/config.schema.json";
 const DOCQA_REVIEW_STATE = `${CONFIG_DIR}/review-state.json`;
@@ -138,7 +141,7 @@ export const VISUAL_DOCUMENT_PATTERNS = Object.freeze([
   ...DIAGRAM_VISUAL_DOCUMENT_PATTERNS,
 ]);
 const DEFAULT_FILE_THEME = "context-room";
-const DEFAULT_APPEARANCE = { fileTheme: DEFAULT_FILE_THEME, autoOpenGitDiff: true };
+const DEFAULT_APPEARANCE = { fileTheme: DEFAULT_FILE_THEME, autoOpenGitDiff: true, showHiddenFiles: true };
 const REPORT_CACHE_TTL_MS = 60_000;
 const FILE_TASK_CACHE_TTL_MS = 30_000;
 const BACKGROUND_REPORT_INVALIDATING_PATHS = new Set([
@@ -420,7 +423,6 @@ const ALLOWED_EXTERNAL_PREFIXES = ["~/.hermes/skills/"];
 const SKIP_DIRS = new Set([".git", ".context-room", "node_modules", "__pycache__", ".pytest_cache", "dist", "build"]);
 const PROJECT_EXPLORER_SKIP_DIRS = new Set([
   ".git",
-  ".context-room",
   "node_modules",
   "__pycache__",
   ".pytest_cache",
@@ -498,6 +500,19 @@ const PROJECT_TEXT_FILENAMES = new Set([
   "README",
   "LICENSE",
   "CHANGELOG",
+  ".dockerignore",
+  ".editorconfig",
+  ".eslintignore",
+  ".gitattributes",
+  ".gitignore",
+  ".markdownlintignore",
+  ".node-version",
+  ".npmignore",
+  ".nvmrc",
+  ".prettierignore",
+  ".python-version",
+  ".ruby-version",
+  ".tool-versions",
 ]);
 const SAFE_ENV_SAMPLE_FILENAMES = new Set([".env.example", ".env.sample", ".env.template", ".env.defaults"]);
 
@@ -639,13 +654,13 @@ export function listMemoryFiles(root = process.cwd(), { externalRoots = [] } = {
     .sort((a, b) => categoryRank(a.category) - categoryRank(b.category) || a.path.localeCompare(b.path, "fr"));
 }
 
-export function listExplorerFiles(root = process.cwd(), { externalRoots = [] } = {}) {
+export function listExplorerFiles(root = process.cwd(), { externalRoots = [], showHiddenFiles = true } = {}) {
   const settings = effectiveMemoryWebappSettings(root);
   const byPath = new Map();
   for (const file of listMemoryFiles(root, { externalRoots })) {
     byPath.set(file.path, { ...file, readOnly: false, explorerScope: "allowed" });
   }
-  for (const rel of walkProjectExplorerTextFiles(root)) {
+  for (const rel of walkProjectExplorerTextFiles(root, { showHiddenFiles })) {
     if (byPath.has(rel)) continue;
     const abs = path.join(root, rel);
     const stats = fs.existsSync(abs) ? fs.statSync(abs) : null;
@@ -676,6 +691,7 @@ export function listExplorerFiles(root = process.cwd(), { externalRoots = [] } =
     });
   }
   return [...byPath.values()]
+    .filter((file) => showHiddenFiles || !isHiddenProjectPath(file.path))
     .sort((a, b) => categoryRank(a.category) - categoryRank(b.category) || a.path.localeCompare(b.path, "fr"));
 }
 
@@ -4233,8 +4249,127 @@ export function initializeContextRoomProject(root = process.cwd(), options = {})
   const watchAllow = options.watchAllow?.length ? options.watchAllow : existing.watchAllow?.length ? existing.watchAllow : [];
   const config = normalizeMemoryWebappSettings({ ...createDefaultProjectConfig({ title, allowedPaths, watchAllow }), ...existing, title, allowedPaths, watchAllow });
   const saved = writeMemoryWebappSettings(root, config);
+  const agentContext = syncContextRoomAgentContext(root);
   ensureRuntimeGitExcludes(root);
-  return { config: saved, configPath: path.join(root, MEMORY_WEBAPP_SETTINGS) };
+  return { config: saved, configPath: path.join(root, MEMORY_WEBAPP_SETTINGS), agentContextPath: agentContext.entryPath };
+}
+
+export function syncContextRoomAgentContext(root = process.cwd()) {
+  const projectRoot = path.resolve(root);
+  const sourceRoot = path.resolve(path.dirname(__filename), "..", "docs");
+  const targetRoot = path.join(projectRoot, AGENT_CONTEXT_DIR);
+  const assets = [
+    [path.join(sourceRoot, "features", "html-visual-documents.md"), "html-visual-documents.md"],
+    [path.join(sourceRoot, "features", "html-visual-patterns.md"), "html-visual-patterns.md"],
+    [path.join(sourceRoot, "context-room-visual-components.html"), "context-room-visual-components.html"],
+    [path.join(sourceRoot, "context-room-data-visual-components.html"), "context-room-data-visual-components.html"],
+  ];
+  const missing = assets.filter(([source]) => !fs.existsSync(source)).map(([source]) => source);
+  if (missing.length) throw new Error(`Context Room agent context is incomplete: ${missing.join(", ")}`);
+
+  fs.mkdirSync(targetRoot, { recursive: true });
+  const entry = `# Context Room HTML Visual Context
+
+This file is generated by Context Room. Do not edit it; \`context-room init\` and \`context-room start\` refresh it from the installed version.
+
+## Goal
+
+Create a visual HTML document only when spatial structure makes a complex subject easier to understand or decide. The rendered document must be clear for people and its semantic source must remain precise for agents.
+
+## Workflow
+
+1. Inspect the source truth before designing the page.
+2. State the one question the document must answer.
+3. Use Markdown if prose, bullets, or a short comparison remain equally clear.
+4. Choose one visual family by reasoning job, not appearance.
+5. Build with semantic HTML and injected \`cr-*\` classes.
+6. Verify desktop, mobile, keyboard interaction, and the rendered review preview.
+
+## Choose The Visual
+
+- Parts, boundaries, and exchanges: system landscape.
+- Causes, mechanisms, effects, and feedback: causal chain.
+- Conditions and outcomes: branching decision.
+- Actors, order, and handoffs: actor sequence.
+- Claim, evidence, objection, and conclusion: reasoning map.
+- Exact quantities: use a data pattern only when the numbers answer the question.
+
+Do not diagram a simple idea. Use three to five nodes for a small subject. Split a map above fifteen meaningful nodes or when links obscure the reading path.
+
+## Build The Document
+
+- Start with \`<main class="cr-page">\` and a \`cr-header\` containing a literal title and one-sentence purpose.
+- Use headings, paragraphs, lists, \`section\`, \`article\`, and \`table\` according to meaning.
+- Use \`cr-section\`, \`cr-grid\`, \`cr-comparison\`, \`cr-card\`, \`cr-callout\`, and the catalog patterns instead of inventing repeated layout CSS.
+- Put a diagram inside \`cr-diagram-scroll\` and \`cr-diagram\`. Position nodes with \`--col\`, \`--row\`, \`--span\`, and \`--rows\`.
+- Name every non-obvious relationship. Color and position may reinforce meaning but must never carry it alone.
+- For a large document, state the scenario, decision, and scale before the map; summarize the main reading, risk, and next question after it.
+- Keep labels short and put explanation around the visual or inside optional \`details\` nodes.
+
+## Interaction
+
+- Prefer native radio controls for a few views and \`details\` / \`summary\` for secondary depth.
+- Keep the main conclusion visible without interaction.
+- Give every control a literal label and visible keyboard focus.
+- Do not require hover or animation to understand the document.
+
+Scripts, iframes, and external resources are removed from Context Room previews. Do not copy theme CSS into the file; Context Room injects the active theme and component styles.
+
+## Theme Contract
+
+The rendered HTML automatically follows the active Context Room app theme. Changing the theme in Context Room regenerates the preview with the matching background, surfaces, text, borders, accents, and status colors.
+
+- Prefer injected \`cr-*\` components and \`data-tone="positive|warning|negative|accent"\`.
+- If custom CSS is necessary, use \`--cr-bg\`, \`--cr-surface\`, \`--cr-surface-strong\`, \`--cr-text\`, \`--cr-muted\`, \`--cr-line\`, \`--cr-accent\`, \`--cr-secondary\`, \`--cr-positive\`, \`--cr-negative\`, and \`--cr-code\`.
+- Do not hard-code a page palette, force light or dark mode, or add a theme selector inside the HTML.
+- Keep custom CSS structural. Context Room owns visual theme tokens so the same document stays readable in every available app theme.
+
+## Where To Find HTML Examples
+
+Open these project-local files before building a visual:
+
+- \`.context-room/agent-context/context-room-visual-components.html\`: five complete examples for systems, causality, decisions, sequences, and reasoning.
+- \`.context-room/agent-context/context-room-data-visual-components.html\`: forty examples for metrics, comparisons, charts, timelines, planning, and status.
+
+Read the rendered examples for composition and interaction, then inspect their semantic HTML source to reuse the relevant \`cr-*\` classes. Adapt the content and scale; do not copy an entire example when a smaller structure is enough.
+
+## Quality Gate
+
+- One explicit question is answered.
+- The visual removes real cognitive work instead of decorating prose.
+- Groupings, links, states, and boundaries are named in text.
+- Parallel options contain parallel information.
+- Text stays readable and the page has no global horizontal overflow.
+- Large maps remain full-size inside a bounded, focusable scroll viewport.
+- Mouse and keyboard interactions both work.
+- The HTML appears as a rendered item in the review queue when watched.
+
+## References
+
+- [HTML visual documents](agent-context/html-visual-documents.md): full usage and review contract.
+- [HTML visual patterns](agent-context/html-visual-patterns.md): classes, diagram grammar, and scale rules.
+- [Five diagram examples](agent-context/context-room-visual-components.html): complex ideas and relationships.
+- [Data visual catalog](agent-context/context-room-data-visual-components.html): quantitative and operational patterns.
+`;
+  const legacyEntry = `# Context Room Agent Context
+
+Read [\`.context-room/README.md\`](../README.md) before creating or editing a visual HTML document.
+
+This compatibility file is generated by Context Room.
+`;
+  const files = [
+    [path.join(projectRoot, AGENT_CONTEXT_FILE), entry],
+    [path.join(projectRoot, LEGACY_AGENT_CONTEXT_FILE), legacyEntry],
+  ];
+  for (const [source, fileName] of assets) files.push([path.join(targetRoot, fileName), fs.readFileSync(source, "utf8")]);
+
+  let updated = 0;
+  for (const [target, content] of files) {
+    if (fs.existsSync(target) && fs.readFileSync(target, "utf8") === content) continue;
+    fs.writeFileSync(target, content, "utf8");
+    updated += 1;
+  }
+  return { entryPath: path.join(projectRoot, AGENT_CONTEXT_FILE), files: files.map(([target]) => target), updated };
 }
 
 export function ensureRuntimeGitExcludes(root = process.cwd()) {
@@ -4247,6 +4382,8 @@ export function ensureRuntimeGitExcludes(root = process.cwd()) {
     ".context-room/agent-command.json",
     ".context-room/agent-annotations.json",
     ".context-room/health-acknowledgements.json",
+    ".context-room/README.md",
+    ".context-room/agent-context/",
     ".context-room/review-baselines/",
     ".context-room/memory-webapp-backups/",
   ].map((entry) => prefix + entry);
@@ -4551,6 +4688,7 @@ function normalizeAppearanceSettings(value = {}) {
   return {
     fileTheme: allowed.has(fileTheme) ? fileTheme : DEFAULT_FILE_THEME,
     autoOpenGitDiff: value.autoOpenGitDiff !== false,
+    showHiddenFiles: value.showHiddenFiles !== false,
   };
 }
 
@@ -5130,7 +5268,8 @@ async function routeRequest(req, res, root, globalPreferencesPath = null) {
     const externalRoots = [];
     if (startupSkillFolder && startupSkill) externalRoots.push(startupSkillExplorerRootPath(root, startupSkillFolder, startupSkill));
     if (startupContextOrder) externalRoots.push(startupContextExplorerPath(root, startupContextOrder));
-    sendJson(res, 200, { files: listExplorerFiles(root, { externalRoots }), root });
+    const appearance = readGlobalContextRoomPreferences(globalPreferencesPath).appearance;
+    sendJson(res, 200, { files: listExplorerFiles(root, { externalRoots, showHiddenFiles: appearance.showHiddenFiles !== false }), root });
     return;
   }
   if (req.method === "GET" && url.pathname === "/api/startup-context") {
@@ -5369,7 +5508,7 @@ function isProjectTextFile(relPath) {
   const normalized = normalizeRelPath(String(relPath || ""));
   const base = path.basename(normalized);
   const ext = path.extname(base);
-  return isSensitiveProjectFile(normalized) || PROJECT_TEXT_EXTENSIONS.has(ext) || PROJECT_TEXT_FILENAMES.has(base);
+  return isSensitiveProjectFile(normalized) || SAFE_ENV_SAMPLE_FILENAMES.has(base) || PROJECT_TEXT_EXTENSIONS.has(ext) || PROJECT_TEXT_FILENAMES.has(base);
 }
 
 function fileKindForPath(relPath) {
@@ -5384,7 +5523,8 @@ function fileKindForPath(relPath) {
 function isProjectReadableMemoryPath(relPath, root = process.cwd()) {
   const normalized = normalizeRelPath(String(relPath || ""));
   if (!normalized || normalized.startsWith("../") || normalized.includes("/../") || path.isAbsolute(normalized)) return false;
-  if (normalized.startsWith("~") || isBlockedPath(normalized) || hasSkippedPathSegment(normalized)) return false;
+  const contextRoomRuntime = normalized.startsWith(CONFIG_DIR + "/");
+  if (normalized.startsWith("~") || (isBlockedPath(normalized) && !isSafeEnvSamplePath(normalized)) || (hasSkippedPathSegment(normalized) && !contextRoomRuntime)) return false;
   if (!isProjectTextFile(normalized)) return false;
   const resolvedRoot = path.resolve(root);
   const abs = path.resolve(resolvedRoot, normalized);
@@ -5405,6 +5545,10 @@ function isSensitiveProjectFile(relPath) {
   if (!base.startsWith(".env")) return false;
   if (SAFE_ENV_SAMPLE_FILENAMES.has(base)) return false;
   return base === ".env" || base.startsWith(".env.");
+}
+
+function isSafeEnvSamplePath(relPath) {
+  return SAFE_ENV_SAMPLE_FILENAMES.has(path.basename(normalizeRelPath(String(relPath || ""))));
 }
 
 function readSensitiveProjectFile(root, relPath) {
@@ -5501,7 +5645,7 @@ function walkTextFiles(dir, root, settings = defaultMemoryWebappSettings()) {
   return results;
 }
 
-function walkProjectExplorerTextFiles(root) {
+function walkProjectExplorerTextFiles(root, { showHiddenFiles = true } = {}) {
   const resolvedRoot = path.resolve(root);
   const results = [];
   const walk = (dir) => {
@@ -5518,8 +5662,8 @@ function walkProjectExplorerTextFiles(root) {
       const abs = path.join(dir, entry.name);
       const rel = path.relative(resolvedRoot, abs).replaceAll(path.sep, "/");
       if (!rel || rel.startsWith("../") || rel.includes("/../")) continue;
-      if (entry.name.startsWith(".") && entry.name !== ".github" && !isSensitiveProjectFile(rel)) continue;
-      if (isBlockedPath(rel) && !isSensitiveProjectFile(rel)) continue;
+      if (!showHiddenFiles && entry.name.startsWith(".")) continue;
+      if (isBlockedPath(rel) && !isSensitiveProjectFile(rel) && !isSafeEnvSamplePath(rel)) continue;
       if (entry.isDirectory()) {
         walk(abs);
       } else if (entry.isFile() && isProjectTextFile(rel)) {
@@ -5531,6 +5675,12 @@ function walkProjectExplorerTextFiles(root) {
   };
   walk(resolvedRoot);
   return results;
+}
+
+function isHiddenProjectPath(relPath) {
+  const normalized = normalizeRelPath(String(relPath || ""));
+  if (!normalized || normalized.startsWith("~")) return false;
+  return normalized.split("/").some((part) => part.startsWith(".") && part !== "." && part !== "..");
 }
 
 function walkExternalTextFiles(dir, baseDir, virtualPrefix, settings = defaultMemoryWebappSettings()) {
@@ -6891,6 +7041,9 @@ export function renderAppHtml() {
     .diff-panel, .file-panel { height: 100%; min-height: 0; display: flex; flex-direction: column; }
     .diff-code, .doc-content, .doc-editor, .external-review-doc, .markdown-editor-shell { flex: 1 1 auto; min-height: 0; max-height: none; }
     .doc-content { max-width: 1040px; margin: 0 auto; font-size: 14px; line-height: 1.68; }
+    .file-panel .doc-editor.markdown-view, .file-panel .markdown-editor-input { padding-left: 36px; }
+    .file-panel .doc-editor.markdown-view .markdown-line { position: relative; }
+    .file-panel .doc-editor.markdown-view .markdown-line::before { content: attr(data-line-number); position: absolute; left: -30px; top: 0.18em; width: 22px; color: color-mix(in srgb, var(--file-muted) 42%, transparent); font: 500 9px/1.7 ui-monospace, SFMono-Regular, Menlo, monospace; font-variant-numeric: tabular-nums; text-align: right; user-select: none; pointer-events: none; }
     .confirm-dialog, .mode-toggle, .card, .conflict-card { border-radius: 8px; }
     button.primary, button.secondary { border-radius: 6px; }
     @media (max-width: 1180px) {
@@ -6925,6 +7078,8 @@ export function renderAppHtml() {
       .hub-folder-meta { align-items: start; flex-direction: column; gap: 2px; }
       .startup-context-item { grid-template-columns: 1fr; }
       .diff-code, .doc-content, .doc-editor { padding: 12px; }
+      .file-panel .doc-editor.markdown-view, .file-panel .markdown-editor-input { padding-left: 32px; }
+      .file-panel .doc-editor.markdown-view .markdown-line::before { left: -27px; width: 20px; font-size: 8px; }
       .file-panel header { padding: 8px; }
     }
     body.app-booting .app { visibility: hidden; opacity: 0; pointer-events: none; }
@@ -9707,7 +9862,7 @@ function renderSettingsPanel() {
   const startupHookFileNames = (startupHooks.fileNames || []).join("\n");
   const startupAgentHookSources = formatAgentHookSourcesForTextarea(startupHooks.agentHookSources, startupHooks.agentHookPaths || startupHooks.codexPaths || []);
   const startupHookManagerPaths = (startupHooks.managerPaths || []).join("\n");
-  const appearance = state.settings.appearance || { fileTheme: DEFAULT_FILE_THEME, autoOpenGitDiff: true };
+  const appearance = state.settings.appearance || { fileTheme: DEFAULT_FILE_THEME, autoOpenGitDiff: true, showHiddenFiles: true };
   const markdownTemplates = state.settings.markdownTemplates || [];
   const sections = state.settings.hubSections?.length ? state.settings.hubSections : [{ id: "main", title: "Main", cards: state.settings.customHubCards || state.availableHubCards || [] }];
   const watchCount = (state.settings.watchAllow || []).length;
@@ -9756,12 +9911,13 @@ function renderSettingsPanel() {
   renderSettingsSection({
     id: "appearance",
     kicker: "Appearance",
-    title: "Theme and diff behavior",
+    title: "Theme, files, and diffs",
     copy: "Shared by every Context Room on this computer.",
     scope: "All rooms",
     body: '<div class="settings-grid compact">' +
       '<div class="settings-field"><label for="fileTheme">App theme</label><select id="fileTheme">' + renderFileThemeOptions(appearance.fileTheme) + '</select></div>' +
       '<div class="settings-field"><label class="settings-toggle" for="autoOpenGitDiff"><input id="autoOpenGitDiff" type="checkbox" ' + (appearance.autoOpenGitDiff !== false ? 'checked' : '') + ' /><span class="settings-switch" aria-hidden="true"></span><span class="settings-toggle-copy"><strong>Auto-open Git diff</strong><em>Leave off to open the diff manually.</em></span></label></div>' +
+      '<div class="settings-field"><label class="settings-toggle" for="showHiddenFiles"><input id="showHiddenFiles" type="checkbox" ' + (appearance.showHiddenFiles !== false ? 'checked' : '') + ' /><span class="settings-switch" aria-hidden="true"></span><span class="settings-toggle-copy"><strong>Show hidden files</strong><em>Display safe dotfiles and .context-room in every explorer.</em></span></label></div>' +
     '</div>' + renderSettingsThemePreview(appearance.fileTheme),
   }) +
   renderSettingsSection({
@@ -9898,6 +10054,7 @@ async function saveSettings() {
   const appearance = {
     fileTheme: el("fileTheme")?.value || DEFAULT_FILE_THEME,
     autoOpenGitDiff: el("autoOpenGitDiff")?.checked !== false,
+    showHiddenFiles: el("showHiddenFiles")?.checked !== false,
   };
   const markdownTemplates = collectMarkdownTemplateEditors();
   const hubSections = collectHubSectionEditors();
@@ -9918,10 +10075,19 @@ async function saveSettings() {
     state.hubFolders = result.hubCards || [];
     state.rootHubSections = result.hubSections || [];
     state.hubSections = state.rootHubSections;
-    state.startupContextFiles = (await api("/api/startup-context")).files || [];
-    state.startupSkillFolders = (await api("/api/startup-skills")).folders || [];
-    state.startupHookFiles = (await api("/api/startup-hooks")).files || [];
-    const [docqa, doctor] = await Promise.all([api("/api/docqa"), api("/api/doctor")]);
+    const [filesData, startupContextData, startupSkillsData, startupHooksData, docqa, doctor] = await Promise.all([
+      api(filesApiPath()),
+      api("/api/startup-context"),
+      api("/api/startup-skills"),
+      api("/api/startup-hooks"),
+      api("/api/docqa"),
+      api("/api/doctor"),
+    ]);
+    state.files = filesData.files || state.files;
+    state.startupContextFiles = startupContextData.files || [];
+    state.startupSkillFolders = startupSkillsData.folders || [];
+    state.startupHookFiles = startupHooksData.files || [];
+    renderFiles();
     state.docqa = docqa;
     state.doctor = doctor;
     state.selectedReview = state.docqa.queue[0]?.path || null;
@@ -11565,7 +11731,7 @@ function syncMarkdownEditorScroll() {
 function renderMarkdownLine(line, index, options = {}) {
   const raw = String(line || "");
   const trimmed = raw.trim();
-  const attrs = ' data-line-index="' + index + '"';
+  const attrs = ' data-line-index="' + index + '" data-line-number="' + (index + 1) + '"';
   if (!raw) return '<div class="markdown-line blank"' + attrs + '>&nbsp;</div>';
   const heading = raw.match(/^(\s{0,3})(#{1,6})\s+(.+?)\s*#*\s*$/);
   if (heading && !options.inFence) {

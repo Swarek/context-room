@@ -63,6 +63,7 @@ if (command === "init") {
     preset: args.preset || "generic",
   });
   console.log(`Context Room initialized: ${result.configPath}`);
+  console.log(`Agent HTML context: ${result.agentContextPath}`);
   console.log(`Run: context-room start --root ${root}`);
   process.exit(0);
 }

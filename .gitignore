@@ -5,6 +5,8 @@ npm-debug.log*
 .context-room/agent-command.json
 .context-room/agent-annotations.json
 .context-room/health-acknowledgements.json
+.context-room/README.md
+.context-room/agent-context/
 .context-room/review-ledger.json
 .context-room/review-baselines/
 .context-room/memory-webapp-backups/

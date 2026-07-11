@@ -14,6 +14,17 @@ context_room:
 
 Use HTML when spatial structure makes an idea clearer than prose. Context Room renders it with the active app theme while agents edit the semantic source and users review changes.
 
+Every initialized project exposes a standalone creation guide at `.context-room/README.md`. It covers the workflow, visual selection, structure, interaction, scale, and quality gate, then links to detailed references and catalogs. Give that stable path to an agent before asking it to create or change a visual HTML document. Context Room refreshes the generated files on every `init` and `start`.
+
+## Theme Contract
+
+Context Room injects the active app theme into every HTML preview. Changing the theme regenerates the preview with matching background, surface, text, border, accent, and status tokens.
+
+- Prefer built-in `cr-*` classes and `data-tone` values.
+- Use injected `--cr-*` variables for necessary custom structural CSS.
+- Do not hard-code a page palette, force light or dark mode, or add a second theme selector inside the document.
+- Do not copy Context Room theme CSS into the HTML source.
+
 ## Rules
 
 - Keep one canonical file. Do not repeat the same truth in Markdown and HTML.

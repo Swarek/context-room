@@ -92,6 +92,23 @@ node scripts/update-context-rooms.mjs
 
 Project configuration and review state are preserved. Restarted rooms write logs to `~/.context-room/logs/`.
 
+## Agent HTML Context
+
+Each initialized project contains a stable agent entry point:
+
+```text
+.context-room/README.md
+```
+
+Link an agent to this standalone workflow before asking it to create or edit a visual HTML document. It explains selection, structure, interaction, scale, and quality checks, then links to the detailed catalogs. Context Room refreshes the local files from the installed version on every `init` and `start`; the generated files stay out of Git.
+
+The reusable HTML examples are available directly at:
+
+```text
+.context-room/agent-context/context-room-visual-components.html
+.context-room/agent-context/context-room-data-visual-components.html
+```
+
 ## Minimal Config
 
 ```json

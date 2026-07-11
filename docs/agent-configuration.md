@@ -24,7 +24,7 @@ Appearance preferences are shared across every Context Room on the computer and 
 ~/.context-room/preferences.json
 ```
 
-Use the Settings screen to change the app theme or `Auto-open Git diff`. Project paths, review rules, scanners, templates, and hub cards remain local to `.context-room/config.json`.
+Use the Settings screen to change the app theme, hidden-file visibility, or `Auto-open Git diff`. Project paths, review rules, scanners, templates, and hub cards remain local to `.context-room/config.json`.
 
 ## Configuration intent checklist
 
@@ -45,7 +45,7 @@ If those boundaries are right, the exact JSON shape is a mechanical concern.
 
 ### Global appearance preferences
 
-`fileTheme` and `autoOpenGitDiff` apply to every Context Room on the computer. The Settings screen writes them to `~/.context-room/preferences.json`; they do not belong in project configuration.
+`fileTheme`, `showHiddenFiles`, and `autoOpenGitDiff` apply to every Context Room on the computer. The Settings screen writes them to `~/.context-room/preferences.json`; they do not belong in project configuration.
 
 ### `allowedPaths`
 
@@ -123,6 +123,12 @@ When enabled, Context Room lists matching files from the filesystem root down to
 These files are read-only in Context Room and do not appear in the explorer.
 
 Startup context files outside the Context Room root are not Git-reviewable from the project. Context Room therefore creates a local internal baseline the first time it sees them, then reports later edits in the Changed files to review queue. Opening one of those queue items shows the same inline accept/reject mini-diff flow, and accepting or rejecting the visible changes updates the Context Room baseline for future reviews.
+
+### Generated agent context
+
+Context Room writes its installed HTML visual guidance to `.context-room/`. The stable entry point is `.context-room/README.md`; it is a standalone creation guide and links to the full usage contract, pattern reference, and both visual catalogs in `.context-room/agent-context/`. `context-room init` and `context-room start` refresh these generated files, so agents can use one project-local path without depending on the npm installation location. The generated files are local runtime material and excluded from Git.
+
+The explorer shows safe hidden files, including this generated folder, by default. `Show hidden files` is a computer-wide Appearance preference; disabling it hides dotfiles and dotfolders without changing project configuration or deleting anything.
 
 ### `startupSkills`
 

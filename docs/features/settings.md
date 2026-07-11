@@ -18,7 +18,7 @@ Settings separates project setup from computer-wide preferences without exposing
 
 - `Review`: watched and required-review paths.
 - `Startup`: context, skills, and hook scanners.
-- `Appearance`: global theme and Git diff behavior.
+- `Appearance`: global theme, hidden-file visibility, and Git diff behavior.
 - `Templates`: Markdown document templates.
 - `Hub`: sections, cards, and routing.
 
@@ -27,6 +27,7 @@ Settings separates project setup from computer-wide preferences without exposing
 - Show one category at a time and keep all categories reachable from the tab bar.
 - Keep unsaved field values when switching categories, then save everything once.
 - Label each category as project-scoped or global.
+- Show safe hidden files by default. The global `Show hidden files` preference may hide dotfiles and dotfolders in every explorer.
 - Restore the active category after browser refresh.
 - Keep nested template and hub editors collapsed until selected.
 
