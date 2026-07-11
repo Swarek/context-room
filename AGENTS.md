@@ -4,7 +4,7 @@ context_room:
   scope: context-room
   status: current
   canonical_for: repository agent instructions
-  last_verified: 2026-07-06
+  last_verified: 2026-07-11
   sources: [README.md, docs/product-overview.md, docs/features/index.md, docs/agent-configuration.md, package.json]
 ---
 
@@ -18,6 +18,9 @@ These instructions apply to this repository. Use them for Context Room product, 
 
 - Product/source map: `docs/product-overview.md`.
 - Feature behavior: `docs/features/index.md`, then the relevant feature page.
+- Visual HTML documents: `docs/features/html-visual-documents.md`.
+- Visual pattern contracts: `docs/features/html-visual-patterns.md`.
+- Visual catalogs: `docs/context-room-visual-components.html` and `docs/context-room-data-visual-components.html`.
 - Config contract: `docs/agent-configuration.md` and `schemas/config.schema.json`.
 - CLI entry point: `bin/context-room.mjs`.
 - Main implementation: `src/context_room.mjs`.
@@ -32,6 +35,8 @@ These instructions apply to this repository. Use them for Context Room product, 
 - Replace stale docs instead of adding competing notes.
 - Prefer fewer clearer words in docs and UI copy.
 - Keep Markdown review focused on human-reviewable docs; do not add code or JSON to review paths unless requested.
+- For visual HTML docs, use the injected Context Room components, semantic text, and no scripts or repeated theme CSS.
+- Do not diagram simple ideas. Use the diagram grammar only when several relationships, branches, actors, states, boundaries, or layers become easier to track spatially; use metrics only for genuinely quantitative questions.
 
 ## Implementation Notes
 

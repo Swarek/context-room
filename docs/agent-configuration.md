@@ -4,7 +4,7 @@ context_room:
   scope: context-room
   status: current
   canonical_for: agent configuration
-  last_verified: 2026-07-08
+  last_verified: 2026-07-11
   sources: [bin/context-room.mjs, src/context_room.mjs, schemas/config.schema.json]
 ---
 
@@ -93,7 +93,9 @@ Verified content is recorded in the local Context Room state and in a shared rep
 .context-room/review-ledger.json
 ```
 
-The shared key is the canonical absolute file path. Trust stores the exact content hash plus a review hash that ignores only `context_room.last_verified`. A date-only edit is omitted from review queues and inline diffs. If two Context Rooms watch the same file, one verification is enough until meaningful content changes.
+The shared key is the canonical absolute file path. Trust stores the exact content hash, a review hash that ignores only `context_room.last_verified`, whether the resource was present or absent when reviewed, and the last Git change for an absent path. When Context Room observes a restored path, it clears that deletion trust so a later deletion at the same path requires review again. A date-only edit is omitted from review queues and inline diffs. If two Context Rooms watch the same present file, one verification is enough until meaningful content changes.
+
+When two or more watched files are deleted without being recognized as renames, the webapp groups them into an expandable deletion set. The path list is loaded only when opened, up to 5,000 pending paths at a time. Routine paths start selected; protected or uncertain-history paths start unselected and require an extra acknowledgement when included. A human can narrow the selection and confirm the removals once; the server rejects a stale batch key and revalidates every path before recording its absent state. This action acknowledges files that are already missing and never deletes them.
 
 ### `hubSections`
 

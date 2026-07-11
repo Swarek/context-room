@@ -4,7 +4,7 @@ context_room:
   scope: context-room
   status: current
   canonical_for: features
-  last_verified: 2026-07-06
+  last_verified: 2026-07-11
   sources: [README.md, docs/product-overview.md, bin/context-room.mjs, src/context_room.mjs, schemas/config.schema.json]
 ---
 
@@ -16,6 +16,7 @@ This folder explains Context Room by user-facing feature. Read this when changin
 
 - [Hub and navigation](hub-and-navigation.md)
 - [File explorer and editor](file-explorer-and-editor.md)
+- [HTML visual documents](html-visual-documents.md)
 - [Review queue](review-queue.md)
 - [Startup context](startup-context.md)
 - [Startup skills](startup-skills.md)
@@ -28,5 +29,6 @@ This folder explains Context Room by user-facing feature. Read this when changin
 
 - Config field details live in [Agent configuration guide](../agent-configuration.md).
 - Product/source map lives in [Product overview](../product-overview.md).
+- Visual component contracts live in [HTML visual patterns](html-visual-patterns.md).
 - `Example Flow` sections show one common path, not the full feature surface.
 - This folder should stay feature-focused and short.

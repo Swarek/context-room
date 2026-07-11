@@ -4,6 +4,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { execFileSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import test from "node:test";
 
 import {
@@ -11,7 +12,11 @@ import {
   CONFIG_FILE,
   GLOBAL_PREFERENCES_FILE,
   DEFAULT_MARKDOWN_TEMPLATES,
+  CONCEPT_VISUAL_DOCUMENT_PATTERNS,
+  DATA_VISUAL_DOCUMENT_PATTERNS,
+  DIAGRAM_VISUAL_DOCUMENT_PATTERNS,
   FILE_THEME_OPTIONS,
+  VISUAL_DOCUMENT_PATTERNS,
   acknowledgeContextHealthIssue,
   appendAgentAnnotation,
   applyMarkdownTemplateToFile,
@@ -19,6 +24,7 @@ import {
   buildAgentReviewQueue,
   buildContextRoomDoctorReport,
   buildContextRoomReports,
+  buildDeletedReviewBatch,
   buildDocQaReport,
   buildDocumentationGraph,
   createStartupSkillFile,
@@ -59,6 +65,7 @@ import {
   renderTemplateOptionsMarkup,
   revertMemoryFile,
   writeDocReviewBaseline,
+  writeDeletedReviewBatchDecision,
   writeStartupContextFile,
   writeStartupHookFile,
   writeStartupSkillFile,
@@ -105,7 +112,7 @@ test("app presents a compact review-first workspace", () => {
 
   assert.ok(asideEnd >= 0 && mainStart > asideEnd && dockStart > mainStart);
   assert.match(html, /id="workspaceTitle" class="workspace-title">Context Room<\/div>/);
-  assert.match(html, /<h2>Review queue<\/h2>/);
+  assert.match(html, /<h2 id="reviewQueueHeading" tabindex="-1">Review queue<\/h2>/);
   assert.match(html, /hubDisclosuresOpen:\s*new Set\(\)/);
   assert.match(html, /data-hub-disclosure=/);
   assert.match(html, /@keyframes workbenchGridDrift/);
@@ -122,13 +129,16 @@ test("app reveals one complete initial frame and keeps recurring refreshes in th
   const loadFilesSource = script.slice(script.indexOf("async function loadFiles"), script.indexOf("function reconcileMissingSelectedFile"));
   const diskRefreshSource = script.slice(script.indexOf("async function refreshFromDisk"), script.indexOf("function scheduleBackgroundRefresh"));
 
-  assert.match(loadFilesSource, /const reportsRequest = options\.initial \? api\("\/api\/reports"\) : Promise\.resolve\(null\);/);
+  assert.match(loadFilesSource, /const reportsRequest = options\.initial \? api\("\/api\/reports"\) : null;/);
   assert.match(loadFilesSource, /Promise\.all\(\[api\(filesApiPath\(\)\), api\("\/api\/settings"\)\]\)/);
-  assert.match(loadFilesSource, /const restoreRequest = restoreNavigationAfterInitialLoad\(\);\s*const reports = await reportsRequest;/);
+  assert.match(loadFilesSource, /const restoreRequest = restoreNavigationAfterInitialLoad\(\);\s*const restored = await restoreRequest;/);
   assert.match(loadFilesSource, /const restored = await restoreRequest;/);
-  assert.match(loadFilesSource, /applyBackgroundReportPayload\(reports\);/);
-  assert.match(loadFilesSource, /if \(state\.page === "file" && state\.selected && !state\.openingFilePath\) \{[\s\S]*renderViewer\(\);[\s\S]*restoreEditorViewState\(viewState\);/);
-  assert.match(loadFilesSource, /else if \(!reports\) scheduleBackgroundRefresh\(\{ forceReports: true \}\);/);
+  assert.doesNotMatch(loadFilesSource, /await reportsRequest/);
+  assert.match(loadFilesSource, /else if \(reportsRequest\) applyInitialReportsWhenReady\(reportsRequest\);/);
+  assert.match(script, /function applyInitialReportsWhenReady\(reportsRequest\) \{[\s\S]*reportsRequest\.then\(\(reports\) => \{[\s\S]*requestAnimationFrame\(\(\) => window\.requestAnimationFrame\(\(\) => \{[\s\S]*applyBackgroundReportPayload\(reports\);[\s\S]*renderAfterBackgroundReportPayload\(\);/);
+  assert.match(script, /function renderAfterBackgroundReportPayload\(\) \{[\s\S]*if \(state\.page === "file" && state\.selected && !state\.openingFilePath\) \{[\s\S]*renderViewer\(\);[\s\S]*restoreEditorViewState\(viewState\);/);
+  assert.match(script, /function restoreNavigationAfterInitialLoad\(\)[\s\S]*void openRequest\.then\(\(\) => setStatus\("restored"\)\)/);
+  assert.doesNotMatch(script, /await selectFile\(persisted\.selectedPath, options\)/);
   assert.match(html, /<body class="app-booting">/);
   assert.match(script, /loadFiles\(\{ initial: true \}\)[\s\S]*requestAnimationFrame\(finishInitialBoot\)/);
   assert.match(html, /body\.app-booting \.app \{ visibility: hidden; opacity: 0; pointer-events: none; \}/);
@@ -304,6 +314,18 @@ test("file listing follows project config and does not inject Hermes/LifeOS file
   assert.deepEqual(paths, ["docs/guide.md"]);
   assert.equal(paths.some((item) => item.includes("~/.hermes")), false);
   assert.equal(paths.some((item) => item.includes(".lifeos")), false);
+});
+
+test("HTML documents are listed as visual documents", () => {
+  const root = makeRoot();
+  fs.mkdirSync(path.join(root, "docs"));
+  fs.writeFileSync(path.join(root, "docs", "map.html"), "<!doctype html><html><body><h1>Map</h1></body></html>\n");
+  initializeContextRoomProject(root, { allowedPaths: ["docs/"], watchAllow: ["docs/"] });
+
+  const file = listMemoryFiles(root).find((item) => item.path === "docs/map.html");
+
+  assert.equal(file?.kind, "html");
+  assert.equal(file?.exists, true);
 });
 
 test("explorer listing can show project files outside watched docs as read-only", () => {
@@ -958,6 +980,26 @@ test("shared review ledger verifies the same absolute path and content across ro
   assert.equal(buildDocQaReport(root).queue.some((item) => item.path === "README.md"), true);
 });
 
+test("watched HTML changes enter the review queue", () => {
+  const root = makeRoot();
+  fs.mkdirSync(path.join(root, "docs"));
+  execFileSync("git", ["init"], { cwd: root, stdio: "ignore" });
+  execFileSync("git", ["config", "user.email", "context-room@example.test"], { cwd: root, stdio: "ignore" });
+  execFileSync("git", ["config", "user.name", "Context Room Test"], { cwd: root, stdio: "ignore" });
+  const filePath = path.join(root, "docs", "ideas.html");
+  fs.writeFileSync(filePath, "<!doctype html><html><body><h1>Ideas</h1></body></html>\n");
+  initializeContextRoomProject(root, { allowedPaths: ["docs/"], watchAllow: ["docs/"] });
+  execFileSync("git", ["add", "."], { cwd: root, stdio: "ignore" });
+  execFileSync("git", ["commit", "-m", "initial"], { cwd: root, stdio: "ignore" });
+  fs.writeFileSync(filePath, "<!doctype html><html><body><h1>Ideas</h1><p>New direction.</p></body></html>\n");
+
+  const item = buildDocQaReport(root).queue.find((entry) => entry.path === "docs/ideas.html");
+
+  assert.ok(item);
+  assert.notEqual(item.gitStatus.trim(), "");
+  assert.equal(item.reviewRequired, false);
+});
+
 test("last_verified-only edits preserve local and global review trust", () => {
   const root = makeRoot();
   execFileSync("git", ["init"], { cwd: root, stdio: "ignore" });
@@ -1179,16 +1221,236 @@ test("doc QA infers review-baseline renames for untracked verified docs", () => 
   const item = report.queue.find((entry) => entry.path === "docs/product-overview.md");
   const reviewBase = readReviewBaseFile(root, "docs/product-overview.md");
   const diff = readFileDiff(root, "docs/product-overview.md");
+  const deletionBatch = buildDeletedReviewBatch(root);
 
   assert.ok(item);
   assert.equal(item.oldPath, "docs/app-overview.md");
   assert.equal(item.gitStatus.trim(), "R");
   assert.equal(report.queue.some((entry) => entry.path === "docs/app-overview.md"), false);
+  assert.equal(deletionBatch.items.some((entry) => entry.path === "docs/app-overview.md"), false);
   assert.equal(reviewBase.changeKind, "renamed");
   assert.equal(reviewBase.oldPath, "docs/app-overview.md");
   assert.match(reviewBase.baseContent, /# App Overview/);
   assert.match(diff.patch, /rename from docs\/app-overview\.md/);
   assert.match(diff.patch, /rename to docs\/product-overview\.md/);
+});
+
+test("batch deletion review records absent resources and revalidates every selected path", () => {
+  const root = makeRoot();
+  fs.mkdirSync(path.join(root, "docs"));
+  execFileSync("git", ["init"], { cwd: root, stdio: "ignore" });
+  execFileSync("git", ["config", "user.email", "context-room@example.test"], { cwd: root, stdio: "ignore" });
+  execFileSync("git", ["config", "user.name", "Context Room Test"], { cwd: root, stdio: "ignore" });
+  fs.writeFileSync(path.join(root, "docs/alpha.md"), "# Alpha\n\nLegacy alpha instructions.\n");
+  fs.writeFileSync(path.join(root, "docs/beta.md"), "---\ncontext_room:\n  kind: canonical\n  scope: demo\n  status: current\n  canonical_for: beta\n  sources: []\n---\n\n# Beta\n\nLegacy beta instructions.\n");
+  initializeContextRoomProject(root, { allowedPaths: ["docs/"], watchAllow: ["docs/"] });
+  execFileSync("git", ["add", "."], { cwd: root, stdio: "ignore" });
+  execFileSync("git", ["commit", "-m", "initial"], { cwd: root, stdio: "ignore" });
+  fs.unlinkSync(path.join(root, "docs/alpha.md"));
+  fs.unlinkSync(path.join(root, "docs/beta.md"));
+  fs.writeFileSync(path.join(root, "docs/reworked.md"), "# Reworked\n\nConsolidated architecture and fresh workflow.\n");
+
+  const before = buildDocQaReport(root);
+  const batch = buildDeletedReviewBatch(root);
+
+  assert.equal(before.summary.deletedDocs, 2);
+  assert.equal(before.summary.protectedDeletedDocs, 1);
+  assert.equal(batch.count, 2);
+  assert.equal(batch.protectedCount, 1);
+  assert.deepEqual(batch.items.map((item) => item.path).sort(), ["docs/alpha.md", "docs/beta.md"]);
+
+  const configPath = path.join(root, CONFIG_FILE);
+  const config = JSON.parse(fs.readFileSync(configPath, "utf8"));
+  config.reviewPaths = ["docs/alpha.md"];
+  fs.writeFileSync(configPath, JSON.stringify(config, null, 2) + "\n");
+  const reclassifiedBatch = buildDeletedReviewBatch(root);
+  assert.notEqual(reclassifiedBatch.key, batch.key, "changing protected status must invalidate an already loaded batch");
+  assert.equal(reclassifiedBatch.protectedCount, 2);
+  config.reviewPaths = [];
+  fs.writeFileSync(configPath, JSON.stringify(config, null, 2) + "\n");
+
+  const result = writeDeletedReviewBatchDecision(root, ["docs/alpha.md", "docs/beta.md", "docs/reworked.md"], { protectedAcknowledged: true });
+  assert.deepEqual(result.confirmed.sort(), ["docs/alpha.md", "docs/beta.md"]);
+  assert.equal(result.protectedConfirmed, 1);
+  assert.deepEqual(result.skipped, [{ path: "docs/reworked.md", reason: "not_pending_deletion" }]);
+
+  const localState = JSON.parse(fs.readFileSync(path.join(root, ".context-room/review-state.json"), "utf8"));
+  assert.equal(localState.reviews["docs/alpha.md"].resourceState, "absent");
+  assert.equal(localState.reviews["docs/beta.md"].resourceState, "absent");
+  assert.match(localState.reviews["docs/alpha.md"].resourceVersion, /^git-path:[a-f0-9]{40,64}$/);
+  assert.equal(Object.values(readGlobalReviewLedger(root).reviews).filter((review) => review.resourceState === "absent").length, 2);
+  const after = buildDocQaReport(root);
+  assert.equal(after.summary.deletedDocs, 0);
+  assert.equal(after.queue.some((item) => item.path === "docs/reworked.md"), true);
+
+  fs.writeFileSync(path.join(root, "docs/alpha.md"), "# Alpha\n\nLegacy alpha instructions.\n");
+  buildDocQaReport(root);
+  fs.unlinkSync(path.join(root, "docs/alpha.md"));
+  const deletedAfterRestore = buildDocQaReport(root);
+  assert.equal(deletedAfterRestore.queue.some((item) => item.path === "docs/alpha.md"), true, "restoring a path clears its earlier absent-resource review");
+
+  fs.writeFileSync(path.join(root, "docs/alpha.md"), "");
+  const recreated = buildDocQaReport(root);
+  assert.equal(recreated.queue.some((item) => item.path === "docs/alpha.md"), true, "a present empty file must not inherit an absent-resource review");
+  execFileSync("git", ["add", "docs/alpha.md"], { cwd: root, stdio: "ignore" });
+  execFileSync("git", ["commit", "-m", "recreate alpha"], { cwd: root, stdio: "ignore" });
+  fs.unlinkSync(path.join(root, "docs/alpha.md"));
+  const deletedAgain = buildDocQaReport(root);
+  assert.equal(deletedAgain.queue.some((item) => item.path === "docs/alpha.md"), true, "a later deletion at the same path must receive a new review");
+});
+
+test("deleted review batch exposes the full set beyond the eighty-item queue cap", () => {
+  const root = makeRoot();
+  fs.mkdirSync(path.join(root, "docs"));
+  execFileSync("git", ["init"], { cwd: root, stdio: "ignore" });
+  execFileSync("git", ["config", "user.email", "context-room@example.test"], { cwd: root, stdio: "ignore" });
+  execFileSync("git", ["config", "user.name", "Context Room Test"], { cwd: root, stdio: "ignore" });
+  for (let index = 0; index < 85; index += 1) {
+    fs.writeFileSync(path.join(root, "docs", "legacy-" + String(index).padStart(2, "0") + ".md"), "# Legacy " + index + "\n\nOld source " + index + ".\n");
+  }
+  initializeContextRoomProject(root, { allowedPaths: ["docs/"], watchAllow: ["docs/"] });
+  execFileSync("git", ["add", "."], { cwd: root, stdio: "ignore" });
+  execFileSync("git", ["commit", "-m", "initial"], { cwd: root, stdio: "ignore" });
+  for (const file of fs.readdirSync(path.join(root, "docs"))) fs.unlinkSync(path.join(root, "docs", file));
+
+  const report = buildDocQaReport(root);
+  const batch = buildDeletedReviewBatch(root);
+
+  assert.equal(report.summary.deletedDocs, 85);
+  assert.equal(report.queue.length, 80);
+  assert.equal(batch.count, 85);
+  assert.equal(batch.items.length, 85);
+});
+
+test("deleted review batch protects paths whose historical content cannot be inspected safely", () => {
+  const root = makeRoot();
+  fs.mkdirSync(path.join(root, "docs"));
+  execFileSync("git", ["init"], { cwd: root, stdio: "ignore" });
+  execFileSync("git", ["config", "user.email", "context-room@example.test"], { cwd: root, stdio: "ignore" });
+  execFileSync("git", ["config", "user.name", "Context Room Test"], { cwd: root, stdio: "ignore" });
+  fs.writeFileSync(path.join(root, "docs/large.md"), "# Large\n\n" + "x".repeat(760_000));
+  initializeContextRoomProject(root, { allowedPaths: ["docs/"], watchAllow: ["docs/"] });
+  execFileSync("git", ["add", "."], { cwd: root, stdio: "ignore" });
+  execFileSync("git", ["commit", "-m", "initial"], { cwd: root, stdio: "ignore" });
+  fs.unlinkSync(path.join(root, "docs/large.md"));
+
+  const batch = buildDeletedReviewBatch(root);
+
+  assert.equal(batch.count, 1);
+  assert.equal(batch.protectedCount, 1);
+  assert.equal(batch.items[0].contentUnavailable, true);
+});
+
+test("unmerged deletion conflicts stay individual and out of the deletion batch", () => {
+  const root = makeRoot();
+  initializeContextRoomProject(root, { allowedPaths: ["docs/"], watchAllow: ["docs/"] });
+  const settings = readMemoryWebappSettings(root);
+  const report = buildDocQaReport(root, {
+    gitStatuses: new Map([["docs/conflict.md", { path: "docs/conflict.md", status: "DD", oldPath: null }]]),
+    gitHeadContents: new Map([["docs/conflict.md", "# Conflicted deletion\n"]]),
+    settings,
+    reviewState: { version: 1, reviews: {} },
+    files: [],
+    startupFiles: [],
+  });
+
+  assert.equal(report.summary.deletedDocs, 0);
+  assert.equal(report.queue.length, 1);
+  assert.equal(report.queue[0].path, "docs/conflict.md");
+  assert.equal(report.queue[0].batchDeletion, false);
+  assert.equal(report.queue[0].issues[0].type, "git_conflict");
+});
+
+test("deleted review batch applies its cap after filtering already confirmed removals", () => {
+  const root = makeRoot();
+  fs.mkdirSync(path.join(root, "docs"));
+  execFileSync("git", ["init"], { cwd: root, stdio: "ignore" });
+  execFileSync("git", ["config", "user.email", "context-room@example.test"], { cwd: root, stdio: "ignore" });
+  execFileSync("git", ["config", "user.name", "Context Room Test"], { cwd: root, stdio: "ignore" });
+  const paths = [];
+  for (let index = 0; index < 5002; index += 1) {
+    const relPath = "docs/legacy-" + String(index).padStart(4, "0") + ".md";
+    paths.push(relPath);
+    fs.writeFileSync(path.join(root, relPath), "# Legacy " + index + "\n");
+  }
+  initializeContextRoomProject(root, { allowedPaths: ["docs/"], watchAllow: ["docs/"] });
+  execFileSync("git", ["add", "."], { cwd: root, stdio: "ignore" });
+  execFileSync("git", ["commit", "-m", "initial"], { cwd: root, stdio: "ignore" });
+  const revision = execFileSync("git", ["rev-parse", "HEAD"], { cwd: root, encoding: "utf8" }).trim();
+  for (const relPath of paths) fs.unlinkSync(path.join(root, relPath));
+
+  const emptyHash = createHash("sha256").update("").digest("hex");
+  const reviews = Object.fromEntries(paths.slice(0, 5000).map((relPath) => [relPath, {
+    status: "verified",
+    contentHash: emptyHash,
+    reviewHash: emptyHash,
+    resourceState: "absent",
+    resourceVersion: "git-path:" + revision,
+  }]));
+  fs.writeFileSync(path.join(root, ".context-room/review-state.json"), JSON.stringify({ version: 1, reviews }) + "\n");
+
+  const batch = buildDeletedReviewBatch(root);
+
+  assert.equal(batch.count, 2);
+  assert.equal(batch.truncated, false);
+  assert.deepEqual(batch.items.map((item) => item.path), paths.slice(5000));
+});
+
+test("deleted review batch API lists and confirms the current server-validated set", async (t) => {
+  const root = makeRoot();
+  fs.mkdirSync(path.join(root, "docs"));
+  execFileSync("git", ["init"], { cwd: root, stdio: "ignore" });
+  execFileSync("git", ["config", "user.email", "context-room@example.test"], { cwd: root, stdio: "ignore" });
+  execFileSync("git", ["config", "user.name", "Context Room Test"], { cwd: root, stdio: "ignore" });
+  fs.writeFileSync(path.join(root, "docs/one.md"), "# One\n\nFirst old doc.\n");
+  fs.writeFileSync(path.join(root, "docs/two.md"), "# Two\n\nSecond old doc.\n");
+  initializeContextRoomProject(root, { allowedPaths: ["docs/"], watchAllow: ["docs/"] });
+  execFileSync("git", ["add", "."], { cwd: root, stdio: "ignore" });
+  execFileSync("git", ["commit", "-m", "initial"], { cwd: root, stdio: "ignore" });
+  fs.unlinkSync(path.join(root, "docs/one.md"));
+  fs.unlinkSync(path.join(root, "docs/two.md"));
+  const { server } = createMemoryServer({ root });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  t.after(() => new Promise((resolve) => server.close(resolve)));
+  const baseUrl = `http://127.0.0.1:${server.address().port}`;
+
+  const listed = await (await fetch(baseUrl + "/api/docqa/review-deletions")).json();
+  assert.equal(listed.count, 2);
+
+  const configPath = path.join(root, CONFIG_FILE);
+  const config = JSON.parse(fs.readFileSync(configPath, "utf8"));
+  config.reviewPaths = ["docs/one.md"];
+  fs.writeFileSync(configPath, JSON.stringify(config, null, 2) + "\n");
+  const staleResponse = await fetch(baseUrl + "/api/docqa/review-deletions", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ paths: ["docs/one.md"], key: listed.key, protectedAcknowledged: true }),
+  });
+  assert.equal(staleResponse.status, 409);
+  assert.match((await staleResponse.json()).error, /changed since this batch was loaded/);
+
+  const relisted = await (await fetch(baseUrl + "/api/docqa/review-deletions")).json();
+  assert.notEqual(relisted.key, listed.key);
+  assert.equal(relisted.protectedCount, 1);
+  const unacknowledgedResponse = await fetch(baseUrl + "/api/docqa/review-deletions", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ paths: ["docs/one.md"], key: relisted.key }),
+  });
+  assert.equal(unacknowledgedResponse.status, 400);
+  assert.match((await unacknowledgedResponse.json()).error, /explicit acknowledgement/);
+
+  const confirmed = await (await fetch(baseUrl + "/api/docqa/review-deletions", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ paths: ["docs/one.md", "docs/missing.md"], key: relisted.key, protectedAcknowledged: true }),
+  })).json();
+  assert.deepEqual(confirmed.confirmed, ["docs/one.md"]);
+  assert.deepEqual(confirmed.skipped, [{ path: "docs/missing.md", reason: "not_pending_deletion" }]);
+  assert.equal(confirmed.docqa.summary.deletedDocs, 1);
+
+  const remaining = await (await fetch(baseUrl + "/api/docqa/review-deletions")).json();
+  assert.deepEqual(remaining.items.map((item) => item.path), ["docs/two.md"]);
 });
 
 test("doc QA review queue follows a human docs verification order", () => {
@@ -1346,6 +1608,23 @@ test("file diff counts tracked patch lines without a second Git diff", () => {
   assert.equal(diff.additions, 3);
   assert.equal(diff.deletions, 1);
   assert.match(diff.patch, /\+Extra\./);
+});
+
+test("file diff skips repository-wide work outside Git", () => {
+  const root = makeRoot();
+  fs.writeFileSync(path.join(root, "AGENTS.md"), "# Agents\n");
+  initializeContextRoomProject(root, { allowedPaths: ["AGENTS.md"], watchAllow: ["AGENTS.md"] });
+
+  const diff = readFileDiff(root, "AGENTS.md");
+  const cachedStart = performance.now();
+  const cachedDiff = readFileDiff(root, "AGENTS.md");
+
+  assert.equal(diff.available, false);
+  assert.equal(diff.changed, false);
+  assert.match(diff.reason, /outside a Git repository/);
+  assert.equal(cachedDiff.available, false);
+  assert.ok(performance.now() - cachedStart < 250, "negative Git lookup should be cached");
+  assert.match(readFileDiff.toString(), /if \(!gitTopLevelRoot\(root\)\)/);
 });
 
 test("review base reads HEAD content for changed files from a git subdirectory", () => {
@@ -2231,8 +2510,9 @@ test("browser refresh restores the last Context Room page", () => {
   assert.match(html, /const restoreRequest = restoreNavigationAfterInitialLoad\(\);/);
   assert.match(html, /const restored = await restoreRequest;/);
   assert.match(html, /if \(restored\) \{[\s\S]*scheduleSessionStatePush\(\);[\s\S]*return;/);
-  assert.match(html, /await selectFile\(persisted\.selectedPath, options\);/);
-  assert.match(html, /await selectStartupContextFile\(startup\.order, options\);/);
+  assert.match(html, /openRequest = selectFile\(persisted\.selectedPath, options\);/);
+  assert.match(html, /openRequest = selectStartupContextFile\(startup\.order, options\);/);
+  assert.match(html, /void openRequest\.then\(\(\) => setStatus\("restored"\)\)/);
   assert.match(html, /showSettingsPage\(\);[\s\S]*return true;/);
   assert.match(html, /restorePersistedViewState\(options\.restoreViewState\);/);
   assert.match(html, /if \(typeof options\.diffCollapsed === "boolean"\) state\.diffCollapsed = options\.diffCollapsed;/);
@@ -2245,7 +2525,8 @@ test("file opening renders loading and retry states instead of a blank document"
 
   assert.match(html, /fileLoadError: null/);
   assert.match(html, /state\.fileLoadError = null;/);
-  assert.match(html, /const loadingFile = state\.openingFilePath === state\.selected;/);
+  assert.match(html, /const openingFile = state\.openingFilePath === state\.selected && state\.fileContentReadyPath !== state\.selected;/);
+  assert.match(html, /const loadingFile = openingFile;/);
   assert.match(html, /const loadError = !isStartupFile && state\.fileLoadError\?\.path === state\.selected/);
   assert.match(html, /function renderFileLoadingState\(file = \{\}\)/);
   assert.match(html, /function renderFileActionsLoading\(\)/);
@@ -2275,7 +2556,92 @@ test("file opening renders loading and retry states instead of a blank document"
   assert.doesNotMatch(html, /renderFiles\(\);\s*if \(options\.revealInExplorer\)/);
 });
 
-test("file opening loads dependencies in parallel and renders stable actions once", () => {
+test("HTML files open as sandboxed visual previews without source editing", () => {
+  const html = renderAppHtml();
+
+  assert.match(html, /function isHtmlDocumentPath\(filePath\)/);
+  assert.match(html, /function sanitizedHtmlPreviewDocument\(source\)/);
+  assert.match(html, /doc\.querySelectorAll\("script, iframe, frame, object, embed, base"\)/);
+  assert.match(html, /Content-Security-Policy/);
+  assert.match(html, /default-src 'none'; style-src 'unsafe-inline'/);
+  assert.match(html, /function contextRoomVisualDocumentStyles\(\)/);
+  assert.match(html, /getComputedStyle\(document\.documentElement\)/);
+  assert.match(html, /\["--cr-bg", token\("--file-bg"/);
+  assert.match(html, /\.cr-comparison/);
+  assert.match(html, /\.cr-flow/);
+  assert.match(html, /\.cr-flow \{ display: grid; grid-template-columns: repeat\(4, minmax\(0, 1fr\)\)/);
+  assert.match(html, /@media \(max-width: 760px\)[^\n]*\.cr-flow \{ grid-template-columns: repeat\(2, minmax\(0, 1fr\)\)/);
+  assert.match(html, /\.cr-metrics/);
+  assert.match(html, /\.cr-callout/);
+  assert.match(html, /theme\.setAttribute\("data-context-room-visual-system", currentFileThemeId\(\)\)/);
+  assert.match(html, /doc\.documentElement\.dataset\.contextRoomTheme = currentFileThemeId\(\)/);
+  assert.match(html, /function applyFileTheme\(themeId = currentFileThemeId\(\)\)[\s\S]*document\.querySelector\("iframe\.html-preview-frame"\)[\s\S]*renderViewer\(\);/);
+  assert.match(html, /function renderHtmlDocumentPreview\(text, filePath = state\.selected\)/);
+  assert.match(html, /class="html-preview-frame" sandbox="" referrerpolicy="no-referrer"/);
+  assert.match(html, /isHtmlDocument\s*\? renderHtmlDocumentPreview\(text, file\.path\)/);
+  assert.match(html, /externalChange[\s\S]*isHtmlDocument[\s\S]*renderHtmlDocumentPreview\(externalChange\.diskContent \|\| "", file\.path\)/);
+  assert.match(html, /const visualHtmlReview = isHtmlDocumentPath\(change\.path\);/);
+  assert.match(html, /const jumpAction = summary\.pending && !visualHtmlReview/);
+  assert.match(html, /const bulkActions = summary\.pending && \(visualHtmlReview \|\| summary\.pending > 1 \|\| summary\.pendingLines > 1\)/);
+  assert.match(html, /savable: !isHtmlDocument/);
+  assert.match(html, /savable \? '<button class="file-action primary"/);
+});
+
+test("visual HTML library keeps forty data patterns and exposes five distinct diagram templates", () => {
+  const html = renderAppHtml();
+  const conceptCatalog = fs.readFileSync(new URL("../docs/context-room-visual-components.html", import.meta.url), "utf8");
+  const dataCatalog = fs.readFileSync(new URL("../docs/context-room-data-visual-components.html", import.meta.url), "utf8");
+  const reference = fs.readFileSync(new URL("../docs/features/html-visual-patterns.md", import.meta.url), "utf8");
+  const groups = VISUAL_DOCUMENT_PATTERNS.reduce((result, pattern) => {
+    (result[pattern.group] ||= []).push(pattern);
+    return result;
+  }, {});
+  const conceptCatalogIds = [...conceptCatalog.matchAll(/data-pattern="([^"]+)"/g)].map((match) => match[1]);
+  const dataCatalogIds = [...dataCatalog.matchAll(/data-pattern="([^"]+)"/g)].map((match) => match[1]);
+  const conceptPanels = conceptCatalog.split('<article class="pattern-panel"').slice(1);
+
+  assert.equal(DIAGRAM_VISUAL_DOCUMENT_PATTERNS.length, 5);
+  assert.strictEqual(CONCEPT_VISUAL_DOCUMENT_PATTERNS, DIAGRAM_VISUAL_DOCUMENT_PATTERNS);
+  assert.equal(DATA_VISUAL_DOCUMENT_PATTERNS.length, 40);
+  assert.equal(VISUAL_DOCUMENT_PATTERNS.length, 45);
+  assert.equal(new Set(VISUAL_DOCUMENT_PATTERNS.map((pattern) => pattern.id)).size, 45);
+  assert.equal(new Set(VISUAL_DOCUMENT_PATTERNS.map((pattern) => pattern.className)).size, 45);
+  assert.deepEqual(Object.fromEntries(Object.entries(groups).map(([group, patterns]) => [group, patterns.length])), {
+    "data-summary": 10,
+    "data-comparison": 10,
+    "data-chart": 10,
+    "data-structure": 10,
+    diagram: 5,
+  });
+  assert.deepEqual(conceptCatalogIds, DIAGRAM_VISUAL_DOCUMENT_PATTERNS.map((pattern) => pattern.id));
+  assert.deepEqual(dataCatalogIds, DATA_VISUAL_DOCUMENT_PATTERNS.map((pattern) => pattern.id));
+  assert.equal((conceptCatalog.match(/type="radio"/g) || []).length, 5);
+  assert.ok((conceptCatalog.match(/<details\b/g) || []).length >= 5);
+  assert.equal((conceptCatalog.match(/pattern-demo cr-diagram-scroll" tabindex="0"/g) || []).length, 5);
+  assert.match(conceptCatalog, /--cr-cols: 16/);
+  assert.match(conceptCatalog, /min-width: 1480px/);
+  assert.match(conceptCatalog, /max-height: 720px/);
+  assert.equal(conceptPanels.length, 5);
+  for (const panel of conceptPanels) {
+    assert.ok((panel.match(/class="cr-diagram-node"/g) || []).length >= 10);
+    assert.equal((panel.match(/class="example-brief"/g) || []).length, 1);
+    assert.equal((panel.match(/class="example-reading"/g) || []).length, 1);
+  }
+  assert.match(conceptCatalog, /#view-system:checked ~ \.pattern-panels \[data-panel="system"\]/);
+  assert.match(conceptCatalog, /#view-reasoning:focus-visible ~ \.pattern-tabs label\[for="view-reasoning"\]/);
+  assert.ok(html.includes("details.cr-diagram-node > summary"));
+  assert.ok(html.includes(".cr-diagram-node:has(> summary:focus-visible)"));
+  for (const pattern of VISUAL_DOCUMENT_PATTERNS) {
+    assert.ok(html.includes("." + pattern.className), `missing injected styles for ${pattern.className}`);
+    assert.ok(reference.includes("`." + pattern.className), `missing reference for ${pattern.className}`);
+  }
+  for (const catalog of [conceptCatalog, dataCatalog]) {
+    assert.doesNotMatch(catalog, /<script\b/i);
+    assert.doesNotMatch(catalog, /\b(?:src|href)=["']https?:/i);
+  }
+});
+
+test("file opening shows content before secondary dependencies and keeps actions stable", () => {
   const html = renderAppHtml();
   const selectFileFn = html.match(/async function selectFile\(path, options = \{\}\) \{[\s\S]*?\n\}\n\nasync function selectStartupContextFile/)?.[0] || "";
 
@@ -2284,19 +2650,23 @@ test("file opening loads dependencies in parallel and renders stable actions onc
   assert.match(selectFileFn, /const diffRequest = settleUiRequest\(readDiffForOpen\(path, \{ force: options\.forceReload \}\)\);/);
   assert.match(selectFileFn, /const reviewBaseRequest = options\.reviewMode[\s\S]*settleUiRequest\(readSelectedReviewBase\(path\)\)/);
   assert.match(selectFileFn, /const data = await fileRequest;[\s\S]*await annotationsRequest;/);
+  assert.match(selectFileFn, /state\.fileContentReadyPath = path;\s*renderViewer\(\);\s*restorePersistedViewState\(options\.restoreViewState\);/);
+  assert.match(selectFileFn, /setStatus\("open · loading Git diff\.\.\."\);/);
   assert.match(selectFileFn, /const \[diffResult, reviewBaseResult\] = await Promise\.all\(\[diffRequest, reviewBaseRequest\]\);/);
   assert.match(selectFileFn, /const \[diffResult, reviewBaseResult\] = await Promise\.all\(\[diffRequest, reviewBaseRequest\]\);[\s\S]*?finishOpen\(diffResult, reviewBaseResult\);/);
   assert.doesNotMatch(selectFileFn, /finishOpen\(null, null\)/);
   assert.doesNotMatch(selectFileFn, /diffRequest\.then/);
   assert.doesNotMatch(selectFileFn, /await loadAnnotationsForPath\(path\)[\s\S]*renderViewer\(\);[\s\S]*const loadDiff/);
+  assert.match(selectFileFn, /const contentViewState = captureEditorViewState\(\);/);
+  assert.match(selectFileFn, /state\.openingFilePath = null;\s*state\.fileContentReadyPath = null;/);
+  assert.match(selectFileFn, /restoreEditorViewState\(contentViewState\);/);
   assert.match(html, /function applyChangedFileInlineReview\(path, diff, review, requestId = state\.selectionRequest\)/);
   assert.match(html, /return applyChangedFileInlineReview\(path, diff, review, requestId\);/);
   assert.match(html, /\[data-file-path\], \[data-review-path\], \[data-hub-file\]/);
   assert.match(html, /const diffPromise = api\("\/api\/file\/diff\?path=" \+ encodeURIComponent\(path\)\);/);
   assert.match(html, /document\.addEventListener\("pointerover", \(event\) => schedulePrefetchPathFromTarget\(event\.target\)/);
-  assert.match(html, /workspaceDock\?\.classList\.toggle\("file-opening", fileOpening\);/);
   assert.match(html, /workspaceDock\?\.setAttribute\("aria-busy", fileOpening \? "true" : "false"\);/);
-  assert.match(html, /\.workspace-dock\.file-opening\s*\{\s*visibility:\s*hidden;\s*pointer-events:\s*none;/);
+  assert.doesNotMatch(html, /\.workspace-dock\.file-opening\s*\{[^}]*visibility:\s*hidden/);
 });
 
 test("verification actions are limited to files opened from the review queue", () => {
@@ -2341,6 +2711,49 @@ test("verification actions are limited to files opened from the review queue", (
   assert.match(html, /status === "unverified"/);
   assert.doesNotMatch(html, /selectedFileNeedsReview/);
   assert.doesNotMatch(html, /data-file-verify/);
+});
+
+test("review queue groups removed files into a selectable human-confirmed batch", () => {
+  const html = renderAppHtml();
+
+  assert.match(html, /const groupDeletions = Number\(s\.deletedDocs \|\| 0\) > 1 \|\| state\.deletionBatchItems\.length > 0;/);
+  assert.match(html, /item\.resourceState === "absent"/);
+  assert.match(html, /item\.batchDeletion === true/);
+  assert.match(html, /queue\.filter\(\(item\) => !isDeletedReviewQueueItem\(item\)\)/);
+  assert.match(html, /data-review-deletion-batch/);
+  assert.match(html, /Files removed together/);
+  assert.match(html, /review this cleanup as one change set/);
+  assert.match(html, /data-review-deletion-path/);
+  assert.match(html, /data-review-deletion-select-all/);
+  assert.match(html, /data-review-deletion-confirm/);
+  assert.match(html, /preserveSelection \? previousSelection\.has\(item\.path\) : !item\.protected/);
+  assert.match(html, /checkboxLabel: protectedCount \? "I reviewed the protected paths" : ""/);
+  assert.match(html, /checkboxRequired: Boolean\(protectedCount\)/);
+  assert.match(html, /checkboxRequired \? ' disabled' : ''/);
+  assert.match(html, /data-confirm-accept\]"\)\.disabled = !event\.currentTarget\.checked/);
+  assert.match(html, /state\.deletionBatchKey !== String\(s\.deletedReviewKey \|\| ""\)/);
+  assert.match(html, /const restoreDeletionBatchFocus = Boolean\(loadedBatchChanged/);
+  assert.match(html, /if \(restoreDeletionBatchFocus\) document\.querySelector\("\[data-review-deletion-batch\] > summary"\)\?\.focus\(\);/);
+  assert.match(html, /details\?\.setAttribute\("aria-busy", "true"\)/);
+  assert.match(html, /if \(state\.deletionBatchLoading\) return;/);
+  assert.match(html, /\.review-deletion-body button, \.review-deletion-body input/);
+  assert.match(html, /deletedReviewKey: state\.deletionBatchKey/);
+  assert.match(html, /data-review-deletion-retry/);
+  assert.match(html, /data-review-deletion-batch' \+ detailsOpen \+ detailsBusy/);
+  assert.match(html, /data-review-deletion-select-all' \+ controlsDisabled/);
+  assert.match(html, /api\("\/api\/docqa\/review-deletions"\)/);
+  assert.match(html, /const batchKey = state\.deletionBatchKey;/);
+  assert.match(html, /method: "POST"[\s\S]*JSON\.stringify\(\{ paths, key: batchKey, protectedAcknowledged \}\)/);
+  assert.match(html, /onConfirm: \(\{ checked \}\) => confirmDeletionReviewBatch/);
+  assert.match(html, /These files are already absent\. This records that their removal was intentional; it does not delete files\./);
+  assert.match(html, /if \(result\.docqa\) state\.docqa = result\.docqa;/);
+  assert.match(html, /backdrop\.querySelector\(checkboxRequired \? "\[data-confirm-checkbox\]" : "\[data-confirm-accept\]"\)\?\.focus\(\);/);
+  assert.match(html, /if \(restoreFocus && returnFocus\?\.isConnected\) returnFocus\.focus\(\);/);
+  assert.match(html, /appShell\?\.setAttribute\("inert", ""\)/);
+  assert.match(html, /if \(event\.key !== "Tab"\) return;/);
+  assert.match(html, /document\.querySelector\("\[data-review-deletion-batch\] > summary"\) \|\| el\("reviewQueueHeading"\)/);
+  assert.match(html, /state\.deletionBatchItems\.find\(\(item\) => item\.path === path\)/);
+  assert.match(html, /\.review-deletion-batch \{[^}]*border-left: 3px solid var\(--danger\)/);
 });
 
 test("opening a file never reopens a collapsed explorer", () => {
@@ -2608,13 +3021,13 @@ test("disk changes stay pending for review instead of silently reloading the ope
   assert.match(html, /renderExternalReviewActions/);
   assert.match(html, /const pendingLabel = summary\.pending \? summary\.pending \+ " left" : "saving\.\.\.";/);
   assert.doesNotMatch(html, /const pendingLabel = summary\.pending \? summary\.pending \+ " left" : "reviewed";/);
-  assert.match(html, /const bulkActions = summary\.pending && \(summary\.pending > 1 \|\| summary\.pendingLines > 1\)/);
+  assert.match(html, /const bulkActions = summary\.pending && \(visualHtmlReview \|\| summary\.pending > 1 \|\| summary\.pendingLines > 1\)/);
   assert.match(html, /function updateExternalReviewActionsInPlace\(change = activeExternalChange\(\)\)/);
   assert.match(html, /function renderFileActionItems\(/);
   assert.match(html, /function externalReviewFileActionOptions\(\)/);
   assert.match(html, /renderExternalReviewActions\(externalChange, \{ fileActionOptions: externalReviewFileActionOptions\(\) \}\)/);
   assert.match(html, /blockedByConflict:\s*true/);
-  assert.match(html, /summary\.pending && \(summary\.pending > 1 \|\| summary\.pendingLines > 1\)/);
+  assert.match(html, /summary\.pending && \(visualHtmlReview \|\| summary\.pending > 1 \|\| summary\.pendingLines > 1\)/);
   assert.match(html, /pendingBlock && \(row\.type === "add" \|\| row\.type === "del"\)/);
   assert.match(html, /state\.externalChange = \{[\s\S]*reviewDecisions: \{\},[\s\S]*\};\s*state\.selectedDiff = diff;\s*state\.diffCollapsed = true;/);
   assert.match(html, /state\.openingFilePath = path;[\s\S]*state\.savedHash = data\.contentHash;[\s\S]*state\.openingFilePath = null;/);

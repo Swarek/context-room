@@ -16,6 +16,13 @@ const __filename = fileURLToPath(import.meta.url);
 const DEFAULT_PORT = 4317;
 const MAX_FILE_BYTES = 750_000;
 const PROJECT_EXPLORER_MAX_FILES = 20000;
+const MAX_BATCH_REVIEW_PATHS = 5000;
+const MAX_GIT_HEAD_SNAPSHOT_BYTES = 64_000_000;
+const DELETED_REVIEW_SCAN_CHUNK_PATHS = 250;
+const MAX_RENAME_SIMILARITY_COMPARISONS = 100_000;
+const MAX_RENAME_SIMILARITY_SIGNATURE_BYTES = 16_000_000;
+const MAX_RENAME_SIMILARITY_TOKEN_CHECKS = 2_000_000;
+const UNMERGED_GIT_STATUSES = new Set(["DD", "AU", "UD", "UA", "DU", "AA", "UU"]);
 export const CONFIG_DIR = ".context-room";
 export const CONFIG_FILE = `${CONFIG_DIR}/config.json`;
 export const GLOBAL_PREFERENCES_FILE = "~/.context-room/preferences.json";
@@ -75,6 +82,61 @@ export const FILE_THEME_OPTIONS = [
   { id: "solarized-dark", label: "Solarized Dark", description: "Soft long-read palette" },
   { id: "light-plus", label: "Light Plus", description: "Bright document surface" },
 ];
+export const DATA_VISUAL_DOCUMENT_PATTERNS = Object.freeze([
+  { id: "data-metric-grid", className: "cr-metrics", group: "data-summary" },
+  { id: "data-kpi-grid", className: "cr-kpi-grid", group: "data-summary" },
+  { id: "data-stat-strip", className: "cr-stat-strip", group: "data-summary" },
+  { id: "data-scorecard", className: "cr-scorecard", group: "data-summary" },
+  { id: "data-progress-list", className: "cr-progress-list", group: "data-summary" },
+  { id: "data-bullet-chart", className: "cr-bullet-chart", group: "data-summary" },
+  { id: "data-gauge", className: "cr-gauge", group: "data-summary" },
+  { id: "data-ring", className: "cr-ring", group: "data-summary" },
+  { id: "data-delta-grid", className: "cr-delta-grid", group: "data-summary" },
+  { id: "data-status-summary", className: "cr-status-summary", group: "data-summary" },
+  { id: "data-comparison", className: "cr-comparison", group: "data-comparison" },
+  { id: "data-before-after", className: "cr-before-after", group: "data-comparison" },
+  { id: "data-pros-cons", className: "cr-pros-cons", group: "data-comparison" },
+  { id: "data-decision-matrix", className: "cr-decision-matrix", group: "data-comparison" },
+  { id: "data-feature-matrix", className: "cr-feature-matrix", group: "data-comparison" },
+  { id: "data-quadrant", className: "cr-quadrant", group: "data-comparison" },
+  { id: "data-spectrum", className: "cr-spectrum", group: "data-comparison" },
+  { id: "data-ranking", className: "cr-ranking", group: "data-comparison" },
+  { id: "data-benchmark", className: "cr-benchmark", group: "data-comparison" },
+  { id: "data-distribution", className: "cr-distribution", group: "data-comparison" },
+  { id: "data-bar-chart", className: "cr-bar-chart", group: "data-chart" },
+  { id: "data-grouped-bars", className: "cr-grouped-bars", group: "data-chart" },
+  { id: "data-stacked-bar", className: "cr-stacked-bar", group: "data-chart" },
+  { id: "data-diverging-bars", className: "cr-diverging-bars", group: "data-chart" },
+  { id: "data-lollipop-chart", className: "cr-lollipop-chart", group: "data-chart" },
+  { id: "data-dot-plot", className: "cr-dot-plot", group: "data-chart" },
+  { id: "data-histogram", className: "cr-histogram", group: "data-chart" },
+  { id: "data-sparkline", className: "cr-sparkline", group: "data-chart" },
+  { id: "data-heatmap", className: "cr-heatmap", group: "data-chart" },
+  { id: "data-waterfall", className: "cr-waterfall", group: "data-chart" },
+  { id: "data-timeline", className: "cr-timeline", group: "data-structure" },
+  { id: "data-roadmap", className: "cr-roadmap", group: "data-structure" },
+  { id: "data-swimlane", className: "cr-swimlane", group: "data-structure" },
+  { id: "data-flow", className: "cr-flow", group: "data-structure" },
+  { id: "data-cycle", className: "cr-cycle", group: "data-structure" },
+  { id: "data-funnel", className: "cr-funnel", group: "data-structure" },
+  { id: "data-pyramid", className: "cr-pyramid", group: "data-structure" },
+  { id: "data-tree", className: "cr-tree", group: "data-structure" },
+  { id: "data-dependency-chain", className: "cr-dependency-chain", group: "data-structure" },
+  { id: "data-status-board", className: "cr-status-board", group: "data-structure" },
+]);
+
+export const DIAGRAM_VISUAL_DOCUMENT_PATTERNS = Object.freeze([
+  { id: "system-landscape", className: "cr-system-landscape", group: "diagram" },
+  { id: "causal-chain", className: "cr-causal-chain-map", group: "diagram" },
+  { id: "branching-decision", className: "cr-branching-decision", group: "diagram" },
+  { id: "actor-sequence", className: "cr-actor-sequence", group: "diagram" },
+  { id: "reasoning-map", className: "cr-reasoning-map", group: "diagram" },
+]);
+export const CONCEPT_VISUAL_DOCUMENT_PATTERNS = DIAGRAM_VISUAL_DOCUMENT_PATTERNS;
+export const VISUAL_DOCUMENT_PATTERNS = Object.freeze([
+  ...DATA_VISUAL_DOCUMENT_PATTERNS,
+  ...DIAGRAM_VISUAL_DOCUMENT_PATTERNS,
+]);
 const DEFAULT_FILE_THEME = "context-room";
 const DEFAULT_APPEARANCE = { fileTheme: DEFAULT_FILE_THEME, autoOpenGitDiff: true };
 const REPORT_CACHE_TTL_MS = 60_000;
@@ -89,6 +151,7 @@ const BACKGROUND_REPORT_INVALIDATING_PATHS = new Set([
   "/api/settings",
   "/api/doctor/ack",
   "/api/docqa/review",
+  "/api/docqa/review-deletions",
   "/api/docqa/review-baseline",
   "/api/file/revert",
   "/api/file",
@@ -406,6 +469,7 @@ const PROJECT_TEXT_EXTENSIONS = new Set([
   ".scss",
   ".sass",
   ".html",
+  ".htm",
   ".xml",
   ".sql",
   ".graphql",
@@ -1751,6 +1815,9 @@ export function readFileDiff(root, relPath) {
   if (resolveExternalPath(normalized)) {
     return { path: normalized, changed: false, additions: 0, deletions: 0, patch: "", available: false, reason: "Git diff is unavailable for files outside the repo."};
   }
+  if (!gitTopLevelRoot(root)) {
+    return { path: normalized, changed: false, additions: 0, deletions: 0, patch: "", available: false, reason: "Git diff is unavailable outside a Git repository."};
+  }
   try {
     const statusEntry = readReviewGitStatusEntry(root, normalized);
     const status = statusEntry?.status || "";
@@ -1920,10 +1987,12 @@ function readGitReviewBaseFile(root, normalized, current) {
 }
 
 function readReviewGitStatusEntry(root, normalized) {
+  if (!gitTopLevelRoot(root)) return null;
   const gitEntries = readGitStatusEntries(root);
   const direct = gitEntries.get(normalized) || null;
   if (direct?.oldPath) return direct;
   if (direct && direct.status !== "??" && !direct.status.includes("A")) return direct;
+  if (!direct) return null;
   const settings = readMemoryWebappSettings(root);
   const files = listMemoryFiles(root);
   const reviewState = readDocReviewState(root);
@@ -2072,26 +2141,58 @@ function canonicalReviewAbsolutePath(root, relPath) {
   }
 }
 
-function writeGlobalReviewDecision(root, relPath, file, decision) {
-  const ledger = readGlobalReviewLedger(root);
+function resourceStateForReviewFile(file) {
+  return file?.exists === false ? "absent" : "present";
+}
+
+function resourceVersionForReviewFile(root, relPath, file, review = null) {
+  if (resourceStateForReviewFile(file) === "present") return null;
+  try {
+    const revision = execFileSync("git", ["log", "-1", "--format=%H", "--", normalizeRelPath(relPath)], { cwd: root, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).trim();
+    if (revision) return `git-path:${revision}`;
+  } catch {}
+  const baseline = readDocReviewBaseline(root, relPath, review);
+  if (baseline?.contentHash) return `baseline:${baseline.contentHash}`;
+  return `absent-path:${hashContent(canonicalReviewAbsolutePath(root, relPath))}`;
+}
+
+function reviewResourceIdentityMatches(review, resourceState, resourceVersion = null) {
+  if (!review) return false;
+  const stateMatches = review.resourceState === "present" || review.resourceState === "absent"
+    ? review.resourceState === resourceState
+    : resourceState === "present";
+  if (!stateMatches) return false;
+  if (resourceState === "absent") return Boolean(resourceVersion) && review.resourceVersion === resourceVersion;
+  return true;
+}
+
+function absentReviewDecisionIsCurrent(review, resourceVersion) {
+  if (!review || review.status !== "verified" || !reviewResourceIdentityMatches(review, "absent", resourceVersion)) return false;
+  const emptyContentHash = hashContent("");
+  return review.contentHash === emptyContentHash || review.reviewHash === emptyContentHash;
+}
+
+function applyGlobalReviewDecision(ledger, root, relPath, file, decision) {
   const key = globalReviewKeyFor(root, relPath);
   const contentHash = hashContent(file?.content || "");
   const reviewHash = reviewContentHash(file?.content || "");
+  const resourceState = resourceStateForReviewFile(file);
+  const resourceVersion = decision.resourceVersion ?? resourceVersionForReviewFile(root, relPath, file);
   const existing = ledger.reviews[key];
   if (decision.status !== "verified") {
-    if (existing?.contentHash === contentHash || existing?.reviewHash === reviewHash) {
+    if (reviewResourceIdentityMatches(existing, resourceState, resourceVersion) && (existing?.contentHash === contentHash || existing?.reviewHash === reviewHash)) {
       delete ledger.reviews[key];
-      writeGlobalReviewLedger(root, ledger);
+      return { entry: null, changed: true };
     }
-    return null;
+    return { entry: null, changed: false };
   }
-  if (existing?.status === "verified" && (existing.contentHash === contentHash || existing.reviewHash === reviewHash)) {
-    const current = { ...existing, contentHash, reviewHash };
-    if (existing.contentHash !== contentHash || existing.reviewHash !== reviewHash) {
+  if (existing?.status === "verified" && reviewResourceIdentityMatches(existing, resourceState, resourceVersion) && (existing.contentHash === contentHash || existing.reviewHash === reviewHash)) {
+    const current = { ...existing, contentHash, reviewHash, resourceState, resourceVersion };
+    if (existing.contentHash !== contentHash || existing.reviewHash !== reviewHash || existing.resourceState !== resourceState || existing.resourceVersion !== resourceVersion) {
       ledger.reviews[key] = current;
-      writeGlobalReviewLedger(root, ledger);
+      return { entry: current, changed: true };
     }
-    return current;
+    return { entry: current, changed: false };
   }
   const reviewedAt = decision.reviewedAt || new Date().toISOString();
   const entry = {
@@ -2099,24 +2200,34 @@ function writeGlobalReviewDecision(root, relPath, file, decision) {
     reviewedAt,
     contentHash,
     reviewHash,
+    resourceState,
+    resourceVersion,
     absolutePath: canonicalReviewAbsolutePath(root, relPath),
     relPath: normalizeRelPath(relPath),
     root: path.resolve(root),
     note: String(decision.note || "").slice(0, 500),
   };
   ledger.reviews[key] = entry;
-  writeGlobalReviewLedger(root, ledger);
-  return entry;
+  return { entry, changed: true };
 }
 
-function currentGlobalReviewFor(root, relPath, content) {
+function writeGlobalReviewDecision(root, relPath, file, decision) {
   const ledger = readGlobalReviewLedger(root);
+  const result = applyGlobalReviewDecision(ledger, root, relPath, file, decision);
+  if (result.changed) writeGlobalReviewLedger(root, ledger);
+  return result.entry;
+}
+
+function currentGlobalReviewFor(root, relPath, content, resourceState = "present", resourceVersion = null, providedLedger = null) {
+  const ledger = providedLedger || readGlobalReviewLedger(root);
   const entry = ledger.reviews[globalReviewKeyFor(root, relPath)];
   const contentHash = hashContent(content);
   const reviewHash = reviewContentHash(content);
-  if (!entry || entry.status !== "verified" || (entry.contentHash !== contentHash && entry.reviewHash !== reviewHash)) return null;
+  if (!entry || entry.status !== "verified" || !reviewResourceIdentityMatches(entry, resourceState, resourceVersion) || (entry.contentHash !== contentHash && entry.reviewHash !== reviewHash)) return null;
   return {
     ...entry,
+    resourceState,
+    resourceVersion,
     status: "verified",
     current: true,
     global: true,
@@ -2154,8 +2265,10 @@ function readDocReviewBaseline(root, relPath, review = null) {
 export function writeDocReviewBaseline(root, relPath, { note = "" } = {}) {
   const file = readReviewTrackedFile(root, relPath);
   const normalized = file.path;
+  const resourceState = resourceStateForReviewFile(file);
   const state = readDocReviewState(root);
   const existing = state.reviews[normalized] && typeof state.reviews[normalized] === "object" ? state.reviews[normalized] : {};
+  const resourceVersion = resourceVersionForReviewFile(root, normalized, file, existing);
   const baseline = writeDocReviewBaselineFile(root, normalized, file.content);
   const next = {
     ...existing,
@@ -2163,6 +2276,8 @@ export function writeDocReviewBaseline(root, relPath, { note = "" } = {}) {
     baselineHash: baseline.baselineHash,
     baselineReviewHash: baseline.baselineReviewHash,
     baselineAt: baseline.baselineAt,
+    resourceState,
+    resourceVersion,
   };
   if (note) next.note = String(note || "").slice(0, 500);
   state.reviews[normalized] = next;
@@ -2170,16 +2285,21 @@ export function writeDocReviewBaseline(root, relPath, { note = "" } = {}) {
   return { path: normalized, ...next };
 }
 
-export function writeDocReviewDecision(root, relPath, { status, note = "" } = {}) {
+export function writeDocReviewDecision(root, relPath, { status, note = "", expectedResourceState = null, expectedResourceVersion = null } = {}) {
   const file = readReviewTrackedFile(root, relPath);
   const normalized = file.path;
-  const allowedStatuses = new Set(["verified", "needs_changes", "snoozed"]);
+  const resourceState = resourceStateForReviewFile(file);
   const state = readDocReviewState(root);
+  const existing = state.reviews[normalized] && typeof state.reviews[normalized] === "object" ? state.reviews[normalized] : null;
+  const resourceVersion = resourceVersionForReviewFile(root, normalized, file, existing);
+  if (expectedResourceState && resourceState !== expectedResourceState) throw new Error(`Review target changed before the decision was saved: ${normalized}`);
+  if (expectedResourceVersion && resourceVersion !== expectedResourceVersion) throw new Error(`Review target version changed before the decision was saved: ${normalized}`);
+  const allowedStatuses = new Set(["verified", "needs_changes", "snoozed"]);
   if (status === "unverified") {
     delete state.reviews[normalized];
     writeDocReviewState(root, state);
     writeGlobalReviewDecision(root, normalized, file, { status: "unverified" });
-    return { path: normalized, status: "unverified", note: "", reviewedAt: new Date().toISOString(), contentHash: hashContent(file.content), reviewHash: reviewContentHash(file.content) };
+    return { path: normalized, status: "unverified", note: "", reviewedAt: new Date().toISOString(), contentHash: hashContent(file.content), reviewHash: reviewContentHash(file.content), resourceState, resourceVersion };
   }
   if (!allowedStatuses.has(status)) throw new Error(`Invalid review status: ${status}`);
   const baseline = writeDocReviewBaselineFile(root, normalized, file.content);
@@ -2189,6 +2309,8 @@ export function writeDocReviewDecision(root, relPath, { status, note = "" } = {}
     reviewedAt: new Date().toISOString(),
     contentHash: hashContent(file.content),
     reviewHash: reviewContentHash(file.content),
+    resourceState,
+    resourceVersion,
     baselinePath: baseline.baselinePath,
     baselineHash: baseline.baselineHash,
     baselineReviewHash: baseline.baselineReviewHash,
@@ -2438,7 +2560,7 @@ function clampNumber(value, min, max) {
   return Math.max(min, Math.min(max, number));
 }
 
-function currentReviewFor(root, reviews, relPath, content) {
+function currentReviewFor(root, reviews, relPath, content, resourceState = "present", resourceVersion = null, globalReviewLedger = null) {
   const review = reviews[relPath] || null;
   const contentHash = hashContent(content);
   const reviewHash = reviewContentHash(content);
@@ -2446,25 +2568,28 @@ function currentReviewFor(root, reviews, relPath, content) {
     const baseline = readDocReviewBaseline(root, relPath, review);
     const baselineReviewHash = review.baselineReviewHash || baseline?.reviewHash || null;
     const semanticCurrent = review.reviewHash === reviewHash || baselineReviewHash === reviewHash;
-    const explicitCurrent = review.contentHash === contentHash || semanticCurrent;
-    const inlineBaselineCurrent = !review.status && review.note === "inline review applied" && (review.baselineHash === contentHash || baselineReviewHash === reviewHash);
+    const resourceCurrent = reviewResourceIdentityMatches(review, resourceState, resourceVersion);
+    const explicitCurrent = resourceCurrent && (review.contentHash === contentHash || semanticCurrent);
+    const inlineBaselineCurrent = resourceCurrent && !review.status && review.note === "inline review applied" && (review.baselineHash === contentHash || baselineReviewHash === reviewHash);
     let local = {
       ...review,
+      resourceState,
+      resourceVersion,
       status: review.status || (inlineBaselineCurrent ? "verified" : undefined),
       current: explicitCurrent || inlineBaselineCurrent,
     };
     if (local.current && local.status !== "verified") return local;
     if (local.current && local.status === "verified") {
-      if (review.status === "verified" && (review.contentHash !== contentHash || review.reviewHash !== reviewHash || review.baselineReviewHash !== baselineReviewHash)) {
-        local = { ...local, contentHash, reviewHash, baselineReviewHash };
-        reviews[relPath] = { ...review, contentHash, reviewHash, baselineReviewHash };
+      if (review.status === "verified" && (review.contentHash !== contentHash || review.reviewHash !== reviewHash || review.baselineReviewHash !== baselineReviewHash || review.resourceState !== resourceState || review.resourceVersion !== resourceVersion)) {
+        local = { ...local, contentHash, reviewHash, baselineReviewHash, resourceState, resourceVersion };
+        reviews[relPath] = { ...review, contentHash, reviewHash, baselineReviewHash, resourceState, resourceVersion };
         try { writeDocReviewState(root, { version: 1, reviews }); } catch {}
       }
-      try { writeGlobalReviewDecision(root, relPath, { content }, local); } catch {}
+      try { writeGlobalReviewDecision(root, relPath, { content, exists: resourceState === "present" }, local); } catch {}
       return local;
     }
   }
-  return currentGlobalReviewFor(root, relPath, content);
+  return currentGlobalReviewFor(root, relPath, content, resourceState, resourceVersion, globalReviewLedger);
 }
 
 function hashContent(content) {
@@ -2501,14 +2626,15 @@ function reviewContentHash(content) {
   return hashContent(reviewIdentityContent(content));
 }
 
-function meaningfulGitStatusForReview(root, relPath, gitEntry, content, reviews = {}, gitHeadContents = null) {
+function meaningfulGitStatusForReview(root, relPath, gitEntry, content, reviews = {}, gitHeadContents = null, resourceState = "present") {
   const status = gitEntry?.status || "";
   if (!status.trim()) return "";
   if (gitEntry?.oldPath || gitEntry?.inferredRename || gitEntry?.baselineRename || !/^[ M]{2}$/.test(status) || !status.includes("M")) return status;
   try {
     const review = reviews[relPath] || null;
     const baseline = readDocReviewBaseline(root, relPath, review);
-    const baseContent = baseline?.content ?? (gitHeadContents?.has(relPath) ? gitHeadContents.get(relPath) : readGitHeadFileContent(root, relPath));
+    if (baseline && !reviewResourceIdentityMatches(review, resourceState, resourceState === "absent" ? resourceVersionForReviewFile(root, relPath, { exists: false }, review) : null)) return status;
+    const baseContent = baseline?.content ?? (gitHeadContents instanceof Map ? gitHeadContents.get(relPath) || "" : readGitHeadFileContent(root, relPath));
     if (reviewContentHash(baseContent) === reviewContentHash(content)) return "";
   } catch {}
   return status;
@@ -3171,17 +3297,28 @@ export function buildContextRoomDoctorReport(root = process.cwd(), options = {})
   };
 }
 
-export function buildContextRoomReports(root = process.cwd()) {
+function readDocQaSnapshot(root) {
   const settings = readMemoryWebappSettings(root);
   const files = listMemoryFiles(root);
   const gitEntries = readGitStatusEntries(root);
   const gitHeadContents = readGitHeadFileContents(root, [...gitEntries.values()].flatMap((entry) => [entry.path, entry.oldPath]).filter(Boolean));
-  const gitStatuses = new Map([...gitEntries.entries()].map(([rel, entry]) => [rel, entry.status]));
   const reviewState = readDocReviewState(root);
   const startupFiles = listStartupContextFiles(root, settings);
+  return { settings, files, gitEntries, gitHeadContents, reviewState, startupFiles };
+}
+
+function buildDocQaReportFromSnapshot(root, snapshot = readDocQaSnapshot(root)) {
+  const { settings, files, gitEntries, gitHeadContents, reviewState, startupFiles } = snapshot;
+  return buildDocQaReport(root, { settings, files, gitStatuses: gitEntries, gitHeadContents, reviewState, startupFiles });
+}
+
+export function buildContextRoomReports(root = process.cwd()) {
+  const snapshot = readDocQaSnapshot(root);
+  const { settings, files, gitEntries, startupFiles } = snapshot;
+  const gitStatuses = new Map([...gitEntries.entries()].map(([rel, entry]) => [rel, entry.status]));
   const startupHooks = listStartupHookFiles(root, settings);
   const startupSkills = listStartupSkillFolders(root, settings);
-  const docqa = buildDocQaReport(root, { settings, files, gitStatuses: gitEntries, gitHeadContents, reviewState, startupFiles });
+  const docqa = buildDocQaReportFromSnapshot(root, snapshot);
   const graph = buildDocumentationGraph(root, { settings, files, gitStatuses, startupFiles, startupHooks });
   const doctor = buildContextRoomDoctorReport(root, { settings, graph, docqa });
   return {
@@ -3298,16 +3435,36 @@ export function computeDocIssues({ path: relPath, content = "", gitStatus = "", 
   return issues;
 }
 
+function invalidateAbsentReviewsForPresentFiles(root, reviewState, files) {
+  const presentPaths = new Set(files.filter((file) => file.exists !== false).map((file) => file.path));
+  let localChanged = false;
+  for (const [relPath, review] of Object.entries(reviewState.reviews || {})) {
+    if (review?.resourceState !== "absent" || !presentPaths.has(relPath)) continue;
+    delete reviewState.reviews[relPath];
+    localChanged = true;
+  }
+  if (localChanged) writeDocReviewState(root, reviewState);
+  const ledger = readGlobalReviewLedger(root);
+  let ledgerChanged = false;
+  for (const [key, review] of Object.entries(ledger.reviews || {})) {
+    if (review?.resourceState !== "absent" || !review.absolutePath || !fs.existsSync(review.absolutePath)) continue;
+    delete ledger.reviews[key];
+    ledgerChanged = true;
+  }
+  if (ledgerChanged) writeGlobalReviewLedger(root, ledger);
+}
+
 export function buildDocQaReport(root = process.cwd(), options = {}) {
   const gitStatuses = options.gitStatuses || readGitStatusEntries(root);
   const gitHeadContents = options.gitHeadContents || null;
   const reviewState = options.reviewState || readDocReviewState(root);
   const settings = options.settings || readMemoryWebappSettings(root);
   const files = options.files || listMemoryFiles(root);
+  invalidateAbsentReviewsForPresentFiles(root, reviewState, files);
   const startupFiles = options.startupFiles || listStartupContextFiles(root, settings);
   const { inferredRenames, renamedDeletedPaths } = inferGitRenames(root, gitStatuses, files, settings, gitHeadContents);
-  const { inferredRenames: inferredBaselineRenames } = inferReviewBaselineRenames(root, reviewState, gitStatuses, files, settings);
-  const filePaths = new Set(files.map((file) => file.path));
+  const { inferredRenames: inferredBaselineRenames, renamedDeletedPaths: baselineRenamedDeletedPaths } = inferReviewBaselineRenames(root, reviewState, gitStatuses, files, settings);
+  const allRenamedDeletedPaths = new Set([...renamedDeletedPaths, ...baselineRenamedDeletedPaths]);
   const gitQueue = files.map((file) => {
     const classification = classifyDocPath(file.path);
     const gitEntry = inferredRenames.get(file.path) || inferredBaselineRenames.get(file.path) || gitStatuses.get(file.path) || null;
@@ -3316,24 +3473,47 @@ export function buildDocQaReport(root = process.cwd(), options = {}) {
     if (!rawGitStatus.trim() && !reviewRequired) return null;
     const abs = resolveExternalPath(file.path) || path.join(root, file.path);
     const content = file.exists && fs.existsSync(abs) && file.bytes <= MAX_FILE_BYTES ? fs.readFileSync(abs, "utf8") : "";
-    const gitStatus = meaningfulGitStatusForReview(root, file.path, gitEntry, content, reviewState.reviews, gitHeadContents);
-    const review = currentReviewFor(root, reviewState.reviews, file.path, content);
+    const gitStatus = meaningfulGitStatusForReview(root, file.path, gitEntry, content, reviewState.reviews, gitHeadContents, file.exists === false ? "absent" : "present");
+    const resourceState = file.exists === false ? "absent" : "present";
+    const resourceVersion = resourceVersionForReviewFile(root, file.path, file, reviewState.reviews[file.path] || null);
+    const review = currentReviewFor(root, reviewState.reviews, file.path, content, resourceState, resourceVersion);
     if (!gitStatus.trim() && !reviewRequired) return null;
     const metadata = parseDocMetadata(content, file.path);
     const issues = computeDocIssues({ path: file.path, content, gitStatus, metadata });
     const riskScore = riskScoreFor({ classification, issues, gitStatus });
-    return { path: file.path, oldPath: gitEntry?.oldPath || null, inferredRename: Boolean(gitEntry?.inferredRename), label: file.label, summary: file.summary, updatedAt: file.updatedAt, classification, metadata, gitStatus, reviewRequired, issues, riskScore, review };
+    return { path: file.path, oldPath: gitEntry?.oldPath || null, inferredRename: Boolean(gitEntry?.inferredRename), label: file.label, summary: file.summary, updatedAt: file.updatedAt, classification, metadata, gitStatus, reviewRequired, issues, riskScore, review, resourceState };
   }).filter(Boolean
   ).filter((item) => item.gitStatus.trim() || item.reviewRequired
   ).filter((item) => isWatchedPath(item.path, settings) || item.reviewRequired
   ).filter((item) => !(item.review?.status === "verified" && item.review.current));
-  const deletedQueue = [...gitStatuses.values()]
-    .filter((entry) => entry.status.includes("D") && !entry.status.includes("R"))
-    .filter((entry) => !filePaths.has(entry.path) && !renamedDeletedPaths.has(entry.path))
-    .filter((entry) => isWatchedPath(entry.path, settings) || isRequiredReviewPath(entry.path, settings))
-    .map((entry) => buildDeletedReviewQueueItem(root, entry, settings, reviewState))
-    .filter((item) => !(item.review?.status === "verified" && item.review.current));
-  const queue = [...gitQueue, ...deletedQueue, ...buildStartupContextReviewQueue(root, settings, reviewState, startupFiles)]
+  const deletedPage = buildDeletedReviewPage(root, {
+    gitStatuses,
+    gitHeadContents,
+    settings,
+    reviewState,
+    files,
+    renamedDeletedPaths: allRenamedDeletedPaths,
+  });
+  const deletedQueue = deletedPage.items;
+  const unmergedDeletedQueue = buildPendingDeletedReviewItems(root, {
+    gitStatuses,
+    gitHeadContents,
+    settings,
+    reviewState,
+    files,
+    renamedDeletedPaths: new Set(),
+    unmergedOnly: true,
+    ignoreReviewTrust: true,
+    limit: 80,
+  }).map((item) => ({
+    ...item,
+    summary: "Unmerged deletion conflict.",
+    batchDeletion: false,
+    protected: true,
+    riskScore: item.riskScore + 90,
+    issues: [{ type: "git_conflict", severity: "critical", message: "Unmerged Git deletion conflict requires individual review." }, ...item.issues],
+  }));
+  const queue = [...gitQueue, ...deletedQueue, ...unmergedDeletedQueue, ...buildStartupContextReviewQueue(root, settings, reviewState, startupFiles)]
   .sort((a, b) => reviewSeverityRank(a) - reviewSeverityRank(b)
     || reviewOrderRank(a.path) - reviewOrderRank(b.path)
     || b.riskScore - a.riskScore
@@ -3345,6 +3525,9 @@ export function buildDocQaReport(root = process.cwd(), options = {}) {
       changedDocs: queue.filter((item) => item.gitStatus.trim()).length,
       needsReview: queue.length,
       requiredReview: queue.filter((item) => item.reviewRequired && !item.gitStatus.trim()).length,
+      deletedDocs: deletedQueue.length + (deletedPage.truncated ? 1 : 0),
+      protectedDeletedDocs: deletedQueue.filter((item) => item.protected).length,
+      deletedReviewKey: deletedReviewBatchKey(deletedQueue),
       critical: queue.filter((item) => item.issues.some((issue) => issue.severity === "critical")).length,
       high: queue.filter((item) => item.issues.some((issue) => issue.severity === "high")).length,
       prompts: files.filter((file) => classifyDocPath(file.path).type === "prompt").length,
@@ -3358,24 +3541,65 @@ function inferGitRenames(root, gitStatuses, files, settings, gitHeadContents = n
   const inferredRenames = new Map();
   const renamedDeletedPaths = new Set();
   const filesByPath = new Map(files.map((file) => [file.path, file]));
-  const deleted = [...gitStatuses.values()].filter((entry) => entry.status.includes("D") && !entry.status.includes("R") && isWatchedPath(entry.path, settings));
+  const deleted = [...gitStatuses.values()].filter((entry) => entry.status.includes("D") && !entry.status.includes("R") && !isUnmergedGitStatus(entry.status) && isWatchedPath(entry.path, settings));
   const added = [...gitStatuses.values()].filter((entry) => (entry.status === "??" || entry.status.includes("A")) && filesByPath.has(entry.path) && isWatchedPath(entry.path, settings));
+  if (!deleted.length || !added.length) return { inferredRenames, renamedDeletedPaths };
+  const deletedByExtension = new Map();
+  const exactDeleted = new Map();
+  const addedCountByExtension = new Map();
+  const deletedCountByExtension = new Map();
+  for (const entry of added) {
+    const extension = path.extname(entry.path).toLowerCase();
+    addedCountByExtension.set(extension, (addedCountByExtension.get(extension) || 0) + 1);
+  }
+  for (const entry of deleted) {
+    const extension = path.extname(entry.path).toLowerCase();
+    deletedCountByExtension.set(extension, (deletedCountByExtension.get(extension) || 0) + 1);
+  }
+  const fuzzyAllowedByExtension = new Map([...deletedCountByExtension].map(([extension, count]) => [
+    extension,
+    count * (addedCountByExtension.get(extension) || 0) <= MAX_RENAME_SIMILARITY_COMPARISONS,
+  ]));
+  let signatureBytesRemaining = MAX_RENAME_SIMILARITY_SIGNATURE_BYTES;
+  let tokenChecksRemaining = MAX_RENAME_SIMILARITY_TOKEN_CHECKS;
+  for (const entry of deleted) {
+    const content = gitHeadContents instanceof Map
+      ? gitHeadContents.get(entry.path) || ""
+      : readGitHeadFileContent(root, entry.path);
+    if (!content) continue;
+    const extension = path.extname(entry.path).toLowerCase();
+    if (!deletedByExtension.has(extension)) deletedByExtension.set(extension, []);
+    const includeWords = fuzzyAllowedByExtension.get(extension) === true && content.length <= signatureBytesRemaining;
+    if (includeWords) signatureBytesRemaining -= content.length;
+    const candidate = { entry, signature: renameSimilaritySignature(content, { includeWords }) };
+    deletedByExtension.get(extension).push(candidate);
+    appendExactRenameCandidate(exactDeleted, extension, candidate.signature.hash, candidate);
+  }
   for (const entry of added) {
     const file = filesByPath.get(entry.path);
     if (!file?.exists || file.bytes > MAX_FILE_BYTES) continue;
     const currentAbs = path.join(root, file.path);
     if (!fs.existsSync(currentAbs) || !fs.statSync(currentAbs).isFile()) continue;
     const currentContent = fs.readFileSync(currentAbs, "utf8");
+    const extension = path.extname(entry.path).toLowerCase();
+    const includeWords = fuzzyAllowedByExtension.get(extension) === true && currentContent.length <= signatureBytesRemaining;
+    if (includeWords) signatureBytesRemaining -= currentContent.length;
+    const currentSignature = renameSimilaritySignature(currentContent, { includeWords });
+    const deletedCandidates = deletedByExtension.get(extension) || [];
     let best = null;
-    for (const deletedEntry of deleted) {
-      if (renamedDeletedPaths.has(deletedEntry.path)) continue;
-      if (path.extname(deletedEntry.path).toLowerCase() !== path.extname(entry.path).toLowerCase()) continue;
-      const baseContent = gitHeadContents?.has(deletedEntry.path)
-        ? gitHeadContents.get(deletedEntry.path)
-        : readGitHeadFileContent(root, deletedEntry.path);
-      if (!baseContent) continue;
-      const score = renameSimilarityScore(baseContent, currentContent, deletedEntry.path, entry.path);
-      if (!best || score > best.score) best = { entry: deletedEntry, score };
+    const exactCandidate = nextExactRenameCandidate(exactDeleted, extension, currentSignature.hash, renamedDeletedPaths, (candidate) => candidate.entry.path);
+    if (exactCandidate) {
+      best = { entry: exactCandidate.entry, score: 1 };
+    } else if (fuzzyAllowedByExtension.get(extension) === true && currentSignature.words) {
+      for (const candidate of deletedCandidates) {
+        if (renamedDeletedPaths.has(candidate.entry.path)) continue;
+        if (!renameSimilarityLengthsCanMatch(candidate.signature, currentSignature)) continue;
+        const tokenCost = renameSimilarityTokenCost(candidate.signature, currentSignature);
+        if (!Number.isFinite(tokenCost) || tokenCost > tokenChecksRemaining) continue;
+        tokenChecksRemaining -= tokenCost;
+        const score = renameSimilarityScoreFromSignatures(candidate.signature, currentSignature, candidate.entry.path, entry.path);
+        if (!best || score > best.score) best = { entry: candidate.entry, score };
+      }
     }
     if (!best || best.score < 0.72) continue;
     inferredRenames.set(entry.path, { ...entry, status: "R ", oldPath: best.entry.path, inferredRename: true });
@@ -3395,56 +3619,222 @@ function inferReviewBaselineRenames(root, reviewState, gitStatuses, files, setti
     const gitStatus = gitStatuses.get(file.path)?.status || "";
     return gitStatus === "??" || gitStatus.includes("A") || isRequiredReviewPath(file.path, settings);
   });
+  const baselinesByExtension = new Map();
+  const exactBaselines = new Map();
+  const candidateCountByExtension = new Map();
+  const potentialBaselineCountByExtension = new Map();
+  for (const file of candidates) {
+    const extension = path.extname(file.path).toLowerCase();
+    candidateCountByExtension.set(extension, (candidateCountByExtension.get(extension) || 0) + 1);
+  }
+  for (const oldPath of Object.keys(reviewState.reviews || {})) {
+    const normalizedOldPath = normalizeRelPath(oldPath);
+    if (!normalizedOldPath || currentPaths.has(normalizedOldPath)) continue;
+    if (!isWatchedPath(normalizedOldPath, settings) && !isRequiredReviewPath(normalizedOldPath, settings)) continue;
+    const extension = path.extname(normalizedOldPath).toLowerCase();
+    potentialBaselineCountByExtension.set(extension, (potentialBaselineCountByExtension.get(extension) || 0) + 1);
+  }
+  const fuzzyAllowedByExtension = new Map([...potentialBaselineCountByExtension].map(([extension, count]) => [
+    extension,
+    count * (candidateCountByExtension.get(extension) || 0) <= MAX_RENAME_SIMILARITY_COMPARISONS,
+  ]));
+  let signatureBytesRemaining = MAX_RENAME_SIMILARITY_SIGNATURE_BYTES;
+  let tokenChecksRemaining = MAX_RENAME_SIMILARITY_TOKEN_CHECKS;
+  if (candidates.length) {
+    for (const [oldPath, review] of Object.entries(reviewState.reviews || {})) {
+      const normalizedOldPath = normalizeRelPath(oldPath);
+      if (!normalizedOldPath || currentPaths.has(normalizedOldPath)) continue;
+      if (!isWatchedPath(normalizedOldPath, settings) && !isRequiredReviewPath(normalizedOldPath, settings)) continue;
+      const baseline = readDocReviewBaseline(root, normalizedOldPath, review);
+      if (!baseline?.content) continue;
+      const extension = path.extname(normalizedOldPath).toLowerCase();
+      if (!baselinesByExtension.has(extension)) baselinesByExtension.set(extension, []);
+      const includeWords = fuzzyAllowedByExtension.get(extension) === true && baseline.content.length <= signatureBytesRemaining;
+      if (includeWords) signatureBytesRemaining -= baseline.content.length;
+      const candidate = { oldPath: normalizedOldPath, signature: renameSimilaritySignature(baseline.content, { includeWords }) };
+      baselinesByExtension.get(extension).push(candidate);
+      appendExactRenameCandidate(exactBaselines, extension, candidate.signature.hash, candidate);
+    }
+  }
 
   for (const file of candidates) {
     const currentAbs = resolveExternalPath(file.path) || path.join(root, file.path);
     if (!fs.existsSync(currentAbs) || !fs.statSync(currentAbs).isFile()) continue;
     const currentContent = fs.readFileSync(currentAbs, "utf8");
+    const extension = path.extname(file.path).toLowerCase();
+    const includeWords = fuzzyAllowedByExtension.get(extension) === true && currentContent.length <= signatureBytesRemaining;
+    if (includeWords) signatureBytesRemaining -= currentContent.length;
+    const currentSignature = renameSimilaritySignature(currentContent, { includeWords });
+    const baselineCandidates = baselinesByExtension.get(extension) || [];
     let best = null;
-    for (const [oldPath, review] of Object.entries(reviewState.reviews || {})) {
-      const normalizedOldPath = normalizeRelPath(oldPath);
-      if (!normalizedOldPath || usedOldPaths.has(normalizedOldPath) || currentPaths.has(normalizedOldPath)) continue;
-      if (path.extname(normalizedOldPath).toLowerCase() !== path.extname(file.path).toLowerCase()) continue;
-      if (!isWatchedPath(normalizedOldPath, settings) && !isRequiredReviewPath(normalizedOldPath, settings)) continue;
-      const baseline = readDocReviewBaseline(root, normalizedOldPath, review);
-      if (!baseline?.content) continue;
-      const score = renameSimilarityScore(baseline.content, currentContent, normalizedOldPath, file.path);
-      if (!best || score > best.score) best = { oldPath: normalizedOldPath, score };
+    const exactCandidate = nextExactRenameCandidate(exactBaselines, extension, currentSignature.hash, usedOldPaths, (candidate) => candidate.oldPath);
+    if (exactCandidate) {
+      best = { oldPath: exactCandidate.oldPath, score: 1 };
+    } else if (fuzzyAllowedByExtension.get(extension) === true && currentSignature.words) {
+      for (const candidate of baselineCandidates) {
+        if (usedOldPaths.has(candidate.oldPath)) continue;
+        if (!renameSimilarityLengthsCanMatch(candidate.signature, currentSignature)) continue;
+        const tokenCost = renameSimilarityTokenCost(candidate.signature, currentSignature);
+        if (!Number.isFinite(tokenCost) || tokenCost > tokenChecksRemaining) continue;
+        tokenChecksRemaining -= tokenCost;
+        const score = renameSimilarityScoreFromSignatures(candidate.signature, currentSignature, candidate.oldPath, file.path);
+        if (!best || score > best.score) best = { oldPath: candidate.oldPath, score };
+      }
     }
     if (!best || best.score < 0.72) continue;
     inferredRenames.set(file.path, { path: file.path, status: "R ", oldPath: best.oldPath, inferredRename: true, baselineRename: true });
     usedOldPaths.add(best.oldPath);
   }
-  return { inferredRenames };
+  return { inferredRenames, renamedDeletedPaths: usedOldPaths };
 }
 
 function renameSimilarityScore(baseContent, currentContent, oldPath, nextPath) {
-  if (hashContent(baseContent) === hashContent(currentContent)) return 1;
+  return renameSimilarityScoreFromSignatures(
+    renameSimilaritySignature(baseContent),
+    renameSimilaritySignature(currentContent),
+    oldPath,
+    nextPath,
+  );
+}
+
+function appendExactRenameCandidate(index, extension, hash, candidate) {
+  const key = `${extension}\0${hash}`;
+  if (!index.has(key)) index.set(key, { cursor: 0, items: [] });
+  index.get(key).items.push(candidate);
+}
+
+function nextExactRenameCandidate(index, extension, hash, usedPaths, pathForCandidate) {
+  const queue = index.get(`${extension}\0${hash}`);
+  if (!queue) return null;
+  while (queue.cursor < queue.items.length && usedPaths.has(pathForCandidate(queue.items[queue.cursor]))) queue.cursor += 1;
+  return queue.items[queue.cursor] || null;
+}
+
+function renameSimilaritySignature(content, { includeWords = true } = {}) {
+  const text = String(content || "");
+  return { hash: hashContent(text), length: text.length, words: includeWords ? wordSetForRenameSimilarity(text) : null };
+}
+
+function renameSimilarityLengthsCanMatch(base, current) {
+  if (base.hash === current.hash) return true;
+  const lengthRatio = Math.min(base.length, current.length) / Math.max(base.length, current.length, 1);
+  return lengthRatio >= 0.6;
+}
+
+function renameSimilarityScoreFromSignatures(base, current, oldPath, nextPath) {
+  if (base.hash === current.hash) return 1;
   const sameParent = path.dirname(oldPath) === path.dirname(nextPath);
-  const baseWords = wordSetForRenameSimilarity(baseContent);
-  const currentWords = wordSetForRenameSimilarity(currentContent);
-  if (baseWords.size < 3 || currentWords.size < 3) return 0;
+  if (!base.words || !current.words || base.words.size < 3 || current.words.size < 3) return 0;
+  const smallerWords = base.words.size <= current.words.size ? base.words : current.words;
+  const largerWords = smallerWords === base.words ? current.words : base.words;
   let shared = 0;
-  for (const word of baseWords) if (currentWords.has(word)) shared += 1;
-  const union = new Set([...baseWords, ...currentWords]).size || 1;
-  const lengthRatio = Math.min(baseContent.length, currentContent.length) / Math.max(baseContent.length, currentContent.length, 1);
+  for (const word of smallerWords) if (largerWords.has(word)) shared += 1;
+  const union = base.words.size + current.words.size - shared || 1;
+  const lengthRatio = Math.min(base.length, current.length) / Math.max(base.length, current.length, 1);
   const score = (shared / union) * Math.min(1, lengthRatio * 1.2);
   return sameParent ? score : score * 0.82;
+}
+
+function renameSimilarityTokenCost(base, current) {
+  if (!base.words || !current.words) return Number.POSITIVE_INFINITY;
+  return Math.min(base.words.size, current.words.size);
 }
 
 function wordSetForRenameSimilarity(content) {
   return new Set(String(content || "").toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "").match(/[a-z0-9_/-]{3,}/g) || []);
 }
 
-function buildDeletedReviewQueueItem(root, entry, settings, reviewState) {
-  const content = readGitHeadFileContent(root, entry.path);
+function isUnmergedGitStatus(status = "") {
+  return UNMERGED_GIT_STATUSES.has(String(status || "").trim());
+}
+
+function buildPendingDeletedReviewItems(root, options = {}) {
+  const gitStatuses = options.gitStatuses || readGitStatusEntries(root);
+  const settings = options.settings || readMemoryWebappSettings(root);
+  const reviewState = options.reviewState || readDocReviewState(root);
+  const files = options.files || listMemoryFiles(root);
+  const filePaths = new Set(files.map((file) => file.path));
+  const limit = Number.isFinite(options.limit) ? Math.max(0, Number(options.limit)) : null;
+  const unmergedOnly = options.unmergedOnly === true;
+  const deletedEntries = [...gitStatuses.values()]
+    .filter((entry) => entry.status.includes("D") && !entry.status.includes("R"))
+    .filter((entry) => unmergedOnly ? isUnmergedGitStatus(entry.status) : !isUnmergedGitStatus(entry.status))
+    .filter((entry) => !filePaths.has(entry.path))
+    .filter((entry) => isWatchedPath(entry.path, settings) || isRequiredReviewPath(entry.path, settings));
+  const providedGitHeadContents = options.gitHeadContents instanceof Map ? options.gitHeadContents : null;
+  const hasPossibleRenameAdditions = [...gitStatuses.values()].some((entry) => (entry.status === "??" || entry.status.includes("A")) && filePaths.has(entry.path));
+  const renameGitHeadContents = providedGitHeadContents
+    || (hasPossibleRenameAdditions ? readGitHeadFileContents(root, deletedEntries.map((entry) => entry.path)) : new Map());
+  const renameInferenceUncertainPaths = hasPossibleRenameAdditions
+    ? new Set(deletedEntries.filter((entry) => !renameGitHeadContents.has(entry.path)).map((entry) => entry.path))
+    : new Set();
+  let renamedDeletedPaths = options.renamedDeletedPaths;
+  if (!(renamedDeletedPaths instanceof Set)) {
+    const gitRenamedDeletedPaths = inferGitRenames(root, gitStatuses, files, settings, renameGitHeadContents).renamedDeletedPaths;
+    const baselineRenamedDeletedPaths = inferReviewBaselineRenames(root, reviewState, gitStatuses, files, settings).renamedDeletedPaths;
+    renamedDeletedPaths = new Set([...gitRenamedDeletedPaths, ...baselineRenamedDeletedPaths]);
+  }
+  const candidates = deletedEntries.filter((entry) => !renamedDeletedPaths.has(entry.path));
+  const maxPending = limit == null ? Number.POSITIVE_INFINITY : limit;
+  const globalReviewLedger = options.globalReviewLedger || readGlobalReviewLedger(root);
+  const pending = [];
+  for (let start = 0; start < candidates.length && pending.length < maxPending; start += DELETED_REVIEW_SCAN_CHUNK_PATHS) {
+    const chunk = candidates.slice(start, start + DELETED_REVIEW_SCAN_CHUNK_PATHS);
+    const chunkPaths = chunk.map((entry) => entry.path);
+    const resourceVersions = options.resourceVersions instanceof Map
+      ? options.resourceVersions
+      : readGitPathLastChangeRevisions(root, chunkPaths);
+    const pendingChunk = chunk.filter((entry) => {
+      const resourceVersion = resourceVersions.get(entry.path)
+        || resourceVersionForReviewFile(root, entry.path, { exists: false }, reviewState.reviews[entry.path] || null);
+      const localCurrent = !options.ignoreReviewTrust && absentReviewDecisionIsCurrent(reviewState.reviews[entry.path], resourceVersion);
+      const globalCurrent = !options.ignoreReviewTrust && absentReviewDecisionIsCurrent(globalReviewLedger.reviews[globalReviewKeyFor(root, entry.path)], resourceVersion);
+      return !localCurrent && !globalCurrent;
+    });
+    if (!pendingChunk.length) continue;
+    const chunkGitHeadContents = providedGitHeadContents || new Map();
+    if (!providedGitHeadContents) {
+      const missingPaths = [];
+      for (const relPath of pendingChunk.map((entry) => entry.path)) {
+        if (renameGitHeadContents.has(relPath)) chunkGitHeadContents.set(relPath, renameGitHeadContents.get(relPath));
+        else missingPaths.push(relPath);
+      }
+      const additionalContents = readGitHeadFileContents(root, missingPaths);
+      for (const [relPath, content] of additionalContents) chunkGitHeadContents.set(relPath, content);
+    }
+    for (const entry of pendingChunk) {
+      let item = buildDeletedReviewQueueItem(root, entry, settings, reviewState, chunkGitHeadContents, resourceVersions, globalReviewLedger);
+      if (renameInferenceUncertainPaths.has(entry.path)) item = { ...item, protected: true, renameInferenceUncertain: true };
+      if (!options.ignoreReviewTrust && item.review?.status === "verified" && item.review.current) continue;
+      pending.push(item);
+      if (pending.length >= maxPending) break;
+    }
+  }
+  return pending.sort((a, b) => reviewSeverityRank(a) - reviewSeverityRank(b)
+    || reviewOrderRank(a.path) - reviewOrderRank(b.path)
+    || b.riskScore - a.riskScore
+    || a.path.localeCompare(b.path, "fr"));
+}
+
+function isProtectedDeletedReviewItem(item) {
+  return Boolean(item.reviewRequired
+    || item.classification?.sensitive
+    || ["critical", "high"].includes(item.classification?.authority)
+    || (item.metadata?.present && ["agents", "canonical", "procedure"].includes(item.metadata?.kind))
+    || item.issues?.some((issue) => ["critical", "high"].includes(issue.severity)));
+}
+
+function buildDeletedReviewQueueItem(root, entry, settings, reviewState, gitHeadContents = null, resourceVersions = null, globalReviewLedger = null) {
+  const contentAvailable = !(gitHeadContents instanceof Map) || gitHeadContents.has(entry.path);
+  const content = gitHeadContents instanceof Map ? gitHeadContents.get(entry.path) || "" : readGitHeadFileContent(root, entry.path);
   const classification = classifyDocPath(entry.path);
   const metadata = parseDocMetadata(content, entry.path);
   const issues = computeDocIssues({ path: entry.path, content, gitStatus: entry.status, metadata });
   const riskScore = riskScoreFor({ classification, issues, gitStatus: entry.status });
   const reviewRequired = isRequiredReviewPath(entry.path, settings);
-  const review = currentReviewFor(root, reviewState.reviews, entry.path, "");
-  return {
+  const resourceVersion = resourceVersions?.get(entry.path) || resourceVersionForReviewFile(root, entry.path, { exists: false }, reviewState.reviews[entry.path] || null);
+  const review = currentReviewFor(root, reviewState.reviews, entry.path, "", "absent", resourceVersion, globalReviewLedger);
+  const item = {
     path: entry.path,
     oldPath: null,
     label: path.basename(entry.path),
@@ -3457,7 +3847,138 @@ function buildDeletedReviewQueueItem(root, entry, settings, reviewState) {
     issues,
     riskScore,
     review,
+    resourceVersion,
+    resourceState: "absent",
+    batchDeletion: true,
+    contentUnavailable: !contentAvailable,
   };
+  return { ...item, protected: !contentAvailable || isProtectedDeletedReviewItem(item) };
+}
+
+function publicDeletedReviewBatchItem(item) {
+  return {
+    path: item.path,
+    label: item.label,
+    protected: Boolean(item.protected),
+    contentUnavailable: Boolean(item.contentUnavailable),
+    renameInferenceUncertain: Boolean(item.renameInferenceUncertain),
+    reviewRequired: Boolean(item.reviewRequired),
+    kind: item.metadata?.kind || "unknown",
+    authority: item.classification?.authority || "low",
+  };
+}
+
+function deletedReviewBatchKey(items = []) {
+  return hashContent(items.slice(0, MAX_BATCH_REVIEW_PATHS).map((item) => [
+    item.path,
+    item.resourceVersion || "",
+    item.gitStatus || "",
+    item.protected ? "protected" : "standard",
+    item.reviewRequired ? "required" : "optional",
+  ].join("\0")).join("\n"));
+}
+
+export function buildDeletedReviewBatch(root = process.cwd()) {
+  const { items, truncated } = buildDeletedReviewPage(root);
+  return {
+    generatedAt: new Date().toISOString(),
+    count: items.length,
+    protectedCount: items.filter((item) => item.protected).length,
+    key: deletedReviewBatchKey(items),
+    truncated,
+    items: items.map(publicDeletedReviewBatchItem),
+  };
+}
+
+function buildDeletedReviewPage(root, options = {}) {
+  const pending = buildPendingDeletedReviewItems(root, { ...options, limit: MAX_BATCH_REVIEW_PATHS + 1 });
+  return {
+    items: pending.slice(0, MAX_BATCH_REVIEW_PATHS),
+    truncated: pending.length > MAX_BATCH_REVIEW_PATHS,
+  };
+}
+
+export function writeDeletedReviewBatchDecision(root, relPaths = [], {
+  note = "batch deletion confirmed from Context Room review queue",
+  expectedKey = null,
+  protectedAcknowledged = false,
+} = {}) {
+  if (!Array.isArray(relPaths) || relPaths.length === 0) throw new Error("No deleted review paths selected");
+  if (relPaths.length > MAX_BATCH_REVIEW_PATHS) throw new Error(`Too many deleted review paths selected (maximum ${MAX_BATCH_REVIEW_PATHS})`);
+  const requested = [];
+  const invalid = [];
+  const seen = new Set();
+  for (const rawPath of relPaths) {
+    const normalized = normalizeRelPath(String(rawPath || ""));
+    if (!normalized || normalized.startsWith("../") || normalized.includes("/../") || path.isAbsolute(normalized)) {
+      invalid.push({ path: String(rawPath || ""), reason: "invalid_path" });
+      continue;
+    }
+    if (seen.has(normalized)) continue;
+    seen.add(normalized);
+    requested.push(normalized);
+  }
+  if (!requested.length) return { requested: relPaths.length, confirmed: [], protectedConfirmed: 0, skipped: invalid };
+  const candidateItems = buildDeletedReviewPage(root).items;
+  const currentKey = deletedReviewBatchKey(candidateItems);
+  if (expectedKey != null && String(expectedKey) !== currentKey) {
+    const error = new Error("Removed files changed since this batch was loaded. Reload the set before confirming it.");
+    error.statusCode = 409;
+    throw error;
+  }
+  const candidates = new Map(candidateItems.map((item) => [item.path, item]));
+  if (!protectedAcknowledged && requested.some((relPath) => candidates.get(relPath)?.protected)) {
+    const error = new Error("Protected removed paths require explicit acknowledgement.");
+    error.statusCode = 400;
+    throw error;
+  }
+  const currentResourceVersions = readGitPathLastChangeRevisions(root, requested);
+  const confirmed = [];
+  const skipped = [...invalid];
+  let protectedConfirmed = 0;
+  const reviewedAt = new Date().toISOString();
+  const cleanNote = String(note || "").slice(0, 500);
+  const state = readDocReviewState(root);
+  const ledger = readGlobalReviewLedger(root);
+  let ledgerChanged = false;
+  for (const relPath of requested) {
+    const candidate = candidates.get(relPath);
+    if (!candidate) {
+      skipped.push({ path: relPath, reason: "not_pending_deletion" });
+      continue;
+    }
+    try {
+      const file = readReviewTrackedFile(root, relPath);
+      const existing = state.reviews[relPath] && typeof state.reviews[relPath] === "object" ? state.reviews[relPath] : null;
+      const resourceState = resourceStateForReviewFile(file);
+      const resourceVersion = currentResourceVersions.get(relPath) || resourceVersionForReviewFile(root, relPath, file, existing);
+      if (resourceState !== "absent" || resourceVersion !== candidate.resourceVersion) throw new Error(`Review target changed before the decision was saved: ${relPath}`);
+      const baseline = writeDocReviewBaselineFile(root, relPath, file.content);
+      const decision = {
+        status: "verified",
+        note: cleanNote,
+        reviewedAt,
+        contentHash: hashContent(file.content),
+        reviewHash: reviewContentHash(file.content),
+        resourceState,
+        resourceVersion,
+        baselinePath: baseline.baselinePath,
+        baselineHash: baseline.baselineHash,
+        baselineReviewHash: baseline.baselineReviewHash,
+        baselineAt: baseline.baselineAt,
+      };
+      state.reviews[relPath] = decision;
+      const globalResult = applyGlobalReviewDecision(ledger, root, relPath, file, decision);
+      ledgerChanged = ledgerChanged || globalResult.changed;
+      confirmed.push(relPath);
+      if (candidate.protected) protectedConfirmed += 1;
+    } catch (error) {
+      skipped.push({ path: relPath, reason: "state_changed", message: error.message });
+    }
+  }
+  if (confirmed.length) writeDocReviewState(root, state);
+  if (ledgerChanged) writeGlobalReviewLedger(root, ledger);
+  return { requested: requested.length, confirmed, protectedConfirmed, skipped };
 }
 
 function readGitHeadFileContent(root, relPath) {
@@ -3468,35 +3989,96 @@ function readGitHeadFileContent(root, relPath) {
   }
 }
 
-function readGitHeadFileContents(root, relPaths = []) {
+function readGitHeadFileContents(root, relPaths = [], { maxTotalBytes = MAX_GIT_HEAD_SNAPSHOT_BYTES } = {}) {
   const paths = [...new Set(relPaths.map(normalizeRelPath).filter(Boolean))];
   if (!paths.length) return new Map();
-  try {
-    const specs = paths.map((relPath) => `HEAD:${gitTreePathForRootRelative(root, relPath)}`);
-    const output = execFileSync("git", ["cat-file", "--batch"], {
-      cwd: root,
-      input: specs.join("\n") + "\n",
-      encoding: null,
-      stdio: ["pipe", "pipe", "ignore"],
-      maxBuffer: Math.max(8_000_000, paths.length * (MAX_FILE_BYTES + 1024)),
-    });
-    const contents = new Map();
-    let offset = 0;
-    for (const relPath of paths) {
-      const headerEnd = output.indexOf(10, offset);
-      if (headerEnd < 0) break;
-      const header = output.subarray(offset, headerEnd).toString("utf8");
-      offset = headerEnd + 1;
-      if (header.endsWith(" missing")) continue;
-      const size = Number(header.split(" ").at(-1));
-      if (!Number.isFinite(size) || size < 0 || offset + size > output.length) break;
-      contents.set(relPath, output.subarray(offset, offset + size).toString("utf8"));
-      offset += size + 1;
+  const contents = new Map();
+  const candidates = [];
+  const totalLimit = Number.isFinite(maxTotalBytes) ? Math.max(0, Number(maxTotalBytes)) : MAX_GIT_HEAD_SNAPSHOT_BYTES;
+  let selectedBytes = 0;
+  for (let start = 0; start < paths.length && selectedBytes < totalLimit; start += 1000) {
+    const chunk = paths.slice(start, start + 1000);
+    const specs = chunk.map((relPath) => `HEAD:${gitTreePathForRootRelative(root, relPath)}`);
+    try {
+      const output = execFileSync("git", ["cat-file", "--batch-check"], {
+        cwd: root,
+        input: specs.join("\n") + "\n",
+        encoding: "utf8",
+        stdio: ["pipe", "pipe", "ignore"],
+        maxBuffer: Math.max(1_000_000, chunk.length * 256),
+      });
+      const lines = output.trimEnd().split("\n");
+      for (let index = 0; index < chunk.length; index += 1) {
+        const match = String(lines[index] || "").match(/^[0-9a-f]+ blob (\d+)$/);
+        const size = match ? Number(match[1]) : Number.NaN;
+        if (!Number.isFinite(size) || size < 0 || size > MAX_FILE_BYTES) continue;
+        if (selectedBytes + size > totalLimit) continue;
+        candidates.push({ relPath: chunk[index], spec: specs[index], size });
+        selectedBytes += size;
+      }
+    } catch {
+      // Missing Git objects stay absent from the bounded snapshot.
     }
-    return contents;
-  } catch {
-    return null;
   }
+  for (let start = 0; start < candidates.length;) {
+    const batch = [];
+    let expectedBytes = 0;
+    while (start < candidates.length && batch.length < 200) {
+      const candidate = candidates[start];
+      if (batch.length && expectedBytes + candidate.size > 16_000_000) break;
+      batch.push(candidate);
+      expectedBytes += candidate.size;
+      start += 1;
+    }
+    try {
+      const output = execFileSync("git", ["cat-file", "--batch"], {
+        cwd: root,
+        input: batch.map((candidate) => candidate.spec).join("\n") + "\n",
+        encoding: null,
+        stdio: ["pipe", "pipe", "ignore"],
+        maxBuffer: Math.max(1_000_000, expectedBytes + batch.length * 1024 + 64_000),
+      });
+      let offset = 0;
+      for (const candidate of batch) {
+        const headerEnd = output.indexOf(10, offset);
+        if (headerEnd < 0) break;
+        const header = output.subarray(offset, headerEnd).toString("utf8");
+        offset = headerEnd + 1;
+        if (header.endsWith(" missing")) continue;
+        const size = Number(header.split(" ").at(-1));
+        if (!Number.isFinite(size) || size < 0 || size > MAX_FILE_BYTES || offset + size > output.length) break;
+        contents.set(candidate.relPath, output.subarray(offset, offset + size).toString("utf8"));
+        offset += size + 1;
+      }
+    } catch {
+      // Keep the other bounded chunks available when one Git read fails.
+    }
+  }
+  return contents;
+}
+
+function readGitPathLastChangeRevisions(root, relPaths = []) {
+  const paths = [...new Set(relPaths.map((relPath) => normalizeRelPath(String(relPath || ""))).filter(Boolean))];
+  const revisions = new Map();
+  for (let start = 0; start < paths.length; start += 400) {
+    const chunk = paths.slice(start, start + 400);
+    const wanted = new Set(chunk);
+    try {
+      const output = execFileSync("git", ["-c", "core.quotepath=false", "log", "--format=@@context-room-revision:%H", "--name-only", "--relative", "--", ...chunk], { cwd: root, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"], maxBuffer: 16_000_000 });
+      let revision = "";
+      for (const rawLine of output.split("\n")) {
+        const line = rawLine.trim();
+        if (!line) continue;
+        if (line.startsWith("@@context-room-revision:")) {
+          revision = line.slice("@@context-room-revision:".length);
+          continue;
+        }
+        const relPath = normalizeRelPath(line);
+        if (revision && wanted.has(relPath) && !revisions.has(relPath)) revisions.set(relPath, `git-path:${revision}`);
+      }
+    } catch {}
+  }
+  return revisions;
 }
 
 function buildStartupContextReviewQueue(root, settings, reviewState, startupFiles = listStartupContextFiles(root, settings)) {
@@ -3527,7 +4109,9 @@ function buildStartupContextReviewQueue(root, settings, reviewState, startupFile
     const metadata = parseDocMetadata(file.content, file.path);
     const issues = computeDocIssues({ path: file.path, content: file.content, gitStatus, metadata });
     issues.unshift({ type: "internal_context_changed", severity: "high", message: "Startup context changed outside the Git review baseline." });
-    const review = currentReviewFor(root, reviewState.reviews, file.path, file.content);
+    const resourceState = file.exists === false ? "absent" : "present";
+    const resourceVersion = resourceVersionForReviewFile(root, file.path, file, reviewState.reviews[file.path] || null);
+    const review = currentReviewFor(root, reviewState.reviews, file.path, file.content, resourceState, resourceVersion);
     if (review?.status === "verified" && review.current) continue;
     queue.push({
       path: file.path,
@@ -3689,14 +4273,14 @@ function gitInfoExcludePath(root) {
 
 function cachedGitTopLevel(root) {
   const resolvedRoot = path.resolve(root);
-  const cached = gitTopLevelCache.get(resolvedRoot);
-  if (cached) return cached;
+  if (gitTopLevelCache.has(resolvedRoot)) return gitTopLevelCache.get(resolvedRoot);
   try {
     const topLevel = execFileSync("git", ["rev-parse", "--show-toplevel"], { cwd: resolvedRoot, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).trim();
     const result = topLevel ? path.resolve(topLevel) : null;
-    if (result) gitTopLevelCache.set(resolvedRoot, result);
+    gitTopLevelCache.set(resolvedRoot, result);
     return result;
   } catch {
+    gitTopLevelCache.set(resolvedRoot, null);
     return null;
   }
 }
@@ -4519,7 +5103,7 @@ export function createMemoryServer({ root = process.cwd(), port = DEFAULT_PORT, 
     try {
       await routeRequest(req, res, root, globalPreferencesPath);
     } catch (error) {
-      sendJson(res, 500, { error: error.message });
+      sendJson(res, Number(error.statusCode) || 500, { error: error.message });
     } finally {
       if (requestInvalidatesBackgroundCaches(req)) invalidateBackgroundCaches(root, { explicit: true });
     }
@@ -4684,6 +5268,25 @@ async function routeRequest(req, res, root, globalPreferencesPath = null) {
     sendJson(res, 200, { annotation: resolveAgentAnnotation(root, { id: body.id, path: body.path }) });
     return;
   }
+  if (req.method === "GET" && url.pathname === "/api/docqa/review-deletions") {
+    sendJson(res, 200, buildDeletedReviewBatch(root));
+    return;
+  }
+  if (req.method === "POST" && url.pathname === "/api/docqa/review-deletions") {
+    const body = await readJsonBody(req);
+    if (typeof body.key !== "string" || !body.key) {
+      const error = new Error("Removed review batch key is required.");
+      error.statusCode = 400;
+      throw error;
+    }
+    const result = writeDeletedReviewBatchDecision(root, body.paths, {
+      note: body.note,
+      expectedKey: body.key,
+      protectedAcknowledged: body.protectedAcknowledged === true,
+    });
+    sendJson(res, 200, { ...result, docqa: buildDocQaReportFromSnapshot(root) });
+    return;
+  }
   if (req.method === "POST" && url.pathname === "/api/docqa/review") {
     const body = await readJsonBody(req);
     sendJson(res, 200, writeDocReviewDecision(root, body.path, { status: body.status, note: body.note }));
@@ -4773,6 +5376,7 @@ function fileKindForPath(relPath) {
   if (isSensitiveProjectFile(relPath)) return "secret";
   const ext = path.extname(normalizeRelPath(String(relPath || ""))).toLowerCase();
   if (ext === ".csv" || ext === ".tsv") return "csv";
+  if (ext === ".html" || ext === ".htm") return "html";
   if (ext === ".md" || ext === ".mdx" || ext === ".txt") return "markdown";
   return "text";
 }
@@ -5110,12 +5714,12 @@ function sendHtml(res, body) {
   res.end(body);
 }
 
-export function renderFileActionButtons({ reviewAction = null, nextReviewAction = null, dirty = false, deletable = true } = {}) {
+export function renderFileActionButtons({ reviewAction = null, nextReviewAction = null, dirty = false, deletable = true, savable = true } = {}) {
   return '<div class="file-actions">' +
     (reviewAction ? '<button class="file-action" type="button" data-file-review-decision="' + escapeHtmlServer(reviewAction.status) + '">' + escapeHtmlServer(reviewAction.label) + '</button>' : '') +
     (nextReviewAction ? '<button class="file-action" type="button" data-next-review>' + escapeHtmlServer(nextReviewAction.label) + '</button>' : '') +
     (deletable ? '<button class="file-action danger-action" type="button" data-file-delete>Delete</button>' : '') +
-    '<button class="file-action primary" type="button" data-file-save ' + (!dirty ? 'disabled' : '') + '>Save</button>' +
+    (savable ? '<button class="file-action primary" type="button" data-file-save ' + (!dirty ? 'disabled' : '') + '>Save</button>' : '') +
   '</div>';
 }
 
@@ -5534,8 +6138,37 @@ export function renderAppHtml() {
     .review-summary-item strong { display: block; font-size: 24px; line-height: 1; }
     .review-summary-item span { display: block; color: var(--muted); font-size: 10px; text-transform: uppercase; letter-spacing: 0.1em; margin-top: 6px; }
     .review-list { display: grid; gap: 8px; padding: 12px; max-height: clamp(220px, 34vh, 360px); overflow: auto; overscroll-behavior-y: auto; scrollbar-gutter: stable; }
+    .review-list.batch-open { max-height: min(58vh, 560px); }
     .review-item { border: 1px solid color-mix(in srgb, var(--line) 88%, transparent); border-radius: 16px; background: var(--surface-card); color: var(--text); text-align: left; padding: var(--space-4); cursor: pointer; display: grid; gap: var(--space-2); }
     .review-item:hover, .review-item.active { border-color: color-mix(in srgb, var(--accent) 42%, transparent); background: var(--surface-card-hover); transform: translateX(2px); }
+    .review-deletion-batch { border: 1px solid color-mix(in srgb, var(--danger) 28%, var(--line)); border-left: 3px solid var(--danger); border-radius: 14px; background: color-mix(in srgb, var(--surface-card) 92%, var(--danger) 8%); overflow: clip; }
+    .review-deletion-batch > summary { list-style: none; display: grid; grid-template-columns: auto minmax(0, 1fr) auto; gap: 12px; align-items: center; padding: 12px 14px; color: var(--text); cursor: pointer; }
+    .review-deletion-batch > summary::-webkit-details-marker { display: none; }
+    .review-deletion-batch > summary:focus-visible { outline: 2px solid color-mix(in srgb, var(--danger) 74%, transparent); outline-offset: -2px; }
+    .review-deletion-count { color: var(--danger); font-size: 22px; font-weight: 950; font-variant-numeric: tabular-nums; line-height: 1; }
+    .review-deletion-heading { min-width: 0; display: grid; gap: 2px; }
+    .review-deletion-heading strong { font-size: 13px; line-height: 1.2; }
+    .review-deletion-heading span { color: var(--muted); font-size: 11px; line-height: 1.35; }
+    .review-deletion-chevron { color: var(--muted); font-size: 14px; transition: transform 160ms ease; }
+    .review-deletion-batch[open] .review-deletion-chevron { transform: rotate(90deg); }
+    .review-deletion-body { display: grid; gap: 10px; padding: 10px 12px 12px; border-top: 1px solid color-mix(in srgb, var(--danger) 18%, var(--line)); }
+    .review-deletion-note { margin: 0; color: var(--muted); font-size: 11px; line-height: 1.45; }
+    .review-deletion-toolbar, .review-deletion-actions { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 8px; }
+    .review-deletion-toolbar span { color: var(--label-strong); font-size: 11px; font-weight: 800; }
+    .review-deletion-toolbar-buttons { display: flex; gap: 6px; }
+    .review-deletion-tool, .review-deletion-open { border: 1px solid var(--line); border-radius: 6px; background: var(--surface-card); color: var(--muted); padding: 5px 7px; cursor: pointer; font-size: 10px; font-weight: 800; }
+    .review-deletion-tool:hover, .review-deletion-open:hover { border-color: color-mix(in srgb, var(--accent) 38%, transparent); color: var(--text); background: var(--surface-card-hover); }
+    .review-deletion-paths { display: grid; gap: 1px; }
+    .review-deletion-row { min-width: 0; display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 8px; align-items: center; padding: 7px 8px; border-radius: 6px; background: color-mix(in srgb, var(--surface-card) 82%, transparent); }
+    .review-deletion-row:hover { background: color-mix(in srgb, var(--danger) 7%, var(--surface-card)); }
+    .review-deletion-selector { min-width: 0; display: flex; gap: 8px; align-items: center; cursor: pointer; }
+    .review-deletion-selector input { flex: 0 0 auto; accent-color: var(--danger); }
+    .review-deletion-selector code { min-width: 0; color: var(--label-strong); font: 11px/1.35 ui-monospace, SFMono-Regular, Menlo, monospace; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .review-deletion-protected { flex: 0 0 auto; color: var(--danger); font-size: 9px; font-weight: 900; letter-spacing: 0.06em; text-transform: uppercase; }
+    .review-deletion-actions { position: sticky; bottom: 0; margin: 0 -12px -12px; padding: 9px 12px; border-top: 1px solid color-mix(in srgb, var(--danger) 16%, var(--line)); background: var(--panel); }
+    .review-deletion-actions span { color: var(--muted); font-size: 11px; }
+    .review-deletion-confirm { border: 1px solid color-mix(in srgb, var(--danger) 42%, transparent); border-radius: 7px; background: color-mix(in srgb, var(--danger) 12%, var(--surface-card)); color: var(--danger); padding: 7px 10px; cursor: pointer; font-size: 11px; font-weight: 900; }
+    .review-deletion-confirm:hover { background: color-mix(in srgb, var(--danger) 20%, var(--surface-card)); }
     .review-top { display: flex; justify-content: space-between; gap: 12px; align-items: center; }
     .review-title { font-weight: 850; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
     .review-path { color: var(--muted); font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -5848,6 +6481,8 @@ export function renderAppHtml() {
     .markdown-editor-input.doc-link-hover { cursor: pointer; }
     .plain-text-editor, .plain-text-view { margin: 0; white-space: pre; overflow: auto; tab-size: 2; font: 13px/1.55 ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; }
     .plain-text-editor { display: block; width: 100%; min-height: 100%; resize: none; border: 0; outline: none; background: var(--file-bg); color: var(--file-fg); padding: 18px 22px; }
+    .html-preview-shell { width: 100%; min-height: calc(100vh - 162px); max-height: calc(100vh - 162px); overflow: hidden; background: var(--file-bg); }
+    .html-preview-frame { display: block; width: 100%; height: calc(100vh - 162px); min-height: 420px; border: 0; background: var(--file-bg); }
     .markdown-editor-input::selection { background: color-mix(in srgb, var(--file-h2) 34%, transparent); color: transparent !important; -webkit-text-fill-color: transparent !important; }
     .markdown-editor-highlight .markdown-line { margin: 0; padding: 0; border: 0; min-height: 1.7em; font-size: inherit; line-height: inherit; font-weight: inherit; letter-spacing: 0; }
     .markdown-editor-highlight .markdown-line.h1, .markdown-editor-highlight .markdown-line.h2, .markdown-editor-highlight .markdown-line.h3, .markdown-editor-highlight .markdown-line.h4 { margin: 0; padding: 0; border: 0; font-size: inherit; line-height: inherit; font-weight: inherit; }
@@ -6190,6 +6825,7 @@ export function renderAppHtml() {
     .review-summary-item span { margin: 0; font-size: 11px; text-transform: none; color: var(--muted); }
     .review-list { gap: 0; padding: 0; max-height: min(34vh, 300px); }
     .review-item { border: 0; border-bottom: 1px solid var(--line); border-radius: 0; background: transparent; padding: 10px 14px; gap: 4px; }
+    .review-deletion-batch { border-top: 0; border-right: 0; border-bottom: 1px solid var(--line); border-radius: 0; background: color-mix(in srgb, var(--danger) 4%, transparent); }
     .review-item:last-child { border-bottom: 0; }
     .review-item:hover, .review-item.active { transform: none; background: color-mix(in srgb, var(--accent) 7%, transparent); box-shadow: inset 2px 0 0 var(--accent); }
     .review-title { font-size: 13px; }
@@ -6291,7 +6927,6 @@ export function renderAppHtml() {
       .diff-code, .doc-content, .doc-editor { padding: 12px; }
       .file-panel header { padding: 8px; }
     }
-    .workspace-dock.file-opening { visibility: hidden; pointer-events: none; }
     body.app-booting .app { visibility: hidden; opacity: 0; pointer-events: none; }
     .boot-screen { position: fixed; inset: 0; z-index: 80; display: grid; place-items: center; background: var(--bg); color: var(--muted); }
     .boot-screen-inner { display: flex; align-items: center; gap: 10px; font: 12px/1.2 ui-monospace, SFMono-Regular, Menlo, monospace; }
@@ -6345,7 +6980,7 @@ export function renderAppHtml() {
             <section class="docqa-panel">
               <header>
                 <div>
-                  <h2>Review queue</h2>
+                  <h2 id="reviewQueueHeading" tabindex="-1">Review queue</h2>
                 </div>
                 <div id="reviewSummary" class="review-summary" aria-label="review metrics"></div>
               </header>
@@ -6392,7 +7027,7 @@ export function renderAppHtml() {
   <div id="explorerContextMenu" class="explorer-context-menu" hidden></div>
 	  <div id="agentToast" class="agent-toast" hidden></div>
 	<script>
-		const state = { root: null, files: [], startupContextFiles: [], startupSkillFolders: [], startupHookFiles: [], startupHooksHelpOpen: false, startupHookFilter: "all", hubDisclosuresOpen: new Set(), activeStartupSkillExplorer: null, activeStartupContextExplorer: null, startupSkillCreateFolder: null, startupContextContextTarget: null, selectedStartupContext: null, docqa: null, doctor: null, backgroundReportRenderKey: "", settings: null, settingsOpen: false, settingsSection: "review", page: "hub", pendingMarkdown: null, availableHubCards: [], hubFolders: [], hubSections: [], rootHubSections: [], activeHubCardId: null, selectedReview: null, reviewModePath: null, reviewModeStatus: null, reviewSessions: {}, reviewFinalizationPromise: null, selected: null, selectedReadOnly: false, selectedDiff: null, fileLoadError: null, fileConflict: null, externalChange: null, conflictCompare: false, conflictMergeText: null, conflictMergeKey: "", conflictMergeMode: "auto", diffCollapsed: false, saved: "", savedHash: null, dirty: false, mode: "view", homeView: "root", planetStack: ["root"], filePanel: false, history: [], historyIndex: -1, pathFilters: [], explorerWatchFilter: "all", explorerRenderKey: "", explorerSearchFrame: 0, selectedForDelete: new Set(), selectionRequest: 0, openingFilePath: null, mobileSidebarTouched: false, sessionStateTimer: null, agentCommandTimer: null, lastAgentCommandId: "", pendingAgentCommand: null, agentAnnotations: {}, userActiveAt: 0, userScrollIntentAt: 0, refreshInFlight: false, reportsRefreshInFlight: false, backgroundRefreshTimer: null, filePrefetches: new Map(), prefetchTimer: null, prefetchPath: "", lastDiffRefreshAt: 0, lastReportRefreshAt: 0, lastFullRefreshAt: 0, navigationRestoreAttempted: false, bootStartedAt: Date.now(), bootMilestones: {}, markdownHighlightFrame: 0, markdownHighlightText: "", markdownHighlightLastText: "", docLinkModifierActive: false, expanded: new Set(["data", "automations", "integrations", "skills", "tools", "~", "~/.hermes", "~/.hermes/memories", "~/.hermes/skills"]) };
+		const state = { root: null, files: [], startupContextFiles: [], startupSkillFolders: [], startupHookFiles: [], startupHooksHelpOpen: false, startupHookFilter: "all", hubDisclosuresOpen: new Set(), activeStartupSkillExplorer: null, activeStartupContextExplorer: null, startupSkillCreateFolder: null, startupContextContextTarget: null, selectedStartupContext: null, docqa: null, doctor: null, backgroundReportRenderKey: "", settings: null, settingsOpen: false, settingsSection: "review", page: "hub", pendingMarkdown: null, availableHubCards: [], hubFolders: [], hubSections: [], rootHubSections: [], activeHubCardId: null, selectedReview: null, deletionBatchExpanded: false, deletionBatchLoading: false, deletionBatchItems: [], deletionBatchKey: "", deletionBatchReportedCount: 0, deletionBatchError: "", selectedDeletionReviews: new Set(), reviewModePath: null, reviewModeStatus: null, reviewSessions: {}, reviewFinalizationPromise: null, selected: null, selectedReadOnly: false, selectedDiff: null, fileLoadError: null, fileConflict: null, externalChange: null, conflictCompare: false, conflictMergeText: null, conflictMergeKey: "", conflictMergeMode: "auto", diffCollapsed: false, saved: "", savedHash: null, dirty: false, mode: "view", homeView: "root", planetStack: ["root"], filePanel: false, history: [], historyIndex: -1, pathFilters: [], explorerWatchFilter: "all", explorerRenderKey: "", explorerSearchFrame: 0, selectedForDelete: new Set(), selectionRequest: 0, openingFilePath: null, fileContentReadyPath: null, mobileSidebarTouched: false, sessionStateTimer: null, agentCommandTimer: null, lastAgentCommandId: "", pendingAgentCommand: null, agentAnnotations: {}, userActiveAt: 0, userScrollIntentAt: 0, refreshInFlight: false, reportsRefreshInFlight: false, backgroundRefreshTimer: null, filePrefetches: new Map(), prefetchTimer: null, prefetchPath: "", lastDiffRefreshAt: 0, lastReportRefreshAt: 0, lastFullRefreshAt: 0, navigationRestoreAttempted: false, bootStartedAt: Date.now(), bootMilestones: {}, markdownHighlightFrame: 0, markdownHighlightText: "", markdownHighlightLastText: "", docLinkModifierActive: false, expanded: new Set(["data", "automations", "integrations", "skills", "tools", "~", "~/.hermes", "~/.hermes/memories", "~/.hermes/skills"]) };
 	const VERIFY_CONFIRM_STORAGE_KEY = "context-room:skip-mark-verified-confirm";
 const NAVIGATION_STATE_STORAGE_PREFIX = "context-room:navigation:";
 const AGENT_COMMAND_ACK_STORAGE_KEY = "context-room:last-agent-command-id";
@@ -6522,6 +7157,11 @@ function applyFileTheme(themeId = currentFileThemeId()) {
   const clean = normalizeFileThemeId(themeId);
   document.documentElement.dataset.fileTheme = clean;
   document.documentElement.dataset.appTheme = clean;
+  if (document.querySelector("iframe.html-preview-frame") && isHtmlDocumentPath(state.selected) && state.openingFilePath !== state.selected) {
+    const viewState = captureEditorViewState();
+    renderViewer();
+    restoreEditorViewState(viewState);
+  }
 }
 
 function previewSelectedFileTheme() {
@@ -6655,12 +7295,13 @@ async function restoreNavigationAfterInitialLoad() {
     restoreViewState: persisted.viewState,
   };
   const startup = persisted.startup || null;
-  if (startup?.type === "startup-context") await selectStartupContextFile(startup.order, options);
-  else if (startup?.type === "startup-skill") await selectStartupSkillFile(startup.folder, startup.skill, options);
-  else if (startup?.type === "startup-hook") await selectStartupHookFile(startup.order, options);
-  else if (selectedFileExists(persisted.selectedPath)) await selectFile(persisted.selectedPath, options);
+  let openRequest = null;
+  if (startup?.type === "startup-context") openRequest = selectStartupContextFile(startup.order, options);
+  else if (startup?.type === "startup-skill") openRequest = selectStartupSkillFile(startup.folder, startup.skill, options);
+  else if (startup?.type === "startup-hook") openRequest = selectStartupHookFile(startup.order, options);
+  else if (selectedFileExists(persisted.selectedPath)) openRequest = selectFile(persisted.selectedPath, options);
   else return false;
-  setStatus("restored");
+  void openRequest.then(() => setStatus("restored")).catch((error) => setStatus(error.message));
   return true;
 }
 
@@ -6709,7 +7350,9 @@ function selectedFileExists(path = state.selected) {
 
 function reviewQueueItemForPath(path) {
   if (!path) return null;
-  return (state.docqa?.queue || []).find((item) => item.path === path || item.oldPath === path) || null;
+  return (state.docqa?.queue || []).find((item) => item.path === path || item.oldPath === path)
+    || state.deletionBatchItems.find((item) => item.path === path)
+    || null;
 }
 
 function canReviewMissingFile(path) {
@@ -7752,10 +8395,37 @@ function applyBackgroundReportPayload(reports = {}) {
   return changed;
 }
 
+function renderAfterBackgroundReportPayload() {
+  renderFiles();
+  if (state.page === "file" && state.selected && !state.openingFilePath) {
+    const viewState = captureEditorViewState();
+    renderViewer();
+    updateHeader();
+    updatePreview();
+    restoreEditorViewState(viewState);
+  } else if (state.page === "hub") {
+    showHome();
+  } else if (state.page === "settings") {
+    renderSettingsPanel();
+    updateActionBanner();
+  }
+}
+
+function applyInitialReportsWhenReady(reportsRequest) {
+  void reportsRequest.then((reports) => {
+    window.requestAnimationFrame(() => window.requestAnimationFrame(() => {
+      state.bootMilestones.reportsReady = Date.now() - state.bootStartedAt;
+      applyBackgroundReportPayload(reports);
+      state.lastReportRefreshAt = Date.now();
+      renderAfterBackgroundReportPayload();
+    }));
+  }).catch(() => scheduleBackgroundRefresh({ forceReports: true }));
+}
+
 async function loadFiles(options = {}) {
   setStatus("chargement...");
   if (options.initial) state.bootMilestones.requestsStarted = Date.now() - state.bootStartedAt;
-  const reportsRequest = options.initial ? api("/api/reports") : Promise.resolve(null);
+  const reportsRequest = options.initial ? api("/api/reports") : null;
   const [data, settingsData] = await Promise.all([api(filesApiPath()), api("/api/settings")]);
   if (options.initial) state.bootMilestones.coreDataReady = Date.now() - state.bootStartedAt;
   state.root = data.root || state.root;
@@ -7767,34 +8437,13 @@ async function loadFiles(options = {}) {
 
   // File restoration and review reports use separate workers, so keep them concurrent.
   const restoreRequest = restoreNavigationAfterInitialLoad();
-  const reports = await reportsRequest;
-  if (options.initial) state.bootMilestones.reportsReady = Date.now() - state.bootStartedAt;
-  if (reports) {
-    applyBackgroundReportPayload(reports);
-    state.lastReportRefreshAt = Date.now();
-  }
   const restored = await restoreRequest;
   if (options.initial) state.bootMilestones.initialDataReady = Date.now() - state.bootStartedAt;
   if (options.initial) state.bootMilestones.navigationReady = Date.now() - state.bootStartedAt;
 
-  if (reports) {
-    renderFiles();
-    if (state.page === "file" && state.selected && !state.openingFilePath) {
-      const viewState = captureEditorViewState();
-      renderViewer();
-      updateHeader();
-      updatePreview();
-      restoreEditorViewState(viewState);
-    } else if (state.page === "hub") {
-      showHome();
-    } else if (state.page === "settings") {
-      renderSettingsPanel();
-      updateActionBanner();
-    }
-  }
-
   if (options.waitForBackground) await refreshBackgroundReports({ forceReports: true });
-  else if (!reports) scheduleBackgroundRefresh({ forceReports: true });
+  else if (reportsRequest) applyInitialReportsWhenReady(reportsRequest);
+  else scheduleBackgroundRefresh({ forceReports: true });
   if (restored) {
     scheduleSessionStatePush();
     return;
@@ -7865,6 +8514,7 @@ async function selectFile(path, options = {}) {
   state.selected = path;
   state.selectedReadOnly = Boolean(state.files.find((item) => item.path === path)?.readOnly);
   state.openingFilePath = path;
+  state.fileContentReadyPath = null;
   state.selectedStartupContext = null;
   state.activeStartupContextExplorer = null;
   state.reviewModePath = options.reviewMode ? path : null;
@@ -7926,9 +8576,14 @@ async function selectFile(path, options = {}) {
     el("editor").value = data.content;
     await annotationsRequest;
     if (!isCurrentSelection(requestId, path)) return;
+    state.fileContentReadyPath = path;
+    renderViewer();
+    restorePersistedViewState(options.restoreViewState);
+    setStatus("open · loading Git diff...");
 
     const finishOpen = (diffResult, reviewBaseResult) => {
       if (!isCurrentSelection(requestId, path)) return;
+      const contentViewState = captureEditorViewState();
       const diff = diffResult?.value;
       setStatus(diffResult?.error?.message || reviewBaseResult?.error?.message || "open");
       if (diff) {
@@ -7941,6 +8596,7 @@ async function selectFile(path, options = {}) {
         }
       }
       state.openingFilePath = null;
+      state.fileContentReadyPath = null;
       if (options.pushHistory !== false) pushHistory(path);
       updateHeader();
       updateHistoryButtons();
@@ -7950,7 +8606,7 @@ async function selectFile(path, options = {}) {
       if (profilingBoot) state.bootMilestones.fileRendered = Date.now() - state.bootStartedAt;
       document.body.dataset.lastFileOpenPath = path;
       document.body.dataset.lastFileOpenMs = String(Math.max(0, Math.round(performance.now() - fileOpenStartedAt)));
-      restorePersistedViewState(options.restoreViewState);
+      restoreEditorViewState(contentViewState);
     };
 
     const [diffResult, reviewBaseResult] = await Promise.all([diffRequest, reviewBaseRequest]);
@@ -7959,6 +8615,7 @@ async function selectFile(path, options = {}) {
   } catch (error) {
     if (isCurrentSelection(requestId, path)) {
       state.openingFilePath = null;
+      state.fileContentReadyPath = null;
       state.fileLoadError = { path, message: error.message || "Failed to open file." };
       state.saved = "";
       state.savedHash = null;
@@ -8422,11 +9079,27 @@ function renderDocQaDashboard() {
   const s = report.summary;
   el("reviewSummary").innerHTML = renderReviewSummary(s);
   const queue = report.queue.length ? report.queue : [];
-  el("reviewQueue").innerHTML = queue.length ? queue.map(renderReviewItem).join("") : '<div class="issue">No watched files changed or created in the current worktree.</div>';
-	  document.querySelectorAll("[data-review-path]").forEach((button) => button.addEventListener("click", () => {
-	    const item = state.docqa?.queue?.find((entry) => entry.path === button.dataset.reviewPath) || { path: button.dataset.reviewPath, startupContext: button.dataset.startupReviewOrder ? { order: button.dataset.startupReviewOrder } : null };
-	    openReviewQueueItem(item).catch((error) => setStatus(error.message));
-	  }));
+  const groupDeletions = Number(s.deletedDocs || 0) > 1 || state.deletionBatchItems.length > 0;
+  const loadedBatchChanged = state.deletionBatchItems.length && (state.deletionBatchKey !== String(s.deletedReviewKey || "") || state.deletionBatchReportedCount !== Number(s.deletedDocs || 0));
+  const previousDeletionBatch = document.querySelector("[data-review-deletion-batch]");
+  const restoreDeletionBatchFocus = Boolean(loadedBatchChanged && document.activeElement && previousDeletionBatch?.contains(document.activeElement));
+  if (loadedBatchChanged) {
+    state.deletionBatchItems = [];
+    state.deletionBatchReportedCount = 0;
+  }
+  const visibleQueue = groupDeletions ? queue.filter((item) => !isDeletedReviewQueueItem(item)) : queue;
+  const deletionBatch = groupDeletions ? renderDeletionReviewBatch(s) : "";
+  const regularItems = visibleQueue.map(renderReviewItem).join("");
+  el("reviewQueue").classList.toggle("batch-open", groupDeletions && state.deletionBatchExpanded);
+  el("reviewQueue").innerHTML = (deletionBatch || regularItems)
+    ? deletionBatch + regularItems
+    : '<div class="issue">No watched files changed or created in the current worktree.</div>';
+  document.querySelectorAll("[data-review-path]").forEach((button) => button.addEventListener("click", () => {
+    const item = state.docqa?.queue?.find((entry) => entry.path === button.dataset.reviewPath) || { path: button.dataset.reviewPath, startupContext: button.dataset.startupReviewOrder ? { order: button.dataset.startupReviewOrder } : null };
+    openReviewQueueItem(item).catch((error) => setStatus(error.message));
+  }));
+  if (restoreDeletionBatchFocus) document.querySelector("[data-review-deletion-batch] > summary")?.focus();
+  wireDeletionReviewBatch();
   renderContextHealth();
   renderHubFolders();
 }
@@ -8665,10 +9338,196 @@ function renderReviewSummary(summary = {}) {
     '<div class="review-summary-item"><strong>' + changed + '</strong><span>changed</span></div>';
 }
 
+function isDeletedReviewQueueItem(item) {
+  return Boolean(item && item.batchDeletion === true && item.resourceState === "absent" && !item.oldPath && String(item.gitStatus || "").includes("D"));
+}
+
+function renderDeletionReviewBatch(summary = {}) {
+  const count = Number(summary.deletedDocs || 0);
+  const protectedCount = Number(summary.protectedDeletedDocs || 0);
+  const selectedCount = state.deletionBatchItems.filter((item) => state.selectedDeletionReviews.has(item.path)).length;
+  const detailsOpen = state.deletionBatchExpanded ? " open" : "";
+  const detailsBusy = state.deletionBatchLoading ? ' aria-busy="true"' : "";
+  const controlsDisabled = state.deletionBatchLoading ? " disabled" : "";
+  const protectedSummary = protectedCount ? protectedCount + " protected · " : "";
+  const protectedNote = protectedCount ? " Protected paths start unselected and require an extra acknowledgement." : "";
+  let body = '<p class="review-deletion-note">Open the set to inspect paths or exclude files. Confirmation records that the files are already absent; it does not delete anything.' + protectedNote + '</p>';
+  if (state.deletionBatchLoading && !state.deletionBatchItems.length) {
+    body += '<div class="issue" role="status" aria-live="polite">Loading removed files...</div>';
+  } else {
+    if (state.deletionBatchError) {
+      body += '<div class="issue critical" role="alert"><span>' + escapeHtml(state.deletionBatchError) + '</span><button class="review-deletion-tool" type="button" data-review-deletion-retry>Retry</button></div>';
+    }
+    if (state.deletionBatchItems.length) {
+    body += '<div class="review-deletion-toolbar"><span>' + selectedCount + ' of ' + state.deletionBatchItems.length + ' selected</span>' +
+      '<div class="review-deletion-toolbar-buttons"><button class="review-deletion-tool" type="button" data-review-deletion-select-all' + controlsDisabled + '>Select all</button><button class="review-deletion-tool" type="button" data-review-deletion-select-none' + controlsDisabled + '>Clear</button></div></div>' +
+      '<div class="review-deletion-paths">' + state.deletionBatchItems.map((item) => {
+        const checked = state.selectedDeletionReviews.has(item.path) ? " checked" : "";
+        const protectedLabel = item.protected ? '<span class="review-deletion-protected">protected</span>' : "";
+        return '<div class="review-deletion-row"><label class="review-deletion-selector"><input type="checkbox" data-review-deletion-path="' + escapeHtml(item.path) + '"' + checked + controlsDisabled + ' /><code title="' + escapeHtml(item.path) + '">' + escapeHtml(item.path) + '</code>' + protectedLabel + '</label><button class="review-deletion-open" type="button" aria-label="Review ' + escapeHtml(item.path) + '" data-review-deletion-open="' + escapeHtml(item.path) + '"' + controlsDisabled + '>Review</button></div>';
+      }).join("") + '</div>' +
+      '<div class="review-deletion-actions"><span data-review-deletion-selection-count>' + selectedCount + ' selected</span><button class="review-deletion-confirm" type="button" data-review-deletion-confirm' + (!selectedCount || state.deletionBatchLoading ? " disabled" : "") + '>' + (state.deletionBatchLoading ? "Confirming..." : "Confirm " + selectedCount + " removals") + '</button></div>';
+    } else if (!state.deletionBatchError) {
+      body += '<div class="issue">Open this set to load every removed path.</div>';
+    }
+  }
+  return '<details class="review-deletion-batch" data-review-deletion-batch' + detailsOpen + detailsBusy + '>' +
+    '<summary><span class="review-deletion-count">' + count + '</span><span class="review-deletion-heading"><strong>Files removed together</strong><span>' + protectedSummary + 'review this cleanup as one change set</span></span><span class="review-deletion-chevron" aria-hidden="true">›</span></summary>' +
+    '<div class="review-deletion-body">' + body + '</div>' +
+  '</details>';
+}
+
+function syncDeletionReviewBatchControls() {
+  const selectedCount = state.deletionBatchItems.filter((item) => state.selectedDeletionReviews.has(item.path)).length;
+  const count = document.querySelector("[data-review-deletion-selection-count]");
+  const confirmButton = document.querySelector("[data-review-deletion-confirm]");
+  if (count) count.textContent = selectedCount + " selected";
+  if (confirmButton) {
+    confirmButton.textContent = "Confirm " + selectedCount + " removals";
+    confirmButton.disabled = !selectedCount || state.deletionBatchLoading;
+  }
+}
+
+function wireDeletionReviewBatch() {
+  const details = document.querySelector("[data-review-deletion-batch]");
+  if (!details) return;
+  details.addEventListener("toggle", () => {
+    state.deletionBatchExpanded = details.open;
+    if (details.open && !state.deletionBatchItems.length && !state.deletionBatchLoading) loadDeletionReviewBatch();
+  });
+  details.querySelectorAll("[data-review-deletion-path]").forEach((input) => input.addEventListener("change", () => {
+    if (input.checked) state.selectedDeletionReviews.add(input.dataset.reviewDeletionPath);
+    else state.selectedDeletionReviews.delete(input.dataset.reviewDeletionPath);
+    syncDeletionReviewBatchControls();
+  }));
+  details.querySelector("[data-review-deletion-select-all]")?.addEventListener("click", () => {
+    state.selectedDeletionReviews = new Set(state.deletionBatchItems.map((item) => item.path));
+    details.querySelectorAll("[data-review-deletion-path]").forEach((input) => { input.checked = true; });
+    syncDeletionReviewBatchControls();
+  });
+  details.querySelector("[data-review-deletion-select-none]")?.addEventListener("click", () => {
+    state.selectedDeletionReviews.clear();
+    details.querySelectorAll("[data-review-deletion-path]").forEach((input) => { input.checked = false; });
+    syncDeletionReviewBatchControls();
+  });
+  details.querySelector("[data-review-deletion-retry]")?.addEventListener("click", () => loadDeletionReviewBatch());
+  details.querySelectorAll("[data-review-deletion-open]").forEach((button) => button.addEventListener("click", () => {
+    const item = state.deletionBatchItems.find((entry) => entry.path === button.dataset.reviewDeletionOpen);
+    openReviewQueueItem(item).catch((error) => setStatus(error.message));
+  }));
+  details.querySelector("[data-review-deletion-confirm]")?.addEventListener("click", requestDeletionReviewBatchConfirmation);
+  if (details.open && !state.deletionBatchItems.length && !state.deletionBatchLoading && !state.deletionBatchError) loadDeletionReviewBatch();
+}
+
+async function loadDeletionReviewBatch() {
+  if (state.deletionBatchLoading) return;
+  const details = document.querySelector("[data-review-deletion-batch]");
+  const summary = details?.querySelector("summary");
+  const restoreSummaryFocus = Boolean(summary && (document.activeElement === summary || details.contains(document.activeElement)));
+  const previousSelection = new Set(state.selectedDeletionReviews);
+  const preserveSelection = Boolean(state.deletionBatchKey);
+  state.deletionBatchLoading = true;
+  state.deletionBatchError = "";
+  details?.setAttribute("aria-busy", "true");
+  details?.querySelectorAll(".review-deletion-body button, .review-deletion-body input").forEach((control) => { control.disabled = true; });
+  const retryButton = details?.querySelector("[data-review-deletion-retry]");
+  if (retryButton) retryButton.textContent = "Retrying...";
+  const loadingStatus = details?.querySelector(".issue");
+  if (loadingStatus && !state.deletionBatchItems.length) {
+    loadingStatus.textContent = "Loading removed files...";
+    loadingStatus.setAttribute("role", "status");
+    loadingStatus.setAttribute("aria-live", "polite");
+  }
+  try {
+    const batch = await api("/api/docqa/review-deletions");
+    state.deletionBatchItems = batch.items || [];
+    state.deletionBatchKey = String(batch.key || "");
+    const reportedCount = Number(batch.count || 0) + (batch.truncated ? 1 : 0);
+    if (state.docqa?.summary) {
+      const previousDeletedCount = Number(state.docqa.summary.deletedDocs || 0);
+      const deletionDelta = reportedCount - previousDeletedCount;
+      state.docqa = {
+        ...state.docqa,
+        generatedAt: batch.generatedAt || state.docqa.generatedAt,
+        summary: {
+          ...state.docqa.summary,
+          deletedDocs: reportedCount,
+          protectedDeletedDocs: Number(batch.protectedCount || 0),
+          deletedReviewKey: state.deletionBatchKey,
+          changedDocs: Math.max(0, Number(state.docqa.summary.changedDocs || 0) + deletionDelta),
+          needsReview: Math.max(0, Number(state.docqa.summary.needsReview || 0) + deletionDelta),
+        },
+        queue: reportedCount ? state.docqa.queue : state.docqa.queue.filter((item) => !isDeletedReviewQueueItem(item)),
+      };
+    }
+    state.deletionBatchReportedCount = reportedCount;
+    state.selectedDeletionReviews = new Set(state.deletionBatchItems
+      .filter((item) => preserveSelection ? previousSelection.has(item.path) : !item.protected)
+      .map((item) => item.path));
+  } catch (error) {
+    state.deletionBatchError = error.message || "Removed files could not be loaded.";
+  } finally {
+    state.deletionBatchLoading = false;
+    renderDocQaDashboard();
+    if (restoreSummaryFocus) document.querySelector("[data-review-deletion-batch] > summary")?.focus();
+  }
+}
+
+function requestDeletionReviewBatchConfirmation() {
+  const selected = state.deletionBatchItems.filter((item) => state.selectedDeletionReviews.has(item.path));
+  if (!selected.length) return;
+  const batchKey = state.deletionBatchKey;
+  const protectedCount = selected.filter((item) => item.protected).length;
+  const protectedCopy = protectedCount ? " This selection includes " + protectedCount + " protected document" + (protectedCount === 1 ? "." : "s.") : "";
+  showConfirmDialog({
+    title: "Confirm " + selected.length + " removals?",
+    body: "These files are already absent. This records that their removal was intentional; it does not delete files." + protectedCopy,
+    confirmLabel: "Confirm removals",
+    checkboxLabel: protectedCount ? "I reviewed the protected paths" : "",
+    checkboxRequired: Boolean(protectedCount),
+    onConfirm: ({ checked }) => confirmDeletionReviewBatch(selected.map((item) => item.path), { batchKey, protectedAcknowledged: checked }),
+  });
+}
+
+async function confirmDeletionReviewBatch(paths, { batchKey = "", protectedAcknowledged = false } = {}) {
+  let confirmationSucceeded = false;
+  state.deletionBatchLoading = true;
+  state.deletionBatchError = "";
+  renderDocQaDashboard();
+  setStatus("confirming removed files...");
+  try {
+    const result = await api("/api/docqa/review-deletions", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ paths, key: batchKey, protectedAcknowledged }),
+    });
+    state.deletionBatchItems = [];
+    state.deletionBatchKey = "";
+    state.deletionBatchReportedCount = 0;
+    state.selectedDeletionReviews.clear();
+    if (result.docqa) state.docqa = result.docqa;
+    state.deletionBatchExpanded = Boolean(result.skipped?.length && Number(state.docqa?.summary?.deletedDocs || 0) > 1);
+    confirmationSucceeded = true;
+    const skipped = result.skipped?.length || 0;
+    setStatus(result.confirmed.length + " removals confirmed" + (skipped ? " · " + skipped + " changed and stayed in review" : ""));
+  } catch (error) {
+    state.deletionBatchError = error.message || "Removed files could not be confirmed.";
+    setStatus(state.deletionBatchError);
+  } finally {
+    state.deletionBatchLoading = false;
+    if (!state.selected && !state.settingsOpen) renderDocQaDashboard();
+    const focusTarget = confirmationSucceeded
+      ? document.querySelector("[data-review-deletion-batch] > summary") || el("reviewQueueHeading")
+      : document.querySelector("[data-review-deletion-retry]");
+    focusTarget?.focus();
+  }
+}
+
 function gitStatusLabel(status, reviewRequired = false) {
   const clean = String(status || "").trim();
   if (!clean && reviewRequired) return "review";
   if (!clean) return "modified";
+  if (["DD", "AU", "UD", "UA", "DU", "AA", "UU"].includes(clean)) return "conflict";
   if (clean === "??") return "new";
   if (clean === "M" || clean === "M M" || clean.includes("M")) return "modified";
   if (clean.includes("R")) return "renamed";
@@ -8694,13 +9553,13 @@ function renderFileActionButtons(options = {}) {
   return '<div class="file-actions">' + renderFileActionItems(options) + '</div>';
 }
 
-function renderFileActionItems({ reviewAction = null, nextReviewAction = null, dirty = false, templateState = null, blockedByConflict = false, readOnly = false, deletable = true } = {}) {
+function renderFileActionItems({ reviewAction = null, nextReviewAction = null, dirty = false, templateState = null, blockedByConflict = false, readOnly = false, deletable = true, savable = true } = {}) {
   return '' +
     (templateState ? '<div class="empty-template-actions"><select class="file-template-select" data-empty-template-select aria-label="Template">' + renderFileTemplateOptions(templateState.selectedId) + '</select></div>' : '') +
     (reviewAction ? '<button class="file-action" type="button" data-file-review-decision="' + escapeHtml(reviewAction.status) + '">' + escapeHtml(reviewAction.label) + '</button>' : '') +
     (nextReviewAction ? '<button class="file-action" type="button" data-next-review>' + escapeHtml(nextReviewAction.label) + '</button>' : '') +
     (deletable ? '<button class="file-action danger-action" type="button" data-file-delete>Delete</button>' : '') +
-    '<button class="file-action primary" type="button" data-file-save ' + (!dirty || blockedByConflict || readOnly ? 'disabled' : '') + (readOnly ? ' title="This file is read-only in Context Room"' : blockedByConflict ? ' title="Resolve the disk change before saving"' : '') + '>Save</button>';
+    (savable ? '<button class="file-action primary" type="button" data-file-save ' + (!dirty || blockedByConflict || readOnly ? 'disabled' : '') + (readOnly ? ' title="This file is read-only in Context Room"' : blockedByConflict ? ' title="Resolve the disk change before saving"' : '') + '>Save</button>' : '');
 }
 
 function reviewStatusForPath(path) {
@@ -9274,7 +10133,6 @@ function updateActionBanner() {
   const onFile = state.page === "file" && Boolean(state.selected);
   const workspaceDock = document.querySelector(".workspace-dock");
   const fileOpening = onFile && Boolean(state.openingFilePath);
-  workspaceDock?.classList.toggle("file-opening", fileOpening);
   workspaceDock?.setAttribute("aria-busy", fileOpening ? "true" : "false");
   const hasGitDiff = onFile && !state.selectedStartupContext && state.selectedDiff?.available !== false && Boolean(state.selectedDiff?.changed);
   el("hub").textContent = state.page === "hub" ? "Settings" : "Hub";
@@ -10049,30 +10907,36 @@ function renderViewer() {
   const text = el("editor").value;
   const diff = state.selectedDiff || { changed: false, additions: 0, deletions: 0, patch: "", available: false };
   const isStartupFile = Boolean(state.selectedStartupContext);
-  const loadingFile = state.openingFilePath === state.selected;
+  const openingFile = state.openingFilePath === state.selected && state.fileContentReadyPath !== state.selected;
+  const loadingFile = openingFile;
   const loadError = !isStartupFile && state.fileLoadError?.path === state.selected ? state.fileLoadError : null;
   const conflict = activeFileConflict();
   const externalChange = activeExternalChange();
   const file = isStartupFile
     ? { label: state.selectedStartupContext.fileName, path: state.selectedStartupContext.displayPath }
     : state.files.find((item) => item.path === state.selected) || { label: state.selected, path: state.selected };
+  const isHtmlDocument = !isStartupFile && isHtmlDocumentPath(file.path);
   const hasDiff = !isStartupFile && diff.available !== false && diff.changed;
   const diffMarkup = hasDiff ? renderDiffPanel(diff) : "";
-  const templateState = !isStartupFile && !loadingFile && !loadError && !conflict && !externalChange ? templateStateForContent(text) : null;
+  const templateState = !isStartupFile && !isHtmlDocument && !openingFile && !loadError && !conflict && !externalChange ? templateStateForContent(text) : null;
   const actionsMarkup = loadError
     ? '<div class="file-actions"><button class="file-action primary" type="button" data-file-retry>Retry</button></div>'
-    : loadingFile
+    : openingFile
       ? renderFileActionsLoading()
       : externalChange && !conflict
       ? renderExternalReviewActions(externalChange, { fileActionOptions: externalReviewFileActionOptions() })
-      : renderFileActionButtons({ reviewAction: isStartupFile || state.selectedReadOnly ? null : reviewActionForSelectedFile(), nextReviewAction: isStartupFile || state.selectedReadOnly ? null : nextReviewActionForSelectedFile(), dirty: state.dirty, templateState, blockedByConflict: Boolean(conflict || externalChange), readOnly: Boolean(state.selectedStartupContext?.readOnly || state.selectedReadOnly), deletable: !isStartupFile && !state.selectedReadOnly });
+      : renderFileActionButtons({ reviewAction: isStartupFile || state.selectedReadOnly ? null : reviewActionForSelectedFile(), nextReviewAction: isStartupFile || state.selectedReadOnly ? null : nextReviewActionForSelectedFile(), dirty: state.dirty, templateState, blockedByConflict: Boolean(conflict || externalChange), readOnly: Boolean(state.selectedStartupContext?.readOnly || state.selectedReadOnly), deletable: !isStartupFile && !state.selectedReadOnly, savable: !isHtmlDocument });
   const conflictMarkup = conflict ? renderConflictPanel(conflict, text) : "";
   const editorMarkup = loadError
     ? renderFileLoadError(loadError)
     : loadingFile
       ? renderFileLoadingState(file)
       : !conflict && externalChange
-        ? renderExternalReviewDocument(externalReviewBaseContent(externalChange), externalChange.diskContent || "")
+        ? isHtmlDocument
+          ? renderHtmlDocumentPreview(externalChange.diskContent || "", file.path)
+          : renderExternalReviewDocument(externalReviewBaseContent(externalChange), externalChange.diskContent || "")
+        : isHtmlDocument
+          ? renderHtmlDocumentPreview(text, file.path)
         : state.mode === "edit"
           ? renderDocumentEditor(text, file.path)
           : renderDocumentView(text, file.path);
@@ -10152,6 +11016,472 @@ function renderMarkdownLineView(text, options = {}) {
 function usePlainTextSurface(filePath, text) {
   const value = String(text || "");
   return !String(filePath || "").toLowerCase().endsWith(".md") || value.length > 120_000 || value.split("\n", 2_501).length > 2_500;
+}
+
+function isHtmlDocumentPath(filePath) {
+  return /\.html?$/i.test(String(filePath || ""));
+}
+
+function contextRoomVisualPatternStyles() {
+  return [
+    "[data-tone='accent'] { --cr-tone: var(--cr-accent); }",
+    "[data-tone='positive'] { --cr-tone: var(--cr-positive); }",
+    "[data-tone='warning'] { --cr-tone: var(--cr-secondary); }",
+    "[data-tone='negative'] { --cr-tone: var(--cr-negative); }",
+    ".cr-vis-label { color: var(--cr-muted); font: 750 11px/1.3 ui-monospace, SFMono-Regular, Menlo, monospace; }",
+    ".cr-vis-value { color: var(--cr-text); font-size: 24px; font-weight: 850; line-height: 1; }",
+    ".cr-vis-note { color: var(--cr-muted); font-size: 11px; }",
+    ".cr-kpi-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 10px; }",
+    ".cr-kpi { --cr-tone: var(--cr-accent); min-width: 0; border: 1px solid var(--cr-line); border-top: 3px solid var(--cr-tone); border-radius: var(--cr-radius); background: var(--cr-surface); padding: 15px; }",
+    ".cr-kpi strong { display: block; margin: 8px 0 5px; color: var(--cr-text); font-size: 28px; line-height: 1; }",
+    ".cr-kpi span { color: var(--cr-muted); font-size: 12px; }",
+    ".cr-stat-strip { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); border: 1px solid var(--cr-line); border-radius: var(--cr-radius); background: var(--cr-surface-strong); overflow: hidden; }",
+    ".cr-stat { min-width: 0; padding: 14px 16px; }",
+    ".cr-stat + .cr-stat { border-left: 1px solid var(--cr-line); }",
+    ".cr-stat strong { display: block; color: var(--cr-text); font-size: 20px; }",
+    ".cr-stat span { color: var(--cr-muted); font-size: 11px; }",
+    ".cr-scorecard { display: grid; border-top: 1px solid var(--cr-line); }",
+    ".cr-score { --cr-tone: var(--cr-accent); display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 14px; align-items: center; padding: 12px 0; border-bottom: 1px solid var(--cr-line); }",
+    ".cr-score strong { color: var(--cr-text); font-size: 13px; }",
+    ".cr-score span { color: var(--cr-muted); font-size: 11px; }",
+    ".cr-score-grade { min-width: 58px; border: 1px solid color-mix(in srgb, var(--cr-tone) 55%, var(--cr-line)); border-radius: 999px; padding: 5px 8px; color: var(--cr-tone) !important; text-align: center; font-weight: 850; }",
+    ".cr-progress-list, .cr-bullet-chart, .cr-bar-chart, .cr-grouped-bars, .cr-benchmark, .cr-distribution, .cr-lollipop-chart, .cr-dot-plot { display: grid; gap: 12px; }",
+    ".cr-progress { --cr-tone: var(--cr-accent); display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 7px 12px; align-items: center; }",
+    ".cr-progress strong, .cr-chart-label { color: var(--cr-text); font-size: 12px; }",
+    ".cr-progress > span { color: var(--cr-muted); font-size: 11px; }",
+    ".cr-progress-track, .cr-bar-track, .cr-benchmark-track { grid-column: 1 / -1; height: 9px; border-radius: 999px; background: color-mix(in srgb, var(--cr-line) 68%, transparent); overflow: hidden; }",
+    ".cr-progress-fill, .cr-bar-fill { width: var(--value, 0%); height: 100%; border-radius: inherit; background: var(--cr-tone, var(--cr-accent)); }",
+    ".cr-bullet { --cr-tone: var(--cr-accent); display: grid; grid-template-columns: minmax(90px, .35fr) minmax(180px, 1fr) auto; gap: 12px; align-items: center; }",
+    ".cr-bullet-track { position: relative; height: 14px; background: linear-gradient(90deg, color-mix(in srgb, var(--cr-line) 58%, transparent) 0 33%, color-mix(in srgb, var(--cr-line) 78%, transparent) 33% 66%, color-mix(in srgb, var(--cr-line) 95%, transparent) 66%); }",
+    ".cr-bullet-track::before { content: ''; position: absolute; inset: 3px auto 3px 0; width: var(--value, 0%); background: var(--cr-tone); }",
+    ".cr-bullet-track::after { content: ''; position: absolute; top: -3px; bottom: -3px; left: var(--target, 100%); width: 2px; background: var(--cr-text); }",
+    ".cr-bullet > span { color: var(--cr-muted); font-size: 11px; }",
+    ".cr-gauge { --cr-tone: var(--cr-accent); display: grid; gap: 9px; }",
+    ".cr-gauge-head { display: flex; justify-content: space-between; gap: 12px; align-items: baseline; }",
+    ".cr-gauge-track { position: relative; height: 18px; border-radius: 999px; background: linear-gradient(90deg, color-mix(in srgb, var(--cr-negative) 75%, var(--cr-surface)) 0 33%, color-mix(in srgb, var(--cr-secondary) 75%, var(--cr-surface)) 33% 66%, color-mix(in srgb, var(--cr-positive) 75%, var(--cr-surface)) 66%); }",
+    ".cr-gauge-track::after { content: ''; position: absolute; top: -5px; left: var(--value, 0%); width: 4px; height: 28px; border-radius: 4px; background: var(--cr-text); transform: translateX(-2px); box-shadow: 0 0 0 3px var(--cr-bg); }",
+    ".cr-ring { --cr-tone: var(--cr-accent); position: relative; display: inline-grid; width: 124px; aspect-ratio: 1; place-items: center; border-radius: 50%; background: conic-gradient(var(--cr-tone) var(--value, 0%), color-mix(in srgb, var(--cr-line) 65%, transparent) 0); }",
+    ".cr-ring::after { content: ''; position: absolute; inset: 13px; border-radius: 50%; background: var(--cr-surface); }",
+    ".cr-ring > * { position: relative; z-index: 1; text-align: center; }",
+    ".cr-ring strong { display: block; color: var(--cr-text); font-size: 24px; line-height: 1; }",
+    ".cr-ring span { color: var(--cr-muted); font-size: 10px; }",
+    ".cr-delta-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 10px; }",
+    ".cr-delta { --cr-tone: var(--cr-accent); border-left: 3px solid var(--cr-tone); background: color-mix(in srgb, var(--cr-tone) 7%, var(--cr-surface)); padding: 12px 14px; }",
+    ".cr-delta strong { display: block; color: var(--cr-tone); font-size: 22px; }",
+    ".cr-delta span { color: var(--cr-muted); font-size: 11px; }",
+    ".cr-status-summary { display: flex; flex-wrap: wrap; gap: 8px; }",
+    ".cr-status { --cr-tone: var(--cr-accent); display: inline-flex; align-items: baseline; gap: 7px; border: 1px solid color-mix(in srgb, var(--cr-tone) 42%, var(--cr-line)); border-radius: 999px; padding: 7px 10px; background: color-mix(in srgb, var(--cr-tone) 8%, var(--cr-surface)); }",
+    ".cr-status strong { color: var(--cr-tone); font-size: 15px; }",
+    ".cr-status span { color: var(--cr-muted); font-size: 11px; }",
+    ".cr-before-after { display: grid; grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr); gap: 12px; align-items: stretch; }",
+    ".cr-before-after > article, .cr-pros-cons > article { min-width: 0; border: 1px solid var(--cr-line); border-radius: var(--cr-radius); padding: 16px; background: var(--cr-surface); }",
+    ".cr-change-arrow { align-self: center; color: var(--cr-accent); font: 850 20px/1 ui-monospace, SFMono-Regular, Menlo, monospace; }",
+    ".cr-pros-cons { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }",
+    ".cr-pros-cons ul { margin: 10px 0 0; padding-left: 18px; color: var(--cr-muted); }",
+    ".cr-pros-cons li + li { margin-top: 6px; }",
+    ".cr-decision-matrix { overflow-x: auto; border: 1px solid var(--cr-line); border-radius: var(--cr-radius); }",
+    ".cr-decision-row { --columns: 3; min-width: 620px; display: grid; grid-template-columns: minmax(160px, 1.35fr) repeat(var(--columns), minmax(90px, 1fr)); }",
+    ".cr-decision-row > * { padding: 10px 12px; border-right: 1px solid var(--cr-line); border-bottom: 1px solid var(--cr-line); color: var(--cr-muted); font-size: 12px; text-align: center; }",
+    ".cr-decision-row > :first-child { color: var(--cr-text); text-align: left; }",
+    ".cr-decision-row[data-head] > * { background: var(--cr-surface-strong); color: var(--cr-text); font-weight: 800; }",
+    ".cr-decision-row:last-child > * { border-bottom: 0; }",
+    ".cr-feature-matrix { width: 100%; min-width: 560px; border-collapse: collapse; }",
+    ".cr-feature-matrix th, .cr-feature-matrix td { padding: 10px 12px; border-bottom: 1px solid var(--cr-line); text-align: center; }",
+    ".cr-feature-matrix th:first-child, .cr-feature-matrix td:first-child { text-align: left; }",
+    ".cr-feature-matrix th { color: var(--cr-text); font-size: 11px; }",
+    ".cr-feature-matrix td { color: var(--cr-muted); font-size: 12px; }",
+    ".cr-quadrant { position: relative; display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); min-height: 320px; border: 1px solid var(--cr-line); background: linear-gradient(90deg, transparent calc(50% - .5px), var(--cr-line) 50%, transparent calc(50% + .5px)), linear-gradient(0deg, transparent calc(50% - .5px), var(--cr-line) 50%, transparent calc(50% + .5px)); }",
+    ".cr-quadrant-cell { min-width: 0; padding: 18px; }",
+    ".cr-quadrant-cell h3 { color: var(--cr-text); }",
+    ".cr-quadrant-cell p { font-size: 12px; }",
+    ".cr-spectrum { display: grid; gap: 10px; padding: 8px 0; }",
+    ".cr-spectrum-track { position: relative; height: 10px; margin: 12px 8px; border-radius: 999px; background: linear-gradient(90deg, var(--cr-negative), var(--cr-secondary), var(--cr-positive)); }",
+    ".cr-spectrum-point { --cr-tone: var(--cr-text); position: absolute; left: var(--value, 50%); top: 50%; width: 14px; height: 14px; border: 3px solid var(--cr-bg); border-radius: 50%; background: var(--cr-tone); transform: translate(-50%, -50%); }",
+    ".cr-spectrum-labels { display: flex; justify-content: space-between; gap: 12px; color: var(--cr-muted); font-size: 10px; }",
+    ".cr-ranking { display: grid; gap: 8px; margin: 0; padding: 0; list-style: none; counter-reset: cr-rank; }",
+    ".cr-ranking > li { --cr-tone: var(--cr-accent); counter-increment: cr-rank; display: grid; grid-template-columns: 28px minmax(100px, .4fr) minmax(160px, 1fr) auto; gap: 10px; align-items: center; }",
+    ".cr-ranking > li::before { content: counter(cr-rank); color: var(--cr-muted); font: 800 11px/1 ui-monospace, SFMono-Regular, Menlo, monospace; }",
+    ".cr-ranking-bar { height: 8px; background: color-mix(in srgb, var(--cr-line) 65%, transparent); }",
+    ".cr-ranking-bar::before { content: ''; display: block; width: var(--value, 0%); height: 100%; background: var(--cr-tone); }",
+    ".cr-ranking strong { color: var(--cr-text); font-size: 12px; }",
+    ".cr-ranking span { color: var(--cr-muted); font-size: 11px; }",
+    ".cr-benchmark-row { --cr-tone: var(--cr-accent); display: grid; grid-template-columns: minmax(90px, .3fr) minmax(180px, 1fr) auto; gap: 12px; align-items: center; }",
+    ".cr-benchmark-track { position: relative; grid-column: auto; height: 14px; overflow: visible; }",
+    ".cr-benchmark-track::before { content: ''; position: absolute; inset: 3px auto 3px 0; width: var(--baseline, 0%); background: var(--cr-muted); opacity: .45; }",
+    ".cr-benchmark-track::after { content: ''; position: absolute; inset: 0 auto 0 0; width: var(--value, 0%); border-right: 2px solid var(--cr-tone); background: color-mix(in srgb, var(--cr-tone) 48%, transparent); }",
+    ".cr-distribution-row { display: grid; grid-template-columns: minmax(90px, .3fr) minmax(180px, 1fr); gap: 12px; align-items: center; }",
+    ".cr-distribution-track { position: relative; height: 16px; border-bottom: 1px solid var(--cr-line); }",
+    ".cr-distribution-range { position: absolute; left: var(--low, 10%); right: calc(100% - var(--high, 90%)); top: 5px; height: 6px; background: color-mix(in srgb, var(--cr-accent) 30%, var(--cr-line)); }",
+    ".cr-distribution-track::after { content: ''; position: absolute; left: var(--median, 50%); top: 1px; width: 2px; height: 14px; background: var(--cr-accent); }",
+    ".cr-chart-row { --cr-tone: var(--cr-accent); display: grid; grid-template-columns: minmax(90px, .32fr) minmax(180px, 1fr) auto; gap: 12px; align-items: center; }",
+    ".cr-chart-row .cr-bar-track { grid-column: auto; }",
+    ".cr-grouped-bars .cr-bar-group { display: grid; gap: 4px; }",
+    ".cr-grouped-bars .cr-bar-track { grid-column: auto; height: 6px; }",
+    ".cr-stacked-bar { display: flex; width: 100%; min-height: 26px; overflow: hidden; border-radius: 5px; background: color-mix(in srgb, var(--cr-line) 65%, transparent); }",
+    ".cr-stacked-segment { --cr-tone: var(--cr-accent); flex: 0 0 var(--value, 0%); display: grid; place-items: center; min-width: 0; background: var(--cr-tone); color: var(--cr-bg); font-size: 10px; font-weight: 850; }",
+    ".cr-diverging-bars { display: grid; gap: 10px; }",
+    ".cr-diverging-row { display: grid; grid-template-columns: minmax(120px, 1fr) auto minmax(120px, 1fr); gap: 10px; align-items: center; }",
+    ".cr-diverging-side { display: flex; height: 12px; background: color-mix(in srgb, var(--cr-line) 60%, transparent); }",
+    ".cr-diverging-side.negative { justify-content: flex-end; }",
+    ".cr-diverging-fill { width: var(--value, 0%); background: var(--cr-tone, var(--cr-accent)); }",
+    ".cr-diverging-row > strong { color: var(--cr-text); font-size: 11px; }",
+    ".cr-lollipop-row { display: grid; grid-template-columns: minmax(90px, .3fr) minmax(180px, 1fr) auto; gap: 12px; align-items: center; }",
+    ".cr-lollipop-track { --cr-tone: var(--cr-accent); position: relative; height: 18px; }",
+    ".cr-lollipop-track::before { content: ''; position: absolute; top: 8px; left: 0; width: var(--value, 0%); height: 2px; background: color-mix(in srgb, var(--cr-tone) 65%, var(--cr-line)); }",
+    ".cr-lollipop-track::after { content: ''; position: absolute; left: var(--value, 0%); top: 3px; width: 12px; height: 12px; border: 3px solid var(--cr-bg); border-radius: 50%; background: var(--cr-tone); transform: translateX(-50%); }",
+    ".cr-dot-row { display: grid; grid-template-columns: minmax(90px, .3fr) minmax(180px, 1fr); gap: 12px; align-items: center; }",
+    ".cr-dot-track { position: relative; height: 18px; border-bottom: 1px solid var(--cr-line); }",
+    ".cr-dot { --cr-tone: var(--cr-accent); position: absolute; left: var(--value, 50%); bottom: -5px; width: 10px; height: 10px; border: 2px solid var(--cr-bg); border-radius: 50%; background: var(--cr-tone); transform: translateX(-50%); }",
+    ".cr-histogram, .cr-sparkline, .cr-waterfall { display: flex; align-items: end; gap: 5px; min-height: 150px; padding-top: 12px; border-bottom: 1px solid var(--cr-line); }",
+    ".cr-histogram-bar, .cr-sparkline-bar, .cr-waterfall-bar { --cr-tone: var(--cr-accent); flex: 1 1 0; min-width: 5px; height: var(--value, 0%); background: var(--cr-tone); }",
+    ".cr-sparkline { min-height: 52px; gap: 3px; border-bottom: 0; }",
+    ".cr-sparkline-bar { border-radius: 2px 2px 0 0; opacity: .8; }",
+    ".cr-heatmap { display: grid; grid-template-columns: repeat(var(--columns, 7), minmax(24px, 1fr)); gap: 4px; }",
+    ".cr-heatmap-cell { --cr-tone: var(--cr-accent); display: grid; min-height: 38px; place-items: center; border: 1px solid color-mix(in srgb, var(--cr-tone) 18%, var(--cr-line)); background: color-mix(in srgb, var(--cr-tone) var(--level, 20%), var(--cr-surface)); color: var(--cr-text); font-size: 10px; }",
+    ".cr-waterfall { min-height: 180px; gap: 8px; }",
+    ".cr-waterfall-bar { align-self: end; margin-bottom: var(--offset, 0%); position: relative; }",
+    ".cr-waterfall-bar span { position: absolute; left: 50%; bottom: calc(100% + 5px); color: var(--cr-muted); font-size: 9px; transform: translateX(-50%); white-space: nowrap; }",
+    ".cr-timeline { display: grid; gap: 0; margin-left: 8px; border-left: 1px solid var(--cr-line); }",
+    ".cr-timeline-item { --cr-tone: var(--cr-accent); position: relative; padding: 0 0 20px 22px; }",
+    ".cr-timeline-item::before { content: ''; position: absolute; left: -6px; top: 4px; width: 11px; height: 11px; border: 3px solid var(--cr-bg); border-radius: 50%; background: var(--cr-tone); }",
+    ".cr-timeline-item time { color: var(--cr-tone); font: 750 10px/1.2 ui-monospace, SFMono-Regular, Menlo, monospace; }",
+    ".cr-timeline-item h3 { margin: 5px 0 4px; }",
+    ".cr-roadmap { overflow-x: auto; }",
+    ".cr-roadmap-grid { min-width: 680px; display: grid; grid-template-columns: 120px repeat(var(--periods, 4), minmax(120px, 1fr)); gap: 6px; }",
+    ".cr-roadmap-label, .cr-roadmap-period { padding: 8px; color: var(--cr-muted); font-size: 10px; }",
+    ".cr-roadmap-period { text-align: center; border-bottom: 1px solid var(--cr-line); }",
+    ".cr-roadmap-lane { grid-column: 2 / -1; display: grid; grid-template-columns: repeat(var(--periods, 4), minmax(120px, 1fr)); min-height: 42px; background: repeating-linear-gradient(90deg, transparent 0 calc(25% - 1px), var(--cr-line) calc(25% - 1px) 25%); }",
+    ".cr-roadmap-item { --cr-tone: var(--cr-accent); grid-column: var(--start, 1) / span var(--span, 1); align-self: center; margin: 4px; border-left: 3px solid var(--cr-tone); padding: 7px 9px; background: color-mix(in srgb, var(--cr-tone) 12%, var(--cr-surface)); color: var(--cr-text); font-size: 11px; }",
+    ".cr-swimlane { overflow-x: auto; }",
+    ".cr-swimlane-row { --columns: 4; min-width: 680px; display: grid; grid-template-columns: 120px repeat(var(--columns), minmax(120px, 1fr)); border-bottom: 1px solid var(--cr-line); }",
+    ".cr-swimlane-row > strong { padding: 11px; color: var(--cr-text); font-size: 11px; }",
+    ".cr-swimlane-track { grid-column: 2 / -1; display: grid; grid-template-columns: repeat(var(--columns), minmax(120px, 1fr)); min-height: 46px; border-left: 1px solid var(--cr-line); }",
+    ".cr-swimlane-item { --cr-tone: var(--cr-accent); grid-column: var(--start, 1) / span var(--span, 1); align-self: center; margin: 5px; border: 1px solid color-mix(in srgb, var(--cr-tone) 42%, var(--cr-line)); border-radius: 5px; padding: 7px 9px; background: color-mix(in srgb, var(--cr-tone) 8%, var(--cr-surface)); color: var(--cr-text); font-size: 10px; }",
+    ".cr-cycle { display: grid; grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); gap: 24px; }",
+    ".cr-cycle-step { --cr-tone: var(--cr-accent); position: relative; border-top: 3px solid var(--cr-tone); padding: 13px; background: var(--cr-surface); }",
+    ".cr-cycle-step:not(:last-child)::after { content: '>'; position: absolute; top: 50%; right: -17px; color: var(--cr-muted); transform: translateY(-50%); }",
+    ".cr-funnel, .cr-pyramid { display: flex; flex-direction: column; align-items: center; gap: 5px; }",
+    ".cr-funnel-step, .cr-pyramid-step { --cr-tone: var(--cr-accent); width: var(--width, 100%); min-width: 180px; padding: 10px 14px; background: color-mix(in srgb, var(--cr-tone) 20%, var(--cr-surface)); color: var(--cr-text); text-align: center; font-size: 12px; }",
+    ".cr-tree, .cr-tree ul { margin: 0; padding-left: 20px; list-style: none; }",
+    ".cr-tree { padding-left: 0; }",
+    ".cr-tree li { position: relative; padding: 5px 0 5px 16px; color: var(--cr-muted); font-size: 12px; }",
+    ".cr-tree li::before { content: ''; position: absolute; left: 0; top: 0; bottom: 50%; width: 10px; border-left: 1px solid var(--cr-line); border-bottom: 1px solid var(--cr-line); }",
+    ".cr-tree strong { color: var(--cr-text); }",
+    ".cr-dependency-chain { display: flex; align-items: stretch; gap: 22px; overflow-x: auto; padding: 2px; }",
+    ".cr-dependency-node { --cr-tone: var(--cr-accent); position: relative; flex: 0 0 min(220px, 70vw); border: 1px solid var(--cr-line); border-left: 3px solid var(--cr-tone); padding: 13px; background: var(--cr-surface); }",
+    ".cr-dependency-node:not(:last-child)::after { content: '>'; position: absolute; left: calc(100% + 8px); top: 50%; color: var(--cr-muted); transform: translateY(-50%); }",
+    ".cr-status-board { display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap: 10px; }",
+    ".cr-status-column { min-width: 0; border-top: 3px solid var(--cr-tone, var(--cr-accent)); background: color-mix(in srgb, var(--cr-tone, var(--cr-accent)) 5%, var(--cr-surface)); padding: 12px; }",
+    ".cr-status-column > header { display: flex; justify-content: space-between; gap: 8px; margin-bottom: 10px; color: var(--cr-text); font-size: 12px; font-weight: 800; }",
+    ".cr-status-item { padding: 9px 0; border-top: 1px solid var(--cr-line); color: var(--cr-muted); font-size: 11px; }",
+    "@media (max-width: 760px) { .cr-before-after, .cr-pros-cons { grid-template-columns: 1fr; } .cr-change-arrow { justify-self: center; transform: rotate(90deg); } .cr-quadrant { grid-template-columns: 1fr; background: none; } .cr-quadrant-cell + .cr-quadrant-cell { border-top: 1px solid var(--cr-line); } .cr-bullet, .cr-chart-row, .cr-lollipop-row, .cr-benchmark-row, .cr-distribution-row, .cr-dot-row { grid-template-columns: 1fr auto; } .cr-bullet-track, .cr-chart-row .cr-bar-track, .cr-lollipop-track, .cr-benchmark-track, .cr-distribution-track, .cr-dot-track { grid-column: 1 / -1; } .cr-ranking > li { grid-template-columns: 24px minmax(90px, 1fr) auto; } .cr-ranking-bar { grid-column: 2 / -1; } .cr-stat + .cr-stat { border-left: 0; border-top: 1px solid var(--cr-line); } .cr-cycle { grid-template-columns: 1fr 1fr; } }",
+    "@media (max-width: 480px) { .cr-cycle { grid-template-columns: 1fr; gap: 10px; } .cr-cycle-step::after { display: none; } .cr-ring { width: 108px; } .cr-histogram, .cr-waterfall { min-height: 130px; } }",
+  ].join("\n");
+}
+
+function contextRoomConceptPatternStyles() {
+  return [
+    ".cr-concept-spotlight { display: grid; grid-template-columns: minmax(0, 1fr) minmax(180px, 1.2fr) minmax(0, 1fr); gap: 12px; align-items: stretch; }",
+    ".cr-concept-core, .cr-concept-context { display: grid; align-content: center; min-width: 0; padding: 16px; text-align: center; }",
+    ".cr-concept-core { border: 2px solid var(--cr-accent); background: color-mix(in srgb, var(--cr-accent) 10%, var(--cr-surface)); }",
+    ".cr-concept-context { border-top: 1px solid var(--cr-line); border-bottom: 1px solid var(--cr-line); }",
+    ".cr-concept-core strong { color: var(--cr-text); font-size: 18px; }",
+    ".cr-concept-core span, .cr-concept-context span { color: var(--cr-muted); font-size: 11px; }",
+    ".cr-definition-anatomy { display: grid; grid-template-columns: minmax(150px, .45fr) minmax(0, 1fr); gap: 18px; }",
+    ".cr-definition-term { display: grid; align-content: center; border-left: 4px solid var(--cr-accent); padding: 16px; background: color-mix(in srgb, var(--cr-accent) 8%, var(--cr-surface)); }",
+    ".cr-definition-term strong { color: var(--cr-text); font-size: 20px; }",
+    ".cr-definition-parts { display: grid; gap: 0; border-top: 1px solid var(--cr-line); }",
+    ".cr-definition-part { display: grid; grid-template-columns: minmax(80px, .3fr) minmax(0, 1fr); gap: 12px; padding: 11px 0; border-bottom: 1px solid var(--cr-line); }",
+    ".cr-definition-part strong { color: var(--cr-accent); font-size: 11px; }",
+    ".cr-definition-part span { color: var(--cr-muted); font-size: 12px; }",
+    ".cr-principle-stack { display: grid; gap: 7px; margin: 0; padding: 0; list-style: none; counter-reset: cr-principle; }",
+    ".cr-principle-stack > li { --cr-tone: var(--cr-accent); counter-increment: cr-principle; display: grid; grid-template-columns: 34px minmax(0, 1fr); gap: 12px; align-items: center; border-left: 3px solid var(--cr-tone); padding: 12px 14px; background: color-mix(in srgb, var(--cr-tone) 6%, var(--cr-surface)); }",
+    ".cr-principle-stack > li::before { content: counter(cr-principle, decimal-leading-zero); color: var(--cr-tone); font: 850 11px/1 ui-monospace, SFMono-Regular, Menlo, monospace; }",
+    ".cr-layered-model { display: grid; gap: 5px; }",
+    ".cr-model-layer { --cr-tone: var(--cr-accent); display: grid; grid-template-columns: minmax(100px, .3fr) minmax(0, 1fr); gap: 14px; align-items: center; border-left: 4px solid var(--cr-tone); padding: 12px 14px; background: color-mix(in srgb, var(--cr-tone) 7%, var(--cr-surface)); }",
+    ".cr-model-layer strong { color: var(--cr-text); font-size: 12px; }",
+    ".cr-model-layer span { color: var(--cr-muted); font-size: 11px; }",
+    ".cr-example-nonexample { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }",
+    ".cr-example-side { --cr-tone: var(--cr-positive); border-top: 3px solid var(--cr-tone); padding: 15px; background: color-mix(in srgb, var(--cr-tone) 6%, var(--cr-surface)); }",
+    ".cr-example-side h3 { color: var(--cr-tone); }",
+    ".cr-example-side ul { margin: 10px 0 0; padding-left: 18px; color: var(--cr-muted); }",
+    ".cr-misconception-correction { display: grid; grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr); gap: 14px; align-items: center; }",
+    ".cr-misconception, .cr-correction { padding: 16px; background: var(--cr-surface); }",
+    ".cr-misconception { border-left: 3px solid var(--cr-negative); color: var(--cr-muted); text-decoration: line-through; text-decoration-color: var(--cr-negative); }",
+    ".cr-correction { border-left: 3px solid var(--cr-positive); color: var(--cr-text); }",
+    ".cr-concept-arrow { color: var(--cr-accent); font: 850 18px/1 ui-monospace, SFMono-Regular, Menlo, monospace; }",
+    ".cr-claim-evidence { display: grid; grid-template-columns: minmax(180px, .8fr) minmax(0, 1.2fr); gap: 16px; }",
+    ".cr-claim { display: grid; align-content: center; border: 1px solid var(--cr-accent); padding: 16px; background: color-mix(in srgb, var(--cr-accent) 8%, var(--cr-surface)); color: var(--cr-text); font-weight: 800; }",
+    ".cr-evidence-list { display: grid; gap: 7px; }",
+    ".cr-evidence { position: relative; border-left: 2px solid var(--cr-positive); padding: 9px 12px; background: var(--cr-surface); color: var(--cr-muted); font-size: 11px; }",
+    ".cr-question-answer { display: grid; gap: 0; }",
+    ".cr-question { border-left: 3px solid var(--cr-secondary); padding: 12px 15px; background: color-mix(in srgb, var(--cr-secondary) 8%, var(--cr-surface)); color: var(--cr-text); font-weight: 800; }",
+    ".cr-answer { margin-left: 24px; border-left: 1px solid var(--cr-line); padding: 13px 15px; color: var(--cr-muted); }",
+    ".cr-analogy-bridge { display: grid; gap: 7px; }",
+    ".cr-analogy-row { display: grid; grid-template-columns: minmax(110px, 1fr) minmax(90px, .7fr) minmax(110px, 1fr); gap: 10px; align-items: center; }",
+    ".cr-analogy-side { border: 1px solid var(--cr-line); padding: 10px 12px; color: var(--cr-text); text-align: center; }",
+    ".cr-analogy-link { color: var(--cr-accent); font-size: 10px; text-align: center; }",
+    ".cr-insight-ladder { display: grid; gap: 7px; }",
+    ".cr-insight-step { --cr-tone: var(--cr-accent); width: calc(100% - var(--indent, 0px)); margin-left: var(--indent, 0px); border-left: 3px solid var(--cr-tone); padding: 10px 13px; background: color-mix(in srgb, var(--cr-tone) 6%, var(--cr-surface)); }",
+    ".cr-insight-step strong { color: var(--cr-text); font-size: 12px; }",
+    ".cr-insight-step span { color: var(--cr-muted); font-size: 11px; }",
+    ".cr-concept-map { position: relative; display: grid; grid-template-columns: repeat(3, minmax(90px, 1fr)); grid-template-rows: repeat(3, minmax(70px, auto)); gap: 12px; }",
+    ".cr-concept-map::before { content: ''; position: absolute; inset: 16% 16%; background: linear-gradient(90deg, transparent calc(50% - .5px), var(--cr-line) 50%, transparent calc(50% + .5px)), linear-gradient(0deg, transparent calc(50% - .5px), var(--cr-line) 50%, transparent calc(50% + .5px)); pointer-events: none; }",
+    ".cr-map-node { --cr-tone: var(--cr-accent); z-index: 1; display: grid; place-items: center; min-width: 0; border: 1px solid color-mix(in srgb, var(--cr-tone) 42%, var(--cr-line)); padding: 11px; background: var(--cr-surface); color: var(--cr-text); text-align: center; font-size: 11px; }",
+    ".cr-map-node[data-slot='top'] { grid-column: 2; grid-row: 1; } .cr-map-node[data-slot='left'] { grid-column: 1; grid-row: 2; } .cr-map-node[data-slot='center'] { grid-column: 2; grid-row: 2; border-width: 2px; background: color-mix(in srgb, var(--cr-accent) 10%, var(--cr-surface)); font-weight: 850; } .cr-map-node[data-slot='right'] { grid-column: 3; grid-row: 2; } .cr-map-node[data-slot='bottom'] { grid-column: 2; grid-row: 3; }",
+    ".cr-hub-spoke { display: grid; grid-template-columns: repeat(3, minmax(90px, 1fr)); grid-template-rows: repeat(3, minmax(74px, auto)); gap: 8px; align-items: center; }",
+    ".cr-hub { grid-column: 2; grid-row: 2; display: grid; width: 132px; max-width: 100%; aspect-ratio: 1; place-self: center; place-items: center; border: 2px solid var(--cr-accent); border-radius: 50%; background: color-mix(in srgb, var(--cr-accent) 10%, var(--cr-surface)); color: var(--cr-text); text-align: center; font-weight: 850; }",
+    ".cr-spoke { --cr-tone: var(--cr-accent); border-bottom: 2px solid var(--cr-tone); padding: 9px; color: var(--cr-muted); text-align: center; font-size: 11px; }",
+    ".cr-spoke[data-slot='top'] { grid-column: 2; grid-row: 1; } .cr-spoke[data-slot='left'] { grid-column: 1; grid-row: 2; } .cr-spoke[data-slot='right'] { grid-column: 3; grid-row: 2; } .cr-spoke[data-slot='bottom'] { grid-column: 2; grid-row: 3; }",
+    ".cr-relationship-pairs { display: grid; gap: 8px; }",
+    ".cr-relationship-row { display: grid; grid-template-columns: minmax(110px, 1fr) minmax(90px, .6fr) minmax(110px, 1fr); gap: 10px; align-items: center; }",
+    ".cr-relationship-node { border: 1px solid var(--cr-line); padding: 10px; color: var(--cr-text); text-align: center; }",
+    ".cr-relationship-label { position: relative; color: var(--cr-accent); font-size: 10px; text-align: center; }",
+    ".cr-relationship-label::before, .cr-relationship-label::after { content: ''; position: absolute; top: 50%; width: 18%; border-top: 1px solid var(--cr-line); } .cr-relationship-label::before { left: 0; } .cr-relationship-label::after { right: 0; }",
+    ".cr-cause-effect, .cr-logic-chain, .cr-ipo { display: flex; gap: 22px; align-items: stretch; overflow-x: auto; padding: 2px; }",
+    ".cr-cause-node, .cr-logic-node, .cr-ipo-stage { --cr-tone: var(--cr-accent); position: relative; flex: 1 0 150px; border-top: 3px solid var(--cr-tone); padding: 13px; background: var(--cr-surface); }",
+    ".cr-cause-node:not(:last-child)::after, .cr-logic-node:not(:last-child)::after, .cr-ipo-stage:not(:last-child)::after { content: '>'; position: absolute; top: 50%; left: calc(100% + 8px); color: var(--cr-muted); transform: translateY(-50%); }",
+    ".cr-causal-loop, .cr-feedback-loop { display: grid; grid-template-columns: repeat(2, minmax(120px, 1fr)); gap: 26px; }",
+    ".cr-loop-node { --cr-tone: var(--cr-accent); position: relative; min-width: 0; border: 1px solid var(--cr-line); border-left: 3px solid var(--cr-tone); padding: 13px; background: var(--cr-surface); }",
+    ".cr-loop-node::after { content: '>'; position: absolute; right: -18px; top: 50%; color: var(--cr-tone); }",
+    ".cr-loop-node:nth-child(2)::after, .cr-loop-node:nth-child(4)::after { right: auto; left: -18px; transform: rotate(180deg); }",
+    ".cr-dependency-map { display: grid; gap: 14px; }",
+    ".cr-dependency-root { justify-self: center; min-width: 180px; border: 2px solid var(--cr-accent); padding: 12px; background: color-mix(in srgb, var(--cr-accent) 8%, var(--cr-surface)); color: var(--cr-text); text-align: center; font-weight: 800; }",
+    ".cr-dependency-branches { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 10px; border-top: 1px solid var(--cr-line); padding-top: 14px; }",
+    ".cr-dependency-branch { --cr-tone: var(--cr-accent); border-top: 3px solid var(--cr-tone); padding: 11px; background: var(--cr-surface); color: var(--cr-muted); font-size: 11px; }",
+    ".cr-influence-map { display: grid; gap: 8px; }",
+    ".cr-influence-row { display: grid; grid-template-columns: minmax(110px, 1fr) 44px minmax(110px, 1fr); gap: 10px; align-items: center; }",
+    ".cr-influence-node { padding: 10px; background: var(--cr-surface); color: var(--cr-text); text-align: center; }",
+    ".cr-influence-sign { --cr-tone: var(--cr-positive); display: grid; width: 30px; aspect-ratio: 1; place-items: center; justify-self: center; border: 1px solid var(--cr-tone); border-radius: 50%; color: var(--cr-tone); font-weight: 850; }",
+    ".cr-tradeoff-balance { display: grid; grid-template-columns: minmax(0, 1fr) 54px minmax(0, 1fr); gap: 8px; align-items: end; }",
+    ".cr-balance-side { --cr-tone: var(--cr-accent); border-bottom: 3px solid var(--cr-tone); padding: 14px; background: var(--cr-surface); text-align: center; }",
+    ".cr-balance-side strong { color: var(--cr-text); } .cr-balance-side span { color: var(--cr-muted); font-size: 11px; }",
+    ".cr-balance-center { width: 0; height: 0; justify-self: center; border-left: 24px solid transparent; border-right: 24px solid transparent; border-bottom: 42px solid var(--cr-line); }",
+    ".cr-overlap-map { position: relative; min-height: 260px; }",
+    ".cr-overlap-circle { --cr-tone: var(--cr-accent); position: absolute; top: 25px; display: grid; width: 210px; max-width: 58%; aspect-ratio: 1; place-items: center; border: 2px solid var(--cr-tone); border-radius: 50%; background: color-mix(in srgb, var(--cr-tone) 13%, transparent); color: var(--cr-text); text-align: center; }",
+    ".cr-overlap-circle:first-child { left: 12%; } .cr-overlap-circle:last-child { right: 12%; }",
+    ".cr-overlap-center { position: absolute; z-index: 2; left: 50%; top: 50%; width: 120px; color: var(--cr-text); text-align: center; font-size: 11px; font-weight: 850; transform: translate(-50%, -50%); }",
+    ".cr-ecosystem-map { display: grid; min-height: 320px; place-items: center; }",
+    ".cr-ecosystem-ring { display: grid; width: min(100%, var(--size, 100%)); aspect-ratio: 1; place-items: center; border: 1px solid var(--cr-line); border-radius: 50%; background: color-mix(in srgb, var(--cr-accent) 3%, transparent); padding: 30px; }",
+    ".cr-ecosystem-core { display: grid; width: 120px; aspect-ratio: 1; place-items: center; border-radius: 50%; background: var(--cr-accent); color: var(--cr-bg); text-align: center; font-weight: 850; }",
+    ".cr-taxonomy { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 12px; }",
+    ".cr-taxonomy-group { border-top: 3px solid var(--cr-tone, var(--cr-accent)); padding-top: 10px; }",
+    ".cr-taxonomy-group h3 { color: var(--cr-text); } .cr-taxonomy-group ul { margin: 8px 0 0; padding-left: 17px; color: var(--cr-muted); }",
+    ".cr-cluster-map, .cr-affinity-groups { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 12px; }",
+    ".cr-cluster, .cr-affinity-group { --cr-tone: var(--cr-accent); border: 1px dashed color-mix(in srgb, var(--cr-tone) 55%, var(--cr-line)); padding: 13px; }",
+    ".cr-cluster h3, .cr-affinity-group h3 { color: var(--cr-tone); }",
+    ".cr-cluster-tags { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 9px; }",
+    ".cr-cluster-tag { border: 1px solid var(--cr-line); border-radius: 999px; padding: 5px 8px; color: var(--cr-muted); font-size: 10px; }",
+    ".cr-nested-scopes { display: grid; place-items: center; }",
+    ".cr-scope { width: min(100%, var(--width, 100%)); border: 1px solid var(--cr-line); padding: 18px; background: color-mix(in srgb, var(--cr-accent) 3%, var(--cr-surface)); }",
+    ".cr-scope > strong { display: block; margin-bottom: 10px; color: var(--cr-accent); font-size: 11px; }",
+    ".cr-architecture-layers { display: grid; gap: 6px; }",
+    ".cr-architecture-layer { --cr-tone: var(--cr-accent); display: grid; grid-template-columns: minmax(110px, .3fr) minmax(0, 1fr); gap: 14px; border: 1px solid var(--cr-line); border-left: 4px solid var(--cr-tone); padding: 12px 14px; }",
+    ".cr-architecture-layer strong { color: var(--cr-text); } .cr-architecture-layer span { color: var(--cr-muted); font-size: 11px; }",
+    ".cr-system-map { display: grid; grid-template-columns: minmax(120px, 1fr) minmax(170px, 1.2fr) minmax(120px, 1fr); gap: 18px; align-items: stretch; }",
+    ".cr-system-side, .cr-system-core { display: grid; align-content: center; gap: 7px; padding: 14px; }",
+    ".cr-system-side { border-top: 2px solid var(--cr-line); border-bottom: 2px solid var(--cr-line); }",
+    ".cr-system-core { border: 2px solid var(--cr-accent); background: color-mix(in srgb, var(--cr-accent) 8%, var(--cr-surface)); }",
+    ".cr-system-map strong { color: var(--cr-text); } .cr-system-map span { color: var(--cr-muted); font-size: 11px; }",
+    ".cr-affinity-group ul { margin: 8px 0 0; padding: 0; list-style: none; color: var(--cr-muted); font-size: 11px; } .cr-affinity-group li + li { margin-top: 5px; }",
+    ".cr-knowledge-index { columns: 2 220px; column-gap: 28px; }",
+    ".cr-index-group { break-inside: avoid; margin-bottom: 18px; border-top: 2px solid var(--cr-accent); padding-top: 8px; }",
+    ".cr-index-group h3 { color: var(--cr-accent); } .cr-index-group ul { margin: 7px 0 0; padding: 0; list-style: none; color: var(--cr-muted); font-size: 11px; }",
+    ".cr-matrix-map { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); border: 1px solid var(--cr-line); }",
+    ".cr-matrix-cell { min-height: 130px; padding: 14px; } .cr-matrix-cell:nth-child(odd) { border-right: 1px solid var(--cr-line); } .cr-matrix-cell:nth-child(-n+2) { border-bottom: 1px solid var(--cr-line); }",
+    ".cr-matrix-cell h3 { color: var(--cr-text); } .cr-matrix-cell p { font-size: 11px; }",
+    ".cr-topic-lanes { display: grid; gap: 6px; }",
+    ".cr-topic-lane { display: grid; grid-template-columns: minmax(100px, .28fr) minmax(0, 1fr); gap: 12px; align-items: center; border-bottom: 1px solid var(--cr-line); padding: 9px 0; }",
+    ".cr-topic-lane > strong { color: var(--cr-text); font-size: 11px; }",
+    ".cr-topic-items { display: flex; flex-wrap: wrap; gap: 6px; } .cr-topic-item { padding: 6px 8px; background: var(--cr-surface); color: var(--cr-muted); font-size: 10px; }",
+    ".cr-decision-tree { display: grid; gap: 14px; }",
+    ".cr-decision-root { justify-self: center; min-width: 200px; border: 2px solid var(--cr-secondary); padding: 12px; color: var(--cr-text); text-align: center; font-weight: 800; }",
+    ".cr-decision-branches { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 12px; border-top: 1px solid var(--cr-line); padding-top: 14px; }",
+    ".cr-decision-branch { --cr-tone: var(--cr-accent); border-top: 3px solid var(--cr-tone); padding: 12px; background: var(--cr-surface); }",
+    ".cr-decision-branch strong { color: var(--cr-text); } .cr-decision-branch span { color: var(--cr-muted); font-size: 11px; }",
+    ".cr-argument-map { display: grid; gap: 14px; }",
+    ".cr-argument-claim { justify-self: center; max-width: 580px; border: 2px solid var(--cr-accent); padding: 14px; background: color-mix(in srgb, var(--cr-accent) 8%, var(--cr-surface)); color: var(--cr-text); text-align: center; font-weight: 800; }",
+    ".cr-argument-branches { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }",
+    ".cr-argument-side { --cr-tone: var(--cr-positive); border-top: 3px solid var(--cr-tone); padding: 13px; background: var(--cr-surface); }",
+    ".cr-argument-side h3 { color: var(--cr-tone); } .cr-argument-side ul { margin: 8px 0 0; padding-left: 17px; color: var(--cr-muted); }",
+    ".cr-hypothesis-test { display: grid; gap: 12px; }",
+    ".cr-hypothesis { border-left: 4px solid var(--cr-secondary); padding: 13px 15px; background: color-mix(in srgb, var(--cr-secondary) 7%, var(--cr-surface)); color: var(--cr-text); font-weight: 800; }",
+    ".cr-test-evidence { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }",
+    ".cr-test-side { --cr-tone: var(--cr-positive); border-top: 3px solid var(--cr-tone); padding: 12px; background: var(--cr-surface); }",
+    ".cr-test-verdict { border-left: 4px solid var(--cr-accent); padding: 12px 14px; color: var(--cr-muted); }",
+    ".cr-problem-solution { display: grid; grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr); gap: 14px; align-items: stretch; }",
+    ".cr-problem, .cr-solution { display: grid; align-content: center; padding: 15px; background: var(--cr-surface); } .cr-problem { border-left: 3px solid var(--cr-negative); } .cr-solution { border-left: 3px solid var(--cr-positive); }",
+    ".cr-feedback-loop { position: relative; }",
+    "@media (max-width: 760px) { .cr-concept-spotlight, .cr-definition-anatomy, .cr-example-nonexample, .cr-claim-evidence, .cr-system-map, .cr-argument-branches, .cr-test-evidence { grid-template-columns: 1fr; } .cr-misconception-correction, .cr-problem-solution { grid-template-columns: 1fr; } .cr-concept-arrow { justify-self: center; transform: rotate(90deg); } .cr-analogy-row, .cr-relationship-row, .cr-influence-row { grid-template-columns: 1fr; } .cr-relationship-label::before, .cr-relationship-label::after { display: none; } .cr-concept-map, .cr-hub-spoke { grid-template-columns: repeat(3, minmax(72px, 1fr)); } .cr-overlap-map { min-height: 220px; } .cr-overlap-circle { width: 170px; } .cr-architecture-layer, .cr-model-layer, .cr-topic-lane { grid-template-columns: 1fr; } .cr-matrix-map { grid-template-columns: 1fr; } .cr-matrix-cell { border-right: 0 !important; border-bottom: 1px solid var(--cr-line); } .cr-tradeoff-balance { grid-template-columns: 1fr; } .cr-balance-center { transform: rotate(90deg); } }",
+    "@media (max-width: 480px) { .cr-concept-map, .cr-hub-spoke { display: flex; flex-direction: column; } .cr-hub { order: -1; } .cr-map-node, .cr-spoke { width: 100%; } .cr-causal-loop, .cr-feedback-loop { grid-template-columns: 1fr; gap: 8px; } .cr-loop-node::after { display: none; } .cr-overlap-circle { width: 150px; max-width: 68%; } .cr-knowledge-index { columns: 1; } }",
+  ].join("\n");
+}
+
+function contextRoomDiagramStyles() {
+  return [
+    ".cr-diagram-scroll { width: 100%; overflow-x: auto; padding: 2px; }",
+    ".cr-diagram { --cr-cols: 12; position: relative; display: grid; min-width: 680px; grid-template-columns: repeat(var(--cr-cols), minmax(0, 1fr)); grid-auto-rows: minmax(42px, auto); gap: 8px; isolation: isolate; }",
+    ".cr-system-landscape, .cr-causal-chain-map, .cr-branching-decision, .cr-actor-sequence, .cr-reasoning-map { --cr-cols: 12; }",
+    ".cr-system-landscape { grid-auto-rows: minmax(48px, auto); }",
+    ".cr-causal-chain-map { grid-auto-rows: minmax(50px, auto); }",
+    ".cr-branching-decision { grid-auto-rows: minmax(54px, auto); }",
+    ".cr-actor-sequence { grid-auto-rows: minmax(46px, auto); }",
+    ".cr-reasoning-map { grid-auto-rows: minmax(52px, auto); }",
+    ".cr-diagram-node { --cr-tone: var(--cr-accent); z-index: 3; position: relative; grid-column: var(--col, auto) / span var(--span, 3); grid-row: var(--row, auto) / span var(--rows, 1); min-width: 0; border: 1px solid color-mix(in srgb, var(--cr-tone) 42%, var(--cr-line)); border-left: 3px solid var(--cr-tone); border-radius: 5px; padding: 10px 12px; background: var(--cr-surface); color: var(--cr-text); box-shadow: 0 4px 14px color-mix(in srgb, var(--cr-bg) 58%, transparent); transition: transform 150ms ease, border-color 150ms ease, box-shadow 150ms ease, background 150ms ease; }",
+    ".cr-diagram-node strong { display: block; overflow-wrap: anywhere; color: var(--cr-text); font-size: 11px; line-height: 1.3; }",
+    ".cr-diagram-node span, .cr-diagram-node p { margin: 4px 0 0; color: var(--cr-muted); font-size: 10px; line-height: 1.35; }",
+    ".cr-diagram-node[data-kind='external'] { border-style: dashed; background: transparent; }",
+    ".cr-diagram-node[data-kind='state'] { border-radius: 999px; border-left-width: 1px; text-align: center; }",
+    ".cr-diagram-node[data-kind='decision'] { border-left-width: 1px; background: color-mix(in srgb, var(--cr-secondary) 9%, var(--cr-surface)); clip-path: polygon(9% 0, 91% 0, 100% 50%, 91% 100%, 9% 100%, 0 50%); padding-left: 18px; padding-right: 18px; text-align: center; }",
+    ".cr-diagram-node[data-kind='event'] { border-left-width: 5px; }",
+    ".cr-diagram-node[data-kind='store'] { border-radius: 50% / 12%; border-left-width: 1px; text-align: center; }",
+    ".cr-diagram-node:is(:hover, :focus-within) { z-index: 7; border-color: var(--cr-tone); background: color-mix(in srgb, var(--cr-tone) 8%, var(--cr-surface)); box-shadow: 0 8px 22px color-mix(in srgb, var(--cr-tone) 18%, transparent); transform: translateY(-2px); }",
+    ".cr-diagram-node:focus-visible, .cr-diagram-node:has(> summary:focus-visible) { outline: 2px solid var(--cr-tone); outline-offset: 2px; }",
+    "details.cr-diagram-node { cursor: pointer; }",
+    "details.cr-diagram-node > summary { list-style: none; }",
+    "details.cr-diagram-node > summary::-webkit-details-marker { display: none; }",
+    "details.cr-diagram-node > summary::after { content: '+'; position: absolute; top: 7px; right: 9px; color: var(--cr-tone); font: 800 12px/1 ui-monospace, SFMono-Regular, Menlo, monospace; }",
+    "details.cr-diagram-node[open] > summary::after { content: '−'; }",
+    "details.cr-diagram-node[open] > p { padding-top: 6px; border-top: 1px solid var(--cr-line); }",
+    ".cr-diagram-group, .cr-diagram-boundary, .cr-diagram-lane { z-index: 0; grid-column: var(--col, 1) / span var(--span, 12); grid-row: var(--row, 1) / span var(--rows, 1); min-width: 0; border: 1px dashed color-mix(in srgb, var(--cr-tone, var(--cr-accent)) 42%, var(--cr-line)); border-radius: 7px; padding: 9px; background: color-mix(in srgb, var(--cr-tone, var(--cr-accent)) 3%, transparent); color: var(--cr-muted); font: 750 9px/1.2 ui-monospace, SFMono-Regular, Menlo, monospace; text-transform: uppercase; }",
+    ".cr-diagram-boundary { border-width: 2px; border-style: solid; }",
+    ".cr-diagram-lane { border-style: solid; border-width: 1px 0 0; border-radius: 0; padding-left: 10px; }",
+    ".cr-diagram-edge { --cr-tone: var(--cr-accent); z-index: 1; position: relative; pointer-events: none; color: var(--cr-tone); }",
+    ".cr-diagram-edge[data-dir='h'] { grid-column: var(--col, auto) / span var(--span, 1); grid-row: var(--row, auto); align-self: center; height: 0; border-top: 2px solid var(--cr-tone); }",
+    ".cr-diagram-edge[data-dir='h']::after { content: ''; position: absolute; top: -5px; right: -1px; width: 0; height: 0; border-top: 4px solid transparent; border-bottom: 4px solid transparent; border-left: 7px solid var(--cr-tone); }",
+    ".cr-diagram-edge[data-dir='h'][data-reverse]::after { right: auto; left: -1px; border-left: 0; border-right: 7px solid var(--cr-tone); }",
+    ".cr-diagram-edge[data-dir='v'] { grid-column: var(--col, auto); grid-row: var(--row, auto) / span var(--rows, 1); justify-self: center; width: 0; border-left: 2px solid var(--cr-tone); }",
+    ".cr-diagram-edge[data-dir='v']::after { content: ''; position: absolute; left: -5px; bottom: -1px; width: 0; height: 0; border-left: 4px solid transparent; border-right: 4px solid transparent; border-top: 7px solid var(--cr-tone); }",
+    ".cr-diagram-edge[data-dir='v'][data-reverse]::after { top: -1px; bottom: auto; border-top: 0; border-bottom: 7px solid var(--cr-tone); }",
+    ".cr-diagram-edge[data-arrow='none']::after { display: none; }",
+    ".cr-diagram-edge > span { position: absolute; left: 50%; top: 50%; max-width: 150px; padding: 2px 5px; background: var(--cr-bg); color: var(--cr-muted); font: 700 8px/1.2 ui-monospace, SFMono-Regular, Menlo, monospace; text-align: center; transform: translate(-50%, -50%); white-space: nowrap; }",
+    ".cr-diagram-note { z-index: 4; grid-column: var(--col, auto) / span var(--span, 3); grid-row: var(--row, auto) / span var(--rows, 1); align-self: start; border-left: 2px solid var(--cr-secondary); padding: 7px 9px; background: color-mix(in srgb, var(--cr-secondary) 7%, var(--cr-surface)); color: var(--cr-muted); font-size: 9px; }",
+    ".cr-diagram-junction { z-index: 2; grid-column: var(--col, auto); grid-row: var(--row, auto); align-self: center; justify-self: center; width: 9px; height: 9px; border-radius: 50%; background: var(--cr-tone, var(--cr-accent)); }",
+    ".cr-entity { padding: 0; overflow: hidden; }",
+    ".cr-entity > strong { padding: 8px 10px; background: color-mix(in srgb, var(--cr-tone, var(--cr-accent)) 10%, var(--cr-surface)); }",
+    ".cr-entity ul { margin: 0; padding: 7px 10px; list-style: none; color: var(--cr-muted); font-size: 9px; }",
+    ".cr-entity li + li { margin-top: 3px; }",
+    ".cr-sequence-actor { z-index: 3; grid-column: var(--col, auto) / span var(--span, 2); grid-row: 1; border: 1px solid var(--cr-line); padding: 8px; background: var(--cr-surface); color: var(--cr-text); text-align: center; font-size: 10px; font-weight: 800; }",
+    ".cr-sequence-lifeline { z-index: 0; grid-column: var(--col, auto); grid-row: 2 / span var(--rows, 7); justify-self: center; border-left: 1px dashed var(--cr-line); }",
+    ".cr-sequence-message { z-index: 2; position: relative; grid-column: var(--col, auto) / span var(--span, 3); grid-row: var(--row, auto); align-self: center; border-top: 2px solid var(--cr-tone, var(--cr-accent)); color: var(--cr-muted); font-size: 8px; text-align: center; }",
+    ".cr-sequence-message::after { content: ''; position: absolute; right: -1px; margin-top: -4px; border-top: 4px solid transparent; border-bottom: 4px solid transparent; border-left: 7px solid var(--cr-tone, var(--cr-accent)); }",
+    ".cr-diagram-legend { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px; color: var(--cr-muted); font-size: 9px; }",
+    ".cr-diagram-legend span { display: inline-flex; align-items: center; gap: 5px; }",
+    ".cr-diagram-legend i { width: 12px; height: 3px; background: var(--cr-tone, var(--cr-accent)); }",
+    "@media (max-width: 760px) { .cr-diagram { min-width: 620px; } .cr-diagram-node { padding: 8px 10px; } }",
+    "@media (prefers-reduced-motion: reduce) { .cr-diagram-node { transition: none; } }",
+  ].join("\n");
+}
+
+function contextRoomVisualDocumentStyles() {
+  const styles = getComputedStyle(document.documentElement);
+  const token = (name, fallback) => styles.getPropertyValue(name).trim() || fallback;
+  const scheme = token("color-scheme", "dark").includes("light") ? "light" : "dark";
+  const variables = [
+    ["--cr-bg", token("--file-bg", "#101416")],
+    ["--cr-surface", token("--file-panel-bg", "#151b1d")],
+    ["--cr-surface-strong", token("--file-header-bg", "#1b2224")],
+    ["--cr-text", token("--file-fg", "#edf2f0")],
+    ["--cr-muted", token("--file-muted", "#96a39f")],
+    ["--cr-line", token("--file-line", "rgba(207,220,217,.18)")],
+    ["--cr-accent", token("--file-h1", "#67c6d3")],
+    ["--cr-secondary", token("--file-h2", "#e2b866")],
+    ["--cr-positive", token("--file-h3", "#72d39a")],
+    ["--cr-negative", token("--file-h4", "#e7a5ad")],
+    ["--cr-code", token("--file-code", "#efbf76")],
+  ].map(([name, value]) => name + ": " + value + ";").join(" ");
+  return [
+    ":root { color-scheme: " + scheme + "; " + variables + " --cr-radius: 8px; --cr-gap: clamp(12px, 2vw, 20px); }",
+    "* { box-sizing: border-box; }",
+    "html { min-height: 100%; background: var(--cr-bg); }",
+    "body { min-height: 100%; margin: 0; padding: clamp(20px, 4vw, 48px); background: var(--cr-bg); color: var(--cr-text); font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; line-height: 1.5; }",
+    "main, .cr-page { width: min(1120px, 100%); margin: 0 auto; }",
+    "h1, h2, h3, p { margin-top: 0; }",
+    "h1 { margin-bottom: 10px; color: var(--cr-text); font-size: 48px; line-height: 1; letter-spacing: 0; }",
+    "h2 { margin-bottom: 16px; color: var(--cr-text); font-size: 22px; line-height: 1.2; letter-spacing: 0; }",
+    "h3 { margin-bottom: 8px; color: var(--cr-text); font-size: 15px; line-height: 1.3; letter-spacing: 0; }",
+    "p { margin-bottom: 0; color: var(--cr-muted); }",
+    "code { color: var(--cr-code); font: .92em/1.4 ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; overflow-wrap: anywhere; }",
+    ".cr-header { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: var(--cr-gap); align-items: end; margin-bottom: clamp(24px, 5vw, 48px); padding-bottom: 22px; border-bottom: 2px solid var(--cr-accent); }",
+    ".cr-kicker { margin-bottom: 10px; color: var(--cr-accent); font: 800 11px/1.2 ui-monospace, SFMono-Regular, Menlo, monospace; text-transform: uppercase; }",
+    ".cr-badge { width: fit-content; border: 1px solid color-mix(in srgb, var(--cr-positive) 58%, var(--cr-line)); border-radius: 999px; padding: 6px 10px; background: color-mix(in srgb, var(--cr-positive) 13%, var(--cr-surface)); color: var(--cr-positive); font-size: 11px; font-weight: 850; white-space: nowrap; }",
+    ".cr-section { margin-top: var(--cr-gap); border: 1px solid var(--cr-line); border-radius: var(--cr-radius); background: var(--cr-surface); padding: clamp(16px, 2.5vw, 24px); }",
+    ".cr-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: var(--cr-gap); }",
+    ".cr-grid-3 { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: var(--cr-gap); }",
+    ".cr-card { min-width: 0; border: 1px solid var(--cr-line); border-radius: var(--cr-radius); background: var(--cr-surface); padding: clamp(15px, 2vw, 20px); }",
+    ".cr-card[data-tone='accent'] { border-top: 3px solid var(--cr-accent); }",
+    ".cr-card[data-tone='positive'] { border-top: 3px solid var(--cr-positive); }",
+    ".cr-card[data-tone='warning'] { border-top: 3px solid var(--cr-secondary); }",
+    ".cr-card[data-tone='negative'] { border-top: 3px solid var(--cr-negative); }",
+    ".cr-flow { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 10px; counter-reset: cr-step; }",
+    ".cr-step { counter-increment: cr-step; min-width: 0; border: 1px solid var(--cr-line); border-radius: var(--cr-radius); background: var(--cr-surface); padding: 18px; }",
+    ".cr-step::before { content: counter(cr-step, decimal-leading-zero) ' / STEP'; display: block; margin-bottom: 18px; color: var(--cr-accent); font: 800 10px/1 ui-monospace, SFMono-Regular, Menlo, monospace; }",
+    ".cr-comparison { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: var(--cr-gap); }",
+    ".cr-option { position: relative; min-width: 0; border: 1px solid var(--cr-line); border-radius: var(--cr-radius); background: var(--cr-surface); padding: 20px; }",
+    ".cr-option[data-tone='positive'] { border-color: color-mix(in srgb, var(--cr-positive) 56%, var(--cr-line)); background: color-mix(in srgb, var(--cr-positive) 8%, var(--cr-surface)); }",
+    ".cr-option[data-tone='warning'] { border-color: color-mix(in srgb, var(--cr-secondary) 56%, var(--cr-line)); background: color-mix(in srgb, var(--cr-secondary) 8%, var(--cr-surface)); }",
+    ".cr-option[data-tone='negative'] { border-color: color-mix(in srgb, var(--cr-negative) 56%, var(--cr-line)); background: color-mix(in srgb, var(--cr-negative) 8%, var(--cr-surface)); }",
+    ".cr-option > .cr-badge { margin-bottom: 14px; }",
+    ".cr-metrics { display: grid; grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); gap: 10px; }",
+    ".cr-metric { border-left: 3px solid var(--cr-accent); background: color-mix(in srgb, var(--cr-accent) 8%, var(--cr-surface)); padding: 12px 14px; }",
+    ".cr-metric strong { display: block; margin-bottom: 3px; color: var(--cr-text); font-size: 28px; line-height: 1; }",
+    ".cr-metric span { color: var(--cr-muted); font-size: 11px; }",
+    ".cr-callout { margin-top: var(--cr-gap); border-left: 3px solid var(--cr-accent); border-radius: 0 var(--cr-radius) var(--cr-radius) 0; background: color-mix(in srgb, var(--cr-accent) 9%, var(--cr-surface)); padding: 14px 16px; }",
+    ".cr-callout[data-tone='positive'] { border-left-color: var(--cr-positive); background: color-mix(in srgb, var(--cr-positive) 9%, var(--cr-surface)); }",
+    ".cr-callout[data-tone='warning'] { border-left-color: var(--cr-secondary); background: color-mix(in srgb, var(--cr-secondary) 9%, var(--cr-surface)); }",
+    ".cr-callout[data-tone='negative'] { border-left-color: var(--cr-negative); background: color-mix(in srgb, var(--cr-negative) 9%, var(--cr-surface)); }",
+    ".cr-list { display: grid; gap: 0; margin: 0; padding: 0; list-style: none; }",
+    ".cr-list > li { display: grid; grid-template-columns: minmax(90px, .28fr) minmax(0, 1fr); gap: 12px; padding: 11px 0; border-bottom: 1px solid var(--cr-line); }",
+    ".cr-list > li:last-child { border-bottom: 0; }",
+    ".cr-list strong { color: var(--cr-accent); font-size: 12px; }",
+    ".cr-list span { color: var(--cr-muted); font-size: 13px; }",
+    ".cr-table-wrap { overflow-x: auto; border: 1px solid var(--cr-line); border-radius: var(--cr-radius); }",
+    ".cr-table { width: 100%; border-collapse: collapse; background: var(--cr-surface); }",
+    ".cr-table th, .cr-table td { padding: 11px 13px; border-bottom: 1px solid var(--cr-line); text-align: left; vertical-align: top; }",
+    ".cr-table th { background: var(--cr-surface-strong); color: var(--cr-text); font-size: 11px; }",
+    ".cr-table td { color: var(--cr-muted); font-size: 13px; }",
+    ".cr-table tr:last-child td { border-bottom: 0; }",
+    contextRoomVisualPatternStyles(),
+    contextRoomConceptPatternStyles(),
+    contextRoomDiagramStyles(),
+    ".cr-footer { display: flex; justify-content: space-between; gap: 14px; margin-top: var(--cr-gap); color: var(--cr-muted); font-size: 11px; }",
+    "@media (max-width: 760px) { body { padding: 16px; } h1 { font-size: 34px; } h2 { font-size: 20px; } .cr-header, .cr-grid, .cr-grid-3, .cr-comparison { grid-template-columns: 1fr; } .cr-flow { grid-template-columns: repeat(2, minmax(0, 1fr)); } .cr-header { align-items: start; } .cr-footer { display: grid; } }",
+    "@media (max-width: 480px) { .cr-flow { grid-template-columns: 1fr; } }",
+  ].join("\n");
+}
+
+function sanitizedHtmlPreviewDocument(source) {
+  const parser = new DOMParser();
+  const doc = parser.parseFromString(String(source || ""), "text/html");
+  doc.querySelectorAll("script, iframe, frame, object, embed, base").forEach((element) => element.remove());
+  doc.querySelectorAll("*").forEach((element) => {
+    for (const attribute of [...element.attributes]) {
+      const name = attribute.name.toLowerCase();
+      const value = attribute.value.trim();
+      if (name.startsWith("on") || name === "href" || name === "xlink:href" || name === "action" || name === "formaction") {
+        element.removeAttribute(attribute.name);
+      } else if (["src", "srcset", "poster"].includes(name) && !/^data:(?:image|font|audio|video)\//i.test(value)) {
+        element.removeAttribute(attribute.name);
+      } else if (name === "http-equiv" && value.toLowerCase() === "refresh") {
+        element.remove();
+        break;
+      }
+    }
+  });
+  const policy = doc.createElement("meta");
+  policy.setAttribute("http-equiv", "Content-Security-Policy");
+  policy.setAttribute("content", "default-src 'none'; style-src 'unsafe-inline'; img-src data:; font-src data:; media-src data:; form-action 'none'; base-uri 'none'; frame-src 'none'; connect-src 'none'");
+  const theme = doc.createElement("style");
+  theme.setAttribute("data-context-room-visual-system", currentFileThemeId());
+  theme.textContent = contextRoomVisualDocumentStyles();
+  doc.documentElement.dataset.contextRoomTheme = currentFileThemeId();
+  doc.head.prepend(theme);
+  doc.head.prepend(policy);
+  return "<!doctype html>\n" + doc.documentElement.outerHTML;
+}
+
+function renderHtmlDocumentPreview(text, filePath = state.selected) {
+  return '<div class="html-preview-shell"><iframe class="html-preview-frame" sandbox="" referrerpolicy="no-referrer" title="HTML preview: ' + escapeHtml(filePath || "document") + '" srcdoc="' + escapeHtml(sanitizedHtmlPreviewDocument(text)) + '"></iframe></div>';
 }
 
 function renderDocumentView(text, filePath = state.selected) {
@@ -10495,12 +11825,13 @@ function renderExternalReviewActions(change, { fileActionOptions = null } = {}) 
   const afterText = change.diskContent || "";
   const blocks = buildExternalReviewBlocks(beforeText, afterText, change.reviewDecisions || {});
   const summary = summarizeExternalReviewBlocks(blocks);
+  const visualHtmlReview = isHtmlDocumentPath(change.path);
   const sourceLabel = change.source === "review" ? "Git changes waiting for review" : "File changed on disk";
   const pendingLabel = summary.pending ? summary.pending + " left" : "saving...";
-  const jumpAction = summary.pending
+  const jumpAction = summary.pending && !visualHtmlReview
     ? '<button class="file-action external-choice bulk" type="button" data-external-review-jump="first" title="Jump to the first pending change">First change</button>'
     : "";
-  const bulkActions = summary.pending && (summary.pending > 1 || summary.pendingLines > 1)
+  const bulkActions = summary.pending && (visualHtmlReview || summary.pending > 1 || summary.pendingLines > 1)
     ? '<button class="file-action primary external-choice bulk" type="button" data-external-review-all="accept">Accept all</button>' +
       '<button class="file-action danger-action external-choice bulk" type="button" data-external-review-all="reject">Reject all</button>'
     : "";
@@ -10529,6 +11860,7 @@ function externalReviewFileActionOptions() {
     dirty: state.dirty,
     blockedByConflict: true,
     deletable: !Boolean(state.selectedStartupContext),
+    savable: !isHtmlDocumentPath(state.selected),
   };
 }
 
@@ -11064,6 +12396,7 @@ function replaceExternalReviewActionsInPlace(text = "") {
     blockedByConflict: Boolean(activeFileConflict()),
     readOnly: Boolean(state.selectedStartupContext?.readOnly || state.selectedReadOnly),
     deletable: !Boolean(state.selectedStartupContext || state.selectedReadOnly),
+    savable: !isHtmlDocumentPath(state.selected),
   });
   wireFileActionButtons(document.querySelector(".file-panel > header") || document);
 }
@@ -11726,9 +13059,12 @@ function promptRevertCurrentDiff() {
   });
 }
 
-function showConfirmDialog({ title, body, confirmLabel = "Confirm", confirmVariant = "danger", checkboxLabel = "", onConfirm }) {
+function showConfirmDialog({ title, body, confirmLabel = "Confirm", confirmVariant = "danger", checkboxLabel = "", checkboxRequired = false, onConfirm }) {
+  document.querySelector(".app")?.removeAttribute("inert");
   document.querySelector(".confirm-backdrop")?.remove();
+  const returnFocus = document.activeElement instanceof HTMLElement ? document.activeElement : null;
   const backdrop = document.createElement("div");
+  const appShell = document.querySelector(".app");
   backdrop.className = "confirm-backdrop";
   const confirmClass = confirmVariant === "primary" ? "primary" : confirmVariant === "secondary" ? "" : "danger-action";
   const checkboxMarkup = checkboxLabel
@@ -11738,27 +13074,51 @@ function showConfirmDialog({ title, body, confirmLabel = "Confirm", confirmVaria
     '<strong>' + escapeHtml(title) + '</strong>' +
     '<p>' + escapeHtml(body) + '</p>' +
     checkboxMarkup +
-    '<div class="confirm-actions"><button class="file-action" type="button" data-confirm-cancel>Cancel</button><button class="file-action ' + confirmClass + '" type="button" data-confirm-accept>' + escapeHtml(confirmLabel) + '</button></div>' +
+    '<div class="confirm-actions"><button class="file-action" type="button" data-confirm-cancel>Cancel</button><button class="file-action ' + confirmClass + '" type="button" data-confirm-accept' + (checkboxRequired ? ' disabled' : '') + '>' + escapeHtml(confirmLabel) + '</button></div>' +
   '</section>';
-  const close = () => {
+  const close = ({ restoreFocus = true } = {}) => {
     backdrop.remove();
+    appShell?.removeAttribute("inert");
     document.removeEventListener("keydown", onKeydown);
+    if (restoreFocus && returnFocus?.isConnected) returnFocus.focus();
   };
   const onKeydown = (event) => {
-    if (event.key === "Escape") close();
+    if (event.key === "Escape") {
+      close();
+      return;
+    }
+    if (event.key !== "Tab") return;
+    const focusable = [...backdrop.querySelectorAll('button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])')];
+    if (!focusable.length) {
+      event.preventDefault();
+      return;
+    }
+    const first = focusable[0];
+    const last = focusable.at(-1);
+    if (event.shiftKey && document.activeElement === first) {
+      event.preventDefault();
+      last.focus();
+    } else if (!event.shiftKey && document.activeElement === last) {
+      event.preventDefault();
+      first.focus();
+    }
   };
   backdrop.addEventListener("click", (event) => {
     if (event.target === backdrop) close();
   });
   backdrop.querySelector("[data-confirm-cancel]").addEventListener("click", close);
+  if (checkboxRequired) backdrop.querySelector("[data-confirm-checkbox]")?.addEventListener("change", (event) => {
+    backdrop.querySelector("[data-confirm-accept]").disabled = !event.currentTarget.checked;
+  });
   backdrop.querySelector("[data-confirm-accept]").addEventListener("click", () => {
     const checked = Boolean(backdrop.querySelector("[data-confirm-checkbox]")?.checked);
-    close();
+    close({ restoreFocus: false });
     onConfirm?.({ checked });
   });
   document.addEventListener("keydown", onKeydown);
+  appShell?.setAttribute("inert", "");
   document.body.appendChild(backdrop);
-  backdrop.querySelector("[data-confirm-accept]")?.focus();
+  backdrop.querySelector(checkboxRequired ? "[data-confirm-checkbox]" : "[data-confirm-accept]")?.focus();
 }
 
 async function revertCurrentDiff(path = state.selected) {
