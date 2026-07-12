@@ -30,7 +30,7 @@
     },
     "reviewPaths": {
       "type": "array",
-      "description": "Important files or folders that stay in the review queue until a human verifies the current content, even when there is no Git diff.",
+      "description": "Ordered important files or folders that stay in the review queue until a human verifies the current content, even when there is no Git diff. Critical safety issues still appear first.",
       "items": { "$ref": "#/$defs/projectPath" },
       "uniqueItems": true,
       "default": []

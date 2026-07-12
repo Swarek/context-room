@@ -77,7 +77,7 @@ Good examples:
 
 Required verification boundary.
 
-Files and folders here appear in the review queue until the current content is marked verified, even when there is no Git diff. Use this for onboarding a documentation set or requiring explicit review of agent-critical files. Only unchanged entries from `reviewPaths` show `Mark verified`; Git changes are reviewed through their inline diff.
+Files and folders here appear in the review queue until the current content is marked verified, even when there is no Git diff. Their array order defines the human verification path; critical safety issues still appear first. Use this for onboarding a documentation set or requiring explicit review of agent-critical files. Only unchanged entries from `reviewPaths` show `Mark verified`; Git changes are reviewed through their inline diff.
 
 Good examples:
 

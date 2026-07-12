@@ -28,6 +28,8 @@ The review queue shows watched documentation that needs verification before it b
 - Agents may surface the queue, but should never mark files verified for the user.
 - `watchAllow` follows changed tracked files and new untracked files.
 - `reviewPaths` keeps important docs in the queue until the current content is verified.
+- The `reviewPaths` array order defines the intended verification path. Critical safety issues remain first; unlisted changed files retain the default risk and documentation order.
+- Reader-facing headings such as `Question: ...` are normal prose. Only explicit TODO markers, including `[QUESTION]` or `<!-- QUESTION -->`, create an unresolved-question issue.
 - `Mark verified` appears only for unchanged `reviewPaths` files. Git changes must be completed through their inline diff.
 - Mixed paragraph edits stay inline when changed words are at most 25% of the combined before and after text. Larger rewrites use separate paragraphs; simple additions or removals stay inline.
 - Verified content is also recorded in the shared review ledger by canonical absolute path and content hash, so another Context Room watching the same file does not require a duplicate review.

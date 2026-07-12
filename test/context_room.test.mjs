@@ -1568,6 +1568,48 @@ context_room:
   assert.deepEqual(report.queue.map((item) => item.path), files.map(([relPath]) => relPath));
 });
 
+test("reviewPaths order defines the human verification path", () => {
+  const root = makeRoot();
+  const files = ["AGENTS.md", "docs/PRODUCT.md", "website/docs/PRODUCT.md"];
+  for (const relPath of files) {
+    fs.mkdirSync(path.dirname(path.join(root, relPath)), { recursive: true });
+    fs.writeFileSync(path.join(root, relPath), `# ${relPath}\n`);
+  }
+  const reviewPaths = ["website/docs/PRODUCT.md", "AGENTS.md", "docs/PRODUCT.md"];
+  initializeContextRoomProject(root, {
+    allowedPaths: ["AGENTS.md", "docs/", "website/docs/"],
+  });
+  const configPath = path.join(root, CONFIG_FILE);
+  const config = JSON.parse(fs.readFileSync(configPath, "utf8"));
+  config.reviewPaths = reviewPaths;
+  fs.writeFileSync(configPath, JSON.stringify(config, null, 2) + "\n");
+
+  const report = buildDocQaReport(root);
+
+  assert.deepEqual(report.queue.map((item) => item.path), reviewPaths);
+});
+
+test("reader questions do not become unresolved TODO markers", () => {
+  const root = makeRoot();
+  fs.mkdirSync(path.join(root, "docs"), { recursive: true });
+  const filePath = path.join(root, "docs", "system-map.html");
+  fs.writeFileSync(filePath, "<!doctype html><html><body><h1>Map</h1><h2>Question: what does the system own?</h2></body></html>\n");
+  initializeContextRoomProject(root, {
+    allowedPaths: ["docs/"],
+  });
+  const configPath = path.join(root, CONFIG_FILE);
+  const config = JSON.parse(fs.readFileSync(configPath, "utf8"));
+  config.reviewPaths = ["docs/system-map.html"];
+  fs.writeFileSync(configPath, JSON.stringify(config, null, 2) + "\n");
+
+  const readerQuestion = buildDocQaReport(root).queue[0];
+  assert.equal(readerQuestion.issues.some((issue) => issue.type === "todo"), false);
+
+  fs.appendFileSync(filePath, "\n<!-- QUESTION -->\n");
+  const unresolvedMarker = buildDocQaReport(root).queue[0];
+  assert.equal(unresolvedMarker.issues.some((issue) => issue.type === "todo"), true);
+});
+
 test("doc QA can require human review for unchanged important docs", () => {
   const root = makeRoot();
   initializeContextRoomProject(root, { allowedPaths: ["AGENTS.md", "docs/"], watchAllow: [] });

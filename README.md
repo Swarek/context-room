@@ -151,7 +151,7 @@ Rules that matter:
 
 - `allowedPaths` is the edit boundary.
 - `watchAllow` controls changed files that need review.
-- `reviewPaths` forces review even when Git has no diff. Only these unchanged required-review files show `Mark verified`; Git changes are completed through the inline diff.
+- `reviewPaths` forces review even when Git has no diff and its array order defines the human verification path. Critical safety issues still appear first. Only unchanged required-review files show `Mark verified`; Git changes are completed through the inline diff.
 - Review verification is shared by canonical absolute path and content hash.
 - `startupHooks.editable` stays `false` unless the owner wants Context Room to edit executable hook files.
 

@@ -3435,7 +3435,7 @@ export function computeDocIssues({ path: relPath, content = "", gitStatus = "", 
   const text = String(content);
   const docMetadata = metadata || parseDocMetadata(text, relPath);
   if (gitStatus.trim() && classification.sensitive) issues.push({ type: "sensitive_changed", severity: "critical", message: "Sensitive file changed: human review before canonical truth." });
-  const todoCount = (text.match(/\b(TODO|FIXME|HACK|QUESTION|à clarifier|a verifier|à vérifier)\b/gi) || []).length;
+  const todoCount = (text.match(/\b(TODO|FIXME|HACK|à clarifier|a verifier|à vérifier)\b|\[QUESTION\]|<!--\s*QUESTION\b/gi) || []).length;
   if (todoCount) issues.push({ type: "todo", severity: docMetadata.kind === "canonical" ? "high" : "medium", message: `${todoCount} TODO/question to consolidate.` });
   if (path.extname(normalizeRelPath(relPath)) === ".md" && gitStatus.trim() && !docMetadata.present) issues.push({ type: "missing_metadata", severity: "medium", message: "Missing context_room metadata." });
   if (["agents", "canonical", "procedure"].includes(docMetadata.kind) && docMetadata.status === "current" && !docMetadata.last_verified && gitStatus.trim()) issues.push({ type: "missing_last_verified", severity: "medium", message: "Missing last_verified while the file is modified." });
@@ -3530,10 +3530,7 @@ export function buildDocQaReport(root = process.cwd(), options = {}) {
     issues: [{ type: "git_conflict", severity: "critical", message: "Unmerged Git deletion conflict requires individual review." }, ...item.issues],
   }));
   const queue = [...gitQueue, ...deletedQueue, ...unmergedDeletedQueue, ...buildStartupContextReviewQueue(root, settings, reviewState, startupFiles)]
-  .sort((a, b) => reviewSeverityRank(a) - reviewSeverityRank(b)
-    || reviewOrderRank(a.path) - reviewOrderRank(b.path)
-    || b.riskScore - a.riskScore
-    || a.path.localeCompare(b.path, "fr"));
+  .sort((a, b) => compareReviewQueueItems(a, b, settings));
   return {
     generatedAt: new Date().toISOString(),
     summary: {
@@ -3826,10 +3823,7 @@ function buildPendingDeletedReviewItems(root, options = {}) {
       if (pending.length >= maxPending) break;
     }
   }
-  return pending.sort((a, b) => reviewSeverityRank(a) - reviewSeverityRank(b)
-    || reviewOrderRank(a.path) - reviewOrderRank(b.path)
-    || b.riskScore - a.riskScore
-    || a.path.localeCompare(b.path, "fr"));
+  return pending.sort((a, b) => compareReviewQueueItems(a, b, settings));
 }
 
 function isProtectedDeletedReviewItem(item) {
@@ -4153,6 +4147,25 @@ function reviewSeverityRank(item) {
   if (item.issues.some((issue) => issue.severity === "critical")) return 0;
   if (item.issues.some((issue) => issue.severity === "high")) return 1;
   return 2;
+}
+
+function configuredReviewOrderRank(relPath, settings = {}) {
+  const normalized = normalizeRelPath(relPath);
+  const index = (settings.reviewPaths || []).findIndex((pattern) => pathMatchesSetting(normalized, pattern));
+  return index < 0 ? Number.POSITIVE_INFINITY : index;
+}
+
+function compareReviewQueueItems(a, b, settings = {}) {
+  const aCritical = a.issues.some((issue) => issue.severity === "critical");
+  const bCritical = b.issues.some((issue) => issue.severity === "critical");
+  if (aCritical !== bCritical) return aCritical ? -1 : 1;
+  const aConfigured = configuredReviewOrderRank(a.path, settings);
+  const bConfigured = configuredReviewOrderRank(b.path, settings);
+  if (aConfigured !== bConfigured) return aConfigured - bConfigured;
+  return reviewSeverityRank(a) - reviewSeverityRank(b)
+    || reviewOrderRank(a.path) - reviewOrderRank(b.path)
+    || b.riskScore - a.riskScore
+    || a.path.localeCompare(b.path, "fr");
 }
 
 function reviewOrderRank(relPath) {
