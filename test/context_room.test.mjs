@@ -2709,6 +2709,66 @@ test("HTML files open as sandboxed visual previews without source editing", () =
   assert.match(html, /savable \? '<button class="file-action primary"/);
 });
 
+test("recurring theme refresh keeps an unchanged HTML preview iframe alive", () => {
+  const script = extractInlineAppScript(renderAppHtml());
+  const themeSource = script.slice(script.indexOf("function currentFileThemeId"), script.indexOf("function previewSelectedFileTheme"));
+  const settingsSource = script.slice(script.indexOf("function applySettingsPayload"), script.indexOf("function backgroundReportRenderKey"));
+  const document = {
+    documentElement: { dataset: { fileTheme: "context-room", appTheme: "context-room" } },
+    frame: { id: "interactive-preview" },
+    querySelector(selector) {
+      return selector === "iframe.html-preview-frame" ? this.frame : null;
+    },
+  };
+  const state = {
+    settings: { appearance: { fileTheme: "context-room" } },
+    availableHubCards: [],
+    hubFolders: [],
+    rootHubSections: [],
+    hubSections: [],
+    selected: "docs/interactive.html",
+    openingFilePath: null,
+  };
+  const harness = Function(
+    "state",
+    "document",
+    "FILE_THEMES",
+    "DEFAULT_FILE_THEME",
+    "isHtmlDocumentPath",
+    "captureEditorViewState",
+    "restoreEditorViewState",
+    `let renderViewer = () => {};
+    ` + themeSource + settingsSource + `
+      let renderCount = 0;
+      renderViewer = () => {
+        renderCount += 1;
+        document.frame = { id: "replacement-" + renderCount };
+      };
+      return {
+        applySettingsPayload,
+        renderCount: () => renderCount,
+      };
+    `,
+  )(
+    state,
+    document,
+    FILE_THEME_OPTIONS,
+    "context-room",
+    (filePath) => /\.html?$/i.test(filePath),
+    () => ({ path: state.selected }),
+    () => {},
+  );
+
+  const originalFrame = document.frame;
+  harness.applySettingsPayload({ settings: { appearance: { fileTheme: "context-room" } } });
+  assert.strictEqual(document.frame, originalFrame);
+  assert.equal(harness.renderCount(), 0);
+
+  harness.applySettingsPayload({ settings: { appearance: { fileTheme: "light-plus" } } });
+  assert.notStrictEqual(document.frame, originalFrame);
+  assert.equal(harness.renderCount(), 1);
+});
+
 test("visual HTML library keeps forty data patterns and exposes five distinct diagram templates", () => {
   const html = renderAppHtml();
   const conceptCatalog = fs.readFileSync(new URL("../docs/context-room-visual-components.html", import.meta.url), "utf8");

@@ -7323,9 +7323,10 @@ function normalizeFileThemeId(wanted) {
 
 function applyFileTheme(themeId = currentFileThemeId()) {
   const clean = normalizeFileThemeId(themeId);
+  const themeChanged = document.documentElement.dataset.fileTheme !== clean || document.documentElement.dataset.appTheme !== clean;
   document.documentElement.dataset.fileTheme = clean;
   document.documentElement.dataset.appTheme = clean;
-  if (document.querySelector("iframe.html-preview-frame") && isHtmlDocumentPath(state.selected) && state.openingFilePath !== state.selected) {
+  if (themeChanged && document.querySelector("iframe.html-preview-frame") && isHtmlDocumentPath(state.selected) && state.openingFilePath !== state.selected) {
     const viewState = captureEditorViewState();
     renderViewer();
     restoreEditorViewState(viewState);
