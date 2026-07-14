@@ -4,7 +4,7 @@ context_room:
   scope: context-room
   status: current
   canonical_for: agent configuration
-  last_verified: 2026-07-11
+  last_verified: 2026-07-14
   sources: [bin/context-room.mjs, src/context_room.mjs, schemas/config.schema.json]
 ---
 
@@ -25,6 +25,14 @@ Appearance preferences are shared across every Context Room on the computer and 
 ```
 
 Use the Settings screen to change the app theme, hidden-file visibility, or `Auto-open Git diff`. Project paths, review rules, scanners, templates, and hub cards remain local to `.context-room/config.json`.
+
+The human-owned review gate is also stored separately:
+
+```text
+.context-room/review-gate.json
+```
+
+Use the Review tab in Settings to choose any combination of `commit`, `push`, `pull request`, and `merge`. This policy is local to the worktree, excluded from Git, omitted from project configuration, and not writable through the Context Room agent CLI. Context Room treats it as owner-controlled policy; it is not a security boundary against a process with unrestricted filesystem access.
 
 ## Configuration intent checklist
 
@@ -220,13 +228,22 @@ context-room brief --task "change billing onboarding"
 context-room start --port 4317
 ```
 
-11. To report watched doc changes before commits without blocking, install the local Git hook:
+11. To install or refresh the local Git hooks selected by the owner review gate, run:
 
 ```bash
-context-room install-hook
+context-room install-hooks
 ```
 
-The hook writes `.git/hooks/pre-commit` in the current clone and runs the advisory guard. Git hooks are local and are not committed to the repository, so each developer or agent environment must run this once after cloning.
+`install-hook` remains as a compatibility alias. Context Room manages `pre-commit`, `pre-push`, and `pre-merge-commit` only when their matching operation is selected and refuses to overwrite a custom hook. A managed dispatcher can remain installed after an operation is deselected; it reads the active worktree's owner policy and exits silently. Git hooks are local and are not committed to the repository.
+
+There is no local Git hook for creating a pull request, and a merge performed by GitHub, GitLab, or another host does not run the clone's hooks. For those selections, connect the corresponding command to a hosted check and make that check required:
+
+```bash
+context-room guard --operation pull-request --profile strict
+context-room guard --operation merge --profile strict
+```
+
+The pull-request check runs after the PR exists; repository rules can use its result to prevent merge. Provider wiring is intentionally separate because Context Room is provider-agnostic.
 
 To check what the hook will enforce without committing, run:
 
@@ -234,7 +251,7 @@ To check what the hook will enforce without committing, run:
 context-room guard
 ```
 
-`guard` is advisory by default and exits with status `0` even when review is pending. `review-only` also reports without blocking; only an explicit `--profile strict` invocation can fail.
+`guard` is advisory by default and exits with status `0` even when review is pending. `review-only` also reports without blocking. An explicit `--profile strict` invocation can fail regardless of owner policy. A selected `--operation` fails only for pending review; it does not add strict documentation-health failures to the Git gate.
 
 ## Agent setup prompt
 
@@ -253,7 +270,7 @@ Goal: make the documentation and agent skills easy to navigate, maintain, and ve
 6. Keep IDs stable and lowercase with dashes.
 7. Prefer structured Markdown templates with `context_room` metadata.
 8. Run `context-room doctor`.
-9. If the project wants advisory pre-commit reporting, run `context-room install-hook`.
+9. Leave `.context-room/review-gate.json` to the project owner; agents do not change the selected operations.
 10. Run `context-room guard` to inspect the watched docs queue without blocking work.
 11. Optionally run `context-room brief --task "..."` before an agent starts a focused change.
 12. Do not include secrets, .env files, build outputs, node_modules, private exports, or generated artifacts.

@@ -25,6 +25,7 @@ const MAX_RENAME_SIMILARITY_TOKEN_CHECKS = 2_000_000;
 const UNMERGED_GIT_STATUSES = new Set(["DD", "AU", "UD", "UA", "DU", "AA", "UU"]);
 export const CONFIG_DIR = ".context-room";
 export const CONFIG_FILE = `${CONFIG_DIR}/config.json`;
+export const REVIEW_GATE_FILE = `${CONFIG_DIR}/review-gate.json`;
 export const AGENT_CONTEXT_DIR = `${CONFIG_DIR}/agent-context`;
 export const AGENT_CONTEXT_FILE = `${CONFIG_DIR}/README.md`;
 const LEGACY_AGENT_CONTEXT_FILE = `${AGENT_CONTEXT_DIR}/README.md`;
@@ -38,6 +39,9 @@ const COLLAB_SESSION_STATE = `${CONFIG_DIR}/session-state.json`;
 const COLLAB_AGENT_COMMAND = `${CONFIG_DIR}/agent-command.json`;
 const COLLAB_AGENT_ANNOTATIONS = `${CONFIG_DIR}/agent-annotations.json`;
 const MEMORY_WEBAPP_SETTINGS = CONFIG_FILE;
+const REVIEW_GATE_OPERATIONS = Object.freeze(["commit", "push", "pull-request", "merge"]);
+const DEFAULT_REVIEW_GATE = Object.freeze({ operations: [] });
+const CONTEXT_ROOM_HOOK_MARKER = "# Managed by Context Room review gate.";
 const HERMES_CRON_JOBS_FILE = "~/.hermes/cron/jobs.json";
 const HERMES_CRON_JOBS_FOLDER = "~/.hermes/cron/jobs/";
 const HERMES_CRON_MD_FOLDER = "~/.hermes/cron/jobs-md/";
@@ -4262,6 +4266,7 @@ export function initializeContextRoomProject(root = process.cwd(), options = {})
   const watchAllow = options.watchAllow?.length ? options.watchAllow : existing.watchAllow?.length ? existing.watchAllow : [];
   const config = normalizeMemoryWebappSettings({ ...createDefaultProjectConfig({ title, allowedPaths, watchAllow }), ...existing, title, allowedPaths, watchAllow });
   const saved = writeMemoryWebappSettings(root, config);
+  if (!fs.existsSync(path.join(root, REVIEW_GATE_FILE))) writeReviewGateSettings(root, DEFAULT_REVIEW_GATE);
   const agentContext = syncContextRoomAgentContext(root);
   ensureRuntimeGitExcludes(root);
   return { config: saved, configPath: path.join(root, MEMORY_WEBAPP_SETTINGS), agentContextPath: agentContext.entryPath };
@@ -4395,6 +4400,7 @@ export function ensureRuntimeGitExcludes(root = process.cwd()) {
     ".context-room/agent-command.json",
     ".context-room/agent-annotations.json",
     ".context-room/health-acknowledgements.json",
+    REVIEW_GATE_FILE,
     ".context-room/README.md",
     ".context-room/agent-context/",
     ".context-room/review-baselines/",
@@ -4498,7 +4504,103 @@ export function writeGlobalContextRoomPreferences(next = {}, preferencesPath = n
 export function readResolvedContextRoomSettings(root = process.cwd(), { preferencesPath = null } = {}) {
   const projectSettings = readMemoryWebappSettings(root);
   const preferences = readGlobalContextRoomPreferences(preferencesPath);
-  return { ...projectSettings, appearance: preferences.appearance };
+  return { ...projectSettings, appearance: preferences.appearance, reviewGate: readReviewGateSettings(root) };
+}
+
+export function readReviewGateSettings(root = process.cwd()) {
+  const target = path.join(root, REVIEW_GATE_FILE);
+  if (!fs.existsSync(target)) return { operations: [...DEFAULT_REVIEW_GATE.operations] };
+  try {
+    return normalizeReviewGateSettings(JSON.parse(fs.readFileSync(target, "utf8")));
+  } catch {
+    return { operations: [...DEFAULT_REVIEW_GATE.operations] };
+  }
+}
+
+export function writeReviewGateSettings(root = process.cwd(), next = {}) {
+  const settings = normalizeReviewGateSettings(next);
+  const target = path.join(root, REVIEW_GATE_FILE);
+  fs.mkdirSync(path.dirname(target), { recursive: true });
+  fs.writeFileSync(target, JSON.stringify(settings, null, 2) + "\n", { encoding: "utf8", mode: 0o600 });
+  fs.chmodSync(target, 0o600);
+  return settings;
+}
+
+function normalizeReviewGateSettings(value = {}) {
+  const allowed = new Set(REVIEW_GATE_OPERATIONS);
+  const operations = [...new Set((Array.isArray(value.operations) ? value.operations : DEFAULT_REVIEW_GATE.operations)
+    .map((operation) => String(operation || "").trim().toLowerCase())
+    .filter((operation) => allowed.has(operation)))];
+  return { operations };
+}
+
+export function syncContextRoomGitHooks(root = process.cwd(), options = {}) {
+  const policy = normalizeReviewGateSettings(options.policy || readReviewGateSettings(root));
+  const cliPath = path.resolve(options.cliPath || path.join(path.dirname(__filename), "..", "bin", "context-room.mjs"));
+  const nodePath = path.resolve(options.nodePath || process.execPath);
+  const hookDefinitions = [
+    { operation: "commit", fileName: "pre-commit" },
+    { operation: "push", fileName: "pre-push" },
+    { operation: "merge", fileName: "pre-merge-commit" },
+  ];
+  let hooksDir;
+  try {
+    hooksDir = execFileSync("git", ["rev-parse", "--path-format=absolute", "--git-path", "hooks"], {
+      cwd: root,
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"],
+    }).trim();
+  } catch {
+    return { policy, installed: [], updated: [], removed: [], conflicts: [], unavailable: "No Git hooks directory is available for this Context Room root." };
+  }
+  if (!hooksDir) return { policy, installed: [], updated: [], removed: [], conflicts: [], unavailable: "No Git hooks directory is available for this Context Room root." };
+  fs.mkdirSync(hooksDir, { recursive: true });
+  const installed = [];
+  const updated = [];
+  const removed = [];
+  const conflicts = [];
+  for (const definition of hookDefinitions) {
+    const hookPath = path.join(hooksDir, definition.fileName);
+    const selected = policy.operations.includes(definition.operation);
+    const existing = fs.existsSync(hookPath) ? fs.readFileSync(hookPath, "utf8") : "";
+    const managed = isContextRoomManagedHook(existing);
+    if (!selected && !managed) continue;
+    if (existing && !managed) {
+      conflicts.push(definition.fileName);
+      continue;
+    }
+    const script = contextRoomHookScript({ cliPath, nodePath, operation: definition.operation });
+    if (existing !== script) {
+      fs.writeFileSync(hookPath, script, { encoding: "utf8", mode: 0o755 });
+      if (!selected) updated.push(definition.fileName);
+    }
+    fs.chmodSync(hookPath, 0o755);
+    if (selected) installed.push(definition.fileName);
+  }
+  return {
+    policy,
+    installed,
+    updated,
+    removed,
+    conflicts,
+    externalOperations: policy.operations.filter((operation) => operation === "pull-request" || operation === "merge"),
+  };
+}
+
+function isContextRoomManagedHook(content = "") {
+  if (!content) return false;
+  if (content.includes(CONTEXT_ROOM_HOOK_MARKER)) return true;
+  if (content.includes("# Installed by Context Room.") && /context-room\.mjs[\s\S]*\bguard\b/.test(content)) return true;
+  const executableLines = content.split(/\r?\n/).map((line) => line.trim()).filter((line) => line && !line.startsWith("#!") && !line.startsWith("#"));
+  return executableLines.length === 1 && /(?:\bnode\b[^\n]*context-room\.mjs|\bcontext-room\b)[^\n]*\bguard\b/.test(executableLines[0]);
+}
+
+function contextRoomHookScript({ cliPath, nodePath, operation }) {
+  return `#!/bin/sh\n${CONTEXT_ROOM_HOOK_MARKER}\nroot=$(git rev-parse --show-toplevel 2>/dev/null) || exit 0\nexec ${shellQuote(nodePath)} ${shellQuote(cliPath)} guard --root "$root" --operation ${shellQuote(operation)} --hook\n`;
+}
+
+function shellQuote(value) {
+  return `'${String(value).replace(/'/g, `'"'"'`)}'`;
 }
 
 function resolveGlobalPreferencesPath(preferencesPath = null) {
@@ -5355,8 +5457,15 @@ async function routeRequest(req, res, root, globalPreferencesPath = null) {
     delete projectInput.appearance;
     const projectSettings = writeMemoryWebappSettings(root, projectInput);
     const preferences = writeGlobalContextRoomPreferences({ appearance: incoming.appearance }, globalPreferencesPath);
-    const settings = { ...projectSettings, appearance: preferences.appearance };
+    const settings = { ...projectSettings, appearance: preferences.appearance, reviewGate: readReviewGateSettings(root) };
     sendJson(res, 200, { settings, hubCards: hubCardsForRoot(root, settings), hubSections: hubSectionsForRoot(root, settings), availableHubCards: settings.customHubCards });
+    return;
+  }
+  if (req.method === "POST" && url.pathname === "/api/review-gate") {
+    const body = await readJsonBody(req);
+    const reviewGate = writeReviewGateSettings(root, body.reviewGate || body);
+    const hooks = syncContextRoomGitHooks(root, { policy: reviewGate });
+    sendJson(res, 200, { reviewGate, hooks });
     return;
   }
   if (req.method === "GET" && url.pathname === "/api/reports") {
@@ -6424,6 +6533,25 @@ export function renderAppHtml() {
     .settings-toggle-copy { display: grid; gap: var(--space-1); min-width: 0; }
     .settings-toggle-copy strong { color: var(--label-strong); font-size: 13px; line-height: 1.25; }
     .settings-toggle-copy em { color: var(--muted); font-size: 12px; line-height: 1.35; font-style: normal; }
+    .review-gate-panel { display: grid; gap: var(--space-3); padding-top: var(--space-4); border-top: 1px solid var(--line); }
+    .review-gate-head { display: flex; align-items: flex-start; justify-content: space-between; gap: var(--space-3); }
+    .review-gate-head > div { display: grid; gap: var(--space-1); }
+    .review-gate-head h4 { margin: 0; color: var(--label-strong); font-size: 13px; }
+    .review-gate-head p { margin: 0; color: var(--muted); font-size: 12px; line-height: 1.45; }
+    .review-gate-owner { flex: 0 0 auto; border: 1px solid color-mix(in srgb, var(--positive) 34%, transparent); border-radius: 999px; padding: 5px 8px; color: var(--positive); background: color-mix(in srgb, var(--positive) 8%, transparent); font-size: 9px; font-weight: 900; letter-spacing: 0.08em; text-transform: uppercase; }
+    .review-gate-options { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: var(--space-2); }
+    .review-gate-option { position: relative; display: grid; gap: var(--space-2); min-width: 0; min-height: 122px; padding: var(--space-3); border: 1px solid color-mix(in srgb, var(--line) 90%, transparent); border-radius: 14px; background: color-mix(in srgb, var(--surface-reader) 66%, var(--surface-card)); cursor: pointer; }
+    .review-gate-option:hover { border-color: color-mix(in srgb, var(--accent) 38%, transparent); background: var(--surface-card-hover); }
+    .review-gate-option:has(input:checked) { border-color: color-mix(in srgb, var(--accent) 58%, transparent); background: color-mix(in srgb, var(--surface-card) 88%, var(--accent) 12%); box-shadow: inset 0 2px 0 color-mix(in srgb, var(--accent) 72%, transparent); }
+    .review-gate-option input { position: absolute; width: 1px; height: 1px; opacity: 0; }
+    .review-gate-option:has(input:focus-visible) { outline: 2px solid color-mix(in srgb, var(--accent) 62%, transparent); outline-offset: 2px; }
+    .review-gate-kind { color: var(--accent); font-size: 9px; font-weight: 900; letter-spacing: 0.1em; text-transform: uppercase; }
+    .review-gate-option strong { color: var(--label-strong); font-size: 13px; }
+    .review-gate-option em { color: var(--muted); font-size: 11px; line-height: 1.4; font-style: normal; }
+    .review-gate-check { position: absolute; top: 10px; right: 10px; display: grid; place-items: center; width: 18px; height: 18px; border: 1px solid var(--line); border-radius: 50%; color: transparent; font-size: 11px; }
+    .review-gate-option input:checked ~ .review-gate-check { border-color: var(--accent); color: var(--surface-reader); background: var(--accent); }
+    .review-gate-provider-note { margin: 0; padding: var(--space-3); border-left: 2px solid color-mix(in srgb, var(--warning) 62%, transparent); color: var(--muted); background: color-mix(in srgb, var(--warning) 6%, transparent); font-size: 11px; line-height: 1.45; }
+    .review-gate-provider-note code { color: var(--label-strong); }
     .settings-theme-preview { border: 1px solid color-mix(in srgb, var(--file-line) 92%, transparent); border-radius: 18px; overflow: hidden; background: var(--file-bg); box-shadow: inset 0 1px 0 rgba(255,255,255,0.025); }
     .settings-theme-preview-head { display: flex; justify-content: space-between; gap: var(--space-3); align-items: center; padding: var(--space-3); border-bottom: 1px solid var(--file-line); background: var(--file-header-bg); color: var(--file-fg); font-size: 11px; font-weight: 850; text-transform: uppercase; letter-spacing: 0.08em; }
     .settings-theme-preview .doc-editor { min-height: 0; max-height: none; padding: var(--space-4); font-size: 12px; line-height: 1.55; background: transparent; }
@@ -6820,6 +6948,7 @@ export function renderAppHtml() {
       .review-top { align-items: flex-start; }
       .settings-grid, .hub-card-editor-grid, .template-editor-grid, .markdown-create { grid-template-columns: 1fr; }
       .settings-grid.compact { grid-template-columns: 1fr; }
+      .review-gate-options { grid-template-columns: repeat(2, minmax(0, 1fr)); }
       .settings-section-head { flex-direction: column; }
       .settings-section-actions { justify-content: flex-start; width: 100%; }
       .hub-section-editor, .hub-card-editor { gap: var(--space-3); padding: var(--space-3); }
@@ -7082,6 +7211,9 @@ export function renderAppHtml() {
       .settings-tab small { display: none; }
       .settings-section-head { flex-direction: column; gap: 10px; }
       .settings-section-actions { justify-content: flex-start; }
+      .review-gate-head { flex-direction: column; }
+      .review-gate-options { grid-template-columns: 1fr; }
+      .review-gate-option { min-height: 104px; }
       .docqa-panel, .hub-disclosure, .docqa-disclosure, .editor-shell { border-radius: 7px; }
       .docqa-panel header { align-items: flex-start; flex-direction: column; }
       .review-summary { width: auto; }
@@ -9867,6 +9999,7 @@ function renderSettingsPanel() {
   if (!holder || !state.settings) return;
   const watchAllow = (state.settings.watchAllow || []).join("\n");
   const reviewPaths = (state.settings.reviewPaths || []).join("\n");
+  const reviewGateOperations = state.settings.reviewGate?.operations || [];
   const startupContext = state.settings.startupContext || { enabled: false, fileNames: ["AGENTS.md", "CLAUDE.md"], globalPaths: [] };
   const startupFileNames = (startupContext.fileNames || []).join("\n");
   const startupGlobalPaths = (startupContext.globalPaths || []).join("\n");
@@ -9881,6 +10014,7 @@ function renderSettingsPanel() {
   const sections = state.settings.hubSections?.length ? state.settings.hubSections : [{ id: "main", title: "Main", cards: state.settings.customHubCards || state.availableHubCards || [] }];
   const watchCount = (state.settings.watchAllow || []).length;
   const reviewPathCount = (state.settings.reviewPaths || []).length;
+  const reviewGateCount = reviewGateOperations.length;
   const startupContextCount = (startupContext.fileNames || []).length + (startupContext.globalPaths || []).length;
   const startupSkillFolderCount = (startupSkills.folderNames || []).length;
   const startupHookNameCount = (startupHooks.fileNames || []).length;
@@ -9899,10 +10033,19 @@ function renderSettingsPanel() {
     kicker: "Review",
     title: "Watched docs",
     copy: "Changed files listed here require human review before handoff.",
-    pills: [watchCount + " watched", reviewPathCount + " required"],
+    pills: [watchCount + " watched", reviewPathCount + " required", reviewGateCount + " gates"],
     body: '<div class="settings-grid">' +
       '<div class="settings-field large"><label for="watchAllow">Watched folders/files</label><span class="settings-field-note">One path per line.</span><textarea id="watchAllow" placeholder="docs/&#10;website/docs/">' + escapeHtml(watchAllow) + '</textarea></div>' +
       '<div class="settings-field large"><label for="reviewPaths">Required review files</label><span class="settings-field-note">Important files that stay in review until verified, even without a Git diff.</span><textarea id="reviewPaths" placeholder="AGENTS.md&#10;docs/INDEX.md">' + escapeHtml(reviewPaths) + '</textarea></div>' +
+    '</div>' +
+    '<div class="review-gate-panel"><div class="review-gate-head"><div><h4>Block Git operations while review is pending</h4><p>Select one or several checkpoints. This local owner policy is kept outside project config and is not writable through the agent CLI.</p></div><span class="review-gate-owner">Owner control</span></div>' +
+      '<div class="review-gate-options" role="group" aria-label="Git operations blocked by pending review">' +
+        '<label class="review-gate-option"><input type="checkbox" data-review-gate-operation value="commit" ' + (reviewGateOperations.includes("commit") ? 'checked' : '') + ' /><span class="review-gate-kind">Local hook</span><strong>Commit</strong><em>Blocks before a commit is created.</em><span class="review-gate-check" aria-hidden="true">✓</span></label>' +
+        '<label class="review-gate-option"><input type="checkbox" data-review-gate-operation value="push" ' + (reviewGateOperations.includes("push") ? 'checked' : '') + ' /><span class="review-gate-kind">Local hook</span><strong>Push</strong><em>Allows local commits, then blocks code leaving the clone.</em><span class="review-gate-check" aria-hidden="true">✓</span></label>' +
+        '<label class="review-gate-option"><input type="checkbox" data-review-gate-operation value="pull-request" ' + (reviewGateOperations.includes("pull-request") ? 'checked' : '') + ' /><span class="review-gate-kind">Hosted check</span><strong>Pull request</strong><em>Exposes a failing guard for the repository provider.</em><span class="review-gate-check" aria-hidden="true">✓</span></label>' +
+        '<label class="review-gate-option"><input type="checkbox" data-review-gate-operation value="merge" ' + (reviewGateOperations.includes("merge") ? 'checked' : '') + ' /><span class="review-gate-kind">Local + hosted</span><strong>Merge</strong><em>Blocks local merge commits; hosted merges need a required check.</em><span class="review-gate-check" aria-hidden="true">✓</span></label>' +
+      '</div>' +
+      '<p class="review-gate-provider-note">Git has no local hook for creating a pull request, and hosted merges do not run local hooks. Wire <code>context-room guard --operation pull-request --profile strict</code> or <code>--operation merge --profile strict</code> into the provider and require that check.</p>' +
     '</div>',
   }) +
   renderSettingsSection({
@@ -10041,6 +10184,9 @@ function addHubCardEditor(holder) {
 async function saveSettings() {
   const watchAllow = linesFromTextarea("watchAllow");
   const reviewPaths = linesFromTextarea("reviewPaths");
+  const reviewGate = {
+    operations: [...document.querySelectorAll("[data-review-gate-operation]:checked")].map((input) => input.value),
+  };
   const startupContext = {
     enabled: Boolean(el("startupContextEnabled")?.checked),
     fileNames: linesFromTextarea("startupContextFileNames"),
@@ -10078,12 +10224,19 @@ async function saveSettings() {
   markButtonSaving(saveButton);
   setStatus("saving settings...");
   try {
-    const result = await api("/api/settings", {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ settings: { watchAllow, reviewPaths, startupContext, startupSkills, startupHooks, appearance, markdownTemplates, hubCards, hubSections } }),
-    });
-    state.settings = result.settings;
+    const [result, reviewGateResult] = await Promise.all([
+      api("/api/settings", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ settings: { watchAllow, reviewPaths, startupContext, startupSkills, startupHooks, appearance, markdownTemplates, hubCards, hubSections } }),
+      }),
+      api("/api/review-gate", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ reviewGate }),
+      }),
+    ]);
+    state.settings = { ...result.settings, reviewGate: reviewGateResult.reviewGate };
     applyFileTheme();
     state.availableHubCards = result.availableHubCards || state.availableHubCards;
     state.hubFolders = result.hubCards || [];
@@ -10107,7 +10260,10 @@ async function saveSettings() {
     state.selectedReview = state.docqa.queue[0]?.path || null;
     if (state.page === "settings") renderSettingsPanel();
     else renderDocQaDashboard();
-    setStatus("settings saved");
+    const hookWarning = reviewGateResult.hooks?.conflicts?.length
+      ? " · custom hooks need manual wiring: " + reviewGateResult.hooks.conflicts.join(", ")
+      : reviewGateResult.hooks?.unavailable ? " · " + reviewGateResult.hooks.unavailable : "";
+    setStatus("settings saved" + hookWarning);
     flashSavedButton(el("saveSettings"), "Saved");
     scheduleSessionStatePush();
   } catch (error) {
@@ -13326,6 +13482,16 @@ function activeFileConflict() {
   return state.fileConflict && state.fileConflict.path === state.selected ? state.fileConflict : null;
 }
 
+function editorBufferHasUnsavedChanges() {
+  const editor = activeEditor();
+  return Boolean(editor && editor.value !== state.saved);
+}
+
+function syncEditorDirtyState() {
+  state.dirty = editorBufferHasUnsavedChanges();
+  return state.dirty;
+}
+
 function activeExternalChange() {
   if (!state.externalChange || state.externalChange.path !== state.selected) return null;
   if (!selectedFileExists(state.externalChange.path)) return null;
@@ -13541,19 +13707,19 @@ function focusExternalReviewChange(blockId) {
 }
 
 function scheduleConflictCheck() {
-  if (!state.selected || state.selectedReadOnly || !state.dirty || state.openingFilePath === state.selected || state.savedHash == null) return;
+  if (!state.selected || state.selectedReadOnly || !syncEditorDirtyState() || state.openingFilePath === state.selected || state.savedHash == null) return;
   window.clearTimeout(state.conflictCheckTimer);
   state.conflictCheckTimer = window.setTimeout(() => checkSelectedFileConflict().catch((error) => setStatus(error.message)), 250);
 }
 
 async function checkSelectedFileConflict() {
-  if (!state.selected || state.selectedReadOnly || !state.dirty || state.openingFilePath === state.selected || state.savedHash == null) return false;
+  if (!state.selected || state.selectedReadOnly || !syncEditorDirtyState() || state.openingFilePath === state.selected || state.savedHash == null) return false;
   const path = state.selected;
   const [data, diff] = await Promise.all([
     readSelectedDiskFile(path),
     readSelectedDiff(path),
   ]);
-  if (state.selected !== path || !state.dirty) return false;
+  if (state.selected !== path || !syncEditorDirtyState()) return false;
   if (data.contentHash === state.savedHash) {
     if (activeFileConflict() || activeExternalChange()) {
       resetConflictState();
@@ -13735,7 +13901,7 @@ async function saveCurrent(options = {}) {
     state.saved = content;
     state.savedHash = result.contentHash;
     if (result.startupContext) state.selectedStartupContext = result.startupContext;
-    state.dirty = false;
+    syncEditorDirtyState();
     resetConflictState();
     resetExternalChangeState();
     await loadFiles();
@@ -13775,9 +13941,9 @@ async function refreshFromDisk() {
       setStatus("file removed or renamed · returned to hub");
       return;
     }
-    if (state.dirty) {
-      await checkSelectedFileConflict();
-      return;
+    if (syncEditorDirtyState()) {
+      const conflictDetected = await checkSelectedFileConflict();
+      if (conflictDetected || syncEditorDirtyState()) return;
     }
     if (data.contentHash === state.savedHash) {
       if (activeExternalChange()) {

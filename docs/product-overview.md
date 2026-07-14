@@ -4,7 +4,7 @@ context_room:
   scope: context-room
   status: current
   canonical_for: product overview
-  last_verified: 2026-07-07
+  last_verified: 2026-07-14
   sources: [README.md, bin/context-room.mjs, src/context_room.mjs, schemas/config.schema.json, docs/agent-configuration.md]
 ---
 
@@ -48,6 +48,7 @@ Feature-level docs live in [Features](features/index.md).
 - `allowedPaths`: files and folders Context Room may expose for editing.
 - `watchAllow`: files and folders that enter the review queue when changed.
 - `reviewPaths`: files and folders that stay in review until the current content is verified. `Mark verified` is reserved for unchanged required-review files.
+- `.context-room/review-gate.json`: local owner policy selecting which Git operations pending review can block. It stays outside project config and the agent CLI cannot change it.
 - `hubSections`: visible navigation structure.
 - `startupContext`: instruction files that may shape agent behavior before work starts.
 - `startupSkills`: skill folders that may shape future agent behavior.

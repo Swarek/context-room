@@ -63,17 +63,18 @@ Runtime files under `.context-room/` are excluded from Git where possible. Commi
 context-room init [--title "My Project"] [--allow docs/,src/] [--watch docs/]
 context-room start [--root .] [--port 4317]
 context-room doctor [--root .] [--strict]
-context-room guard [--root .] [--profile advisory|review-only|strict]
+context-room guard [--root .] [--profile advisory|review-only|strict] [--operation commit|push|pull-request|merge]
 context-room brief [--root .] [--task "change billing onboarding"] [--limit 12]
 context-room agent queue [--root .]
 context-room agent open [--root .] [--path docs/INDEX.md] [--view hub|settings|file|diff]
 context-room agent annotate --root . --path docs/INDEX.md --note "Human-facing note"
-context-room install-hook [--root .]
+context-room install-hooks [--root .]
 context-room update-all [--dry-run] [--no-restart] [--exclude /path]
 ```
 
 - `doctor` reports config, graph, metadata, link, startup-context, startup-hook, and hub health.
-- `guard` and `review-only` are non-blocking. Only `--profile strict` can fail the command.
+- `guard` and `review-only` are non-blocking. `--profile strict` can always fail; a selected `--operation` fails when review is pending.
+- The Review settings tab stores owner-selected gates outside project config. Local hooks cover commit, push, and local merge; pull requests and hosted merges need a required provider check.
 - `brief` ranks relevant docs locally and deterministically. It does not call an LLM.
 - `agent` commands let an agent open files, inspect the queue, and leave annotations for the human.
 - `update-all` installs the latest npm release globally and restarts every active room except a Context Room development checkout.

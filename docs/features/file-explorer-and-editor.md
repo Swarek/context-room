@@ -4,7 +4,7 @@ context_room:
   scope: context-room
   status: current
   canonical_for: file explorer and editor
-  last_verified: 2026-07-09
+  last_verified: 2026-07-14
   sources: [src/context_room.mjs, schemas/config.schema.json]
 ---
 
@@ -44,7 +44,7 @@ The explorer and editor expose safe project text files in one compact workspace.
 - Secret-looking paths, dependency folders, build outputs, and binary files stay out.
 - `.git`, dependencies, caches, and build outputs stay excluded even when hidden files are shown. Sensitive environment files remain read-only and expose names only, never values.
 - External startup files are shown only through explicit startup surfaces.
-- Pending changes never block navigation. A concurrent disk edit blocks only the save that would overwrite it silently.
+- Pending changes never block navigation. A disk edit becomes a conflict only when the current editor buffer differs from the last successful save; otherwise it enters normal external review.
 - File data, annotations, Git diff state, and review data load concurrently.
 - File text appears as soon as it is read; slow Git diff or review work never holds the document behind a loading screen.
 - Intentional hover or keyboard focus preloads file content and Git diff; repeated opens reuse the result until the file changes.

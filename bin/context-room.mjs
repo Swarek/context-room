@@ -1,5 +1,4 @@
 #!/usr/bin/env node
-import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { updateAllContextRooms } from "../scripts/update-context-rooms.mjs";
@@ -14,6 +13,8 @@ import {
   readAgentAnnotations,
   readCollaborationSessionState,
   readMemoryWebappSettings,
+  readReviewGateSettings,
+  syncContextRoomGitHooks,
   writeAgentCommand,
   CONFIG_FILE,
 } from "../src/context_room.mjs";
@@ -43,7 +44,7 @@ function splitList(value) {
 }
 
 function usage() {
-  return `Context Room\n\nUsage:\n  context-room init [--title "My Project"] [--allow docs/,src/] [--watch docs/]\n  context-room start [--port 4317] [--root .]\n  context-room doctor [--root .] [--strict]\n  context-room guard [--root .] [--profile advisory|review-only|strict]\n  context-room brief [--root .] [--task "what the agent will do"] [--limit 12]\n  context-room agent state [--root .]\n  context-room agent open [--root .] [--path docs/INDEX.md] [--view hub|settings|file|diff] [--heading "Purpose"] [--text "needle"] [--percent 50]\n  context-room agent annotate --root . --path docs/INDEX.md --note "Human-facing note" [--target "text"]\n  context-room agent queue [--root .]\n  context-room install-hook [--root .]\n  context-room update-all [--dry-run] [--no-restart] [--exclude /path]\n\nConfig: ${CONFIG_FILE}\n`;
+  return `Context Room\n\nUsage:\n  context-room init [--title "My Project"] [--allow docs/,src/] [--watch docs/]\n  context-room start [--port 4317] [--root .]\n  context-room doctor [--root .] [--strict]\n  context-room guard [--root .] [--profile advisory|review-only|strict] [--operation commit|push|pull-request|merge]\n  context-room brief [--root .] [--task "what the agent will do"] [--limit 12]\n  context-room agent state [--root .]\n  context-room agent open [--root .] [--path docs/INDEX.md] [--view hub|settings|file|diff] [--heading "Purpose"] [--text "needle"] [--percent 50]\n  context-room agent annotate --root . --path docs/INDEX.md --note "Human-facing note" [--target "text"]\n  context-room agent queue [--root .]\n  context-room install-hook [--root .]\n  context-room install-hooks [--root .]\n  context-room update-all [--dry-run] [--no-restart] [--exclude /path]\n\nConfig: ${CONFIG_FILE}\n`;
 }
 
 const args = parseArgs(process.argv.slice(2));
@@ -88,15 +89,25 @@ if (command === "doctor") {
 }
 
 if (command === "guard") {
-  const profile = args.strict ? "strict" : args.advisory ? "advisory" : String(args.profile || "advisory");
+  const allowedOperations = new Set(["commit", "push", "pull-request", "merge"]);
+  const operation = args.operation ? String(args.operation).trim().toLowerCase() : "";
+  if (operation && !allowedOperations.has(operation)) {
+    console.error(`Unknown review-gate operation: ${operation}`);
+    process.exit(2);
+  }
+  const requestedProfile = args.strict ? "strict" : args.advisory ? "advisory" : args.profile ? String(args.profile) : "";
+  const gateActive = Boolean(operation && !requestedProfile && readReviewGateSettings(root).operations.includes(operation));
+  if (args.hook && operation && !gateActive) process.exit(0);
+  const profile = requestedProfile || (gateActive ? "review-gate" : "advisory");
   const report = buildDocQaReport(root);
   const doctor = profile === "strict" || profile === "advisory" ? buildContextRoomDoctorReport(root) : null;
   const blockingHealth = doctor ? doctor.issues.filter((issue) => ["critical", "high"].includes(issue.severity)) : [];
-  const shouldBlock = profile === "strict" && (report.queue.length || blockingHealth.length);
+  const shouldBlock = gateActive ? report.queue.length > 0 : profile === "strict" && (report.queue.length || blockingHealth.length);
+  const operationLabel = operation === "pull-request" ? "pull request" : operation || "commit";
   if (report.queue.length) {
     const write = shouldBlock ? console.error : console.log;
     write(shouldBlock
-      ? "Context Room guard blocked this commit: watched documentation changes need human review:"
+      ? `Context Room guard blocked this ${operationLabel}: watched documentation changes need human review:`
       : "Context Room guard found watched documentation changes that need human review:");
     for (const item of report.queue) write(`- ${item.gitStatus.trim() || "changed"} ${item.path}`);
   }
@@ -106,12 +117,12 @@ if (command === "guard") {
   }
   if (shouldBlock) {
     console.error(
-      "\nOpen the Context Room webapp for the user, show the Changed files to review queue, and have the user review each diff before committing. Agents must not mark files verified on the user's behalf.",
+      "\nOpen the Context Room webapp for the user, show the Changed files to review queue, and have the user review each diff before continuing this Git operation. Agents must not mark files verified on the user's behalf.",
     );
     if (blockingHealth.length) console.error("If strict health issues are listed, fix them before asking the user to verify.");
     process.exit(1);
   }
-  if (profile !== "strict" && (report.queue.length || blockingHealth.length)) {
+  if (profile !== "strict" && !gateActive && (report.queue.length || blockingHealth.length)) {
     console.log(`Context Room ${profile} guard found issues but did not block.`);
   } else {
     console.log(profile === "strict" ? "Strict Context Room guard passed." : "No unverified watched documentation changes.");
@@ -174,18 +185,21 @@ if (command === "agent") {
   process.exit(1);
 }
 
-if (command === "install-hook") {
-  const hooksDir = path.join(root, ".git", "hooks");
-  if (!fs.existsSync(hooksDir)) {
-    console.error(`No Git hooks directory found at ${hooksDir}`);
+if (command === "install-hook" || command === "install-hooks") {
+  const result = syncContextRoomGitHooks(root, { cliPath: fileURLToPath(import.meta.url) });
+  if (result.unavailable) {
+    console.error(result.unavailable);
     process.exit(1);
   }
-  const hookPath = path.join(hooksDir, "pre-commit");
-  const cliPath = fileURLToPath(import.meta.url);
-  const script = `#!/bin/sh\n# Installed by Context Room. Reports watched documentation changes without blocking commits.\nnode "${cliPath}" guard --root "${root}" --profile advisory\n`;
-  fs.writeFileSync(hookPath, script, { mode: 0o755 });
-  fs.chmodSync(hookPath, 0o755);
-  console.log(`Context Room pre-commit hook installed: ${hookPath}`);
+  for (const hook of result.installed) console.log(`Context Room ${hook} hook installed.`);
+  for (const hook of result.updated) console.log(`Context Room ${hook} hook updated.`);
+  for (const hook of result.removed) console.log(`Context Room ${hook} hook removed.`);
+  if (result.conflicts.length) {
+    console.error(`Context Room did not overwrite custom hooks: ${result.conflicts.join(", ")}`);
+    process.exit(1);
+  }
+  if (result.externalOperations.length) console.log(`Hosted checks still need provider wiring: ${result.externalOperations.join(", ")}.`);
+  if (!result.installed.length && !result.removed.length) console.log("No local Context Room Git hooks selected.");
   process.exit(0);
 }
 

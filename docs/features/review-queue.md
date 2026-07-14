@@ -4,7 +4,7 @@ context_room:
   scope: context-room
   status: current
   canonical_for: review queue
-  last_verified: 2026-07-11
+  last_verified: 2026-07-14
   sources: [src/context_room.mjs, bin/context-room.mjs, docs/agent-configuration.md]
 ---
 
@@ -26,6 +26,7 @@ The review queue shows watched documentation that needs verification before it b
 
 - Review owns the final trust decision.
 - Agents may surface the queue, but should never mark files verified for the user.
+- The owner can select one or several blocking checkpoints: commit, push, pull request, or merge. Commit, push, and local merge use managed Git hooks; hosted checks require provider wiring.
 - `watchAllow` follows changed tracked files and new untracked files.
 - `reviewPaths` keeps important docs in the queue until the current content is verified.
 - The `reviewPaths` array order defines the intended verification path. Critical safety issues remain first; unlisted changed files retain the default risk and documentation order.

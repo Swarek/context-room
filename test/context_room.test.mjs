@@ -12,6 +12,7 @@ import {
   AGENT_CONTEXT_FILE,
   CONFIG_DIR,
   CONFIG_FILE,
+  REVIEW_GATE_FILE,
   GLOBAL_PREFERENCES_FILE,
   DEFAULT_MARKDOWN_TEMPLATES,
   CONCEPT_VISUAL_DOCUMENT_PATTERNS,
@@ -56,6 +57,7 @@ import {
   readGlobalContextRoomPreferences,
   readMemoryFile,
   readMemoryWebappSettings,
+  readReviewGateSettings,
   readResolvedContextRoomSettings,
   readReviewBaseFile,
   readStartupContextFile,
@@ -66,6 +68,7 @@ import {
   renderReviewSummary,
   renderTemplateOptionsMarkup,
   syncContextRoomAgentContext,
+  syncContextRoomGitHooks,
   revertMemoryFile,
   writeDocReviewBaseline,
   writeDeletedReviewBatchDecision,
@@ -76,6 +79,7 @@ import {
   writeCollaborationSessionState,
   writeDocReviewDecision,
   writeGlobalContextRoomPreferences,
+  writeReviewGateSettings,
 } from "../src/context_room.mjs";
 
 function makeRoot() {
@@ -344,6 +348,50 @@ test("appearance preferences are shared across Context Rooms and stay out of pro
   assert.deepEqual(payload.settings.appearance, { fileTheme: "github-dark", autoOpenGitDiff: false, showHiddenFiles: true });
   assert.deepEqual(readResolvedContextRoomSettings(secondRoot, { preferencesPath }).appearance, { fileTheme: "github-dark", autoOpenGitDiff: false, showHiddenFiles: true });
   assert.equal("appearance" in savedProject, false);
+});
+
+test("review gates are owner-local, sanitized, and separate from project config", () => {
+  const root = makeRoot();
+  initializeContextRoomProject(root, { allowedPaths: ["docs/"] });
+
+  assert.deepEqual(readReviewGateSettings(root), { operations: [] });
+  const saved = writeReviewGateSettings(root, { operations: ["push", "merge", "push", "unknown"] });
+  const projectConfig = JSON.parse(fs.readFileSync(path.join(root, CONFIG_FILE), "utf8"));
+  const mode = fs.statSync(path.join(root, REVIEW_GATE_FILE)).mode & 0o777;
+
+  assert.deepEqual(saved, { operations: ["push", "merge"] });
+  assert.deepEqual(readReviewGateSettings(root), saved);
+  assert.equal("reviewGate" in projectConfig, false);
+  assert.equal(mode, 0o600);
+});
+
+test("settings API cannot change the owner review gate through project settings", async (t) => {
+  const root = makeRoot();
+  initializeContextRoomProject(root, { allowedPaths: ["docs/"] });
+  writeReviewGateSettings(root, { operations: ["push"] });
+  const { server } = createMemoryServer({ root });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  t.after(() => new Promise((resolve, reject) => server.close((error) => error ? reject(error) : resolve())));
+  const base = `http://127.0.0.1:${server.address().port}`;
+
+  const projectResponse = await fetch(`${base}/api/settings`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ settings: { ...readMemoryWebappSettings(root), reviewGate: { operations: ["commit"] } } }),
+  });
+  const projectPayload = await projectResponse.json();
+  const ownerResponse = await fetch(`${base}/api/review-gate`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ reviewGate: { operations: ["merge", "pull-request"] } }),
+  });
+  const ownerPayload = await ownerResponse.json();
+
+  assert.equal(projectResponse.status, 200);
+  assert.deepEqual(projectPayload.settings.reviewGate.operations, ["push"]);
+  assert.equal(ownerResponse.status, 200);
+  assert.deepEqual(ownerPayload.reviewGate.operations, ["merge", "pull-request"]);
+  assert.deepEqual(readReviewGateSettings(root).operations, ["merge", "pull-request"]);
 });
 
 test("file listing follows project config and does not inject Hermes/LifeOS files by default", () => {
@@ -939,6 +987,7 @@ test("init adds Context Room runtime files to local Git excludes", () => {
   assert.match(exclude, /\.context-room\/agent-command\.json/);
   assert.match(exclude, /\.context-room\/agent-annotations\.json/);
   assert.match(exclude, /\.context-room\/health-acknowledgements\.json/);
+  assert.match(exclude, /\.context-room\/review-gate\.json/);
   assert.match(exclude, /\.context-room\/README\.md/);
   assert.match(exclude, /\.context-room\/agent-context\//);
   assert.match(exclude, /\.context-room\/review-baselines\//);
@@ -998,6 +1047,19 @@ test("CLI guard is non-blocking unless strict mode is explicit", () => {
     },
   );
 
+  writeReviewGateSettings(root, { operations: ["push"] });
+  const commitGateOutput = execFileSync(process.execPath, [cli, "guard", "--operation", "commit"], { cwd: root, encoding: "utf8" });
+  assert.match(commitGateOutput, /did not block/);
+  assert.throws(
+    () => execFileSync(process.execPath, [cli, "guard", "--operation", "push"], { cwd: root, encoding: "utf8", stdio: "pipe" }),
+    (error) => {
+      const output = `${error.stdout || ""}${error.stderr || ""}`;
+      assert.match(output, /Context Room guard blocked this push/);
+      assert.match(output, /README\.md/);
+      return true;
+    },
+  );
+
   writeDocReviewDecision(root, "README.md", { status: "verified", note: "test baseline" });
   const output = execFileSync(process.execPath, [cli, "guard", "--profile", "review-only"], { cwd: root, encoding: "utf8" });
   assert.match(output, /No unverified watched documentation changes/);
@@ -1014,11 +1076,86 @@ test("CLI guard is non-blocking unless strict mode is explicit", () => {
     },
   );
 
+  writeReviewGateSettings(root, { operations: ["commit"] });
   execFileSync(process.execPath, [cli, "install-hook"], { cwd: root, encoding: "utf8" });
   const hook = fs.readFileSync(path.join(root, ".git", "hooks", "pre-commit"), "utf8");
-  assert.match(hook, /Reports watched documentation changes without blocking commits/);
-  assert.match(hook, /--profile advisory/);
-  assert.doesNotMatch(hook, /--profile review-only/);
+  assert.match(hook, /Managed by Context Room review gate/);
+  assert.match(hook, /--operation 'commit'/);
+  assert.doesNotMatch(hook, /--profile advisory/);
+});
+
+test("review gate hook sync installs selected local operations and preserves custom hooks", () => {
+  const root = makeRoot();
+  execFileSync("git", ["init"], { cwd: root, stdio: "ignore" });
+  initializeContextRoomProject(root, { allowedPaths: ["docs/"] });
+  const hooksDir = execFileSync("git", ["rev-parse", "--path-format=absolute", "--git-path", "hooks"], { cwd: root, encoding: "utf8" }).trim();
+  const customCommitHook = "#!/bin/sh\necho custom\n";
+  fs.writeFileSync(path.join(hooksDir, "pre-commit"), customCommitHook, { mode: 0o755 });
+
+  const first = syncContextRoomGitHooks(root, { policy: { operations: ["commit", "push", "merge", "pull-request"] } });
+
+  assert.deepEqual(first.conflicts, ["pre-commit"]);
+  assert.deepEqual(first.installed, ["pre-push", "pre-merge-commit"]);
+  assert.deepEqual(first.externalOperations, ["merge", "pull-request"]);
+  assert.equal(fs.readFileSync(path.join(hooksDir, "pre-commit"), "utf8"), customCommitHook);
+  assert.match(fs.readFileSync(path.join(hooksDir, "pre-push"), "utf8"), /--operation 'push'/);
+  assert.match(fs.readFileSync(path.join(hooksDir, "pre-merge-commit"), "utf8"), /--operation 'merge'/);
+  assert.match(fs.readFileSync(path.join(hooksDir, "pre-push"), "utf8"), /git rev-parse --show-toplevel/);
+  assert.match(fs.readFileSync(path.join(hooksDir, "pre-push"), "utf8"), /--hook/);
+
+  const second = syncContextRoomGitHooks(root, { policy: { operations: [] } });
+  assert.deepEqual(second.removed, []);
+  assert.equal(fs.existsSync(path.join(hooksDir, "pre-push")), true);
+  assert.equal(fs.existsSync(path.join(hooksDir, "pre-merge-commit")), true);
+  assert.equal(fs.readFileSync(path.join(hooksDir, "pre-commit"), "utf8"), customCommitHook);
+});
+
+test("review gate hook sync makes an old Context Room pre-commit hook inert when commit is deselected", () => {
+  const root = makeRoot();
+  execFileSync("git", ["init"], { cwd: root, stdio: "ignore" });
+  initializeContextRoomProject(root, { allowedPaths: ["docs/"] });
+  const hooksDir = execFileSync("git", ["rev-parse", "--path-format=absolute", "--git-path", "hooks"], { cwd: root, encoding: "utf8" }).trim();
+  fs.writeFileSync(path.join(hooksDir, "pre-commit"), "#!/bin/sh\nnode \"/tmp/context-room.mjs\" guard --root \"/tmp/project\" --profile strict\n", { mode: 0o755 });
+
+  const result = syncContextRoomGitHooks(root, { policy: { operations: ["push"] } });
+  const migrated = fs.readFileSync(path.join(hooksDir, "pre-commit"), "utf8");
+
+  assert.deepEqual(result.updated, ["pre-commit"]);
+  assert.match(migrated, /Managed by Context Room review gate/);
+  assert.match(migrated, /--operation 'commit' --hook/);
+  assert.doesNotMatch(migrated, /--profile strict/);
+});
+
+test("push-only gate allows a code commit while a watched doc waits, then blocks pre-push", () => {
+  const root = makeRoot();
+  fs.mkdirSync(path.join(root, "src"));
+  fs.writeFileSync(path.join(root, "README.md"), "# Demo\n");
+  fs.writeFileSync(path.join(root, "src", "app.js"), "export const value = 1;\n");
+  execFileSync("git", ["init"], { cwd: root, stdio: "ignore" });
+  execFileSync("git", ["config", "user.email", "context-room@example.test"], { cwd: root, stdio: "ignore" });
+  execFileSync("git", ["config", "user.name", "Context Room Test"], { cwd: root, stdio: "ignore" });
+  initializeContextRoomProject(root, { allowedPaths: ["README.md", "src/"], watchAllow: ["README.md"] });
+  execFileSync("git", ["add", "."], { cwd: root, stdio: "ignore" });
+  execFileSync("git", ["commit", "-m", "initial"], { cwd: root, stdio: "ignore" });
+  writeReviewGateSettings(root, { operations: ["push"] });
+  syncContextRoomGitHooks(root);
+
+  fs.writeFileSync(path.join(root, "README.md"), "# Demo\n\nNeeds human review.\n");
+  fs.writeFileSync(path.join(root, "src", "app.js"), "export const value = 2;\n");
+  execFileSync("git", ["add", "src/app.js"], { cwd: root, stdio: "ignore" });
+  execFileSync("git", ["commit", "-m", "change code"], { cwd: root, stdio: "pipe" });
+
+  const hooksDir = execFileSync("git", ["rev-parse", "--path-format=absolute", "--git-path", "hooks"], { cwd: root, encoding: "utf8" }).trim();
+  assert.equal(fs.existsSync(path.join(hooksDir, "pre-commit")), false);
+  assert.throws(
+    () => execFileSync(path.join(hooksDir, "pre-push"), { cwd: root, encoding: "utf8", stdio: "pipe" }),
+    (error) => {
+      const output = `${error.stdout || ""}${error.stderr || ""}`;
+      assert.match(output, /Context Room guard blocked this push/);
+      assert.match(output, /README\.md/);
+      return true;
+    },
+  );
 });
 
 test("shared review ledger verifies the same absolute path and content across rooms", () => {
@@ -2439,6 +2576,17 @@ test("rendered app supports selectable file themes and colored markdown reading"
   assert.match(html, /function renderSettingsSection\(\{ id, kicker, title, copy, scope/);
   assert.match(html, /'<section id="settings-section-' \+ sectionId/);
   assert.match(html, /id:\s*"review"[\s\S]*kicker:\s*"Review"[\s\S]*title:\s*"Watched docs"/);
+  assert.match(html, /Block Git operations while review is pending/);
+  assert.match(html, /data-review-gate-operation value="commit"/);
+  assert.match(html, /data-review-gate-operation value="push"/);
+  assert.match(html, /data-review-gate-operation value="pull-request"/);
+  assert.match(html, /data-review-gate-operation value="merge"/);
+  assert.match(html, /Owner control/);
+  assert.match(html, /not writable through the agent CLI/);
+  assert.match(html, /Git has no local hook for creating a pull request/);
+  assert.match(html, /api\("\/api\/review-gate"/);
+  assert.match(html, /document\.querySelectorAll\("\[data-review-gate-operation\]:checked"\)/);
+  assert.match(html, /\.review-gate-options\s*\{[^}]*grid-template-columns:\s*repeat\(4/);
   assert.match(html, /id:\s*"startup"[\s\S]*kicker:\s*"Startup"[\s\S]*title:\s*"Injected context scanners"/);
   assert.match(html, /id:\s*"appearance"[\s\S]*kicker:\s*"Appearance"[\s\S]*title:\s*"Theme, files, and diffs"/);
   assert.match(html, /copy:\s*"Shared by every Context Room on this computer\."/);
@@ -3214,7 +3362,10 @@ test("disk changes stay pending for review instead of silently reloading the ope
   assert.match(html, /state\.externalChange = \{[\s\S]*reviewDecisions: \{\},[\s\S]*\};\s*state\.selectedDiff = diff;\s*state\.diffCollapsed = true;/);
   assert.match(html, /state\.openingFilePath = path;[\s\S]*state\.savedHash = data\.contentHash;[\s\S]*state\.openingFilePath = null;/);
   assert.match(html, /if \(state\.openingFilePath === state\.selected \|\| state\.savedHash == null\) return;/);
-  assert.match(html, /if \(!state\.selected \|\| state\.selectedReadOnly \|\| !state\.dirty \|\| state\.openingFilePath === state\.selected \|\| state\.savedHash == null\) return;/);
+  assert.match(html, /function editorBufferHasUnsavedChanges\(\) \{[\s\S]*editor\.value !== state\.saved/);
+  assert.match(html, /function syncEditorDirtyState\(\) \{[\s\S]*state\.dirty = editorBufferHasUnsavedChanges\(\);/);
+  assert.match(html, /if \(!state\.selected \|\| state\.selectedReadOnly \|\| !syncEditorDirtyState\(\) \|\| state\.openingFilePath === state\.selected \|\| state\.savedHash == null\) return false;/);
+  assert.match(html, /state\.saved = content;\s*state\.savedHash = result\.contentHash;[\s\S]*syncEditorDirtyState\(\);/);
   assert.match(html, /const viewState = captureEditorViewState\(\);[\s\S]*state\.externalChange = \{[\s\S]*renderViewer\(\);\s*restoreEditorViewState\(viewState\);/);
   assert.match(html, /const previousHeight = current\.getBoundingClientRect\(\)\.height;/);
   assert.match(html, /next\.style\.minHeight = Math\.ceil\(previousHeight\) \+ "px"/);
@@ -3317,6 +3468,137 @@ test("disk changes stay pending for review instead of silently reloading the ope
   assert.doesNotMatch(html, /activeBlockingExternalChange/);
   assert.match(html, /apply or reject before saving/);
   assert.doesNotMatch(html, /setStatus\("reloaded from disk"\);\n  \} catch \(error\) \{\n    setStatus\(error\.message\);\n  \}\n\}/);
+});
+
+test("saved startup skill with stale dirty state treats a later disk edit as external review, not a conflict", async () => {
+  const script = extractInlineAppScript(renderAppHtml());
+  const selectionSource = script.slice(
+    script.indexOf("function activeFileConflict"),
+    script.indexOf("async function readSelectedDiff"),
+  );
+  const conflictSource = script.slice(
+    script.indexOf("function scheduleConflictCheck"),
+    script.indexOf("async function applyExternalChange"),
+  );
+  const refreshSource = script.slice(
+    script.indexOf("async function refreshFromDisk"),
+    script.indexOf("function scheduleBackgroundRefresh"),
+  );
+  const editor = { value: "Saved by the user.\n" };
+  const state = {
+    selected: "~/.codex/skills/documentation-excellence/SKILL.md",
+    selectedReadOnly: false,
+    selectedStartupContext: {
+      kind: "startup-skill",
+      order: "0:documentation-excellence",
+      skillName: "documentation-excellence",
+    },
+    openingFilePath: null,
+    saved: editor.value,
+    savedHash: "saved-hash",
+    dirty: true,
+    refreshInFlight: false,
+    externalChange: null,
+    fileConflict: null,
+    conflictCompare: false,
+    conflictMergeText: null,
+    conflictMergeKey: "",
+    conflictMergeMode: "auto",
+    selectedDiff: null,
+    diffCollapsed: false,
+    lastDiffRefreshAt: 0,
+  };
+  const requests = [];
+  const statuses = [];
+  const harness = Function(
+    "state",
+    "document",
+    "window",
+    "api",
+    "activeEditor",
+    "el",
+    "selectedFileExists",
+    "readSelectedDiff",
+    "canReviewMissingFile",
+    "clearMissingSelectedFile",
+    "renderFiles",
+    "showHome",
+    "scheduleSessionStatePush",
+    "onlyIgnoredReviewMetadataChanged",
+    "captureEditorViewState",
+    "resetConflictState",
+    "resetExternalChangeState",
+    "renderViewer",
+    "restoreEditorViewState",
+    "updateHeader",
+    "updatePreview",
+    "setStatus",
+    selectionSource + conflictSource + refreshSource + "; return { refreshFromDisk };",
+  )(
+    state,
+    { hidden: false },
+    { clearTimeout() {}, setTimeout() {} },
+    async (requestPath) => {
+      requests.push(requestPath);
+      if (state.selectedStartupContext) {
+        assert.match(requestPath, /^\/api\/startup-skills\/file\?folder=0&skill=documentation-excellence$/);
+        return { exists: true, content: "Changed by an agent.\n", contentHash: "disk-hash", updatedAt: "now" };
+      }
+      assert.equal(requestPath, "/api/file?path=docs%2Fguide.md");
+      return { exists: true, content: "Changed on disk.\n", contentHash: "regular-disk-hash", updatedAt: "later" };
+    },
+    () => editor,
+    () => editor,
+    () => true,
+    async () => ({ available: false, changed: false }),
+    () => false,
+    () => {},
+    () => {},
+    () => {},
+    () => {},
+    () => false,
+    () => ({ scrollTop: 0 }),
+    () => { state.fileConflict = null; },
+    () => { state.externalChange = null; },
+    () => {},
+    () => {},
+    () => {},
+    () => {},
+    (status) => statuses.push(status),
+  );
+
+  await harness.refreshFromDisk();
+
+  assert.ok(requests.length >= 1);
+  assert.equal(state.dirty, false);
+  assert.equal(state.fileConflict, null);
+  assert.equal(state.externalChange?.source, "disk");
+  assert.equal(state.externalChange?.baseContent, "Saved by the user.\n");
+  assert.equal(state.externalChange?.diskContent, "Changed by an agent.\n");
+  assert.equal(statuses.at(-1), "file changed on disk · review before applying");
+
+  requests.length = 0;
+  statuses.length = 0;
+  editor.value = "Unsaved user edit.\n";
+  Object.assign(state, {
+    selected: "docs/guide.md",
+    selectedStartupContext: null,
+    saved: "Saved regular file.\n",
+    savedHash: "regular-saved-hash",
+    dirty: false,
+    externalChange: null,
+    fileConflict: null,
+    selectedDiff: null,
+  });
+
+  await harness.refreshFromDisk();
+
+  assert.ok(requests.length >= 1);
+  assert.equal(state.dirty, true);
+  assert.equal(state.externalChange, null);
+  assert.equal(state.fileConflict?.path, "docs/guide.md");
+  assert.equal(state.fileConflict?.diskContent, "Changed on disk.\n");
+  assert.equal(statuses.at(-1), "file changed on disk · resolve conflict before saving");
 });
 
 test("inline review highlights only changed paragraph fragments", () => {
