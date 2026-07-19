@@ -868,8 +868,40 @@ function startupSkillNamespaceFolders(abs, folderName) {
 }
 
 function effectiveMemoryWebappSettings(root = process.cwd()) {
-  const settings = readMemoryWebappSettings(root);
+  const settings = withProjectAgentInstructionPaths(root, readMemoryWebappSettings(root));
   return withStartupSkillExternalPaths(root, settings);
+}
+
+function withProjectAgentInstructionPaths(root, settings = defaultMemoryWebappSettings()) {
+  const agentPaths = listProjectAgentInstructionPaths(root);
+  return {
+    ...settings,
+    allowedPaths: appendUniquePaths(settings.allowedPaths || [], agentPaths),
+    watchAllow: appendUniquePaths(settings.watchAllow || [], agentPaths),
+  };
+}
+
+function listProjectAgentInstructionPaths(root = process.cwd()) {
+  const resolvedRoot = path.resolve(root);
+  const found = [];
+  const walk = (dir) => {
+    let entries = [];
+    try {
+      entries = fs.readdirSync(dir, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const entry of entries) {
+      if (entry.isDirectory()) {
+        if (PROJECT_EXPLORER_SKIP_DIRS.has(entry.name) || entry.name === ".context-room") continue;
+        walk(path.join(dir, entry.name));
+      } else if (entry.isFile() && entry.name === "AGENTS.md") {
+        found.push(path.relative(resolvedRoot, path.join(dir, entry.name)).replaceAll(path.sep, "/"));
+      }
+    }
+  };
+  walk(resolvedRoot);
+  return found.sort((a, b) => a.localeCompare(b, "fr"));
 }
 
 function withStartupSkillExternalPaths(root, settings = defaultMemoryWebappSettings()) {
@@ -927,7 +959,7 @@ export function readStartupSkillFile(root = process.cwd(), folderOrder = 0, skil
   const fileName = path.basename(abs) === "SKILL.md" ? `${requestedName}/SKILL.md` : path.basename(abs);
   return {
     label: path.basename(abs),
-    path: displayPath(abs),
+    path: memoryPathForAbsolutePath(root, abs),
     content,
     exists: true,
     updatedAt: stats.mtime.toISOString(),
@@ -1915,7 +1947,7 @@ function buildInferredRenameDiff(root, oldPath, nextPath) {
 export function readReviewBaseFile(root, relPath) {
   const normalized = normalizeRelPath(relPath);
   if (!normalized) throw new Error("Path is required");
-  const startupFile = readStartupContextReviewFile(root, normalized);
+  const startupFile = readStartupContextReviewFile(root, normalized) || readStartupSkillReviewFile(root, normalized);
   if (startupFile) return readInternalReviewBaseFile(root, startupFile);
   if (resolveExternalPath(normalized)) {
     const file = readMemoryFile(root, normalized);
@@ -2048,6 +2080,21 @@ function readStartupContextReviewFile(root, relPath, settings = readMemoryWebapp
       label: file.label,
       summary: file.impact,
     };
+  }
+  return null;
+}
+
+function readStartupSkillReviewFile(root, relPath, settings = readMemoryWebappSettings(root)) {
+  const normalized = normalizeRelPath(relPath);
+  if (!normalized) return null;
+  for (const folder of listStartupSkillFolders(root, settings)) {
+    for (const skillName of folder.skills || []) {
+      const file = readStartupSkillFile(root, folder.order, skillName, settings);
+      const key = normalizeRelPath(file.path || file.startupContext?.displayPath || "");
+      const explorerPath = normalizeRelPath(file.startupContext?.explorerPath || "");
+      if (normalized !== key && normalized !== explorerPath) continue;
+      return { ...file, path: key };
+    }
   }
   return null;
 }
@@ -2305,6 +2352,28 @@ export function writeDocReviewBaseline(root, relPath, { note = "" } = {}) {
   return { path: normalized, ...next };
 }
 
+export function writeDocReviewBaselineContent(root, relPath, content, { note = "" } = {}) {
+  if (typeof content !== "string") throw new Error("Review baseline content must be a string");
+  const file = readReviewTrackedFile(root, relPath);
+  const normalized = file.path;
+  const resourceState = resourceStateForReviewFile(file);
+  const resourceVersion = resourceVersionForReviewFile(root, normalized, file);
+  const state = readDocReviewState(root);
+  const baseline = writeDocReviewBaselineFile(root, normalized, content);
+  const next = {
+    baselinePath: baseline.baselinePath,
+    baselineHash: baseline.baselineHash,
+    baselineReviewHash: baseline.baselineReviewHash,
+    baselineAt: baseline.baselineAt,
+    resourceState,
+    resourceVersion,
+  };
+  if (note) next.note = String(note).slice(0, 500);
+  state.reviews[normalized] = next;
+  writeDocReviewState(root, state);
+  return { path: normalized, ...next };
+}
+
 export function writeDocReviewDecision(root, relPath, { status, note = "", expectedResourceState = null, expectedResourceVersion = null } = {}) {
   const file = readReviewTrackedFile(root, relPath);
   const normalized = file.path;
@@ -2344,7 +2413,7 @@ export function writeDocReviewDecision(root, relPath, { status, note = "", expec
 
 function readReviewTrackedFile(root, relPath) {
   const normalized = normalizeRelPath(relPath);
-  const startupFile = readStartupContextReviewFile(root, normalized);
+  const startupFile = readStartupContextReviewFile(root, normalized) || readStartupSkillReviewFile(root, normalized);
   if (startupFile) return startupFile;
   return readMemoryFile(root, normalized);
 }
@@ -3478,7 +3547,9 @@ export function buildDocQaReport(root = process.cwd(), options = {}) {
   const gitStatuses = options.gitStatuses || readGitStatusEntries(root);
   const gitHeadContents = options.gitHeadContents || null;
   const reviewState = options.reviewState || readDocReviewState(root);
-  const settings = options.settings || readMemoryWebappSettings(root);
+  const settings = options.settings
+    ? withStartupSkillExternalPaths(root, withProjectAgentInstructionPaths(root, options.settings))
+    : effectiveMemoryWebappSettings(root);
   const files = options.files || listMemoryFiles(root);
   invalidateAbsentReviewsForPresentFiles(root, reviewState, files);
   const startupFiles = options.startupFiles || listStartupContextFiles(root, settings);
@@ -3533,7 +3604,10 @@ export function buildDocQaReport(root = process.cwd(), options = {}) {
     riskScore: item.riskScore + 90,
     issues: [{ type: "git_conflict", severity: "critical", message: "Unmerged Git deletion conflict requires individual review." }, ...item.issues],
   }));
-  const queue = [...gitQueue, ...deletedQueue, ...unmergedDeletedQueue, ...buildStartupContextReviewQueue(root, settings, reviewState, startupFiles)]
+  const primaryQueue = [...gitQueue, ...deletedQueue, ...unmergedDeletedQueue, ...buildStartupContextReviewQueue(root, settings, reviewState, startupFiles)];
+  const primaryPaths = new Set(primaryQueue.map((item) => item.path));
+  const startupSkillQueue = buildStartupSkillReviewQueue(root, settings, reviewState).filter((item) => !primaryPaths.has(item.path));
+  const queue = [...primaryQueue, ...startupSkillQueue]
   .sort((a, b) => compareReviewQueueItems(a, b, settings));
   return {
     generatedAt: new Date().toISOString(),
@@ -4102,29 +4176,24 @@ function buildStartupContextReviewQueue(root, settings, reviewState, startupFile
     if (!isExternalStartupContextReviewFile(root, startupFile)) continue;
     const file = readStartupContextReviewFile(root, startupFile.startupContext.displayPath, settings);
     if (!file) continue;
-    const existing = reviewState.reviews[file.path] && typeof reviewState.reviews[file.path] === "object" ? reviewState.reviews[file.path] : {};
-    const baseline = readDocReviewBaseline(root, file.path, existing);
+    let existing = reviewState.reviews[file.path] && typeof reviewState.reviews[file.path] === "object" ? reviewState.reviews[file.path] : {};
+    let baseline = readDocReviewBaseline(root, file.path, existing);
     if (!baseline) {
-      const nextBaseline = writeDocReviewBaselineFile(root, file.path, file.content);
-      reviewState.reviews[file.path] = {
-        ...existing,
-        baselinePath: nextBaseline.baselinePath,
-        baselineHash: nextBaseline.baselineHash,
-        baselineReviewHash: nextBaseline.baselineReviewHash,
-        baselineAt: nextBaseline.baselineAt,
-        note: existing.note || "startup context baseline",
-      };
+      const observed = observeReviewBaseline(root, file, reviewState, existing, "startup context observed before review");
+      existing = observed.review;
+      baseline = observed.baseline;
       stateChanged = true;
-      continue;
     }
-    if (baseline.reviewHash === reviewContentHash(file.content)) continue;
+    const changedSinceBaseline = Boolean(baseline && baseline.reviewHash !== reviewContentHash(file.content));
     const classification = { type: "startup-context", authority: "critical", sensitive: false };
-    const gitStatus = "M";
+    const gitStatus = changedSinceBaseline ? "M" : "";
     const metadata = parseDocMetadata(file.content, file.path);
     const issues = computeDocIssues({ path: file.path, content: file.content, gitStatus, metadata });
-    issues.unshift({ type: "internal_context_changed", severity: "high", message: "Startup context changed outside the Git review baseline." });
+    issues.unshift(changedSinceBaseline
+      ? { type: "internal_context_changed", severity: "high", message: "Startup context changed outside the Git review baseline." }
+      : { type: "startup_context_review_required", severity: "high", message: "Startup context has not been reviewed in this Context Room yet." });
     const resourceState = file.exists === false ? "absent" : "present";
-    const resourceVersion = resourceVersionForReviewFile(root, file.path, file, reviewState.reviews[file.path] || null);
+    const resourceVersion = resourceVersionForReviewFile(root, file.path, file, existing);
     const review = currentReviewFor(root, reviewState.reviews, file.path, file.content, resourceState, resourceVersion);
     if (review?.status === "verified" && review.current) continue;
     queue.push({
@@ -4135,7 +4204,8 @@ function buildStartupContextReviewQueue(root, settings, reviewState, startupFile
       classification,
       metadata,
       gitStatus,
-      internalChange: true,
+      internalChange: changedSinceBaseline,
+      initialReview: !existing.status && !changedSinceBaseline,
       startupContext: file.startupContext,
       reviewRequired: true,
       issues,
@@ -4145,6 +4215,78 @@ function buildStartupContextReviewQueue(root, settings, reviewState, startupFile
   }
   if (stateChanged) writeDocReviewState(root, reviewState);
   return queue;
+}
+
+function buildStartupSkillReviewQueue(root, settings, reviewState) {
+  const queue = [];
+  let stateChanged = false;
+  for (const folder of listStartupSkillFolders(root, settings)) {
+    for (const skillName of folder.skills || []) {
+      const file = readStartupSkillFile(root, folder.order, skillName, settings);
+      let existing = reviewState.reviews[file.path] && typeof reviewState.reviews[file.path] === "object" ? reviewState.reviews[file.path] : {};
+      let baseline = readDocReviewBaseline(root, file.path, existing);
+      if (!baseline) {
+        const observed = observeReviewBaseline(root, file, reviewState, existing, "startup skill observed before review");
+        existing = observed.review;
+        baseline = observed.baseline;
+        stateChanged = true;
+      }
+      const changedSinceBaseline = Boolean(baseline && baseline.reviewHash !== reviewContentHash(file.content));
+      const classification = { type: "skill", authority: "high", sensitive: false };
+      const gitStatus = changedSinceBaseline ? "M" : "";
+      const metadata = parseDocMetadata(file.content, file.path);
+      const issues = computeDocIssues({ path: file.path, content: file.content, gitStatus, metadata });
+      issues.unshift(changedSinceBaseline
+        ? { type: "internal_skill_changed", severity: "high", message: "Startup skill changed after its last Context Room review." }
+        : { type: "startup_skill_review_required", severity: "high", message: "Startup skill has not been reviewed in this Context Room yet." });
+      const resourceState = resourceStateForReviewFile(file);
+      const resourceVersion = resourceVersionForReviewFile(root, file.path, file, existing);
+      const review = currentReviewFor(root, reviewState.reviews, file.path, file.content, resourceState, resourceVersion);
+      if (review?.status === "verified" && review.current) continue;
+      queue.push({
+        path: file.path,
+        label: skillName,
+        summary: changedSinceBaseline ? "Startup skill changed after review." : "Startup skill requires review.",
+        updatedAt: file.updatedAt,
+        classification,
+        metadata,
+        gitStatus,
+        initialReview: !existing.status && !changedSinceBaseline,
+        internalChange: changedSinceBaseline,
+        startupContext: file.startupContext,
+        reviewRequired: true,
+        issues,
+        riskScore: riskScoreFor({ classification, issues, gitStatus }) + 20,
+        review,
+      });
+    }
+  }
+  if (stateChanged) writeDocReviewState(root, reviewState);
+  return queue;
+}
+
+function observeReviewBaseline(root, file, reviewState, existing = {}, note = "resource observed before review") {
+  const baselineMetadata = writeDocReviewBaselineFile(root, file.path, file.content);
+  const review = {
+    ...existing,
+    baselinePath: baselineMetadata.baselinePath,
+    baselineHash: baselineMetadata.baselineHash,
+    baselineReviewHash: baselineMetadata.baselineReviewHash,
+    baselineAt: baselineMetadata.baselineAt,
+    resourceState: resourceStateForReviewFile(file),
+    resourceVersion: resourceVersionForReviewFile(root, file.path, file, existing),
+    note: existing.note || note,
+  };
+  reviewState.reviews[file.path] = review;
+  return {
+    review,
+    baseline: {
+      path: baselineMetadata.baselinePath,
+      content: file.content,
+      contentHash: baselineMetadata.baselineHash,
+      reviewHash: baselineMetadata.baselineReviewHash,
+    },
+  };
 }
 
 function reviewSeverityRank(item) {
@@ -4244,6 +4386,7 @@ export function createDefaultProjectConfig({ title = "Context Room", allowedPath
     allowedPaths: sanitizePathList(allowedPaths),
     watchAllow: sanitizePathList(watchAllow),
     reviewPaths: [],
+    reviewAgentInstructions: true,
     integrations: { hermes: false },
     startupContext: { ...DEFAULT_STARTUP_CONTEXT },
     startupSkills: { ...DEFAULT_STARTUP_SKILLS },
@@ -4786,6 +4929,7 @@ function normalizeMemoryWebappSettings(raw = {}, base = defaultMemoryWebappSetti
     allowedPaths: sanitizePathList(raw.allowedPaths ?? base.allowedPaths ?? ALLOWED_PREFIXES),
     watchAllow: sanitizePathList(raw.watchAllow ?? base.watchAllow),
     reviewPaths: sanitizePathList(raw.reviewPaths ?? base.reviewPaths ?? []),
+    reviewAgentInstructions: Boolean(raw.reviewAgentInstructions ?? base.reviewAgentInstructions ?? true),
     integrations: { hermes: Boolean(raw.integrations?.hermes ?? base.integrations?.hermes ?? false) },
     startupContext: normalizeStartupContextSettings(raw.startupContext ?? base.startupContext),
     startupSkills: normalizeStartupSkillSettings(raw.startupSkills ?? base.startupSkills),
@@ -5053,7 +5197,9 @@ function isWatchedPath(relPath, settings = defaultMemoryWebappSettings()) {
 
 function isRequiredReviewPath(relPath, settings = defaultMemoryWebappSettings()) {
   const normalized = normalizeRelPath(relPath);
-  return (settings.reviewPaths || []).some((pattern) => pathMatchesSetting(normalized, pattern));
+  return (settings.reviewAgentInstructions !== false && (normalized === "AGENTS.md"
+    || normalized.endsWith("/AGENTS.md")))
+    || (settings.reviewPaths || []).some((pattern) => pathMatchesSetting(normalized, pattern));
 }
 
 function pathMatchesSetting(relPath, pattern) {
@@ -5986,9 +6132,10 @@ function sendHtml(res, body) {
   res.end(body);
 }
 
-export function renderFileActionButtons({ reviewAction = null, nextReviewAction = null, dirty = false, deletable = true, savable = true } = {}) {
+export function renderFileActionButtons({ reviewAction = null, nextReviewAction = null, requestChangesAction = null, dirty = false, deletable = true, savable = true } = {}) {
   return '<div class="file-actions">' +
     (reviewAction ? '<button class="file-action" type="button" data-file-review-decision="' + escapeHtmlServer(reviewAction.status) + '">' + escapeHtmlServer(reviewAction.label) + '</button>' : '') +
+    (requestChangesAction ? '<button class="file-action" type="button" data-file-review-decision="' + escapeHtmlServer(requestChangesAction.status) + '">' + escapeHtmlServer(requestChangesAction.label) + '</button>' : '') +
     (nextReviewAction ? '<button class="file-action" type="button" data-next-review>' + escapeHtmlServer(nextReviewAction.label) + '</button>' : '') +
     (deletable ? '<button class="file-action danger-action" type="button" data-file-delete>Delete</button>' : '') +
     (savable ? '<button class="file-action primary" type="button" data-file-save ' + (!dirty ? 'disabled' : '') + '>Save</button>' : '') +
@@ -6766,16 +6913,21 @@ export function renderAppHtml() {
     .markdown-inline-code.markdown-path { color: var(--file-list); }
     .markdown-editor-shell { position: relative; min-height: calc(100vh - 162px); max-height: calc(100vh - 162px); overflow: hidden; background: var(--file-bg); isolation: isolate; }
     .markdown-editor-shell .doc-editor { min-height: 100%; max-height: none; box-sizing: border-box; }
-    .markdown-editor-highlight { position: absolute; inset: 0; z-index: 1; pointer-events: none; overflow: auto; background: transparent; color: var(--file-fg); scrollbar-width: none; }
+    .markdown-editor-highlight { position: absolute; inset: 0; z-index: 1; pointer-events: none; user-select: none; overflow: auto; background: transparent; color: var(--file-fg); scrollbar-width: none; }
     .markdown-editor-highlight::-webkit-scrollbar { display: none; }
-    .markdown-editor-input { position: absolute; inset: 0; width: 100%; height: 100%; z-index: 2; resize: none; overflow: auto; background: transparent !important; color: transparent !important; -webkit-text-fill-color: transparent !important; caret-color: var(--file-h1); text-shadow: none !important; }
+    .markdown-editor-input { position: absolute; inset: 0; width: 100%; height: 100%; z-index: 3; resize: none; overflow: auto; overflow-wrap: break-word; word-break: normal; pointer-events: auto; cursor: text; background: transparent !important; color: transparent !important; -webkit-text-fill-color: transparent !important; caret-color: transparent; text-shadow: none !important; }
+    .markdown-editor-shell[data-source-mode="false"] .markdown-editor-highlight { z-index: 1; pointer-events: none; user-select: none; }
+    .markdown-editor-shell[data-source-mode="false"] .markdown-editor-input { pointer-events: auto; }
     .markdown-editor-input.doc-link-hover { cursor: pointer; }
     .plain-text-editor, .plain-text-view { margin: 0; white-space: pre; overflow: auto; tab-size: 2; font: 13px/1.55 ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; }
     .plain-text-editor { display: block; width: 100%; min-height: 100%; resize: none; border: 0; outline: none; background: var(--file-bg); color: var(--file-fg); padding: 18px 22px; }
     .html-preview-shell { width: 100%; min-height: calc(100vh - 162px); max-height: calc(100vh - 162px); overflow: hidden; background: var(--file-bg); }
     .html-preview-frame { display: block; width: 100%; height: calc(100vh - 162px); min-height: 420px; border: 0; background: var(--file-bg); }
-    .markdown-editor-input::selection { background: color-mix(in srgb, var(--file-h2) 34%, transparent); color: transparent !important; -webkit-text-fill-color: transparent !important; }
-    .markdown-editor-highlight .markdown-line { margin: 0; padding: 0; border: 0; min-height: 1.7em; font-size: inherit; line-height: inherit; font-weight: inherit; letter-spacing: 0; }
+    .markdown-editor-input::selection { background: transparent; color: transparent !important; -webkit-text-fill-color: transparent !important; }
+    .markdown-editor-caret { position: absolute; z-index: 4; width: 2px; border-radius: 1px; background: var(--file-h1); pointer-events: none; animation: markdownCaretBlink 1s steps(1, end) infinite; }
+    @keyframes markdownCaretBlink { 0%, 48% { opacity: 1; } 49%, 100% { opacity: 0; } }
+    ::highlight(markdown-editor-selection) { background: color-mix(in srgb, var(--file-h2) 34%, transparent); }
+    .markdown-editor-highlight .markdown-line { margin: 0; padding: 0; border: 0; min-height: 1.7em; overflow-wrap: break-word; word-break: normal; font-size: inherit; line-height: inherit; font-weight: inherit; letter-spacing: 0; }
     .markdown-editor-highlight .markdown-line.h1, .markdown-editor-highlight .markdown-line.h2, .markdown-editor-highlight .markdown-line.h3, .markdown-editor-highlight .markdown-line.h4 { margin: 0; padding: 0; border: 0; font-size: inherit; line-height: inherit; font-weight: inherit; }
     .markdown-editor-highlight .markdown-line.h1 { color: var(--file-h1); }
     .markdown-editor-highlight .markdown-line.h2 { color: var(--file-h2); }
@@ -6788,6 +6940,10 @@ export function renderAppHtml() {
     .markdown-editor-highlight .markdown-line.frontmatter, .markdown-editor-highlight .markdown-line.hr { color: var(--file-marker); }
     .markdown-editor-highlight .markdown-inline-code { color: var(--file-code); padding: 0; border-radius: 0; background: transparent; }
     .markdown-editor-highlight .markdown-inline-code.markdown-path { color: var(--file-list); }
+    .markdown-editor-highlight .markdown-source-link { border-bottom: 0; color: inherit; }
+    .markdown-editor-highlight .markdown-link-label { color: var(--file-list); border-bottom: 1px solid color-mix(in srgb, var(--file-list) 42%, transparent); }
+    .markdown-editor-highlight .markdown-link-punctuation { color: color-mix(in srgb, var(--file-muted) 42%, transparent); }
+    .markdown-editor-highlight .markdown-link-target { color: color-mix(in srgb, var(--file-muted) 34%, transparent); }
     .external-review-doc.editor-metrics .markdown-line { margin: 0; padding: 0; border: 0; min-height: 1.7em; font-size: inherit; line-height: inherit; font-weight: inherit; letter-spacing: 0; }
     .external-review-doc.editor-metrics .markdown-line.h1, .external-review-doc.editor-metrics .markdown-line.h2, .external-review-doc.editor-metrics .markdown-line.h3, .external-review-doc.editor-metrics .markdown-line.h4 { margin: 0; padding: 0; border: 0; font-size: inherit; line-height: inherit; font-weight: inherit; }
     .external-review-doc.editor-metrics .markdown-line.h1 { color: var(--file-h1); }
@@ -6812,6 +6968,7 @@ export function renderAppHtml() {
     .diff-raw-meta summary::-webkit-details-marker { display: none; }
     .diff-raw-meta pre { margin: 6px 0 0; padding: 8px 10px; border-radius: 10px; background: rgba(255,255,255,0.025); white-space: pre-wrap; }
     .diff-empty { padding: var(--space-5); color: var(--muted); font: 14px/1.5 Inter, ui-sans-serif, system-ui, sans-serif; }
+    .initial-review-notice { margin: var(--space-4); padding: var(--space-3) var(--space-4); border: 1px solid color-mix(in srgb, var(--accent) 40%, transparent); border-radius: 12px; background: color-mix(in srgb, var(--accent) 9%, transparent); color: var(--text); font: 13px/1.5 Inter, ui-sans-serif, system-ui, sans-serif; }
     .conflict-panel { position: sticky; top: 0; z-index: 8; margin: var(--space-4); border: 1px solid rgba(255,196,107,0.54); border-radius: 16px; background: linear-gradient(135deg, rgba(255,196,107,0.18), rgba(255,140,157,0.12)); box-shadow: 0 14px 44px rgba(0,0,0,0.24); padding: var(--space-4); display: grid; gap: var(--space-3); font-family: Inter, ui-sans-serif, system-ui, sans-serif; color: #f7efe1; }
     .external-review-actions { align-items: center; flex-wrap: wrap; justify-content: flex-end; }
     .external-choice { min-height: 24px; padding: 4px 8px; border-radius: 999px; font-size: 11px; font-weight: 900; letter-spacing: 0; box-shadow: 0 6px 18px rgba(0,0,0,0.22); }
@@ -9057,7 +9214,11 @@ async function selectStartupSkillFile(folderOrder, skillName, options = {}) {
     const data = await api("/api/startup-skills/file?folder=" + encodeURIComponent(folderOrder) + "&skill=" + encodeURIComponent(skillName));
     if (!isCurrentSelection(requestId, selectedKey)) return;
     state.selectedStartupContext = data.startupContext;
-    state.selected = startupSkillSelectedExplorerPath(data.startupContext) || selectedKey;
+    const finalPath = startupSkillSelectedExplorerPath(data.startupContext) || selectedKey;
+    state.selected = finalPath;
+    state.reviewModePath = options.reviewMode ? finalPath : null;
+    state.reviewModeStatus = options.reviewMode ? reviewStatusForPath(finalPath) : null;
+    if (options.reviewMode) state.selectedReview = finalPath;
     activateStartupSkillExplorer(folderOrder, data.startupContext?.skillName || skillName, data.startupContext);
     state.saved = data.content;
     state.savedHash = data.contentHash;
@@ -9067,9 +9228,12 @@ async function selectStartupSkillFile(folderOrder, skillName, options = {}) {
     revealActiveStartupSkillExplorer();
     updateHeader();
     updatePreview();
+    if (options.reviewMode) await startChangedFileInlineReview(finalPath, { changed: true }, requestId).catch((error) => {
+      if (isCurrentSelection(requestId, finalPath)) setStatus(error.message);
+    });
     renderViewer();
     restorePersistedViewState(options.restoreViewState);
-    setStatus("startup skill open");
+    setStatus(options.reviewMode ? "startup skill review open" : "startup skill open");
     scheduleSessionStatePush();
   } catch (error) {
     if (isCurrentSelection(requestId, selectedKey)) {
@@ -9854,10 +10018,11 @@ function renderFileActionButtons(options = {}) {
   return '<div class="file-actions">' + renderFileActionItems(options) + '</div>';
 }
 
-function renderFileActionItems({ reviewAction = null, nextReviewAction = null, dirty = false, templateState = null, blockedByConflict = false, readOnly = false, deletable = true, savable = true } = {}) {
+function renderFileActionItems({ reviewAction = null, secondaryReviewAction = null, nextReviewAction = null, dirty = false, templateState = null, blockedByConflict = false, readOnly = false, deletable = true, savable = true } = {}) {
   return '' +
     (templateState ? '<div class="empty-template-actions"><select class="file-template-select" data-empty-template-select aria-label="Template">' + renderFileTemplateOptions(templateState.selectedId) + '</select></div>' : '') +
     (reviewAction ? '<button class="file-action" type="button" data-file-review-decision="' + escapeHtml(reviewAction.status) + '">' + escapeHtml(reviewAction.label) + '</button>' : '') +
+    (secondaryReviewAction ? '<button class="file-action" type="button" data-file-review-decision="' + escapeHtml(secondaryReviewAction.status) + '">' + escapeHtml(secondaryReviewAction.label) + '</button>' : '') +
     (nextReviewAction ? '<button class="file-action" type="button" data-next-review>' + escapeHtml(nextReviewAction.label) + '</button>' : '') +
     (deletable ? '<button class="file-action danger-action" type="button" data-file-delete>Delete</button>' : '') +
     (savable ? '<button class="file-action primary" type="button" data-file-save ' + (!dirty || blockedByConflict || readOnly ? 'disabled' : '') + (readOnly ? ' title="This file is read-only in Context Room"' : blockedByConflict ? ' title="Resolve the disk change before saving"' : '') + '>Save</button>' : '');
@@ -9873,7 +10038,23 @@ function reviewActionForSelectedFile() {
   if (state.reviewModeStatus === "verified") return null;
   const reviewItem = state.docqa?.queue?.find((item) => item.path === state.selected);
   if (!reviewItem?.reviewRequired || String(reviewItem.gitStatus || "").trim()) return null;
+  if (reviewItem.initialReview) return { status: "verified", label: "Accept document" };
   return { status: "verified", label: "Mark verified" };
+}
+
+function secondaryReviewActionForSelectedFile() {
+  if (!state.selected || state.reviewModePath !== state.selected) return null;
+  if (state.reviewModeStatus === "verified") return null;
+  const reviewItem = state.docqa?.queue?.find((item) => item.path === state.selected);
+  if (!reviewItem?.initialReview || !reviewItem.reviewRequired || String(reviewItem.gitStatus || "").trim()) return null;
+  return { status: "needs_changes", label: "Request changes" };
+}
+
+function initialReviewNoticeForSelectedFile() {
+  if (!state.selected || state.reviewModePath !== state.selected) return "";
+  const reviewItem = state.docqa?.queue?.find((item) => item.path === state.selected);
+  if (!reviewItem?.initialReview) return "";
+  return '<div class="issue initial-review-notice"><strong>First review</strong><span>No previous baseline exists for this first review. Review the current document as a whole; requesting changes will not modify the file.</span></div>';
 }
 
 function nextReviewActionForSelectedFile() {
@@ -9922,6 +10103,12 @@ async function openNextReviewManually() {
 
 async function openReviewQueueItem(item) {
   if (!item?.path) return;
+  if (item.startupContext?.kind === "startup-skill" || item.startupContext?.skillName) {
+    const folder = String(item.startupContext.order || "").split(":")[0];
+    const skill = item.startupContext.skillName || String(item.startupContext.order || "").split(":").slice(1).join(":");
+    await selectStartupSkillFile(folder, skill, { reviewMode: true });
+    return;
+  }
   if (item.startupContext?.order) {
     await selectStartupContextFile(item.startupContext.order, { reviewMode: true });
     return;
@@ -10918,10 +11105,11 @@ async function requestReviewDecision(path, status) {
     await applyReviewDecision(path, "verified");
     return;
   }
+  const initialReview = Boolean(state.docqa?.queue?.find((item) => item.path === path)?.initialReview);
   showConfirmDialog({
-    title: "Mark verified?",
-    body: "This marks the current content as trusted. Use Next review when ready.",
-    confirmLabel: "Mark verified",
+    title: initialReview ? "Accept document?" : "Mark verified?",
+    body: initialReview ? "This accepts the current document as the first trusted baseline. Use Next review when ready." : "This marks the current content as trusted. Use Next review when ready.",
+    confirmLabel: initialReview ? "Accept document" : "Mark verified",
     confirmVariant: "primary",
     checkboxLabel: "Do not ask again",
     onConfirm: ({ checked } = {}) => {
@@ -11261,7 +11449,7 @@ function renderViewer() {
       ? renderFileActionsLoading()
       : externalChange && !conflict
       ? renderExternalReviewActions(externalChange, { fileActionOptions: externalReviewFileActionOptions() })
-      : renderFileActionButtons({ reviewAction: isStartupFile || state.selectedReadOnly ? null : reviewActionForSelectedFile(), nextReviewAction: isStartupFile || state.selectedReadOnly ? null : nextReviewActionForSelectedFile(), dirty: state.dirty, templateState, blockedByConflict: Boolean(conflict || externalChange), readOnly: Boolean(state.selectedStartupContext?.readOnly || state.selectedReadOnly), deletable: !isStartupFile && !state.selectedReadOnly, savable: !isHtmlDocument });
+      : renderFileActionButtons({ reviewAction: reviewActionForSelectedFile(), secondaryReviewAction: secondaryReviewActionForSelectedFile(), nextReviewAction: nextReviewActionForSelectedFile(), dirty: state.dirty, templateState, blockedByConflict: Boolean(conflict || externalChange), readOnly: Boolean(state.selectedStartupContext?.readOnly || state.selectedReadOnly), deletable: !isStartupFile && !state.selectedReadOnly, savable: !isHtmlDocument });
   const conflictMarkup = conflict ? renderConflictPanel(conflict, text) : "";
   const editorMarkup = loadError
     ? renderFileLoadError(loadError)
@@ -11277,9 +11465,10 @@ function renderViewer() {
           ? renderDocumentEditor(text, file.path)
           : renderDocumentView(text, file.path);
   const annotationMarkup = !isStartupFile && !conflict ? renderAgentAnnotations(state.selected) : "";
+  const initialReviewNotice = initialReviewNoticeForSelectedFile();
   el("viewer").innerHTML = '<div class="review-workspace ' + (!hasDiff || state.diffCollapsed ? 'no-diff' : '') + '">' +
     (state.diffCollapsed ? "" : diffMarkup) +
-    '<section class="file-panel"><header><div class="file-header-copy"><strong>' + escapeHtml(file.label || "Document") + '</strong>' + (isStartupFile ? '<span class="muted">' + escapeHtml(file.path) + '</span>' : '') + '</div>' + actionsMarkup + '</header>' + conflictMarkup + annotationMarkup + editorMarkup + '</section></div>';
+    '<section class="file-panel"><header><div class="file-header-copy"><strong>' + escapeHtml(file.label || "Document") + '</strong>' + (isStartupFile ? '<span class="muted">' + escapeHtml(file.path) + '</span>' : '') + '</div>' + actionsMarkup + '</header>' + conflictMarkup + initialReviewNotice + annotationMarkup + editorMarkup + '</section></div>';
   updateActionBanner();
   document.querySelector("[data-hide-diff]")?.addEventListener("click", (event) => {
     event.preventDefault();
@@ -11327,20 +11516,387 @@ function renderFileLoadError(error = {}) {
 function wireRenderedMarkdownEditor() {
   const docEditor = el("docEditor");
   if (!docEditor) return;
+  prepareMarkdownEditorHistory(docEditor);
   state.markdownHighlightLastText = docEditor.value;
   syncMarkdownEditorScroll();
-  docEditor.addEventListener("input", () => {
-    el("editor").value = docEditor.value;
-    state.dirty = docEditor.value !== state.saved;
-    updateMarkdownEditorHighlight(docEditor.value);
-    updateHeader();
-    updatePreview();
-    updateConflictCompareLive(docEditor.value);
-    scheduleConflictCheck();
-    scheduleSessionStatePush();
+  docEditor.addEventListener("beforeinput", (event) => captureMarkdownEditorHistory(docEditor, event));
+  docEditor.addEventListener("input", (event) => {
+    commitMarkdownEditorHistory(docEditor, event);
+    syncMarkdownEditorValue(docEditor);
   });
+  docEditor.addEventListener("keyup", updateMarkdownEditorVisualSelection);
+  docEditor.addEventListener("keydown", (event) => {
+    if (handleMarkdownEditorHistoryShortcut(event, docEditor)) return;
+    if (["ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown", "Home", "End", "PageUp", "PageDown"].includes(event.key)) resetMarkdownEditorHistoryGroup();
+    window.requestAnimationFrame(updateMarkdownEditorVisualSelection);
+  });
+  docEditor.addEventListener("select", updateMarkdownEditorVisualSelection);
   docEditor.addEventListener("scroll", syncMarkdownEditorScroll, { passive: true });
+  docEditor.addEventListener("pointerdown", enterMarkdownEditorAtPoint);
+  docEditor.addEventListener("pointermove", extendMarkdownEditorPointerSelection);
+  docEditor.addEventListener("pointerup", finishMarkdownEditorPointerSelection);
+  docEditor.addEventListener("pointercancel", finishMarkdownEditorPointerSelection);
   wireMarkdownEditorDocLinks(docEditor);
+  updateMarkdownEditorVisualSelection();
+}
+
+function markdownEditorHistorySnapshot(editor) {
+  return {
+    value: editor.value,
+    selectionStart: editor.selectionStart,
+    selectionEnd: editor.selectionEnd,
+    selectionDirection: editor.selectionDirection || "none",
+  };
+}
+
+function prepareMarkdownEditorHistory(editor) {
+  const current = markdownEditorHistorySnapshot(editor);
+  if (state.markdownEditorHistory?.path === state.selected && state.markdownEditorHistory.current?.value === current.value) {
+    state.markdownEditorHistory.current = current;
+    return state.markdownEditorHistory;
+  }
+  state.markdownEditorHistory = {
+    path: state.selected,
+    past: [],
+    future: [],
+    pending: null,
+    current,
+    lastInputType: "",
+    lastInputAt: 0,
+  };
+  return state.markdownEditorHistory;
+}
+
+function captureMarkdownEditorHistory(editor, event) {
+  const history = prepareMarkdownEditorHistory(editor);
+  history.pending = markdownEditorHistorySnapshot(editor);
+  history.pendingInputType = String(event.inputType || "");
+}
+
+function commitMarkdownEditorHistory(editor, event) {
+  const history = state.markdownEditorHistory?.path === state.selected
+    ? state.markdownEditorHistory
+    : prepareMarkdownEditorHistory(editor);
+  const before = history.pending || history.current;
+  const inputType = String(event.inputType || history.pendingInputType || "");
+  const now = Date.now();
+  const coalescible = ["insertText", "deleteContentBackward", "deleteContentForward"].includes(inputType) && before.selectionStart === before.selectionEnd;
+  const continuesGroup = coalescible && history.lastInputType === inputType && now - history.lastInputAt < 1000;
+  if (before?.value !== editor.value && !continuesGroup) {
+    history.past.push(before);
+    if (history.past.length > 200) history.past.shift();
+  }
+  if (before?.value !== editor.value) history.future = [];
+  history.pending = null;
+  history.pendingInputType = "";
+  history.current = markdownEditorHistorySnapshot(editor);
+  history.lastInputType = coalescible ? inputType : "";
+  history.lastInputAt = coalescible ? now : 0;
+}
+
+function resetMarkdownEditorHistoryGroup() {
+  if (!state.markdownEditorHistory) return;
+  state.markdownEditorHistory.lastInputType = "";
+  state.markdownEditorHistory.lastInputAt = 0;
+}
+
+function handleMarkdownEditorHistoryShortcut(event, editor) {
+  const modifier = isMacPlatform() ? event.metaKey : event.ctrlKey;
+  if (!modifier || event.altKey) return false;
+  const key = String(event.key || "").toLowerCase();
+  const undo = key === "z" && !event.shiftKey;
+  const redo = (key === "z" && event.shiftKey) || (!isMacPlatform() && key === "y" && !event.shiftKey);
+  if (!undo && !redo) return false;
+  event.preventDefault();
+  applyMarkdownEditorHistory(editor, redo ? "redo" : "undo");
+  return true;
+}
+
+function applyMarkdownEditorHistory(editor, direction) {
+  const history = prepareMarkdownEditorHistory(editor);
+  const source = direction === "redo" ? history.future : history.past;
+  const destination = direction === "redo" ? history.past : history.future;
+  const snapshot = source.pop();
+  if (!snapshot) return;
+  destination.push(markdownEditorHistorySnapshot(editor));
+  editor.value = snapshot.value;
+  editor.setSelectionRange(snapshot.selectionStart, snapshot.selectionEnd, snapshot.selectionDirection);
+  history.pending = null;
+  history.current = markdownEditorHistorySnapshot(editor);
+  resetMarkdownEditorHistoryGroup();
+  syncMarkdownEditorValue(editor);
+}
+
+function syncMarkdownEditorValue(editor) {
+  el("editor").value = editor.value;
+  state.dirty = editor.value !== state.saved;
+  updateMarkdownEditorHighlight(editor.value);
+  updateHeader();
+  updatePreview();
+  updateConflictCompareLive(editor.value);
+  scheduleConflictCheck();
+  scheduleSessionStatePush();
+  window.requestAnimationFrame(updateMarkdownEditorVisualSelection);
+}
+
+function enterMarkdownEditorAtPoint(event) {
+  const editor = el("docEditor");
+  if (!editor || event.button !== 0 || isDocLinkModifierEventActive(event)) return;
+  resetMarkdownEditorHistoryGroup();
+  const offset = markdownEditorSourceOffsetAtPoint(event.clientX, event.clientY);
+  if (!Number.isInteger(offset)) return;
+  event.preventDefault();
+  try { editor.focus({ preventScroll: true }); }
+  catch { editor.focus(); }
+
+  if (event.detail >= 3) {
+    const range = markdownEditorLineRange(editor.value, offset);
+    editor.setSelectionRange(range.start, range.end, "forward");
+    state.markdownPointerSelection = null;
+    updateMarkdownEditorVisualSelection();
+    return;
+  }
+  if (event.detail === 2) {
+    const range = markdownEditorWordRange(editor.value, offset);
+    editor.setSelectionRange(range.start, range.end, "forward");
+    state.markdownPointerSelection = null;
+    updateMarkdownEditorVisualSelection();
+    return;
+  }
+
+  const anchor = event.shiftKey ? markdownEditorSelectionAnchor(editor) : offset;
+  setMarkdownEditorSelection(editor, anchor, offset);
+  state.markdownPointerSelection = { pointerId: event.pointerId, anchor };
+  try { editor.setPointerCapture(event.pointerId); }
+  catch {}
+  updateMarkdownEditorVisualSelection();
+}
+
+function extendMarkdownEditorPointerSelection(event) {
+  const editor = el("docEditor");
+  const pointer = state.markdownPointerSelection;
+  if (!editor || !pointer || pointer.pointerId !== event.pointerId) return;
+  event.preventDefault();
+  scrollMarkdownEditorForPointer(editor, event.clientY);
+  const offset = markdownEditorSourceOffsetAtPoint(event.clientX, event.clientY);
+  if (!Number.isInteger(offset)) return;
+  setMarkdownEditorSelection(editor, pointer.anchor, offset);
+  updateMarkdownEditorVisualSelection();
+}
+
+function finishMarkdownEditorPointerSelection(event) {
+  const editor = el("docEditor");
+  const pointer = state.markdownPointerSelection;
+  if (!editor || !pointer || pointer.pointerId !== event.pointerId) return;
+  try { editor.releasePointerCapture(event.pointerId); }
+  catch {}
+  state.markdownPointerSelection = null;
+  updateMarkdownEditorVisualSelection();
+}
+
+function markdownEditorSelectionAnchor(editor) {
+  if (editor.selectionStart === editor.selectionEnd) return editor.selectionStart;
+  return editor.selectionDirection === "backward" ? editor.selectionEnd : editor.selectionStart;
+}
+
+function setMarkdownEditorSelection(editor, anchor, focus) {
+  const safeAnchor = Math.max(0, Math.min(editor.value.length, Number(anchor) || 0));
+  const safeFocus = Math.max(0, Math.min(editor.value.length, Number(focus) || 0));
+  editor.setSelectionRange(
+    Math.min(safeAnchor, safeFocus),
+    Math.max(safeAnchor, safeFocus),
+    safeFocus < safeAnchor ? "backward" : "forward",
+  );
+}
+
+function markdownEditorWordRange(value, offset) {
+  const text = String(value || "");
+  const safe = Math.max(0, Math.min(text.length, Number(offset) || 0));
+  if (!text.length) return { start: 0, end: 0 };
+  const pivot = safe === text.length ? safe - 1 : safe;
+  const classify = (character) => /[\p{L}\p{N}_]/u.test(character || "") ? "word" : /\s/u.test(character || "") ? "space" : "symbol";
+  const type = classify(text[pivot]);
+  let start = pivot;
+  let end = pivot + 1;
+  while (start > 0 && classify(text[start - 1]) === type && text[start - 1] !== "\n") start -= 1;
+  while (end < text.length && classify(text[end]) === type && text[end] !== "\n") end += 1;
+  return { start, end };
+}
+
+function markdownEditorLineRange(value, offset) {
+  const text = String(value || "");
+  const safe = Math.max(0, Math.min(text.length, Number(offset) || 0));
+  const start = text.lastIndexOf("\n", Math.max(0, safe - 1)) + 1;
+  const nextBreak = text.indexOf("\n", safe);
+  return { start, end: nextBreak === -1 ? text.length : nextBreak + 1 };
+}
+
+function scrollMarkdownEditorForPointer(editor, clientY) {
+  const rect = editor.getBoundingClientRect();
+  const edge = Math.min(42, Math.max(20, rect.height * 0.08));
+  if (clientY < rect.top + edge) editor.scrollTop = Math.max(0, editor.scrollTop - edge);
+  else if (clientY > rect.bottom - edge) editor.scrollTop += edge;
+  syncMarkdownEditorScroll();
+}
+
+function markdownEditorSourceOffsetAtPoint(clientX, clientY) {
+  const editor = el("docEditor");
+  const highlighter = el("docHighlighter");
+  if (!editor || !highlighter) return null;
+  const rect = highlighter.getBoundingClientRect();
+  const x = Math.max(rect.left + 1, Math.min(rect.right - 1, clientX));
+  const y = Math.max(rect.top + 1, Math.min(rect.bottom - 1, clientY));
+  const previousHighlighterPointerEvents = highlighter.style.pointerEvents;
+  const previousEditorPointerEvents = editor.style.pointerEvents;
+  highlighter.style.pointerEvents = "auto";
+  editor.style.pointerEvents = "none";
+  try {
+    let line = document.elementFromPoint(x, y)?.closest?.(".markdown-line") || null;
+    if (!line || !highlighter.contains(line)) {
+      const lines = [...highlighter.querySelectorAll(".markdown-line")];
+      line = y <= (lines[0]?.getBoundingClientRect().top ?? y) ? lines[0] : lines.at(-1);
+    }
+    if (!line) return editor.value.length;
+    const lineIndex = Number(line.dataset.lineIndex);
+    if (!Number.isInteger(lineIndex)) return null;
+    const sourceLines = editor.value.split("\n");
+    const sourceLine = sourceLines[lineIndex] || "";
+    const renderedOffset = renderedCaretOffsetAtPoint(line, x, y);
+    const sourceColumn = markdownSourceOffsetForRenderedOffset(sourceLine, renderedOffset);
+    const lineStart = sourceLines.slice(0, lineIndex).reduce((total, current) => total + current.length + 1, 0);
+    return Math.min(editor.value.length, lineStart + sourceColumn);
+  } finally {
+    highlighter.style.pointerEvents = previousHighlighterPointerEvents;
+    editor.style.pointerEvents = previousEditorPointerEvents;
+  }
+}
+
+function renderedCaretOffsetAtPoint(line, clientX, clientY) {
+  const position = document.caretPositionFromPoint?.(clientX, clientY);
+  const node = position?.offsetNode;
+  const offset = position?.offset;
+  if (node && line.contains(node)) {
+    const range = document.createRange();
+    range.setStart(line, 0);
+    range.setEnd(node, offset);
+    return range.toString().length;
+  }
+  const legacyRange = document.caretRangeFromPoint?.(clientX, clientY);
+  if (legacyRange?.startContainer && line.contains(legacyRange.startContainer)) {
+    const range = document.createRange();
+    range.setStart(line, 0);
+    range.setEnd(legacyRange.startContainer, legacyRange.startOffset);
+    return range.toString().length;
+  }
+  return line.textContent?.length || 0;
+}
+
+function markdownSourceOffsetForRenderedOffset(sourceLine, renderedOffset) {
+  const source = String(sourceLine || "");
+  const wanted = Math.max(0, Number(renderedOffset) || 0);
+  const pattern = /\[([^\]\n]+)\]\(([^) \n]+)\)/g;
+  let sourceIndex = 0;
+  let renderedIndex = 0;
+  for (const match of source.matchAll(pattern)) {
+    const plainLength = match.index - sourceIndex;
+    if (wanted <= renderedIndex + plainLength) return sourceIndex + (wanted - renderedIndex);
+    renderedIndex += plainLength;
+    const label = match[1];
+    if (wanted <= renderedIndex + label.length) return match.index + 1 + (wanted - renderedIndex);
+    renderedIndex += label.length;
+    sourceIndex = match.index + match[0].length;
+  }
+  return Math.min(source.length, sourceIndex + (wanted - renderedIndex));
+}
+
+function markdownRenderedOffsetForSourceOffset(sourceLine, sourceOffset) {
+  const source = String(sourceLine || "");
+  const wanted = Math.max(0, Math.min(source.length, Number(sourceOffset) || 0));
+  const pattern = /\[([^\]\n]+)\]\(([^) \n]+)\)/g;
+  let sourceIndex = 0;
+  let renderedIndex = 0;
+  for (const match of source.matchAll(pattern)) {
+    const plainLength = match.index - sourceIndex;
+    if (wanted <= match.index) return renderedIndex + (wanted - sourceIndex);
+    renderedIndex += plainLength;
+    const labelStart = match.index + 1;
+    const labelEnd = labelStart + match[1].length;
+    if (wanted <= labelEnd) return renderedIndex + Math.max(0, wanted - labelStart);
+    renderedIndex += match[1].length;
+    const linkEnd = match.index + match[0].length;
+    if (wanted <= linkEnd) return renderedIndex;
+    sourceIndex = linkEnd;
+  }
+  return renderedIndex + (wanted - sourceIndex);
+}
+
+function markdownEditorDomPosition(sourceOffset) {
+  const editor = el("docEditor");
+  const highlighter = el("docHighlighter");
+  if (!editor || !highlighter) return null;
+  const safeOffset = Math.max(0, Math.min(editor.value.length, Number(sourceOffset) || 0));
+  const before = editor.value.slice(0, safeOffset);
+  const lineIndex = before.split("\n").length - 1;
+  const lineStart = before.lastIndexOf("\n") + 1;
+  const sourceLine = editor.value.split("\n")[lineIndex] || "";
+  let renderedOffset = markdownRenderedOffsetForSourceOffset(sourceLine, safeOffset - lineStart);
+  const line = highlighter.querySelector('.markdown-line[data-line-index="' + lineIndex + '"]');
+  if (!line) return null;
+  const walker = document.createTreeWalker(line, NodeFilter.SHOW_TEXT);
+  let node = walker.nextNode();
+  while (node) {
+    const length = node.nodeValue?.length || 0;
+    if (renderedOffset <= length) return { node, offset: renderedOffset, line };
+    renderedOffset -= length;
+    node = walker.nextNode();
+  }
+  return { node: line, offset: line.childNodes.length, line };
+}
+
+function markdownCaretRect(position) {
+  if (!position) return null;
+  const range = document.createRange();
+  range.setStart(position.node, position.offset);
+  range.collapse(true);
+  const direct = range.getClientRects()[0];
+  if (direct) return direct;
+  if (position.node.nodeType === Node.TEXT_NODE && position.offset > 0) {
+    range.setStart(position.node, position.offset - 1);
+    range.setEnd(position.node, position.offset);
+    const previous = range.getBoundingClientRect();
+    return { left: previous.right, top: previous.top, height: previous.height };
+  }
+  const lineRect = position.line.getBoundingClientRect();
+  return { left: lineRect.left, top: lineRect.top, height: Number.parseFloat(getComputedStyle(position.line).lineHeight) || 24 };
+}
+
+function updateMarkdownEditorVisualSelection() {
+  const editor = el("docEditor");
+  const highlighter = el("docHighlighter");
+  const caret = el("markdownEditorCaret");
+  if (!editor || !highlighter || !caret) return;
+  if (globalThis.CSS?.highlights) CSS.highlights.delete("markdown-editor-selection");
+  const focused = document.activeElement === editor;
+  const collapsed = editor.selectionStart === editor.selectionEnd;
+  caret.hidden = !focused || !collapsed;
+  if (focused && collapsed) {
+    const position = markdownEditorDomPosition(editor.selectionStart);
+    const rect = markdownCaretRect(position);
+    const shellRect = caret.parentElement.getBoundingClientRect();
+    if (rect) {
+      caret.style.left = (rect.left - shellRect.left) + "px";
+      caret.style.top = (rect.top - shellRect.top) + "px";
+      caret.style.height = Math.max(16, rect.height || 0) + "px";
+    }
+  }
+  if (!focused || collapsed || !globalThis.CSS?.highlights || typeof Highlight !== "function") return;
+  const start = markdownEditorDomPosition(editor.selectionStart);
+  const end = markdownEditorDomPosition(editor.selectionEnd);
+  if (!start || !end) return;
+  const range = document.createRange();
+  range.setStart(start.node, start.offset);
+  range.setEnd(end.node, end.offset);
+  CSS.highlights.set("markdown-editor-selection", new Highlight(range));
 }
 
 function renderMarkdownLineView(text, options = {}) {
@@ -11831,9 +12387,10 @@ function renderDocumentEditor(text, filePath = state.selected) {
 }
 
 function renderMarkdownEditor(text) {
-  return '<div class="markdown-editor-shell">' +
-    '<div id="docHighlighter" class="doc-editor markdown-view markdown-editor-highlight" aria-hidden="true">' + renderMarkdownLines(text) + '</div>' +
+  return '<div class="markdown-editor-shell" data-source-mode="false">' +
+    '<div id="docHighlighter" class="doc-editor markdown-view markdown-editor-highlight" aria-hidden="true" data-source-faithful="false">' + renderMarkdownLines(text) + '</div>' +
     '<textarea id="docEditor" class="doc-editor markdown-editor-input" spellcheck="false">' + escapeHtml(text) + '</textarea>' +
+    '<span id="markdownEditorCaret" class="markdown-editor-caret" hidden></span>' +
   '</div>';
 }
 
@@ -11843,7 +12400,7 @@ function renderMarkdownLines(text, options = {}) {
   const decorations = Array.isArray(options.lineDecorations) ? options.lineDecorations : [];
   return lines.map((line, index) => {
       const startsFence = /^\s*(\`\`\`|~~~)/.test(line);
-      const rendered = renderMarkdownLine(line, index, { inFence: inFence || startsFence });
+      const rendered = renderMarkdownLine(line, index, { ...options, inFence: inFence || startsFence });
       if (startsFence) inFence = !inFence;
       return decorateMarkdownLine(rendered, decorations[index]);
     }).join("");
@@ -11887,15 +12444,17 @@ function renderMarkdownEditorHighlightNow(text) {
   const next = String(text || "");
   highlighter.innerHTML = renderMarkdownLines(next);
   state.markdownHighlightLastText = next;
-  syncMarkdownEditorScroll();
+  updateMarkdownEditorVisualSelection();
 }
 
 function syncMarkdownEditorScroll() {
   const editor = el("docEditor");
   const highlighter = el("docHighlighter");
-  if (!editor || !highlighter) return;
-  highlighter.scrollTop = editor.scrollTop;
-  highlighter.scrollLeft = editor.scrollLeft;
+  if (editor && highlighter) {
+    highlighter.scrollTop = editor.scrollTop;
+    highlighter.scrollLeft = editor.scrollLeft;
+  }
+  updateMarkdownEditorVisualSelection();
 }
 
 function renderMarkdownLine(line, index, options = {}) {
@@ -11907,26 +12466,26 @@ function renderMarkdownLine(line, index, options = {}) {
   if (heading && !options.inFence) {
     const level = Math.min(4, heading[2].length);
     const text = heading[3].trim();
-    return '<div class="markdown-line h' + level + '"' + attrs + ' data-heading-marker="' + escapeHtml(heading[2]) + '" data-heading-text="' + escapeHtml(text) + '">' + renderMarkdownInline(raw) + '</div>';
+    return '<div class="markdown-line h' + level + '"' + attrs + ' data-heading-marker="' + escapeHtml(heading[2]) + '" data-heading-text="' + escapeHtml(text) + '">' + renderMarkdownInline(raw, options) + '</div>';
   }
   if (options.inFence) return '<div class="markdown-line ' + (/^\s*(\`\`\`|~~~)/.test(raw) ? "fence" : "code") + '"' + attrs + '>' + escapeHtml(raw || " ") + '</div>';
   if (/^\s*[-*_]{3,}\s*$/.test(raw)) return '<div class="markdown-line hr"' + attrs + '>' + escapeHtml(raw) + '</div>';
   if (trimmed === "---" || trimmed === "...") return '<div class="markdown-line frontmatter"' + attrs + '>' + escapeHtml(raw) + '</div>';
   const quote = raw.match(/^(\s*>+\s?)(.*)$/);
-  if (quote) return '<div class="markdown-line quote"' + attrs + '><span class="markdown-marker">' + escapeHtml(quote[1]) + '</span>' + renderMarkdownInline(quote[2]) + '</div>';
+  if (quote) return '<div class="markdown-line quote"' + attrs + '><span class="markdown-marker">' + escapeHtml(quote[1]) + '</span>' + renderMarkdownInline(quote[2], options) + '</div>';
   const list = raw.match(/^(\s*(?:[-*+]|\d+[.)])\s+)(.*)$/);
-  if (list) return '<div class="markdown-line list"' + attrs + '><span class="markdown-marker">' + escapeHtml(list[1]) + '</span>' + renderMarkdownInline(list[2]) + '</div>';
-  return '<div class="markdown-line body"' + attrs + '>' + renderMarkdownInline(raw) + '</div>';
+  if (list) return '<div class="markdown-line list"' + attrs + '><span class="markdown-marker">' + escapeHtml(list[1]) + '</span>' + renderMarkdownInline(list[2], options) + '</div>';
+  return '<div class="markdown-line body"' + attrs + '>' + renderMarkdownInline(raw, options) + '</div>';
 }
 
-function renderMarkdownInline(value) {
+function renderMarkdownInline(value, options = {}) {
   return String(value || "").split(/(\`[^\`\n]+\`)/g).map((part) => {
     if (/^\`[^\`\n]+\`$/.test(part)) {
       const token = part.slice(1, -1);
       const docLinkAttrs = markdownDocLinkAttributes(token);
       return '<span class="markdown-inline-code' + (isMarkdownPathToken(token) ? ' markdown-path' : '') + '"' + docLinkAttrs + '>' + escapeHtml(part) + '</span>';
     }
-    return renderMarkdownPlainInline(part);
+    return renderMarkdownPlainInline(part, options);
   }).join("");
 }
 
@@ -11934,12 +12493,21 @@ function isMarkdownPathToken(value) {
   return isMarkdownDocLinkTarget(value) || /^(?:~\/|\.{1,2}\/|\.?[A-Za-z0-9_-]+\/)[A-Za-z0-9_./@~-]+$/.test(String(value || ""));
 }
 
-function renderMarkdownPlainInline(value) {
+function renderMarkdownPlainInline(value, options = {}) {
   return String(value || "").split(/(\[[^\]\n]+\]\([^) \n]+\))/g).map((part) => {
     const link = part.match(/^\[([^\]\n]+)\]\(([^) \n]+)\)$/);
     if (link) {
-      const label = renderMarkdownPlainInline(link[1]);
       const docLinkAttrs = markdownDocLinkAttributes(link[2]);
+      if (options.sourceFaithful && docLinkAttrs) {
+        return '<span class="markdown-source-link markdown-path"' + docLinkAttrs + '>' +
+          '<span class="markdown-link-punctuation">[</span>' +
+          '<span class="markdown-link-label">' + escapeHtml(link[1]) + '</span>' +
+          '<span class="markdown-link-punctuation">](</span>' +
+          '<span class="markdown-link-target">' + escapeHtml(link[2]) + '</span>' +
+          '<span class="markdown-link-punctuation">)</span>' +
+        '</span>';
+      }
+      const label = renderMarkdownPlainInline(link[1], options);
       if (docLinkAttrs) return '<a href="#" class="markdown-doc-link markdown-path"' + docLinkAttrs + '>' + label + '</a>';
       return escapeHtml(part);
     }
@@ -12116,7 +12684,7 @@ function markdownDocLinkAtOffset(text, offset) {
 }
 
 function wireFileActionButtons(root = document) {
-  root.querySelector("[data-file-review-decision]")?.addEventListener("click", (event) => requestReviewDecision(state.selected, event.currentTarget.dataset.fileReviewDecision).catch((error) => setStatus(error.message)));
+  root.querySelectorAll("[data-file-review-decision]").forEach((button) => button.addEventListener("click", (event) => requestReviewDecision(state.selected, event.currentTarget.dataset.fileReviewDecision).catch((error) => setStatus(error.message))));
   root.querySelector("[data-next-review]")?.addEventListener("click", () => openNextReviewManually().catch((error) => setStatus(error.message)));
   root.querySelector("[data-file-save]")?.addEventListener("click", () => saveCurrent().catch((error) => setStatus(error.message)));
   root.querySelector("[data-file-delete]")?.addEventListener("click", () => deletePaths([state.selected]).catch((error) => setStatus(error.message)));
@@ -12725,8 +13293,9 @@ function replaceExternalReviewActionsInPlace(text = "") {
   if (!actions) return;
   const templateState = !state.selectedStartupContext && !activeFileConflict() ? templateStateForContent(text) : null;
   actions.outerHTML = renderFileActionButtons({
-    reviewAction: state.selectedStartupContext || state.selectedReadOnly ? null : reviewActionForSelectedFile(),
-    nextReviewAction: state.selectedStartupContext || state.selectedReadOnly ? null : nextReviewActionForSelectedFile(),
+    reviewAction: reviewActionForSelectedFile(),
+    secondaryReviewAction: secondaryReviewActionForSelectedFile(),
+    nextReviewAction: nextReviewActionForSelectedFile(),
     dirty: state.dirty,
     templateState,
     blockedByConflict: Boolean(activeFileConflict()),
@@ -13538,7 +14107,7 @@ async function readSelectedReviewBase(path = state.selected) {
 
 async function recordSelectedReviewBaseline(path = state.selected, note = "") {
   const startupReviewPath = selectedStartupContextReviewPath(path);
-  if (!path || (state.selectedStartupContext && !startupReviewPath) || state.selectedReadOnly) return null;
+  if (!path || (state.selectedStartupContext && !startupReviewPath) || (state.selectedReadOnly && !startupReviewPath)) return null;
   const reviewPath = startupReviewPath || path;
   return api("/api/docqa/review-baseline", {
     method: "POST",
@@ -13548,8 +14117,9 @@ async function recordSelectedReviewBaseline(path = state.selected, note = "") {
 }
 
 function selectedStartupContextReviewPath(path = state.selected) {
-  if (state.selectedStartupContext?.kind !== "startup-context") return "";
-  return startupContextSelectedExplorerPath(state.selectedStartupContext) || path || "";
+  if (state.selectedStartupContext?.kind === "startup-context") return startupContextSelectedExplorerPath(state.selectedStartupContext) || path || "";
+  if (state.selectedStartupContext?.kind === "startup-skill") return startupSkillSelectedExplorerPath(state.selectedStartupContext) || path || "";
+  return "";
 }
 
 function applyChangedFileInlineReview(path, diff, review, requestId = state.selectionRequest) {
@@ -14114,7 +14684,7 @@ function isScrollableY(element) {
   return /(auto|scroll|overlay)/.test(style.overflowY) && element.scrollHeight > element.clientHeight + 1;
 }
 function activeDocumentScrollTarget() {
-  const documentSurface = document.querySelector(".external-review-doc") || el("docEditor") || el("docReader");
+  const documentSurface = document.querySelector(".external-review-doc") || el("docEditor") || el("docHighlighter") || el("docReader");
   if (isScrollableY(documentSurface)) return documentSurface;
   if (isScrollableY(el("viewer"))) return el("viewer");
   return documentSurface || el("viewer");

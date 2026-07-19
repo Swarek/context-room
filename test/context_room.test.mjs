@@ -615,13 +615,15 @@ test("doc QA tracks startup context changes with an internal baseline", () => {
     fs.writeFileSync(configPath, JSON.stringify(config, null, 2) + "\n");
 
     const initial = buildDocQaReport(root);
+    writeDocReviewDecision(root, "~/parent/AGENTS.md", { status: "verified", note: "startup context reviewed" });
     fs.writeFileSync(path.join(parent, "AGENTS.md"), "# Parent Agents\n\nNew global rule.\n");
     const changed = buildDocQaReport(root);
     const review = readReviewBaseFile(root, "~/parent/AGENTS.md");
     const baseline = writeDocReviewBaseline(root, "~/parent/AGENTS.md", { note: "inline review applied" });
     const afterBaseline = buildDocQaReport(root);
 
-    assert.equal(initial.summary.needsReview, 0);
+    assert.equal(initial.summary.needsReview, 1);
+    assert.equal(initial.queue[0].reviewRequired, true);
     assert.equal(changed.summary.needsReview, 1);
     assert.equal(changed.summary.changedDocs, 1);
     assert.equal(changed.queue[0].path, "~/parent/AGENTS.md");
@@ -635,6 +637,42 @@ test("doc QA tracks startup context changes with an internal baseline", () => {
     assert.equal(review.currentContent, "# Parent Agents\n\nNew global rule.\n");
     assert.match(baseline.baselinePath, /\.context-room\/review-baselines\/external\/home\/parent\/AGENTS\.md\.baseline$/);
     assert.equal(afterBaseline.summary.needsReview, 0);
+  } finally {
+    if (originalHome === undefined) delete process.env.HOME;
+    else process.env.HOME = originalHome;
+  }
+});
+
+test("startup context observation preserves changes made before the first human decision", () => {
+  const originalHome = process.env.HOME;
+  const base = makeRoot();
+  process.env.HOME = base;
+  try {
+    const parent = path.join(base, "parent");
+    const root = path.join(parent, "project");
+    const agentsPath = path.join(parent, "AGENTS.md");
+    fs.mkdirSync(root, { recursive: true });
+    fs.writeFileSync(agentsPath, "# Parent Agents\n");
+    initializeContextRoomProject(root, { allowedPaths: ["docs/"], watchAllow: [] });
+    const configPath = path.join(root, CONFIG_FILE);
+    const config = JSON.parse(fs.readFileSync(configPath, "utf8"));
+    config.startupContext = { enabled: true, fileNames: ["AGENTS.md"] };
+    fs.writeFileSync(configPath, JSON.stringify(config, null, 2) + "\n");
+
+    const initial = buildDocQaReport(root).queue.find((entry) => entry.path === "~/parent/AGENTS.md");
+    assert.ok(initial);
+    assert.equal(initial.initialReview, true);
+    assert.equal(initial.gitStatus, "");
+
+    fs.writeFileSync(agentsPath, "# Parent Agents\n\nChanged before review.\n");
+    const changed = buildDocQaReport(root).queue.find((entry) => entry.path === "~/parent/AGENTS.md");
+    const review = readReviewBaseFile(root, "~/parent/AGENTS.md");
+    assert.ok(changed);
+    assert.equal(changed.initialReview, false);
+    assert.equal(changed.gitStatus, "M");
+    assert.equal(review.available, true);
+    assert.equal(review.baseContent, "# Parent Agents\n");
+    assert.equal(review.currentContent, "# Parent Agents\n\nChanged before review.\n");
   } finally {
     if (originalHome === undefined) delete process.env.HOME;
     else process.env.HOME = originalHome;
@@ -700,6 +738,180 @@ test("startup skills scanner lists configured skill folders from ancestors to ro
   assert.match(deleted.backupPath, /\.context-room\/memory-webapp-backups/);
   assert.equal(fs.readFileSync(path.join(root, deleted.backupPath, "scripts", "check.sh"), "utf8"), "echo ok\n");
   assert.equal(fs.existsSync(path.join(parent, ".agents", "skills", "review-docs")), false);
+});
+
+test("doc QA requires review for every discovered startup skill and tracks later content changes", () => {
+  const originalHome = process.env.HOME;
+  const base = makeRoot();
+  process.env.HOME = base;
+  try {
+    const root = path.join(base, "project");
+    const skillPath = path.join(base, ".codex", "skills", "documentation-excellence", "SKILL.md");
+    fs.mkdirSync(path.dirname(skillPath), { recursive: true });
+    fs.mkdirSync(root, { recursive: true });
+    fs.writeFileSync(skillPath, "# Documentation Excellence\n");
+    initializeContextRoomProject(root, { allowedPaths: ["docs/"], watchAllow: [] });
+    const configPath = path.join(root, CONFIG_FILE);
+    const config = JSON.parse(fs.readFileSync(configPath, "utf8"));
+    config.startupContext.enabled = false;
+    config.startupSkills = { enabled: true, folderNames: [".codex/skills"] };
+    fs.writeFileSync(configPath, JSON.stringify(config, null, 2) + "\n");
+
+    const initial = buildDocQaReport(root);
+    const item = initial.queue.find((entry) => entry.path.endsWith("/documentation-excellence/SKILL.md"));
+    assert.ok(item);
+    assert.equal(item.reviewRequired, true);
+    assert.equal(item.gitStatus, "");
+    assert.equal(item.initialReview, true);
+    assert.equal(item.startupContext.kind, "startup-skill");
+    assert.equal(item.startupContext.skillName, "documentation-excellence");
+
+    writeDocReviewDecision(root, item.path, { status: "needs_changes", note: "request changes" });
+    assert.equal(fs.readFileSync(skillPath, "utf8"), "# Documentation Excellence\n");
+    const requestedChanges = buildDocQaReport(root).queue.find((entry) => entry.path === item.path);
+    assert.ok(requestedChanges);
+    assert.equal(requestedChanges.review.status, "needs_changes");
+    assert.equal(requestedChanges.initialReview, false);
+
+    writeDocReviewDecision(root, item.path, { status: "verified", note: "skill reviewed" });
+    assert.equal(buildDocQaReport(root).queue.some((entry) => entry.path === item.path), false);
+
+    fs.writeFileSync(skillPath, "# Documentation Excellence\n\nChanged.\n");
+    const changed = buildDocQaReport(root);
+    const changedItem = changed.queue.find((entry) => entry.path === item.path);
+    const review = readReviewBaseFile(root, item.path);
+    assert.ok(changedItem);
+    assert.equal(changedItem.gitStatus, "M");
+    assert.equal(changedItem.initialReview, false);
+    assert.equal(changedItem.internalChange, true);
+    assert.equal(review.available, true);
+    assert.equal(review.baseContent, "# Documentation Excellence\n");
+    assert.equal(review.currentContent, "# Documentation Excellence\n\nChanged.\n");
+  } finally {
+    if (originalHome === undefined) delete process.env.HOME;
+    else process.env.HOME = originalHome;
+  }
+});
+
+test("startup skill observation preserves changes made before the first human decision", () => {
+  const originalHome = process.env.HOME;
+  const base = makeRoot();
+  process.env.HOME = base;
+  try {
+    const root = path.join(base, "project");
+    const skillPath = path.join(base, ".codex", "skills", "documentation-excellence", "SKILL.md");
+    fs.mkdirSync(path.dirname(skillPath), { recursive: true });
+    fs.mkdirSync(root, { recursive: true });
+    fs.writeFileSync(skillPath, "# Documentation Excellence\n");
+    initializeContextRoomProject(root, { allowedPaths: ["docs/"], watchAllow: [] });
+    const configPath = path.join(root, CONFIG_FILE);
+    const config = JSON.parse(fs.readFileSync(configPath, "utf8"));
+    config.startupContext.enabled = false;
+    config.startupSkills = { enabled: true, folderNames: [".codex/skills"] };
+    fs.writeFileSync(configPath, JSON.stringify(config, null, 2) + "\n");
+
+    const initial = buildDocQaReport(root).queue.find((entry) => entry.path.endsWith("/documentation-excellence/SKILL.md"));
+    assert.ok(initial);
+    assert.equal(initial.initialReview, true);
+    assert.equal(initial.gitStatus, "");
+
+    fs.writeFileSync(skillPath, "# Documentation Excellence\n\nChanged before review.\n");
+    const changed = buildDocQaReport(root).queue.find((entry) => entry.path === initial.path);
+    const review = readReviewBaseFile(root, initial.path);
+    assert.ok(changed);
+    assert.equal(changed.initialReview, false);
+    assert.equal(changed.gitStatus, "M");
+    assert.equal(review.available, true);
+    assert.equal(review.baseContent, "# Documentation Excellence\n");
+    assert.equal(review.currentContent, "# Documentation Excellence\n\nChanged before review.\n");
+  } finally {
+    if (originalHome === undefined) delete process.env.HOME;
+    else process.env.HOME = originalHome;
+  }
+});
+
+test("a recovered startup skill baseline restores its real review diff without accepting the document", async () => {
+  const originalHome = process.env.HOME;
+  const base = makeRoot();
+  process.env.HOME = base;
+  try {
+    const root = path.join(base, "project");
+    const skillPath = path.join(base, ".codex", "skills", "documentation-excellence", "SKILL.md");
+    fs.mkdirSync(path.dirname(skillPath), { recursive: true });
+    fs.mkdirSync(root, { recursive: true });
+    fs.writeFileSync(skillPath, "# Documentation Excellence\n\nAfter.\n");
+    initializeContextRoomProject(root, { allowedPaths: ["docs/"], watchAllow: [] });
+    const configPath = path.join(root, CONFIG_FILE);
+    const config = JSON.parse(fs.readFileSync(configPath, "utf8"));
+    config.startupContext.enabled = false;
+    config.startupSkills = { enabled: true, folderNames: [".codex/skills"] };
+    fs.writeFileSync(configPath, JSON.stringify(config, null, 2) + "\n");
+
+    const contextRoom = await import("../src/context_room.mjs");
+    assert.equal(typeof contextRoom.writeDocReviewBaselineContent, "function");
+    contextRoom.writeDocReviewBaselineContent(
+      root,
+      "~/.codex/skills/documentation-excellence/SKILL.md",
+      "# Documentation Excellence\n\nBefore.\n",
+      { note: "recovered pre-edit content" },
+    );
+
+    const item = buildDocQaReport(root).queue.find((entry) => entry.path.endsWith("/documentation-excellence/SKILL.md"));
+    const review = readReviewBaseFile(root, item.path);
+    assert.ok(item);
+    assert.equal(item.initialReview, false);
+    assert.equal(item.gitStatus, "M");
+    assert.equal(item.review?.status, undefined);
+    assert.equal(review.available, true);
+    assert.equal(review.baseContent, "# Documentation Excellence\n\nBefore.\n");
+    assert.equal(review.currentContent, "# Documentation Excellence\n\nAfter.\n");
+  } finally {
+    if (originalHome === undefined) delete process.env.HOME;
+    else process.env.HOME = originalHome;
+  }
+});
+
+test("doc QA automatically requires every project AGENTS.md without duplicate queue entries", () => {
+  const root = makeRoot();
+  fs.mkdirSync(path.join(root, "website", "nested"), { recursive: true });
+  fs.writeFileSync(path.join(root, "AGENTS.md"), "# Root agents\n");
+  fs.writeFileSync(path.join(root, "website", "AGENTS.md"), "# Website agents\n");
+  fs.writeFileSync(path.join(root, "website", "nested", "AGENTS.md"), "# Nested agents\n");
+  initializeContextRoomProject(root, { allowedPaths: ["docs/"], watchAllow: [] });
+  const configPath = path.join(root, CONFIG_FILE);
+  const config = JSON.parse(fs.readFileSync(configPath, "utf8"));
+  config.startupContext.enabled = false;
+  config.startupSkills.enabled = false;
+  fs.writeFileSync(configPath, JSON.stringify(config, null, 2) + "\n");
+
+  const initial = buildDocQaReport(root);
+  const agentItems = initial.queue.filter((entry) => entry.path.endsWith("AGENTS.md"));
+  assert.deepEqual(agentItems.map((entry) => entry.path).sort(), ["AGENTS.md", "website/AGENTS.md", "website/nested/AGENTS.md"]);
+  assert.equal(new Set(agentItems.map((entry) => entry.path)).size, 3);
+  for (const item of agentItems) writeDocReviewDecision(root, item.path, { status: "verified", note: "instructions reviewed" });
+  assert.equal(buildDocQaReport(root).queue.some((entry) => entry.path.endsWith("AGENTS.md")), false);
+
+  fs.writeFileSync(path.join(root, "website", "AGENTS.md"), "# Website agents\n\nChanged.\n");
+  const changed = buildDocQaReport(root).queue.filter((entry) => entry.path.endsWith("AGENTS.md"));
+  assert.deepEqual(changed.map((entry) => entry.path), ["website/AGENTS.md"]);
+});
+
+test("doc QA shows a repo startup skill only once when Git review already covers it", () => {
+  const root = makeRoot();
+  execFileSync("git", ["init"], { cwd: root, stdio: "ignore" });
+  const skillPath = path.join(root, ".codex", "skills", "investigate", "SKILL.md");
+  fs.mkdirSync(path.dirname(skillPath), { recursive: true });
+  fs.writeFileSync(skillPath, "# Investigate\n");
+  initializeContextRoomProject(root, { allowedPaths: [".codex/skills/"], watchAllow: [".codex/skills/"] });
+  const configPath = path.join(root, CONFIG_FILE);
+  const config = JSON.parse(fs.readFileSync(configPath, "utf8"));
+  config.startupContext.enabled = false;
+  config.startupSkills = { enabled: true, folderNames: [".codex/skills"] };
+  fs.writeFileSync(configPath, JSON.stringify(config, null, 2) + "\n");
+
+  const matches = buildDocQaReport(root).queue.filter((entry) => entry.path === ".codex/skills/investigate/SKILL.md");
+  assert.equal(matches.length, 1);
+  assert.equal(matches[0].gitStatus, "??");
 });
 
 test("startup skill folders can be exposed in the explorer for file and folder creation", () => {
@@ -881,7 +1093,7 @@ test("startup context virtual files stay out of the explorer tree", () => {
   assert.match(html, /function selectStartupSkillFile\(folderOrder, skillName, options = \{\}\)/);
   assert.match(html, /function selectStartupHookFile\(order, options = \{\}\)/);
   assert.match(html, /const selectedPath = startupContextSelectedExplorerPath\(data\.startupContext\);[\s\S]*const finalPath = selectedPath \|\| selectedKey;[\s\S]*state\.selected = finalPath;/);
-  assert.match(html, /state\.selected = startupSkillSelectedExplorerPath\(data\.startupContext\) \|\| selectedKey;/);
+  assert.match(html, /const finalPath = startupSkillSelectedExplorerPath\(data\.startupContext\) \|\| selectedKey;/);
   assert.match(html, /function createStartupSkillFromPanel\(folderOrder\)/);
   assert.match(html, /function submitStartupSkillCreateForm\(folderOrder\)/);
   assert.match(html, /function cancelStartupSkillCreate\(\)/);
@@ -1726,6 +1938,23 @@ test("reviewPaths order defines the human verification path", () => {
   assert.deepEqual(report.queue.map((item) => item.path), reviewPaths);
 });
 
+test("reviewAgentInstructions can limit required reviews to explicit reviewPaths", () => {
+  const root = makeRoot();
+  fs.mkdirSync(path.join(root, "docs", "verification"), { recursive: true });
+  fs.writeFileSync(path.join(root, "AGENTS.md"), "# Agent instructions\n");
+  fs.writeFileSync(path.join(root, "docs", "verification", "README.md"), "# Verification\n");
+  initializeContextRoomProject(root, { allowedPaths: ["AGENTS.md", "docs/"] });
+  const configPath = path.join(root, CONFIG_FILE);
+  const config = JSON.parse(fs.readFileSync(configPath, "utf8"));
+  config.reviewAgentInstructions = false;
+  config.reviewPaths = ["docs/verification/README.md"];
+  fs.writeFileSync(configPath, JSON.stringify(config, null, 2) + "\n");
+
+  const report = buildDocQaReport(root);
+
+  assert.deepEqual(report.queue.map((item) => item.path), ["docs/verification/README.md"]);
+});
+
 test("reader questions do not become unresolved TODO markers", () => {
   const root = makeRoot();
   fs.mkdirSync(path.join(root, "docs"), { recursive: true });
@@ -1791,6 +2020,7 @@ test("revertMemoryFile restores tracked changes in a git subdirectory", () => {
   initializeContextRoomProject(root, { allowedPaths: ["AGENTS.md"], watchAllow: ["AGENTS.md"] });
   execFileSync("git", ["add", "."], { cwd: repo, stdio: "ignore" });
   execFileSync("git", ["commit", "-m", "initial"], { cwd: repo, stdio: "ignore" });
+  writeDocReviewDecision(root, "AGENTS.md", { status: "verified", note: "instructions reviewed" });
   fs.writeFileSync(path.join(root, "AGENTS.md"), "# AGENTS\n\nUpdated routing.\n");
 
   const result = revertMemoryFile(root, "AGENTS.md");
@@ -2285,6 +2515,7 @@ context_room:
   const config = JSON.parse(fs.readFileSync(configPath, "utf8"));
   config.startupContext = { enabled: true, fileNames: ["AGENTS.md"] };
   fs.writeFileSync(configPath, JSON.stringify(config, null, 2) + "\n");
+  writeDocReviewDecision(root, "AGENTS.md", { status: "verified", note: "instructions reviewed" });
 
   const doctor = buildContextRoomDoctorReport(root);
   const brief = buildAgentBrief(root, { task: "update billing docs", limit: 4 });
@@ -2675,10 +2906,12 @@ test("rendered app supports selectable file themes and colored markdown reading"
   assert.match(html, /\.viewer a\.path-link\s*\{[^}]*cursor:\s*inherit/);
   assert.match(html, /\.doc-link-modifier-active \.viewer a\.path-link:hover\s*\{[^}]*cursor:\s*pointer/);
   assert.match(html, /\.markdown-editor-shell\s*\{[^}]*isolation:\s*isolate/);
-  assert.match(html, /\.markdown-editor-highlight\s*\{[^}]*z-index:\s*1/);
-  assert.match(html, /\.markdown-editor-input\s*\{[^}]*position:\s*absolute;[^}]*-webkit-text-fill-color:\s*transparent !important/);
+  assert.match(html, /\.markdown-editor-highlight\s*\{[^}]*z-index:\s*1;[^}]*pointer-events:\s*none;[^}]*user-select:\s*none/);
+  assert.match(html, /\.markdown-editor-input\s*\{[^}]*position:\s*absolute;[^}]*z-index:\s*3;[^}]*pointer-events:\s*auto;[^}]*cursor:\s*text;[^}]*-webkit-text-fill-color:\s*transparent !important/);
+  assert.match(html, /\.markdown-editor-input\s*\{[^}]*overflow-wrap:\s*break-word;[^}]*word-break:\s*normal;/);
   assert.match(html, /\.markdown-editor-input\.doc-link-hover\s*\{\s*cursor:\s*pointer;\s*\}/);
   assert.match(html, /\.markdown-editor-highlight \.markdown-line\s*\{[^}]*padding:\s*0;[^}]*font-size:\s*inherit/);
+  assert.match(html, /\.markdown-editor-highlight \.markdown-line\s*\{[^}]*overflow-wrap:\s*break-word;[^}]*word-break:\s*normal;/);
   assert.match(html, /\.markdown-editor-highlight \.markdown-line\.h1\s*\{\s*color:\s*var\(--file-h1\)/);
   assert.match(html, /\.markdown-editor-highlight \.markdown-line\.h2\s*\{\s*color:\s*var\(--file-h2\)/);
   assert.match(html, /\.markdown-editor-highlight \.markdown-line\.list\s*\{\s*padding-left:\s*0/);
@@ -2743,6 +2976,33 @@ test("rendered app supports selectable file themes and colored markdown reading"
   assert.match(html, /function updateMarkdownEditorHighlight\(text, options = \{\}\)/);
   assert.match(html, /state\.markdownHighlightFrame = window\.requestAnimationFrame/);
   assert.match(html, /function renderMarkdownEditorHighlightNow\(text\)/);
+  assert.match(html, /\.markdown-editor-shell\[data-source-mode="false"\] \.markdown-editor-highlight\s*\{[^}]*pointer-events:\s*none;[^}]*user-select:\s*none/);
+  assert.match(html, /\.markdown-editor-shell\[data-source-mode="false"\] \.markdown-editor-input\s*\{\s*pointer-events:\s*auto/);
+  assert.match(html, /addEventListener\("pointerdown", enterMarkdownEditorAtPoint\)/);
+  assert.match(html, /addEventListener\("pointermove", extendMarkdownEditorPointerSelection\)/);
+  assert.match(html, /addEventListener\("pointerup", finishMarkdownEditorPointerSelection\)/);
+  assert.match(html, /function markdownEditorSourceOffsetAtPoint\(clientX, clientY\)/);
+  assert.match(html, /function markdownEditorWordRange\(value, offset\)/);
+  assert.match(html, /function markdownEditorLineRange\(value, offset\)/);
+  assert.match(html, /setSelectionRange\([\s\S]*safeFocus < safeAnchor \? "backward" : "forward"/);
+  assert.match(html, /addEventListener\("beforeinput", \(event\) => captureMarkdownEditorHistory\(docEditor, event\)\)/);
+  assert.match(html, /function handleMarkdownEditorHistoryShortcut\(event, editor\)/);
+  assert.match(html, /const undo = key === "z" && !event\.shiftKey;/);
+  assert.match(html, /const redo = \(key === "z" && event\.shiftKey\)/);
+  assert.match(html, /function applyMarkdownEditorHistory\(editor, direction\)/);
+  assert.match(html, /destination\.push\(markdownEditorHistorySnapshot\(editor\)\)/);
+  assert.match(html, /editor\.setSelectionRange\(snapshot\.selectionStart, snapshot\.selectionEnd, snapshot\.selectionDirection\)/);
+  assert.doesNotMatch(html, /data-markdown-source-toggle/);
+  assert.match(html, /function markdownSourceOffsetForRenderedOffset\(sourceLine, renderedOffset\)/);
+  assert.match(html, /function markdownRenderedOffsetForSourceOffset\(sourceLine, sourceOffset\)/);
+  assert.match(html, /function updateMarkdownEditorVisualSelection\(\)/);
+  assert.match(html, /id="markdownEditorCaret"/);
+  assert.match(html, /highlighter\.scrollTop = editor\.scrollTop;/);
+  assert.match(html, /highlighter\.scrollLeft = editor\.scrollLeft;/);
+  assert.match(html, /if \(options\.sourceFaithful && docLinkAttrs\) \{/);
+  assert.match(html, /class="markdown-link-label"/);
+  assert.match(html, /class="markdown-link-target"/);
+  assert.match(html, /\.markdown-editor-highlight \.markdown-link-target\s*\{[^}]*color:\s*color-mix/);
   assert.match(html, /state\.markdownHighlightLastText = docEditor\.value;/);
   assert.doesNotMatch(html, /syncMarkdownEditorHighlight/);
   assert.match(html, /function syncMarkdownEditorScroll\(\)/);
@@ -2762,7 +3022,7 @@ test("normal and startup files open directly editable while review mode owns ver
   assert.match(html, /writeSelectedDiskFile\(content\)/);
   assert.match(html, /api\("\/api\/startup-context\/file", \{/);
   assert.match(html, /api\("\/api\/startup-skills\/file", \{/);
-  assert.match(html, /reviewAction: isStartupFile \|\| state\.selectedReadOnly \? null : reviewActionForSelectedFile\(\)/);
+  assert.match(html, /reviewAction: reviewActionForSelectedFile\(\)/);
   assert.match(html, /deletable: !isStartupFile && !state\.selectedReadOnly/);
   assert.match(html, /el\("viewer"\)\.hidden = false;\s*el\("editor"\)\.hidden = true;\s*renderPlanetSystem\(\);/);
   assert.doesNotMatch(html, /data-file-mode-toggle/);
@@ -3005,9 +3265,11 @@ test("verification actions are limited to files opened from the review queue", (
   assert.match(html, /reviewModePath: null, reviewModeStatus: null/);
   assert.match(html, /openReviewQueueItem\(item\)\.catch\(\(error\) => setStatus\(error\.message\)\)/);
   assert.match(html, /await selectStartupContextFile\(item\.startupContext\.order, \{ reviewMode: true \}\);/);
+  assert.match(html, /await selectStartupSkillFile\(folder, skill, \{ reviewMode: true \}\);/);
   assert.match(html, /await selectFile\(item\.path, \{ reviewMode: true \}\);/);
   assert.match(html, /state\.reviewModePath = options\.reviewMode \? path : null;/);
   assert.match(html, /state\.reviewModePath = options\.reviewMode \? finalPath : null;/);
+  assert.match(html, /renderFileActionButtons\(\{ reviewAction: reviewActionForSelectedFile\(\), secondaryReviewAction: secondaryReviewActionForSelectedFile\(\), nextReviewAction: nextReviewActionForSelectedFile\(\)/);
   assert.match(html, /function reviewActionForSelectedFile\(\)/);
   assert.match(html, /if \(!state\.selected \|\| state\.reviewModePath !== state\.selected\) return null;/);
   assert.match(html, /if \(state\.reviewModeStatus === "verified"\) return null;/);
@@ -3025,7 +3287,10 @@ test("verification actions are limited to files opened from the review queue", (
   assert.match(html, /VERIFY_CONFIRM_STORAGE_KEY = "context-room:skip-mark-verified-confirm"/);
   assert.match(html, /checkboxLabel: "Do not ask again"/);
   assert.match(html, /confirmVariant: "primary"/);
-  assert.match(html, /body: "This marks the current content as trusted\. Use Next review when ready\."/);
+  assert.match(html, /This marks the current content as trusted\. Use Next review when ready\./);
+  assert.match(html, /No previous baseline exists for this first review\./);
+  assert.match(html, /label: "Accept document"/);
+  assert.match(html, /label: "Request changes"/);
   assert.match(html, /if \(!reviewActionForSelectedFile\(\)\) return;/);
   assert.match(html, /applyReviewDecision\(path, "verified"\)/);
   assert.match(html, /const previousQueue = options\.previousQueue \|\| state\.docqa\?\.queue \|\| \[\];/);
@@ -3170,7 +3435,7 @@ test("save preserves the editor scroll position after rerendering", () => {
   assert.match(html, /renderViewer\(\);\s*restoreEditorViewState\(viewState\);/);
   assert.match(html, /function isScrollableY\(element\)/);
   assert.match(html, /function activeDocumentScrollTarget\(\)/);
-  assert.match(html, /const documentSurface = document\.querySelector\("\.external-review-doc"\) \|\| el\("docEditor"\) \|\| el\("docReader"\);/);
+  assert.match(html, /const documentSurface = document\.querySelector\("\.external-review-doc"\) \|\| el\("docEditor"\) \|\| el\("docHighlighter"\) \|\| el\("docReader"\);/);
   assert.match(html, /if \(isScrollableY\(documentSurface\)\) return documentSurface;/);
   assert.match(html, /if \(isScrollableY\(el\("viewer"\)\)\) return el\("viewer"\);/);
   assert.match(html, /function externalReviewBlockElement\(blockId\)/);

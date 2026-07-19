@@ -30,6 +30,7 @@ The explorer and editor expose safe project text files in one compact workspace.
 - Opening a file never reopens a collapsed explorer; use the explorer control when the file tree is needed.
 - Open project text files; files outside `allowedPaths` stay read-only.
 - Edit and save allowed files. HTML visual documents render directly; their source is changed by an agent and reviewed in the queue.
+- Select Markdown text with normal editor gestures: drag, Shift-click, double-click a word, or triple-click a line. Native Delete, Backspace, cut, copy, paste, undo, redo, and keyboard selection operate on that selection.
 - Create Markdown files and folders from the explorer.
 - Select files or folders for bulk actions.
 - Add selected paths to `watchAllow` or remove them from `watchAllow`.
@@ -50,6 +51,7 @@ The explorer and editor expose safe project text files in one compact workspace.
 - Intentional hover or keyboard focus preloads file content and Git diff; repeated opens reuse the result until the file changes.
 - The workspace toolbar and file actions replace one stable loading state together instead of appearing in stages.
 - Markdown keeps its rich line rendering and shows discreet source line numbers in a narrow gutter; wrapped text keeps one number for its source line. Code, JSON, and large files use a lightweight text surface to keep opening fast.
+- The Markdown overlay is visual only. The real text field owns pointer selection, clipboard commands, keyboard editing, undo history, and scrolling; the overlay mirrors its caret, selection, and viewport.
 - HTML opens as a sandboxed visual preview. Scripts, navigation, forms, and external resources cannot run from the preview.
 - HTML previews inherit the active Context Room theme and its built-in visual components.
 - Watched HTML changes use the same review queue and source diff as other watched files.

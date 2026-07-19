@@ -35,6 +35,11 @@
       "uniqueItems": true,
       "default": []
     },
+    "reviewAgentInstructions": {
+      "type": "boolean",
+      "description": "Whether project AGENTS.md files are implicit required-review paths. Disable this only for a room whose human review scope is intentionally narrower.",
+      "default": true
+    },
     "markdownTemplates": {
       "type": "array",
       "description": "Markdown templates available when creating new .md files from the site. Supports {{title}}, {{path}}, and metadata placeholders such as {{scope_yaml}}, {{status_yaml}}, {{canonical_for_yaml}}, {{last_verified_yaml}}, {{sources_inline}}, and {{sources_list}}.",

@@ -4,7 +4,7 @@ context_room:
   scope: context-room
   status: current
   canonical_for: agent configuration
-  last_verified: 2026-07-14
+  last_verified: 2026-07-15
   sources: [bin/context-room.mjs, src/context_room.mjs, schemas/config.schema.json]
 ---
 
@@ -87,6 +87,8 @@ Required verification boundary.
 
 Files and folders here appear in the review queue until the current content is marked verified, even when there is no Git diff. Their array order defines the human verification path; critical safety issues still appear first. Use this for onboarding a documentation set or requiring explicit review of agent-critical files. Only unchanged entries from `reviewPaths` show `Mark verified`; Git changes are reviewed through their inline diff.
 
+Context Room automatically adds every project `AGENTS.md` to the editable and watched boundaries. By default they are also required-review paths. Set `"reviewAgentInstructions": false` only when a room deliberately reserves human review for a narrower set such as one documentation area; explicit `reviewPaths` still apply.
+
 Good examples:
 
 ```json
@@ -130,7 +132,7 @@ When enabled, Context Room lists matching files from the filesystem root down to
 
 These files are read-only in Context Room and do not appear in the explorer.
 
-Startup context files outside the Context Room root are not Git-reviewable from the project. Context Room therefore creates a local internal baseline the first time it sees them, then reports later edits in the Changed files to review queue. Opening one of those queue items shows the same inline accept/reject mini-diff flow, and accepting or rejecting the visible changes updates the Context Room baseline for future reviews.
+Startup context files outside the Context Room root are not Git-reviewable from the project. Context Room requires an initial review of each one and stores an untrusted observation baseline immediately at discovery. An edit made before the first human decision therefore appears as a real inline diff. Accepting or rejecting visible changes updates the local baseline for future reviews. Content that changed before the first observation still requires Git history, a backup, or another recovered snapshot.
 
 ### Generated agent context
 
@@ -145,6 +147,8 @@ Startup skill scanner.
 When enabled, Context Room lists configured skill folders such as `.codex/skills` or `skills`. This helps users see which reusable instructions may affect future agent work.
 
 Startup skills can be opened in the explorer without making the whole project editable.
+
+Every discovered skill entrypoint requires an initial review, including skills outside the repo. Context Room captures the first observed content immediately without treating it as verified. If it remains unchanged, the UI offers whole-document acceptance or a non-destructive request-changes decision; if it changes first, the UI shows the line-level diff against that observation baseline. Once verified, its content hash is trusted until the skill changes. If a repo skill already appears through the normal Git queue, Context Room keeps only that richer Git-backed item instead of showing a duplicate.
 
 ### `startupHooks`
 

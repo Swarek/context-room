@@ -4,7 +4,7 @@ context_room:
   scope: context-room
   status: current
   canonical_for: product overview
-  last_verified: 2026-07-14
+  last_verified: 2026-07-15
   sources: [README.md, bin/context-room.mjs, src/context_room.mjs, schemas/config.schema.json, docs/agent-configuration.md]
 ---
 
@@ -26,7 +26,7 @@ Context Room is a local browser UI for keeping project context visible, editable
 
 - Hub: card-based navigation from `hubSections`.
 - Explorer and editor: project files limited by `allowedPaths`.
-- Changed files to review: Git-backed review queue plus required review paths.
+- Changed files to review: Git-backed review queue, required review paths, every project `AGENTS.md`, and every skill exposed by Startup skills.
 - Startup context: ancestor agent instruction files from configured filenames.
 - Startup skills: discovered skill folders from configured roots.
 - Startup hooks: AI agent hooks, Git hooks, and hook-manager files.

@@ -4,7 +4,7 @@ context_room:
   scope: context-room
   status: current
   canonical_for: review queue
-  last_verified: 2026-07-14
+  last_verified: 2026-07-15
   sources: [src/context_room.mjs, bin/context-room.mjs, docs/agent-configuration.md]
 ---
 
@@ -21,6 +21,7 @@ The review queue shows watched documentation that needs verification before it b
 3. For a Git change, accept or reject every visible change; the completed diff records the review.
 4. When several files were removed together, expand the deletion set, inspect or narrow the selected paths, then confirm their removal once.
 5. For an unchanged `reviewPaths` file, read the current content and use `Mark verified`.
+6. Review newly discovered startup instructions and skills once; they return only when their content changes.
 
 ## Rules
 
@@ -29,6 +30,11 @@ The review queue shows watched documentation that needs verification before it b
 - The owner can select one or several blocking checkpoints: commit, push, pull request, or merge. Commit, push, and local merge use managed Git hooks; hosted checks require provider wiring.
 - `watchAllow` follows changed tracked files and new untracked files.
 - `reviewPaths` keeps important docs in the queue until the current content is verified.
+- Every project `AGENTS.md` is an implicit required-review path by default, even when nested outside configured documentation folders. A deliberately narrow room can set `reviewAgentInstructions` to `false`; explicit `reviewPaths` still apply.
+- Every entrypoint exposed by Startup skills requires an initial review and hash-based re-review after changes.
+- Context Room captures an untrusted observation baseline when an external startup resource is first discovered. An unchanged initial review uses whole-document acceptance or a non-destructive request-changes decision; an edit made before that decision already receives the normal inline diff.
+- Changes that predate the first Context Room observation need an existing Git version, backup, or recovered snapshot; Context Room does not invent missing history.
+- A startup resource already represented by a normal Git queue item is shown only once.
 - The `reviewPaths` array order defines the intended verification path. Critical safety issues remain first; unlisted changed files retain the default risk and documentation order.
 - Reader-facing headings such as `Question: ...` are normal prose. Only explicit TODO markers, including `[QUESTION]` or `<!-- QUESTION -->`, create an unresolved-question issue.
 - `Mark verified` appears only for unchanged `reviewPaths` files. Git changes must be completed through their inline diff.

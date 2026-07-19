@@ -21,6 +21,7 @@
     "README.md",
     "AGENTS.md"
   ],
+  "reviewAgentInstructions": true,
   "integrations": {
     "hermes": false
   },
