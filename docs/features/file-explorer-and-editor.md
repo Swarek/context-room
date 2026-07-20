@@ -5,7 +5,7 @@ context_room:
   status: current
   canonical_for: file explorer and editor
   last_verified: 2026-07-20
-  sources: [src/context_room.mjs, schemas/config.schema.json]
+  sources: [src/context_room.mjs, src/codex_composer_bridge.mjs, schemas/config.schema.json]
 ---
 
 # File Explorer And Editor
@@ -31,6 +31,7 @@ The explorer and editor expose safe project text files in one compact workspace.
 - Open project text files; files outside `allowedPaths` stay read-only.
 - Edit and save allowed files. HTML visual documents render directly; their source is changed by an agent and reviewed in the queue.
 - Select Markdown text with normal editor gestures: drag, Shift-click, double-click a word, or triple-click a line. Native Delete, Backspace, cut, copy, paste, undo, redo, and keyboard selection operate on that selection.
+- Select text in the source editor, then use the floating **@ Codex** action above the selection or its configurable shortcut. Context Room adds a native, clickable file mention and the source line range to the active Codex composer without sending it or replacing the existing draft. Clean saved files omit the selected passage because Codex can read it from disk. An unsaved selection includes the selected bytes and labels them `unsaved`. If the local bridge is unavailable, Context Room copies the same compact reference instead.
 - Create Markdown files and folders from the explorer.
 - Select files or folders for bulk actions.
 - Watch one file exactly, or choose a folder watch mode for one or more selected folders.
@@ -47,6 +48,8 @@ The explorer and editor expose safe project text files in one compact workspace.
 - `.git`, dependencies, caches, and build outputs stay excluded even when hidden files are shown. Sensitive environment files remain read-only and expose names only, never values.
 - External startup files are shown through explicit startup surfaces. Other external files appear only when their `~/...` file or folder is explicitly present in `allowedPaths`.
 - Pending changes never block navigation. A disk edit becomes a conflict only when the current editor buffer differs from the last successful save; otherwise it enters normal external review.
+- A Codex reference uses the live editor buffer and labels unsaved content. Diff-review selections are excluded because deleted and replacement lines do not map unambiguously to the current file.
+- Direct composer insertion requires Codex to run with a loopback-only renderer bridge. Context Room resolves the selected file inside its allowed path boundary, chooses only an exact native Codex file-mention match, and never submits the composer.
 - File data, annotations, Git diff state, and review data load concurrently.
 - File text appears as soon as it is read; slow Git diff or review work never holds the document behind a loading screen.
 - Intentional hover or keyboard focus preloads file content and Git diff; repeated opens reuse the result until the file changes.
@@ -84,5 +87,7 @@ For the persisted JSON contract, overlap rules, and snapshot shape, see [Agent c
 - `applyExplorerFolderWatchMode`, `showFolderWatchModeDialog`, `addSelectedToWatch`, and `removeSelectedFromWatch` apply the same four folder modes to context-menu and bulk actions.
 - `deletePaths` handles bulk deletion separately from watch configuration.
 - `renderViewer` renders preview, editor, diffs, conflicts, and annotations.
+- `referenceCodexSelectionInCurrentTask` posts the selected path and line range to `/api/codex/reference`. `insertFileReferenceIntoActiveCodexComposer` creates the native file mention through the active loopback Codex renderer bridge; compact clipboard copy is the safe fallback when that bridge is unavailable.
+- The renderer event and launcher pattern are compatible with the unofficial [Codex Deck bridge](https://github.com/dazer1234/codex-stream-deck). This is an internal Codex compatibility boundary and may require an update after a Codex release.
 - `contextRoomVisualDocumentStyles` supplies themed HTML components without adding CSS to each document.
 - `background_worker.mjs` keeps Git diff work off the HTTP and UI critical path.

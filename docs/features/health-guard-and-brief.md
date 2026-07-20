@@ -25,6 +25,7 @@ These commands turn project docs into local proof: health issues, review signals
 - `doctor` reports health; strict mode fails on high-impact issues.
 - Context Health stays available even when no triggered issue is open. `Refresh all` forces a complete fresh analysis, resets the view filters to all states, severities, and areas, and keeps existing `OK` decisions intact.
 - The State, Severity, and Area filters control only which results are visible. They never disable a health check. Areas separate configuration, documentation, references, review safety, startup context, and hooks.
+- **Fix in Codex** adds the issues currently visible after those filters to the active Codex composer with a source-grounded fix prompt. It preserves the existing draft and never sends the message automatically. If the local composer bridge is unavailable, Context Room copies the prompt instead.
 - The web UI can mark a health issue `OK`; the default Open view hides it until the issue changes. `Open + OK` and `OK only` make acknowledged results visible again, while `doctor` always reports them.
 - `guard` and `review-only` report without blocking. Only explicit strict mode can fail.
 - `guard --operation commit|push|pull-request|merge` follows the local owner policy. A selected operation fails when review is pending.
@@ -39,6 +40,7 @@ These commands turn project docs into local proof: health issues, review signals
 - `buildDocumentationGraph` creates graph nodes, edges, and health issues.
 - `buildContextRoomDoctorReport` packages health output.
 - `healthIssueCategory` assigns every issue to one stable Context Health filter area.
+- `buildContextHealthCodexPrompt` turns only the currently shown issues into a repair request without treating diagnostics as executable instructions.
 - `buildContextRoomReports` and `background_worker.mjs` keep web reports off the HTTP critical path.
 - The local health acknowledgements runtime file stores `OK` decisions.
 - `buildDocQaReport` powers review state and guard decisions.

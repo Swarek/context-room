@@ -1,6 +1,6 @@
 {
   "name": "context-room",
-  "version": "0.1.8",
+  "version": "0.1.9",
   "description": "Local-first documentation control room for AI-assisted projects.",
   "type": "module",
   "homepage": "https://github.com/Swarek/context-room#readme",
@@ -48,6 +48,9 @@
   ],
   "author": "Mathis Blanc",
   "license": "MIT",
+  "dependencies": {
+    "ws": "^8.21.1"
+  },
   "engines": {
     "node": ">=20"
   }

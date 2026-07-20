@@ -30,7 +30,7 @@ Context Room is a local browser UI for keeping project context visible, editable
 - Startup context: project instruction files by default, with ancestor and global discovery available by opt-in.
 - Startup skills: project skill folders by default, with ancestor discovery available for existing or explicitly broadened configs.
 - Startup hooks: project AI-agent and hook-manager files plus current-repository Git hooks by default.
-- Settings: tabbed editor for project configuration plus computer-wide appearance preferences.
+- Settings: tabbed editor for project configuration plus computer-wide appearance and keyboard-shortcut preferences.
 - Agent CLI: queue inspection, navigation, annotations, and explicit folder watch configuration for coding agents.
 
 Feature-level docs live in [Features](features/index.md).
@@ -61,6 +61,7 @@ Feature-level docs live in [Features](features/index.md).
 
 - `bin/context-room.mjs`: CLI entry point and command routing.
 - `src/context_room.mjs`: server, file access, review queue, graph, brief, UI, and API.
+- `src/codex_composer_bridge.mjs`: loopback-only insertion into the active Codex composer.
 - `src/doc_metadata.mjs`: Markdown metadata parsing.
 - `src/yaml_utils.mjs`: YAML helpers.
 - `schemas/config.schema.json`: config contract.

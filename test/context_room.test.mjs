@@ -13,6 +13,7 @@ import {
   AGENT_CONTEXT_FILE,
   CONFIG_DIR,
   CONFIG_FILE,
+  DEFAULT_CODEX_REFERENCE_SHORTCUT,
   REVIEW_GATE_FILE,
   GLOBAL_PREFERENCES_FILE,
   DEFAULT_MARKDOWN_TEMPLATES,
@@ -55,6 +56,7 @@ import {
   listStartupContextFiles,
   listStartupHookFiles,
   listStartupSkillFolders,
+  normalizeKeyboardShortcut,
   parseDocMetadata,
   readAgentAnnotations,
   readAgentCommand,
@@ -1287,7 +1289,7 @@ test("allowed paths are driven by project config", () => {
   assert.equal(isAllowedMemoryPath("../secret.md", settings), false);
 });
 
-test("appearance preferences are shared across Context Rooms and stay out of project config", async (t) => {
+test("appearance and shortcut preferences are shared across Context Rooms and stay out of project config", async (t) => {
   const firstRoot = makeRoot();
   const secondRoot = makeRoot();
   const preferencesPath = path.join(makeRoot(), "preferences.json");
@@ -1297,9 +1299,14 @@ test("appearance preferences are shared across Context Rooms and stay out of pro
   assert.equal(GLOBAL_PREFERENCES_FILE, "~/.context-room/preferences.json");
   assert.equal(readGlobalContextRoomPreferences(preferencesPath).appearance.autoOpenGitDiff, true);
   assert.equal(readGlobalContextRoomPreferences(preferencesPath).appearance.showHiddenFiles, true);
-  writeGlobalContextRoomPreferences({ appearance: { fileTheme: "dracula", autoOpenGitDiff: false, showHiddenFiles: false } }, preferencesPath);
+  assert.equal(readGlobalContextRoomPreferences(preferencesPath).shortcuts.codexReference, DEFAULT_CODEX_REFERENCE_SHORTCUT);
+  writeGlobalContextRoomPreferences({
+    appearance: { fileTheme: "dracula", autoOpenGitDiff: false, showHiddenFiles: false },
+    shortcuts: { codexReference: "Mod+Alt+K" },
+  }, preferencesPath);
   assert.deepEqual(readResolvedContextRoomSettings(firstRoot, { preferencesPath }).appearance, { fileTheme: "dracula", autoOpenGitDiff: false, showHiddenFiles: false });
   assert.deepEqual(readResolvedContextRoomSettings(secondRoot, { preferencesPath }).appearance, { fileTheme: "dracula", autoOpenGitDiff: false, showHiddenFiles: false });
+  assert.deepEqual(readResolvedContextRoomSettings(secondRoot, { preferencesPath }).shortcuts, { codexReference: "Mod+Alt+K" });
 
   const { server } = createMemoryServer({ root: firstRoot, globalPreferencesPath: preferencesPath });
   await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
@@ -1307,15 +1314,21 @@ test("appearance preferences are shared across Context Rooms and stay out of pro
   const response = await fetch(`http://127.0.0.1:${server.address().port}/api/settings`, {
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify({ settings: { ...readMemoryWebappSettings(firstRoot), appearance: { fileTheme: "github-dark", autoOpenGitDiff: false, showHiddenFiles: true } } }),
+    body: JSON.stringify({ settings: { ...readMemoryWebappSettings(firstRoot), appearance: { fileTheme: "github-dark", autoOpenGitDiff: false, showHiddenFiles: true }, shortcuts: { codexReference: "Mod+Shift+R" } } }),
   });
   const payload = await response.json();
   const savedProject = JSON.parse(fs.readFileSync(path.join(firstRoot, CONFIG_FILE), "utf8"));
 
   assert.equal(response.status, 200);
   assert.deepEqual(payload.settings.appearance, { fileTheme: "github-dark", autoOpenGitDiff: false, showHiddenFiles: true });
+  assert.deepEqual(payload.settings.shortcuts, { codexReference: "Mod+Shift+R" });
   assert.deepEqual(readResolvedContextRoomSettings(secondRoot, { preferencesPath }).appearance, { fileTheme: "github-dark", autoOpenGitDiff: false, showHiddenFiles: true });
+  assert.deepEqual(readResolvedContextRoomSettings(secondRoot, { preferencesPath }).shortcuts, { codexReference: "Mod+Shift+R" });
   assert.equal("appearance" in savedProject, false);
+  assert.equal("shortcuts" in savedProject, false);
+  assert.equal(normalizeKeyboardShortcut("Command + shift + l"), "Mod+Shift+L");
+  assert.equal(normalizeKeyboardShortcut(""), "");
+  assert.equal(normalizeKeyboardShortcut("L"), DEFAULT_CODEX_REFERENCE_SHORTCUT);
 });
 
 test("review gates are owner-local, sanitized, and separate from project config", () => {
@@ -4597,7 +4610,7 @@ test("rendered app supports selectable file themes and colored markdown reading"
   assert.match(html, /document\.querySelectorAll\("\[data-review-gate-operation\]:checked"\)/);
   assert.match(html, /\.review-gate-options\s*\{[^}]*grid-template-columns:\s*repeat\(4/);
   assert.match(html, /id:\s*"startup"[\s\S]*kicker:\s*"Startup"[\s\S]*title:\s*"Injected context scanners"/);
-  assert.match(html, /id:\s*"appearance"[\s\S]*kicker:\s*"Appearance"[\s\S]*title:\s*"Theme, files, and diffs"/);
+  assert.match(html, /id:\s*"appearance"[\s\S]*kicker:\s*"Appearance"[\s\S]*title:\s*"Theme, files, and shortcuts"/);
   assert.match(html, /copy:\s*"Shared by every Context Room on this computer\."/);
   assert.match(html, /scope:\s*"All rooms"/);
   assert.match(html, /id:\s*"templates"[\s\S]*kicker:\s*"Templates"[\s\S]*title:\s*"Markdown document templates"/);
@@ -4616,7 +4629,10 @@ test("rendered app supports selectable file themes and colored markdown reading"
   assert.match(html, /settingsSection: normalizeSettingsSectionId\(state\.settingsSection\)/);
   assert.match(html, /state\.settingsSection = persisted\.settingsSection/);
   assert.match(html, /activateSettingsSection\(state\.settingsSection, \{ resetScroll: false \}\)/);
-  assert.match(html, /Project setup stays in this room\. Appearance applies to all rooms\./);
+  assert.match(html, /Reference in Codex shortcut/);
+  assert.match(html, /id="codexReferenceShortcut"/);
+  assert.match(html, /function wireShortcutRecorder\(\)/);
+  assert.match(html, /Project setup stays in this room\. Appearance and shortcuts apply to all rooms\./);
   assert.match(html, /\.settings-toggle\s*\{[^}]*grid-template-columns:\s*auto minmax\(0, 1fr\)/);
   assert.match(html, /\.settings-footer\s*\{[^}]*position:\s*sticky/);
   assert.match(html, /button\.save-pending, \.file-action\.save-pending/);
@@ -4804,6 +4820,140 @@ test("normal and startup files open directly editable while review mode owns ver
   assert.match(html, /deletable: !isStartupFile && !state\.selectedReadOnly/);
   assert.match(html, /el\("viewer"\)\.hidden = false;\s*el\("editor"\)\.hidden = true;\s*renderPlanetSystem\(\);/);
   assert.doesNotMatch(html, /data-file-mode-toggle/);
+});
+
+test("selected text opens a floating compact Codex file mention action", () => {
+  const html = renderAppHtml();
+  const script = extractInlineAppScript(html);
+  const pureSource = script.slice(
+    script.indexOf("function codexReferenceLineNumber"),
+    script.indexOf("function currentCodexReferencePath"),
+  );
+  const helpers = Function(
+    pureSource + "; return { codexReferenceLineRange, buildCompactCodexReferenceText };",
+  )();
+
+  assert.deepEqual(helpers.codexReferenceLineRange("alpha\nbeta\ngamma", 6, 10), { startLine: 2, endLine: 2 });
+  assert.deepEqual(helpers.codexReferenceLineRange("alpha\nbeta\ngamma", 6, 11), { startLine: 2, endLine: 2 });
+  assert.deepEqual(helpers.codexReferenceLineRange("alpha\nbeta\ngamma", 2, 13), { startLine: 1, endLine: 3 });
+  const prompt = helpers.buildCompactCodexReferenceText({
+    path: "docs/guide.md",
+    startLine: 2,
+    endLine: 3,
+    text: "Selected line\nAnother line",
+    dirty: true,
+  });
+  assert.match(prompt, /^@docs\/guide\.md L2–3 · unsaved/);
+  assert.match(prompt, /> Selected line\n> Another line/);
+
+  assert.match(html, /id="codexReferencePopover" class="codex-reference-popover"/);
+  assert.match(html, /data-codex-reference-line/);
+  assert.match(html, /positionCodexReferenceAction/);
+  assert.match(html, /markdownReferenceSelectionRect/);
+  assert.match(html, /plainTextReferenceSelectionRect/);
+  assert.doesNotMatch(html, /data-codex-reference disabled/);
+  assert.match(html, /dirty: editor\.value !== state\.saved/);
+  assert.match(html, /api\("\/api\/codex\/reference", \{/);
+  assert.match(html, /selectedText: reference\.dirty \? reference\.text : ""/);
+  assert.match(html, /navigator\.clipboard\?\.writeText/);
+  assert.match(html, /document\.execCommand\("copy"\)/);
+  assert.match(html, /result\.nativeMention \? "Linked" : "Added"/);
+  assert.match(html, /handleCodexReferenceShortcut/);
+  assert.match(html, /keyboardEventMatchesShortcut/);
+  assert.match(html, /DEFAULT_CODEX_REFERENCE_SHORTCUT/);
+  assert.doesNotMatch(html, /domCodexReferenceSelection|exactCodexReferenceLineRange/);
+  assert.doesNotMatch(html, /codex:\/\/threads\/new|openCodexReferenceComposer/);
+  assert.doesNotMatch(pureSource, /turn\/start|saveCurrent\(/);
+});
+
+test("Codex reference API resolves an allowed file and delegates a compact reference", async (t) => {
+  const root = makeRoot();
+  initializeContextRoomProject(root, { allowedPaths: ["docs/"] });
+  fs.mkdirSync(path.join(root, "docs"), { recursive: true });
+  fs.writeFileSync(path.join(root, "docs/guide.md"), "alpha\nbeta\ngamma\n", "utf8");
+  fs.writeFileSync(path.join(root, "README.md"), "# Read only\n", "utf8");
+  fs.writeFileSync(path.join(root, ".env"), "SECRET=hidden\n", "utf8");
+  const inserted = [];
+  const { server } = createMemoryServer({
+    root,
+    codexReferenceInsert: async (reference) => {
+      inserted.push(reference);
+      return { inserted: true, nativeMention: true, activeThreadKey: "thread-1", preservedDraft: true };
+    },
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  t.after(() => new Promise((resolve, reject) => server.close((error) => error ? reject(error) : resolve())));
+  const base = `http://127.0.0.1:${server.address().port}`;
+
+  const response = await fetch(base + "/api/codex/reference", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ path: "docs/guide.md", startLine: 2, endLine: 3, selectedText: "beta\ngamma", dirty: true }),
+  });
+  const payload = await response.json();
+  const readOnlyResponse = await fetch(base + "/api/codex/reference", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ path: "README.md", startLine: 1, endLine: 1, dirty: false }),
+  });
+  const sensitiveResponse = await fetch(base + "/api/codex/reference", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ path: ".env", startLine: 1, endLine: 1, dirty: false }),
+  });
+
+  assert.equal(response.status, 200);
+  assert.equal(payload.nativeMention, true);
+  assert.deepEqual(inserted, [{
+    absolutePath: path.join(root, "docs/guide.md"),
+    displayPath: "docs/guide.md",
+    startLine: 2,
+    endLine: 3,
+    selectedText: "beta\ngamma",
+    dirty: true,
+  }, {
+    absolutePath: path.join(root, "README.md"),
+    displayPath: "README.md",
+    startLine: 1,
+    endLine: 1,
+    selectedText: "",
+    dirty: false,
+  }]);
+  assert.equal(readOnlyResponse.status, 200);
+  assert.equal(sensitiveResponse.status, 403);
+});
+
+test("Codex composer API inserts only validated text through the injected local bridge", async (t) => {
+  const root = makeRoot();
+  initializeContextRoomProject(root, { allowedPaths: ["docs/"] });
+  const inserted = [];
+  const { server } = createMemoryServer({
+    root,
+    codexComposerInsert: async (text) => {
+      inserted.push(text);
+      return { inserted: true, activeThreadKey: "thread-1", preservedDraft: true };
+    },
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  t.after(() => new Promise((resolve, reject) => server.close((error) => error ? reject(error) : resolve())));
+  const base = `http://127.0.0.1:${server.address().port}`;
+
+  const response = await fetch(base + "/api/codex/composer", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ text: "Reference\n\nRequest:\n" }),
+  });
+  const payload = await response.json();
+  const missingResponse = await fetch(base + "/api/codex/composer", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ text: "" }),
+  });
+
+  assert.equal(response.status, 200);
+  assert.deepEqual(payload, { inserted: true, activeThreadKey: "thread-1", preservedDraft: true });
+  assert.deepEqual(inserted, ["Reference\n\nRequest:\n"]);
+  assert.equal(missingResponse.status, 400);
 });
 
 test("browser refresh restores the last Context Room page", () => {
@@ -5148,9 +5298,22 @@ test("opening a file never reopens a collapsed explorer", () => {
 
 test("context health supports full refresh, acknowledged results, and simple filters", () => {
   const html = renderAppHtml();
+  const script = extractInlineAppScript(html);
+  const promptSource = script.slice(
+    script.indexOf("function buildContextHealthCodexPrompt"),
+    script.indexOf("async function sendContextHealthIssuesToCodex"),
+  );
+  const { buildContextHealthCodexPrompt } = Function(
+    promptSource + "; return { buildContextHealthCodexPrompt };",
+  )();
+  const prompt = buildContextHealthCodexPrompt([
+    { severity: "high", path: "docs/INDEX.md", message: "Broken canonical link." },
+    { severity: "medium", message: "Missing metadata." },
+  ], "/tmp/example-project");
 
   assert.match(html, /id="contextHealthPanel" class="docqa-panel">/);
   assert.match(html, /id="refreshContextHealth"[^>]*>Refresh all<\/button>/);
+  assert.match(html, /id="sendContextHealthToCodex"[^>]*><span aria-hidden="true">@<\/span> Fix in Codex<\/button>/);
   assert.doesNotMatch(html, /shown only when checks need attention/);
   assert.match(html, /contextHealthStatusFilter: "open"/);
   assert.match(html, /contextHealthSeverityFilter: "triggered"/);
@@ -5172,6 +5335,17 @@ test("context health supports full refresh, acknowledged results, and simple fil
   assert.match(html, /data-health-ack/);
   assert.match(html, /api\("\/api\/doctor\/ack"/);
   assert.match(html, /function acknowledgeContextHealthIssueFromPanel\(key\)/);
+  assert.match(html, /Fix " \+ issues\.length \+ " in Codex/);
+  assert.match(html, /api\("\/api\/codex\/composer", \{/);
+  assert.match(html, /function sendContextHealthIssuesToCodex\(\)/);
+  assert.match(html, /fix prompt added to the active Codex composer · review it before sending/);
+  assert.match(html, /el\("sendContextHealthToCodex"\)\?\.addEventListener/);
+  assert.match(prompt, /Fix the valid Context Room health issues listed below\./);
+  assert.match(prompt, /Project root: \/tmp\/example-project/);
+  assert.match(prompt, /1\. \[high\] docs\/INDEX\.md: Broken canonical link\./);
+  assert.match(prompt, /2\. \[medium\] Missing metadata\./);
+  assert.match(prompt, /Do not mark issues OK merely to hide them\./);
+  assert.doesNotMatch(promptSource, /turn\/start|submit/);
   assert.doesNotMatch(html, /<span>no metadata<\/span>/);
   assert.doesNotMatch(html, /Context health is clean\./);
 });
