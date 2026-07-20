@@ -4,7 +4,7 @@ context_room:
   scope: context-room
   status: current
   canonical_for: hub and navigation
-  last_verified: 2026-07-06
+  last_verified: 2026-07-19
   sources: [src/context_room.mjs, schemas/config.schema.json, docs/agent-configuration.md]
 ---
 
@@ -27,9 +27,11 @@ The hub is the first screen for review-first work. It keeps the review queue vis
 - The review queue is the primary hub surface. Do not bury it behind navigation.
 - The explorer is the direct path to known files and folders.
 - Cards are secondary navigation for stable project areas.
+- Fresh setup derives cards from paths that exist. It uses nonempty sections for Start here, Current documentation, Target documentation, Decisions, research, and incidents, Documentation to classify, and Agent guidance. Unclassified docs stay visible without being promoted to current truth.
 - Startup context, skills, and hooks stay collapsed until needed.
 - Cards must point only to paths covered by `allowedPaths`.
 - Browser refresh should restore the current page, file, diff state, and scroll position.
+- A current tab binds API requests to the project root established at boot. If the same origin later serves a different root, stale requests are rejected and the tab reloads before its navigation or session state can affect the new room. Browser mutations from an older tab without a project identity are also rejected with `409` and cannot write state until the tab is reloaded.
 - The first frame appears only after files, settings, and review data are ready, so the hub never assembles in visible stages.
 - Background audits reuse cached results until a relevant file or setting changes; navigation and session-state updates do not rebuild the hub.
 - Use child cards for curated structure and `autoChildren` for immediate folder children.

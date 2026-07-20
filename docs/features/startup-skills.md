@@ -4,7 +4,7 @@ context_room:
   scope: context-room
   status: current
   canonical_for: startup skills
-  last_verified: 2026-07-15
+  last_verified: 2026-07-20
   sources: [src/context_room.mjs, docs/agent-configuration.md]
 ---
 
@@ -16,8 +16,8 @@ Startup skills show skill folders that may affect future agent behavior.
 
 ## Example Flow
 
-1. Enable `startupSkills`.
-2. Configure folder names such as user or repo skill roots.
+1. Fresh setup enables `startupSkills` when the project contains a configured local skill root.
+2. Keep `projectOnly: true`, or deliberately opt into ancestor skill roots for a broader room.
 3. Open a discovered skill from the startup skills panel.
 4. Review each discovered skill entrypoint once to establish its trusted content.
 5. Create or delete skills only in writable skill folders.
@@ -25,6 +25,8 @@ Startup skills show skill folders that may affect future agent behavior.
 ## Rules
 
 - System skill folders are read-only.
+- Accepting the current content of a changed system skill records the review without rewriting the file. A reject or mixed decision that would change the file is blocked and returns the review to an actionable state.
+- Fresh configs discover project skill roots only. Existing configs without `projectOnly` retain ancestor discovery for compatibility.
 - Writable skill folders can create a new skill from the panel.
 - Startup skills can be opened in the explorer without broadening the whole project allowlist.
 - Every discovered skill entrypoint enters review once, then re-enters only after its meaningful content changes.

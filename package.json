@@ -1,6 +1,6 @@
 {
   "name": "context-room",
-  "version": "0.1.7",
+  "version": "0.1.8",
   "description": "Local-first documentation control room for AI-assisted projects.",
   "type": "module",
   "homepage": "https://github.com/Swarek/context-room#readme",

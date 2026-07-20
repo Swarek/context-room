@@ -4,7 +4,7 @@ context_room:
   scope: context-room
   status: current
   canonical_for: review queue
-  last_verified: 2026-07-15
+  last_verified: 2026-07-20
   sources: [src/context_room.mjs, bin/context-room.mjs, docs/agent-configuration.md]
 ---
 
@@ -16,9 +16,9 @@ The review queue shows watched documentation that needs verification before it b
 
 ## Example Flow
 
-1. Configure `watchAllow` and optional `reviewPaths`.
+1. Configure `watchAllow`, optional folder `watchRules`, and optional `reviewPaths`.
 2. Open a queued file.
-3. For a Git change, accept or reject every visible change; the completed diff records the review.
+3. For a Git change, accept or reject each visible change, or use `Accept all` or `Reject all` even when only one change remains; the completed diff records the review.
 4. When several files were removed together, expand the deletion set, inspect or narrow the selected paths, then confirm their removal once.
 5. For an unchanged `reviewPaths` file, read the current content and use `Mark verified`.
 6. Review newly discovered startup instructions and skills once; they return only when their content changes.
@@ -28,7 +28,10 @@ The review queue shows watched documentation that needs verification before it b
 - Review owns the final trust decision.
 - Agents may surface the queue, but should never mark files verified for the user.
 - The owner can select one or several blocking checkpoints: commit, push, pull request, or merge. Commit, push, and local merge use managed Git hooks; hosted checks require provider wiring.
-- `watchAllow` follows changed tracked files and new untracked files.
+- `watchAllow` follows changed tracked files and new untracked files in the project; an explicitly allowed `~/...` path follows the same scope using a Context Room review baseline because project Git does not own it. A folder entry keeps the compatible recursive live behavior.
+- `watchRules` can narrow a folder to current-file snapshots, direct children, or both. Only live modes admit later files; only recursive modes admit subfolder files. See [Agent configuration](../agent-configuration.md#watchrules) for the canonical mode contract.
+- The queue reviews files, not empty directories. A retained live folder rule makes eligible future files enter as new-file reviews.
+- The first eligible file discovered under an external watch is labeled new and reviewed as a whole. Verification records its local baseline; later external modifications and reviewed-file deletions receive inline baseline diffs with synthetic `M` and `D` states.
 - `reviewPaths` keeps important docs in the queue until the current content is verified.
 - Every project `AGENTS.md` is an implicit required-review path by default, even when nested outside configured documentation folders. A deliberately narrow room can set `reviewAgentInstructions` to `false`; explicit `reviewPaths` still apply.
 - Every entrypoint exposed by Startup skills requires an initial review and hash-based re-review after changes.
@@ -58,9 +61,10 @@ The review queue shows watched documentation that needs verification before it b
 ## Source Map
 
 - `buildDocQaReport` builds the queue.
+- `isWatchedPath` resolves legacy paths and the most-specific structured folder rule before queue items are admitted.
 - `buildDeletedReviewBatch` builds the current on-demand deletion page.
 - `writeDeletedReviewBatchDecision` revalidates and records selected removals.
 - `writeDocReviewDecision` records review decisions.
 - `readGlobalReviewLedger` lets multiple Context Rooms trust the same absolute path and content hash.
-- `readFileDiff`, `readReviewBaseFile`, and `startChangedFileInlineReview` power review diffs.
+- `readFileDiff`, `readReviewBaseFile`, and `startChangedFileInlineReview` power Git-backed and external-baseline review diffs.
 - `context-room guard` and `review-only` report pending review without blocking; only strict mode can fail.

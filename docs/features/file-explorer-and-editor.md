@@ -4,7 +4,7 @@ context_room:
   scope: context-room
   status: current
   canonical_for: file explorer and editor
-  last_verified: 2026-07-14
+  last_verified: 2026-07-20
   sources: [src/context_room.mjs, schemas/config.schema.json]
 ---
 
@@ -33,7 +33,8 @@ The explorer and editor expose safe project text files in one compact workspace.
 - Select Markdown text with normal editor gestures: drag, Shift-click, double-click a word, or triple-click a line. Native Delete, Backspace, cut, copy, paste, undo, redo, and keyboard selection operate on that selection.
 - Create Markdown files and folders from the explorer.
 - Select files or folders for bulk actions.
-- Add selected paths to `watchAllow` or remove them from `watchAllow`.
+- Watch one file exactly, or choose a folder watch mode for one or more selected folders.
+- Remove exact selected file watches or folder rules without changing the files themselves; an ancestor rule may still apply.
 - Delete selected files or folders after confirmation.
 - Inspect Git diffs, hide them, or revert the current file diff.
 - Keep navigating when Git diffs, pending reviews, or disk changes exist; resolve a disk conflict only before overwriting it.
@@ -41,10 +42,10 @@ The explorer and editor expose safe project text files in one compact workspace.
 ## Rules
 
 - `allowedPaths` is the edit boundary.
-- `watchAllow` is the review boundary.
+- `watchAllow` and `watchRules` form the review boundary.
 - Secret-looking paths, dependency folders, build outputs, and binary files stay out.
 - `.git`, dependencies, caches, and build outputs stay excluded even when hidden files are shown. Sensitive environment files remain read-only and expose names only, never values.
-- External startup files are shown only through explicit startup surfaces.
+- External startup files are shown through explicit startup surfaces. Other external files appear only when their `~/...` file or folder is explicitly present in `allowedPaths`.
 - Pending changes never block navigation. A disk edit becomes a conflict only when the current editor buffer differs from the last successful save; otherwise it enters normal external review.
 - File data, annotations, Git diff state, and review data load concurrently.
 - File text appears as soon as it is read; slow Git diff or review work never holds the document behind a loading screen.
@@ -57,13 +58,31 @@ The explorer and editor expose safe project text files in one compact workspace.
 - Watched HTML changes use the same review queue and source diff as other watched files.
 - Search rendering is frame-scheduled so typing stays responsive in large explorers.
 
+## Folder Watch Options
+
+Watching a folder from its context menu or a bulk selection presents four choices:
+
+| Explorer option | Config mode | Result |
+| --- | --- | --- |
+| Folder and all subfolders — current and future files | `recursive-live` | Watches eligible files now and later at any depth. This is the default. |
+| Existing files in folder and subfolders | `recursive-current` | Takes a snapshot of eligible files at any depth. Later files and folders do not join it. |
+| Existing files in this folder only | `direct-current` | Takes a snapshot of eligible immediate file children. Subfolder contents and future files stay out. |
+| This folder only — current and future files | `direct-live` | Watches eligible immediate file children now and later. Subfolder contents stay out. |
+
+Watching one file remains an exact one-click watch. Allowed folders remain visible in the Explorer even when they are empty, so a live rule can be applied before the first file exists. Folder rules govern files; Git and the review queue do not review empty directories. The recursive live option retains the folder rule, so a file created later inside a new deeply nested folder enters review as a new file.
+
+The same four options apply to an external `~/...` folder only after that folder is explicitly listed in `allowedPaths`. External watches never expand the edit boundary. Because project Git cannot describe those changes, Context Room labels a first-seen external file as new, records the accepted content in its local review baseline, and compares later edits or deletion against that baseline.
+
+For the persisted JSON contract, overlap rules, and snapshot shape, see [Agent configuration](../agent-configuration.md#watchrules).
+
 ## Source Map
 
 - `isAllowedMemoryPath` enforces the edit boundary.
-- `listMemoryFiles` and `listExplorerFiles` build file lists.
+- `listMemoryFiles`, `listExplorerFiles`, and `listExplorerDirectories` build the Explorer's file and folder nodes.
 - `readMemoryFile` and `writeMemoryFile` handle normal file IO.
 - `renderExplorerContextMenu`, `createMarkdownFile`, and `createFolder` handle explorer creation.
-- `addSelectedToWatch`, `removeSelectedFromWatch`, and `deletePaths` handle bulk actions.
+- `applyExplorerFolderWatchMode`, `showFolderWatchModeDialog`, `addSelectedToWatch`, and `removeSelectedFromWatch` apply the same four folder modes to context-menu and bulk actions.
+- `deletePaths` handles bulk deletion separately from watch configuration.
 - `renderViewer` renders preview, editor, diffs, conflicts, and annotations.
 - `contextRoomVisualDocumentStyles` supplies themed HTML components without adding CSS to each document.
 - `background_worker.mjs` keeps Git diff work off the HTTP and UI critical path.

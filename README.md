@@ -18,7 +18,7 @@ Context Room gives a repository a browser UI to map important docs, edit safe te
 1. Configure `.context-room/config.json`.
 2. Start the local UI.
 3. Edit docs inside `allowedPaths`.
-4. Review changes from `watchAllow` or `reviewPaths`.
+4. Review changes from `watchAllow`, folder `watchRules`, or `reviewPaths`.
 5. Run `doctor`, `guard`, or `brief` when you need proof.
 
 ## Quick Start
@@ -29,23 +29,19 @@ From npm:
 
 ```bash
 npm install -D context-room
-npx context-room init --title "My Project"
-npx context-room start --root . --port 4317
+npx context-room setup --title "My Project"
 ```
 
 From this repo checkout:
 
 ```bash
 npm test
-node bin/context-room.mjs init --root /path/to/project --title "My Project"
-node bin/context-room.mjs start --root /path/to/project --port 4317
+node bin/context-room.mjs setup --root /path/to/project --title "My Project"
 ```
 
-Open:
+Fresh setup discovers the project's documentation, watches it, organizes it into truth-aware hub sections, and starts on the first free local port from `4317` upward. It prints the URL. Existing Context Rooms keep running, and re-running setup preserves an existing project configuration unless an explicit setup option deliberately amends its matching field.
 
-```text
-http://127.0.0.1:4317
-```
+Open the printed `/api/health` URL and confirm that `root` is the intended project before relying on the room.
 
 ## Main Files
 
@@ -61,6 +57,7 @@ Runtime files under `.context-room/` are excluded from Git where possible. Commi
 
 ```bash
 context-room init [--title "My Project"] [--allow docs/,src/] [--watch docs/]
+context-room setup [--root .] [--title "My Project"] [--port 4317]
 context-room start [--root .] [--port 4317]
 context-room doctor [--root .] [--strict]
 context-room guard [--root .] [--profile advisory|review-only|strict] [--operation commit|push|pull-request|merge]
@@ -68,16 +65,20 @@ context-room brief [--root .] [--task "change billing onboarding"] [--limit 12]
 context-room agent queue [--root .]
 context-room agent open [--root .] [--path docs/INDEX.md] [--view hub|settings|file|diff]
 context-room agent annotate --root . --path docs/INDEX.md --note "Human-facing note"
+context-room agent watch --root . --path docs/ [--mode recursive-live|recursive-current|direct-current|direct-live]
+context-room agent unwatch --root . --path docs/
 context-room install-hooks [--root .]
 context-room update-all [--dry-run] [--no-restart] [--exclude /path]
 ```
 
 - `doctor` reports config, graph, metadata, link, startup-context, startup-hook, and hub health.
+- `setup` performs fresh project-aware initialization and starts the room; `init` remains write-only.
+- Without an explicit port, `setup` and `start` choose the first free port within the 200-port range starting at `4317` and never stop another room. An occupied explicit port fails.
 - `guard` and `review-only` are non-blocking. `--profile strict` can always fail; a selected `--operation` fails when review is pending.
 - The Review settings tab stores owner-selected gates outside project config. Local hooks cover commit, push, and local merge; pull requests and hosted merges need a required provider check.
 - `brief` ranks relevant docs locally and deterministically. It does not call an LLM.
-- `agent` commands let an agent open files, inspect the queue, and leave annotations for the human.
-- `update-all` installs the latest npm release globally and restarts every active room except a Context Room development checkout.
+- `agent` commands let an agent open files, inspect the queue, leave annotations for the human, and manage explicit folder watch rules without making review decisions.
+- `update-all` installs the latest npm release globally and restarts every verified active room it discovers except a Context Room development checkout. Before acting, it verifies each room's canonical project root through `/api/health`, so paths containing spaces are not inferred from process command text.
 
 Preview an update without changing installations or processes:
 
@@ -93,7 +94,7 @@ node scripts/update-context-rooms.mjs
 
 Project configuration and review state are preserved. Restarted rooms write logs to `~/.context-room/logs/`.
 
-## Agent HTML Context
+## Agent Context
 
 Each initialized project contains a stable agent entry point:
 
@@ -101,7 +102,7 @@ Each initialized project contains a stable agent entry point:
 .context-room/README.md
 ```
 
-Link an agent to this standalone workflow before asking it to create or edit a visual HTML document. It explains selection, structure, interaction, scale, and quality checks, then links to the detailed catalogs. Context Room refreshes the local files from the installed version on every `init` and `start`; the generated files stay out of Git.
+Link an agent to this standalone workflow when configuring the room or creating a visual HTML document. It routes project setup, then explains visual selection, structure, interaction, scale, and quality checks. Context Room refreshes the local files from the installed version on every `init`, `setup`, and `start`; the generated files stay out of Git.
 
 The reusable HTML examples are available directly at:
 
@@ -116,17 +117,21 @@ The reusable HTML examples are available directly at:
 {
   "$schema": "https://raw.githubusercontent.com/Swarek/context-room/main/schemas/config.schema.json",
   "title": "My Project",
+  "projectOnly": true,
   "allowedPaths": ["docs/", "README.md", "AGENTS.md"],
   "watchAllow": ["docs/", "README.md"],
+  "watchRules": [],
   "reviewPaths": [],
   "startupContext": {
     "enabled": true,
+    "projectOnly": true,
     "fileNames": ["AGENTS.md", "CLAUDE.md"],
-    "globalPaths": ["~/.codex/AGENTS.md"]
+    "globalPaths": []
   },
-  "startupSkills": { "enabled": true, "folderNames": [".codex/skills", "skills"] },
+  "startupSkills": { "enabled": true, "projectOnly": true, "folderNames": [".codex/skills", "skills"] },
   "startupHooks": {
     "enabled": true,
+    "projectOnly": true,
     "editable": false,
     "agentHooks": true,
     "gitHooks": true,
@@ -150,24 +155,27 @@ The reusable HTML examples are available directly at:
 
 Rules that matter:
 
-- `allowedPaths` is the edit boundary.
-- `watchAllow` controls changed files that need review.
+- `allowedPaths` is the edit boundary. Project-relative entries stay in the project; an explicit `~/...` entry authorizes that external home file or folder without making other home paths accessible.
+- Top-level `projectOnly: true` also requires ordinary allowed, watched, and hub paths to remain physically inside the project after symbolic links are resolved. Fresh setup enables it. Setting it to `false`, or omitting it in a legacy config, can make explicitly configured symlink targets outside the project both readable and editable; retain that compatibility only for trusted, established hubs.
+- `watchAllow` keeps the simple watch list. A folder entry uses the default recursive live behavior: current and future files at any depth can enter review.
+- `watchRules` stores explicit folder modes for recursive versus direct-child scope and live versus current-file snapshots. External rules must already be covered by a narrow `~/...` entry in `allowedPaths` and use Context Room review baselines because project Git does not own them. See [Agent configuration](docs/agent-configuration.md#watchrules).
 - `reviewPaths` forces review even when Git has no diff and its array order defines the human verification path. Critical safety issues still appear first. Only unchanged required-review files show `Mark verified`; Git changes are completed through the inline diff.
 - Review verification is shared by canonical absolute path and content hash.
+- The separate `startupContext.projectOnly`, `startupSkills.projectOnly`, and `startupHooks.projectOnly` flags control scanner scope. Fresh setup enables all three; broader ancestor or global discovery is opt-in.
 - `startupHooks.editable` stays `false` unless the owner wants Context Room to edit executable hook files.
 
 ## Documentation
 
-- `docs/product-overview.md`: product map and development source map.
-- `docs/features/`: clear docs for each user-facing feature.
-- `docs/agent-configuration.md`: config fields, metadata, and agent setup.
+- [Product overview](docs/product-overview.md): product map and development source map.
+- [Feature documentation](docs/features/index.md): clear docs for each user-facing feature.
+- [Agent configuration](docs/agent-configuration.md): config fields, metadata, and agent setup.
 
 ## Development
 
 ```bash
 npm test
 node bin/context-room.mjs doctor --root .
-node bin/context-room.mjs start --root . --port 4317
+node bin/context-room.mjs start --root .
 ```
 
 The package has no runtime dependencies beyond Node.js built-ins.

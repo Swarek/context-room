@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { updateAllContextRooms } from "../scripts/update-context-rooms.mjs";
@@ -12,11 +13,14 @@ import {
   initializeContextRoomProject,
   readAgentAnnotations,
   readCollaborationSessionState,
-  readMemoryWebappSettings,
   readReviewGateSettings,
+  removeFolderWatchRule,
+  selectAvailableContextRoomPort,
   syncContextRoomGitHooks,
   writeAgentCommand,
+  writeFolderWatchRule,
   CONFIG_FILE,
+  WATCH_RULE_MODES,
 } from "../src/context_room.mjs";
 
 function parseArgs(argv) {
@@ -27,7 +31,14 @@ function parseArgs(argv) {
       args._.push(arg);
       continue;
     }
-    const key = arg.slice(2);
+    const option = arg.slice(2);
+    const equalsIndex = option.indexOf("=");
+    if (equalsIndex !== -1) {
+      const key = option.slice(0, equalsIndex);
+      args[key] = option.slice(equalsIndex + 1);
+      continue;
+    }
+    const key = option;
     const next = argv[index + 1];
     if (!next || next.startsWith("--")) args[key] = true;
     else {
@@ -44,40 +55,111 @@ function splitList(value) {
 }
 
 function usage() {
-  return `Context Room\n\nUsage:\n  context-room init [--title "My Project"] [--allow docs/,src/] [--watch docs/]\n  context-room start [--port 4317] [--root .]\n  context-room doctor [--root .] [--strict]\n  context-room guard [--root .] [--profile advisory|review-only|strict] [--operation commit|push|pull-request|merge]\n  context-room brief [--root .] [--task "what the agent will do"] [--limit 12]\n  context-room agent state [--root .]\n  context-room agent open [--root .] [--path docs/INDEX.md] [--view hub|settings|file|diff] [--heading "Purpose"] [--text "needle"] [--percent 50]\n  context-room agent annotate --root . --path docs/INDEX.md --note "Human-facing note" [--target "text"]\n  context-room agent queue [--root .]\n  context-room install-hook [--root .]\n  context-room install-hooks [--root .]\n  context-room update-all [--dry-run] [--no-restart] [--exclude /path]\n\nConfig: ${CONFIG_FILE}\n`;
+  return `Context Room\n\nUsage:\n  context-room setup [--root .] [--title "My Project"] [--allow docs/] [--watch docs/] [--port 4317]\n  context-room init [--root .] [--title "My Project"] [--allow docs/] [--watch docs/]\n  context-room start [--root .] [--port 4317]\n  context-room doctor [--root .] [--strict]\n  context-room guard [--root .] [--profile advisory|review-only|strict] [--operation commit|push|pull-request|merge]\n  context-room brief [--root .] [--task "what the agent will do"] [--limit 12]\n  context-room agent state [--root .]\n  context-room agent open [--root .] [--path docs/INDEX.md] [--view hub|settings|file|diff] [--heading "Purpose"] [--text "needle"] [--percent 50]\n  context-room agent annotate --root . --path docs/INDEX.md --note "Human-facing note" [--target "text"]\n  context-room agent queue [--root .]\n  context-room agent watch --root . --path docs/ [--mode recursive-live|recursive-current|direct-current|direct-live]\n  context-room agent unwatch --root . --path docs/\n  context-room install-hook [--root .]\n  context-room install-hooks [--root .]\n  context-room update-all [--dry-run] [--no-restart] [--exclude /path]\n  context-room --version\n\nFolder watch modes:\n  recursive-live     Current and future files at any depth (default)\n  recursive-current  Current files at any depth; future files are excluded\n  direct-current     Current direct child files; future files and subfolders are excluded\n  direct-live        Current and future direct child files; subfolder files are excluded\n\nFresh setup discovers and watches project documentation, builds project-specific hub sections, and uses the first free port when --port is omitted.\n\nConfig: ${CONFIG_FILE}\n`;
+}
+
+const KNOWN_OPTIONS = new Set([
+  "advisory", "allow", "dry-run", "exclude", "h", "heading", "help", "highlight", "hook",
+  "limit", "message", "mode", "no-restart", "note", "operation", "path", "percent", "port", "profile",
+  "root", "strict", "target", "task", "text", "title", "version", "view", "watch",
+]);
+
+function packageVersion() {
+  return JSON.parse(fs.readFileSync(new URL("../package.json", import.meta.url), "utf8")).version;
+}
+
+function quotedCliValue(value) {
+  return `'${String(value).replaceAll("'", `'"'"'`)}'`;
 }
 
 const args = parseArgs(process.argv.slice(2));
 const command = args._[0] || "start";
-const root = path.resolve(args.root || process.cwd());
+
+if (args.version !== undefined) {
+  console.log(packageVersion());
+  process.exit(0);
+}
 
 if (args.help || args.h) {
   console.log(usage());
   process.exit(0);
 }
 
+const unknownOption = Object.keys(args).find((key) => key !== "_" && !KNOWN_OPTIONS.has(key));
+if (unknownOption) {
+  console.error(`Unknown option: --${unknownOption}`);
+  process.exit(2);
+}
+
+if (args.root === true || args.root === "") {
+  console.error("--root requires a path.");
+  process.exit(2);
+}
+
+if (args.title === true || args.title === "") {
+  console.error("--title requires a value.");
+  process.exit(2);
+}
+
+if (args.allow === true || args.allow === "") {
+  console.error("--allow requires a path list.");
+  process.exit(2);
+}
+
+if (args.watch === true || args.watch === "") {
+  console.error("--watch requires a path list.");
+  process.exit(2);
+}
+
+const root = path.resolve(args.root || process.cwd());
+let rootStats;
+try {
+  rootStats = fs.statSync(root);
+} catch {
+  rootStats = null;
+}
+if (!rootStats?.isDirectory()) {
+  console.error(`Context Room root must be an existing directory: ${root}`);
+  process.exit(2);
+}
+
 if (command === "init") {
-  const result = initializeContextRoomProject(root, {
-    title: args.title,
-    allowedPaths: splitList(args.allow),
-    watchAllow: splitList(args.watch),
-    preset: args.preset || "generic",
-  });
+  let result;
+  try {
+    result = initializeContextRoomProject(root, {
+      title: args.title,
+      allowedPaths: splitList(args.allow),
+      watchAllow: splitList(args.watch),
+    });
+  } catch (error) {
+    console.error(`Context Room initialization failed: ${error.message}`);
+    process.exit(1);
+  }
   console.log(`Context Room initialized: ${result.configPath}`);
-  console.log(`Agent HTML context: ${result.agentContextPath}`);
-  console.log(`Run: context-room start --root ${root}`);
+  if (result.discoverySkipped) console.log("Documentation discovery skipped: the existing configuration was preserved.");
+  else console.log(`Documentation discovered: ${result.documentationPaths.length}`);
+  console.log(`Watched paths: ${result.config.watchAllow.length}`);
+  console.log(`Hub sections: ${result.config.hubSections.length}`);
+  console.log(`Agent setup guide: ${result.agentContextPath}`);
+  console.log(`Agent next step: read ${JSON.stringify(result.agentContextPath)} and follow its setup checklist.`);
+  console.log(`Run: context-room setup --root ${quotedCliValue(root)}`);
   process.exit(0);
 }
 
 if (command === "doctor") {
-  const settings = readMemoryWebappSettings(root);
-  const report = buildContextRoomDoctorReport(root);
+  let report;
+  try {
+    report = buildContextRoomDoctorReport(root);
+  } catch (error) {
+    console.error(`Context Room doctor failed: [critical] ${error.message}`);
+    process.exit(1);
+  }
   const blocking = report.issues.filter((issue) => ["critical", "high"].includes(issue.severity));
-  console.log(`Context Room OK`);
+  console.log(blocking.length ? "Context Room needs attention" : "Context Room OK");
   console.log(`Root: ${root}`);
   console.log(`Config: ${path.join(root, CONFIG_FILE)}`);
-  console.log(`Allowed paths: ${settings.allowedPaths.length}`);
-  console.log(`Watched paths: ${settings.watchAllow.length}`);
+  console.log(`Allowed paths: ${report.settings.allowedPaths}`);
+  console.log(`Watched paths: ${report.settings.watchAllow}`);
   console.log(`Docs in graph: ${report.graph.docs}`);
   console.log(`Missing metadata: ${report.graph.missingMetadata}`);
   console.log(`Health issues: ${report.issues.length}`);
@@ -145,6 +227,41 @@ if (command === "agent") {
     console.log(JSON.stringify(buildAgentReviewQueue(root), null, 2));
     process.exit(0);
   }
+  if (action === "watch") {
+    if (!args.path || args.path === true) {
+      console.error("Usage: context-room agent watch --root . --path docs/ [--mode recursive-live|recursive-current|direct-current|direct-live]");
+      process.exit(2);
+    }
+    if (args.mode === true || args.mode === "") {
+      console.error("--mode requires a folder watch mode.");
+      process.exit(2);
+    }
+    const mode = args.mode ? String(args.mode).trim() : "recursive-live";
+    if (!WATCH_RULE_MODES.includes(mode)) {
+      console.error(`Unknown folder watch mode: ${mode}. Expected one of: ${WATCH_RULE_MODES.join(", ")}.`);
+      process.exit(2);
+    }
+    try {
+      console.log(JSON.stringify(writeFolderWatchRule(root, { path: args.path, mode }), null, 2));
+    } catch (error) {
+      console.error(`Unable to watch folder: ${error.message}`);
+      process.exit(1);
+    }
+    process.exit(0);
+  }
+  if (action === "unwatch") {
+    if (!args.path || args.path === true) {
+      console.error("Usage: context-room agent unwatch --root . --path docs/");
+      process.exit(2);
+    }
+    try {
+      console.log(JSON.stringify(removeFolderWatchRule(root, { path: args.path }), null, 2));
+    } catch (error) {
+      console.error(`Unable to unwatch folder: ${error.message}`);
+      process.exit(1);
+    }
+    process.exit(0);
+  }
   if (action === "open" || action === "navigate" || action === "scroll" || action === "highlight") {
     const targetType = args.heading ? "heading" : args.text ? "text" : args.percent !== undefined ? "percent" : "";
     const targetValue = args.heading || args.text || args.percent || "";
@@ -209,14 +326,58 @@ if (command === "update-all") {
   process.exit(0);
 }
 
-if (command === "start") {
-  const port = Number(args.port || 4317);
-  initializeContextRoomProject(root, {});
-  const { server } = createMemoryServer({ root, port });
-  server.listen(port, "127.0.0.1", () => {
-    console.log(`Context Room: http://127.0.0.1:${port}`);
+if (command === "start" || command === "setup") {
+  if (args.port === true || args.port === "") {
+    console.error("--port requires a number.");
+    process.exit(2);
+  }
+  const preferredPort = args.port === undefined ? 4317 : Number(args.port);
+  let port;
+  try {
+    port = await selectAvailableContextRoomPort(preferredPort, { allowFallback: args.port === undefined });
+  } catch (error) {
+    console.error(error.message);
+    process.exit(1);
+  }
+  let initialized;
+  let server;
+  try {
+    initialized = initializeContextRoomProject(root, {
+      title: args.title,
+      allowedPaths: splitList(args.allow),
+      watchAllow: splitList(args.watch),
+    });
+    ({ server } = createMemoryServer({ root, port }));
+  } catch (error) {
+    console.error(`Context Room setup failed: ${error.message}`);
+    process.exit(1);
+  }
+  try {
+    await new Promise((resolve, reject) => {
+      const onError = (error) => reject(error);
+      server.once("error", onError);
+      server.listen(port, "127.0.0.1", () => {
+        server.off("error", onError);
+        resolve();
+      });
+    });
+    const url = `http://127.0.0.1:${port}`;
+    const response = await fetch(url + "/api/health", { signal: AbortSignal.timeout(3000) });
+    const health = await response.json();
+    if (!response.ok || !health.ok || path.resolve(health.root) !== root) throw new Error("Context Room health check returned the wrong project root.");
+    if (port !== preferredPort) console.log(`Port ${preferredPort} is in use; selected ${port} without stopping another Context Room.`);
+    console.log(`Context Room: ${url}`);
     console.log(`Root: ${root}`);
-  });
+    console.log(`Health: ${url}/api/health`);
+    console.log(`Watched paths: ${initialized.config.watchAllow.length}`);
+    console.log(`Hub sections: ${initialized.config.hubSections.length}`);
+    console.log(`Agent setup guide: ${initialized.agentContextPath}`);
+    console.log(`Agent next step: read ${JSON.stringify(initialized.agentContextPath)} and follow its setup checklist.`);
+  } catch (error) {
+    console.error(`Context Room failed to start: ${error.message}`);
+    if (server.listening) server.close();
+    process.exit(1);
+  }
 } else {
   console.error(`Unknown command: ${command}\n`);
   console.error(usage());

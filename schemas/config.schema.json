@@ -14,18 +14,29 @@
       "type": "string",
       "description": "Display title for this project."
     },
+    "projectOnly": {
+      "type": "boolean",
+      "description": "When true, ordinary project paths must remain physically inside this project root after symbolic links are resolved. Fresh setup writes true. False, or omission in a legacy config, can make configured external symlink targets readable and editable; retain that mode only for trusted established hubs.",
+      "default": false
+    },
     "allowedPaths": {
       "type": "array",
-      "description": "Safety boundary. Context Room can only read/write editable text files inside these files or folders.",
-      "items": { "$ref": "#/$defs/projectPath" },
+      "description": "Safety boundary. Context Room can only read/write editable text files inside these project-relative files or folders and explicitly listed ~/... home paths.",
+      "items": { "$ref": "#/$defs/allowedPath" },
       "uniqueItems": true,
       "default": ["docs/", "context/", "skills/", "README.md", "AGENTS.md"]
     },
     "watchAllow": {
       "type": "array",
-      "description": "Files or folders to monitor for the review queue. Changed tracked files and new untracked files under watched folders appear for verification.",
-      "items": { "$ref": "#/$defs/projectPath" },
+      "description": "Simple files or folders to monitor for the review queue. Folder entries use recursive-live behavior: current and future files at any depth can appear for verification.",
+      "items": { "$ref": "#/$defs/allowedPath" },
       "uniqueItems": true,
+      "default": []
+    },
+    "watchRules": {
+      "type": "array",
+      "description": "Explicit folder watch rules covered by allowedPaths. Use these when a folder needs direct-child scope or a frozen current-file snapshot instead of the default recursive-live behavior.",
+      "items": { "$ref": "#/$defs/watchRule" },
       "default": []
     },
     "reviewPaths": {
@@ -48,10 +59,15 @@
     },
     "startupContext": {
       "type": "object",
-      "description": "Optional scanner for agent instruction files above the Context Room root. These files are shown read-only and never added to the explorer.",
+      "description": "Optional scanner for agent instruction files in the project or, when projectOnly is false, its ancestors and explicit global paths. External files stay separate from the normal explorer.",
       "additionalProperties": true,
       "properties": {
         "enabled": { "type": "boolean", "default": false },
+        "projectOnly": {
+          "type": "boolean",
+          "description": "When true, scan only this project root and ignore ancestor and explicit global instruction files.",
+          "default": false
+        },
         "fileNames": {
           "type": "array",
           "items": { "type": "string", "minLength": 1 },
@@ -69,10 +85,15 @@
     },
     "startupSkills": {
       "type": "object",
-      "description": "Optional scanner for skill folders above the Context Room root. These folders are shown read-only and never added to the explorer.",
+      "description": "Optional scanner for project skill folders or, when projectOnly is false, matching folders in ancestor directories.",
       "additionalProperties": true,
       "properties": {
         "enabled": { "type": "boolean", "default": true },
+        "projectOnly": {
+          "type": "boolean",
+          "description": "When true, scan skill folders only inside this project root instead of every ancestor directory.",
+          "default": false
+        },
         "folderNames": {
           "type": "array",
           "items": { "type": "string", "minLength": 1 },
@@ -87,6 +108,11 @@
       "additionalProperties": true,
       "properties": {
         "enabled": { "type": "boolean", "default": true },
+        "projectOnly": {
+          "type": "boolean",
+          "description": "When true, scan agent hook configuration only inside this project root. Effective Git hooks and project hook-manager files remain project-scoped.",
+          "default": false
+        },
         "editable": {
           "type": "boolean",
           "description": "When true, Context Room can edit detected hook files. Off by default because hooks execute code.",
@@ -203,7 +229,7 @@
     "projectPath": {
       "type": "string",
       "minLength": 1,
-      "not": { "pattern": "(^/|^\\.\\.|/\\.\\./|\\u0000)" },
+      "not": { "pattern": "(^/|^~/|^\\.\\.|/\\.\\./|\\u0000)" },
       "examples": ["README.md", "AGENTS.md", "docs/", "context/architecture.md", "skills/review.md"]
     },
     "homePath": {
@@ -212,6 +238,45 @@
       "pattern": "^~/",
       "not": { "pattern": "(/\\.\\./|\\u0000)" },
       "examples": ["~/.codex/AGENTS.md"]
+    },
+    "allowedPath": {
+      "oneOf": [
+        { "$ref": "#/$defs/projectPath" },
+        { "$ref": "#/$defs/homePath" }
+      ]
+    },
+    "watchRule": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "mode"],
+      "properties": {
+        "path": {
+          "$ref": "#/$defs/allowedPath",
+          "description": "Allowed folder governed by this rule, conventionally written with a trailing slash. It can be project-relative or an explicit ~/... path already listed in allowedPaths."
+        },
+        "mode": {
+          "type": "string",
+          "enum": ["recursive-live", "recursive-current", "direct-current", "direct-live"],
+          "description": "recursive-live watches current and future files at any depth; recursive-current snapshots current files at any depth; direct-current snapshots current immediate file children; direct-live watches current and future immediate file children."
+        },
+        "files": {
+          "type": "array",
+          "description": "Frozen eligible file paths for a current-file mode. Paths are normally project-relative; configured ~/ integrations are also supported. Context Room populates this list when the rule is created.",
+          "items": { "$ref": "#/$defs/allowedPath" },
+          "uniqueItems": true
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "mode": { "enum": ["recursive-current", "direct-current"] }
+            },
+            "required": ["mode"]
+          },
+          "then": { "required": ["files"] }
+        }
+      ]
     },
     "section": {
       "type": "object",

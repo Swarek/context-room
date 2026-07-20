@@ -4,7 +4,7 @@ context_room:
   scope: context-room
   status: current
   canonical_for: agent configuration
-  last_verified: 2026-07-15
+  last_verified: 2026-07-20
   sources: [bin/context-room.mjs, src/context_room.mjs, schemas/config.schema.json]
 ---
 
@@ -16,7 +16,7 @@ Project behavior is configured with one JSON file:
 .context-room/config.json
 ```
 
-That file is the contract between the project owner, the UI, and AI agents. If an agent needs to add a card, create a sub-card, change which folders are watched, or adjust the safe editable surface, it should edit this JSON file and then run `context-room doctor`.
+That file is the contract between the project owner, the UI, and AI agents. Fresh setup derives it from the documentation that actually exists in the project. If an agent later needs to curate a card or safe editable surface, it should edit this JSON file and then run `context-room doctor`. For folder watch rules, prefer `context-room agent watch` and `context-room agent unwatch` so snapshots are captured consistently.
 
 Appearance preferences are shared across every Context Room on the computer and stored separately:
 
@@ -34,17 +34,49 @@ The human-owned review gate is also stored separately:
 
 Use the Review tab in Settings to choose any combination of `commit`, `push`, `pull request`, and `merge`. This policy is local to the worktree, excluded from Git, omitted from project configuration, and not writable through the Context Room agent CLI. Context Room treats it as owner-controlled policy; it is not a security boundary against a process with unrestricted filesystem access.
 
+## Fresh project setup
+
+Use one command to initialize the project-aware configuration and start an isolated room:
+
+```bash
+context-room setup --root . --title "My Project"
+```
+
+For a fresh project, `setup` and `init` inspect the existing repository before writing configuration. They:
+
+- discover project-owned documentation, indexes, agent instructions, skills, runbooks, decisions, and records;
+- add safe documentation surfaces to `allowedPaths` and `watchAllow`;
+- organize discovered docs into the nonempty sections Start here, Current documentation, Target documentation, Decisions, research, and incidents, Documentation to classify, and Agent guidance;
+- keep startup context, skills, and hooks project-only by default; and
+- leave existing `AGENTS.md`, CLAUDE.md, documentation, and owner-controlled review policy unchanged.
+
+`init` remains write-only. `setup` continues into the local server. Re-running either command preserves an existing `.context-room/config.json`, including intentionally empty or curated lists, instead of rebuilding it from inference. Explicit `--title`, `--allow`, or `--watch` options amend only their matching fields and preserve extension fields permitted by the schema. Invalid JSON stops setup without overwriting the file.
+
+When no port is supplied, `setup` and `start` select the first free port within the 200-port range starting at `4317`. They never stop another Context Room. An explicitly requested occupied port fails with a clear error.
+
+After startup, open the printed `/api/health` URL and confirm that `root` is the intended absolute project path. A current tab also binds itself to that root. If the same port later serves another project, the server rejects requests carrying the stale identity and the current tab reloads before old project state can be written into the new room. During an upgrade, browser-originated mutations from an older tab that sends no project identity are rejected with `409`; reload that tab once before editing. Headerless non-browser API and CLI requests remain compatible.
+
+Run the deterministic configuration check as well:
+
+```bash
+context-room doctor --root .
+```
+
+Setup is complete when the health endpoint reports the intended root, watched and hub paths resolve inside `allowedPaths`, the hub exposes the discovered documentation clearly, and `doctor` has no unresolved high- or critical-severity setup issue.
+
 ## Configuration intent checklist
 
 Use this checklist to make the intended setup clear before checking field details. The schema and `context-room doctor` validate JSON syntax.
 
 Check intent:
 
-- `allowedPaths` exposes only safe editable text.
-- `watchAllow` contains the docs, skills, and agent instructions that must be reviewed after changes.
+- `allowedPaths` exposes only safe editable text. A `~/...` entry is an explicit external authorization, so keep it as narrow as a project-relative entry.
+- Top-level `projectOnly` controls physical containment for ordinary project paths. Fresh setup writes `true`. Setting it to `false`, or omitting it in a legacy config, can make configured symlink targets outside the project readable and editable; retain that compatibility only for trusted, established hubs.
+- `watchAllow` contains simple file watches and legacy/default recursive live folder watches.
+- `watchRules` contains folder watches that need an explicit recursive/direct and live/current-files mode.
 - `reviewPaths` is used only for files that must be reviewed even without a Git diff.
-- `hubSections` matches the clearest project navigation path.
-- `startupContext`, `startupSkills`, and `startupHooks` show what can affect agent behavior before work starts.
+- `hubSections` separates current truth, target truth, and records when the project makes those distinctions.
+- Fresh `startupContext`, `startupSkills`, and `startupHooks` settings expose project-local surfaces only unless the owner opts into broader scanning.
 - Hook editing stays off unless the project owner explicitly wants Context Room to edit executable files.
 
 If those boundaries are right, the exact JSON shape is a mechanical concern.
@@ -59,27 +91,70 @@ If those boundaries are right, the exact JSON shape is a mechanical concern.
 
 Safety boundary.
 
-Context Room only reads and writes editable text files inside these files or folders. Keep this list narrow and documentation-focused.
+Context Room only reads and writes editable text files inside these files or folders. Project-relative entries stay inside the room's normal project boundary. An entry beginning with `~/` explicitly authorizes that home file or folder even though Git in the project does not own it. Keep both forms narrow and documentation-focused.
+
+Set top-level `projectOnly: true` to require every ordinary allowed, watched, and hub path to remain physically inside the project root after symbolic links are resolved. Fresh setup writes this flag. Setting it to `false`, or omitting it in an existing configuration, preserves established symlink documentation hubs but can make their configured targets outside the project both readable and editable. Use that mode only for trusted, established hubs. This flag does not govern explicit `~/...` integrations.
+
+The three nested startup scanner flags have a separate purpose: they control whether instruction, skill, and hook discovery stays inside the project or includes compatible ancestor/global sources.
 
 Good examples:
 
 ```json
-"allowedPaths": ["docs/", "skills/", "README.md", "AGENTS.md"]
+"allowedPaths": ["docs/", "skills/", "README.md", "AGENTS.md", "~/shared-project-docs/"]
 ```
 
-Avoid secrets, dependency folders, build outputs, generated files, private exports, and binary assets.
+Do not use `~/` as a broad filesystem browser. Avoid secrets, dependency folders, build outputs, generated files, private exports, and binary assets. External entries remain subject to the same supported-text and blocked-path checks as project entries.
 
 ### `watchAllow`
 
 Review boundary.
 
-Files and folders here appear in the review queue when they are changed or newly created. This is where you put the documentation and skills that must be easy to review after agent work.
+Files here enter the review queue when they change. Folder entries use `recursive-live`: current and future eligible files at any depth enter the queue. Project files use Git status; files under an explicit `~/...` `allowedPaths` boundary use Context Room's local review baseline. This remains the compatible simple format for existing configurations.
 
 Good examples:
 
 ```json
 "watchAllow": ["docs/", "skills/", "AGENTS.md", "docs/decisions/"]
 ```
+
+### `watchRules`
+
+Explicit folder review boundary.
+
+Use `watchRules` when a folder needs a mode other than the default recursive live behavior. Each rule stores an allowed folder path—normally project-relative, or an explicit `~/...` path already present in `allowedPaths`—and one of four modes:
+
+Here, an eligible file is an allowed, supported text file that passes Context Room's secret, dependency, build-output, binary, and containment exclusions.
+
+| Mode | Existing files | Future files | Subfolder files |
+| --- | --- | --- | --- |
+| `recursive-live` | Included | Included | Included at any depth |
+| `recursive-current` | Included in a saved snapshot | Excluded | Included in the snapshot at any depth |
+| `direct-current` | Included in a saved snapshot | Excluded | Excluded |
+| `direct-live` | Included | Included | Excluded |
+
+`recursive-live` is the default when the Explorer or agent CLI does not specify a mode. A live rule stays active after it is created. For example, `recursive-live` includes a file later created inside a new nested folder, while `direct-live` includes only future files whose immediate parent is the watched folder.
+
+The two `current` modes persist the eligible file paths in `files` when the rule is created. They do not expand when later files or folders appear. Context Room reviews files, not empty directory objects: saying that a folder is watched means a live rule is retained so eligible files created under it can enter the queue.
+
+```json
+"watchRules": [
+  {
+    "path": "docs/",
+    "mode": "recursive-current",
+    "files": ["docs/index.md", "docs/guides/setup.md"]
+  },
+  {
+    "path": "decisions/",
+    "mode": "direct-live"
+  }
+]
+```
+
+Keep snapshot `files` inside their rule path. `recursive-current` may list descendants at any depth; `direct-current` lists only immediate file children. When rules overlap, the most specific matching path controls a file. An explicit structured rule wins a tie with a `watchAllow` folder entry at the same path.
+
+The Explorer and agent CLI require an existing folder covered by `allowedPaths`; adding a watch rule never widens the edit boundary. They remove that same folder from `watchAllow` when they upsert a structured rule, leaving one owner for the scope. Use those surfaces to create snapshot rules so Context Room records the eligible files correctly. Removing an exact folder rule does not create an exclusion; a broader ancestor rule may still watch files below it.
+
+External watched files are not assigned invented Git history. Their first appearance is a new-file first review. Accepting it records a local baseline; later edits and deletions are reviewed against that baseline. A live external rule also admits later eligible files according to its recursive or direct-child scope. The shared ledger still keys trust by canonical absolute path, so another room watching the same external file can reuse a matching verified content hash.
 
 ### `reviewPaths`
 
@@ -122,21 +197,23 @@ Use hub sections for the paths that should be opened first. A card can point to 
 }
 ```
 
-Use nested cards only when a folder needs a curated hierarchy. Use `autoChildren: true` when immediate children are enough.
+Fresh setup builds sections from discovered documentation rather than retaining generic cards for paths that do not exist. Explicit `_target`, `target`, `plans`, `proposals`, and `roadmap` paths go under Target documentation; a generic `draft` status alone does not prove target ownership and remains under Documentation to classify. Decisions, research, history, and incidents get their own records section. Entry points and indexes go under Start here unless their path makes them target or record material. Documentation explicitly marked `current` goes under Current documentation. Missing or invalid status metadata remains under Documentation to classify unless an explicit target or record path supplies its truth state; it is never presented as current truth. Project instructions plus safe skill documentation appear under Agent guidance. Empty sections are omitted.
 
 ### `startupContext`
 
 Startup context scanner.
 
-When enabled, Context Room lists matching files from the filesystem root down to the Context Room root. `globalPaths` adds explicit tool-level files such as `~/.codex/AGENTS.md`. This is useful for checking which instruction files may be injected before an agent starts working.
+When enabled, Context Room lists matching instruction files. Fresh setup writes `projectOnly: true` and enables this scanner only when the project contains a matching local instruction file. In that mode, it does not traverse ancestor folders or load global instruction paths. Owners can set `projectOnly: false` and configure `globalPaths` when they intentionally want broader startup context.
 
-These files are read-only in Context Room and do not appear in the explorer.
+Existing configs without `projectOnly` keep the previous ancestor-scanning behavior for compatibility.
+
+Project-local instruction files can also appear in the normal explorer, where project `AGENTS.md` files are automatically editable and watched. Ancestor and global startup-context files stay outside the project explorer.
 
 Startup context files outside the Context Room root are not Git-reviewable from the project. Context Room requires an initial review of each one and stores an untrusted observation baseline immediately at discovery. An edit made before the first human decision therefore appears as a real inline diff. Accepting or rejecting visible changes updates the local baseline for future reviews. Content that changed before the first observation still requires Git history, a backup, or another recovered snapshot.
 
 ### Generated agent context
 
-Context Room writes its installed HTML visual guidance to `.context-room/`. The stable entry point is `.context-room/README.md`; it is a standalone creation guide and links to the full usage contract, pattern reference, and both visual catalogs in `.context-room/agent-context/`. `context-room init` and `context-room start` refresh these generated files, so agents can use one project-local path without depending on the npm installation location. The generated files are local runtime material and excluded from Git.
+Context Room writes its installed setup and HTML visual guidance to `.context-room/`. The stable entry point is `.context-room/README.md`; it routes an agent through project setup and links to the full visual usage contract, pattern reference, and catalogs in `.context-room/agent-context/`. `context-room init`, `setup`, and `start` refresh these generated files, so agents can use one project-local path without depending on the npm installation location. The generated files are local runtime material and excluded from Git.
 
 The explorer shows safe hidden files, including this generated folder, by default. `Show hidden files` is a computer-wide Appearance preference; disabling it hides dotfiles and dotfolders without changing project configuration or deleting anything.
 
@@ -144,7 +221,7 @@ The explorer shows safe hidden files, including this generated folder, by defaul
 
 Startup skill scanner.
 
-When enabled, Context Room lists configured skill folders such as `.codex/skills` or `skills`. This helps users see which reusable instructions may affect future agent work.
+When enabled, Context Room lists configured skill folders such as `.codex/skills` or `skills`. Fresh setup enables it only when one of those folders exists locally and writes `projectOnly: true`, preventing discovery in ancestor folders. Existing configs without `projectOnly` keep ancestor discovery for compatibility.
 
 Startup skills can be opened in the explorer without making the whole project editable.
 
@@ -154,7 +231,7 @@ Every discovered skill entrypoint requires an initial review, including skills o
 
 Startup hook scanner.
 
-When enabled, Context Room lists hook files that can affect agent work, commits, or validation. It scans AI coding agent hook sources from `agentHookSources`, effective Git hook directories including `core.hooksPath`, and common hook managers such as Husky, Lefthook, pre-commit, lint-staged, and `package.json` hook config.
+When enabled, Context Room lists hook files that can affect agent work, commits, or validation. Fresh setup keeps hooks enabled with `projectOnly: true`: it scans project-local AI-agent and hook-manager paths plus the current repository's effective Git hooks, without walking unrelated ancestor projects. Existing configs without `projectOnly` retain their broader discovery behavior.
 
 Each `agentHookSources` entry names one agent system and the config/plugin paths to scan. This keeps Context Room usable with Codex, Claude Code, OpenCode, or any other coding agent without hard-coding one vendor as the default mental model.
 
@@ -200,9 +277,9 @@ Keep metadata small. The goal is not bureaucracy; it lets Context Room find stal
 ## Rules for agents
 
 1. Treat `.context-room/config.json` as the source of truth for Context Room setup.
-2. Prefer editing the JSON directly over clicking in the UI when doing repository setup.
+2. Start with `context-room setup`; edit the JSON directly only when the inferred project map needs deliberate curation.
 3. Keep `allowedPaths` conservative: documentation, skills, runbooks, agent instructions, and safe text files.
-4. Put the truly important docs in `watchAllow`, not every file in the repo.
+4. Put the truly important docs in `watchAllow` or an explicit `watchRules` mode, not every file in the repo. Use `context-room agent watch` to create folder snapshots.
 5. Use stable lowercase IDs with dashes, for example `agent-context`, `architecture`, `release-runbooks`.
 6. Preserve the `$schema` field so editors and agents can validate the file shape.
 7. After editing config, run:
@@ -229,8 +306,10 @@ context-room brief --task "change billing onboarding"
 10. If available, start the UI and smoke-test the hub and review queue:
 
 ```bash
-context-room start --port 4317
+context-room start --root .
 ```
+
+Without `--port`, Context Room selects a free port and prints the URL. Do not stop or reuse an unrelated room to obtain a preferred port.
 
 11. To install or refresh the local Git hooks selected by the owner review gate, run:
 
@@ -260,22 +339,18 @@ context-room guard
 ## Agent setup prompt
 
 ```text
-Configure Context Room for this repository.
-
-Edit `.context-room/config.json` directly.
+Configure Context Room for this repository with `context-room setup --root .`.
 
 Goal: make the documentation and agent skills easy to navigate, maintain, and verify.
 
-1. Inspect the repo structure.
-2. Identify docs, skills, runbooks, agent instructions, prompts, and decision records.
-3. Add them to `allowedPaths` only if they are safe editable text surfaces.
-4. Add the critical ones to `watchAllow` so future agent changes are reviewable.
-5. Organize `hubSections` into clear cards and nested cards.
-6. Keep IDs stable and lowercase with dashes.
-7. Prefer structured Markdown templates with `context_room` metadata.
-8. Run `context-room doctor`.
-9. Leave `.context-room/review-gate.json` to the project owner; agents do not change the selected operations.
-10. Run `context-room guard` to inspect the watched docs queue without blocking work.
-11. Optionally run `context-room brief --task "..."` before an agent starts a focused change.
-12. Do not include secrets, .env files, build outputs, node_modules, private exports, or generated artifacts.
+1. Read the root README, every applicable project `AGENTS.md` or CLAUDE.md, and existing documentation indexes. Do not create, replace, or append agent instructions merely to configure Context Room.
+2. Confirm that the discovered docs, skills, runbooks, decisions, and records are project-owned safe text surfaces.
+3. Check that important docs are in `watchAllow` or an appropriate `watchRules` mode, not only `allowedPaths`. Use `context-room agent watch` for explicit folder modes so current-file snapshots are captured consistently.
+4. Check that `hubSections` separates Start here, Current documentation, Target documentation, records, unclassified docs, and Agent guidance where those groups exist.
+5. Preserve existing config values and leave `.context-room/review-gate.json` to the project owner.
+6. Keep startup scanners project-only unless the owner explicitly requests ancestor or global context.
+7. Run `context-room doctor --root .` and resolve high- or critical-severity setup issues.
+8. Open the printed `/api/health` URL and confirm that `root` matches this repository.
+9. Run `context-room guard` to inspect the watched-doc queue without blocking work.
+10. Do not include secrets, `.env` files, private data, build outputs, dependencies, exports, or generated artifacts.
 ```

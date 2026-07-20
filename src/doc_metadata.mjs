@@ -78,22 +78,30 @@ export function parseDocMetadata(content = "", relPath = "") {
     return {
       present: false,
       parseError: "",
+      statusValid: false,
       ...normalizeDocMetadata({}, relPath),
+      status: "",
     };
   }
   try {
     const parsed = parseSimpleYaml(frontmatter.data);
     const raw = parsed.context_room || parsed.contextRoom || {};
+    const declaredStatus = String(raw.status || "").trim();
+    const statusValid = DOC_METADATA_STATUSES.includes(declaredStatus);
     return {
       present: Boolean(parsed.context_room || parsed.contextRoom),
       parseError: "",
+      statusValid,
       ...normalizeDocMetadata(raw, relPath),
+      status: statusValid ? declaredStatus : "",
     };
   } catch (error) {
     return {
       present: false,
       parseError: error.message,
+      statusValid: false,
       ...normalizeDocMetadata({}, relPath),
+      status: "",
     };
   }
 }

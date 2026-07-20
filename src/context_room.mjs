@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import fs from "node:fs";
 import http from "node:http";
+import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import { execFileSync } from "node:child_process";
@@ -29,6 +30,13 @@ export const REVIEW_GATE_FILE = `${CONFIG_DIR}/review-gate.json`;
 export const AGENT_CONTEXT_DIR = `${CONFIG_DIR}/agent-context`;
 export const AGENT_CONTEXT_FILE = `${CONFIG_DIR}/README.md`;
 const LEGACY_AGENT_CONTEXT_FILE = `${AGENT_CONTEXT_DIR}/README.md`;
+const AGENT_CONTEXT_ASSET_FILENAMES = [
+  "agent-configuration.md",
+  "html-visual-documents.md",
+  "html-visual-patterns.md",
+  "context-room-visual-components.html",
+  "context-room-data-visual-components.html",
+];
 export const GLOBAL_PREFERENCES_FILE = "~/.context-room/preferences.json";
 const CONFIG_SCHEMA_URL = "https://raw.githubusercontent.com/Swarek/context-room/main/schemas/config.schema.json";
 const DOCQA_REVIEW_STATE = `${CONFIG_DIR}/review-state.json`;
@@ -41,12 +49,39 @@ const COLLAB_AGENT_ANNOTATIONS = `${CONFIG_DIR}/agent-annotations.json`;
 const MEMORY_WEBAPP_SETTINGS = CONFIG_FILE;
 const REVIEW_GATE_OPERATIONS = Object.freeze(["commit", "push", "pull-request", "merge"]);
 const DEFAULT_REVIEW_GATE = Object.freeze({ operations: [] });
+export const WATCH_RULE_MODES = Object.freeze(["recursive-live", "recursive-current", "direct-current", "direct-live"]);
+export const WATCH_RULE_MODE_OPTIONS = Object.freeze([
+  { id: "recursive-live", label: "Folder and all subfolders — current and future files", description: "Default. New eligible files at any depth enter the review queue." },
+  { id: "recursive-current", label: "Existing files in folder and subfolders", description: "Freeze the eligible files that exist now at any depth." },
+  { id: "direct-current", label: "Existing files in this folder only", description: "Freeze only the eligible files that are direct children now." },
+  { id: "direct-live", label: "This folder only — current and future files", description: "Include new direct children, but never files inside subfolders." },
+]);
+const CURRENT_FILE_WATCH_RULE_MODES = new Set(["recursive-current", "direct-current"]);
 const CONTEXT_ROOM_HOOK_MARKER = "# Managed by Context Room review gate.";
 const HERMES_CRON_JOBS_FILE = "~/.hermes/cron/jobs.json";
 const HERMES_CRON_JOBS_FOLDER = "~/.hermes/cron/jobs/";
 const HERMES_CRON_MD_FOLDER = "~/.hermes/cron/jobs-md/";
 const DEFAULT_STARTUP_CONTEXT = { enabled: false, fileNames: ["AGENTS.md", "CLAUDE.md"], globalPaths: ["~/.codex/AGENTS.md"] };
 const DEFAULT_STARTUP_SKILLS = { enabled: true, folderNames: [".codex/skills", "skills"] };
+const PROJECT_DOCUMENTATION_DIR_NAMES = new Set([
+  "docs",
+  "doc",
+  "documentation",
+  "handbook",
+  "guides",
+  "runbooks",
+  "adr",
+  "adrs",
+  "decisions",
+  "history",
+  "incidents",
+  "research",
+]);
+const PROJECT_DOCUMENTATION_EXTENSIONS = new Set([".md", ".mdx", ".html", ".htm"]);
+const PROJECT_AGENT_INSTRUCTION_NAMES = new Set(["AGENTS.md", "CLAUDE.md", ".hermes.md"]);
+const PROJECT_RECORD_DIR_NAMES = new Set(["adr", "adrs", "decisions", "history", "incidents", "research"]);
+const PROJECT_STRONG_DOCUMENTATION_DIR_NAMES = new Set(["docs", "doc", "documentation", "handbook", "guides", "runbooks"]);
+const PROJECT_DOCUMENTATION_VENDOR_DIR_NAMES = new Set(["vendor", "vendors", "third_party", "third-party", "external"]);
 const DEFAULT_AGENT_HOOK_SOURCES = [
   { id: "codex", label: "Codex", paths: [".codex/hooks.json"] },
   { id: "claude-code", label: "Claude Code", paths: [".claude/settings.json", ".claude/settings.local.json"] },
@@ -156,6 +191,7 @@ const BACKGROUND_REPORT_INVALIDATING_PATHS = new Set([
   "/api/startup-context/delete",
   "/api/startup-hooks/file",
   "/api/settings",
+  "/api/watch-rule",
   "/api/doctor/ack",
   "/api/docqa/review",
   "/api/docqa/review-deletions",
@@ -541,12 +577,16 @@ export function resolveMemoryPath(root, relPath) {
     throw new Error(`Path not allowed in context room: ${relPath}`);
   }
   const external = resolveExternalPath(normalized);
-  if (external) return external;
+  if (external) {
+    assertExternalPathContained(normalized, settings, { allowMissing: true });
+    return external;
+  }
   const resolvedRoot = path.resolve(root);
   const resolvedPath = path.resolve(resolvedRoot, normalized);
   if (resolvedPath !== resolvedRoot && !resolvedPath.startsWith(`${resolvedRoot}${path.sep}`)) {
     throw new Error(`Path escapes repository root: ${relPath}`);
   }
+  if (settings.projectOnly) assertProjectPathContained(resolvedRoot, resolvedPath, { allowMissing: true, label: relPath });
   return resolvedPath;
 }
 
@@ -591,6 +631,7 @@ export function listMemoryFiles(root = process.cwd(), { externalRoots = [] } = {
     }
     const absPath = path.join(root, clean);
     if (!fs.existsSync(absPath)) continue;
+    if (settings.projectOnly && !projectPathIsContained(root, absPath)) continue;
     const stats = fs.statSync(absPath);
     const found = stats.isDirectory() ? walkTextFiles(absPath, root, settings) : [clean];
     for (const rel of found) {
@@ -635,7 +676,12 @@ export function listMemoryFiles(root = process.cwd(), { externalRoots = [] } = {
   }
 
   return [...byPath.values()]
-    .filter((file) => isAllowedMemoryPath(file.path, settings))
+    .filter((file) => {
+      if (!isAllowedMemoryPath(file.path, settings)) return false;
+      if (resolveExternalPath(file.path)) return true;
+      const abs = path.join(root, file.path);
+      return !settings.projectOnly || !pathEntryExists(abs) || projectPathIsContained(root, abs);
+    })
     .map((file) => {
       if (isCronJobVirtualPath(file.path)) return cronJobVirtualMetadata(file);
       if (isCronJobMarkdownPath(file.path)) return cronJobMarkdownMetadata(file);
@@ -667,6 +713,7 @@ export function listExplorerFiles(root = process.cwd(), { externalRoots = [], sh
   for (const rel of walkProjectExplorerTextFiles(root, { showHiddenFiles })) {
     if (byPath.has(rel)) continue;
     const abs = path.join(root, rel);
+    if (!projectPathIsContained(root, abs)) continue;
     const stats = fs.existsSync(abs) ? fs.statSync(abs) : null;
     if (!stats?.isFile()) continue;
     const canRead = isProjectReadableMemoryPath(rel, root);
@@ -697,6 +744,48 @@ export function listExplorerFiles(root = process.cwd(), { externalRoots = [], sh
   return [...byPath.values()]
     .filter((file) => showHiddenFiles || !isHiddenProjectPath(file.path))
     .sort((a, b) => categoryRank(a.category) - categoryRank(b.category) || a.path.localeCompare(b.path, "fr"));
+}
+
+export function listExplorerDirectories(root = process.cwd(), { externalRoots = [], showHiddenFiles = true } = {}) {
+  const settings = effectiveMemoryWebappSettings(root);
+  const roots = [...new Set([...(settings.allowedPaths || []), ...(externalRoots || [])].map((item) => normalizeRelPath(String(item || ""))))];
+  const directories = new Set();
+  const walk = (absDir, virtualPath, containmentRoot = null) => {
+    const cleanVirtual = normalizeRelPath(virtualPath).replace(/\/$/, "");
+    if (!cleanVirtual || directories.has(cleanVirtual)) return;
+    if (containmentRoot && !projectPathIsContained(containmentRoot, absDir)) return;
+    directories.add(cleanVirtual);
+    let entries = [];
+    try {
+      entries = fs.readdirSync(absDir, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const entry of entries) {
+      if (!entry.isDirectory() || SKIP_DIRS.has(entry.name) || PROJECT_EXPLORER_SKIP_DIRS.has(entry.name)) continue;
+      if (!showHiddenFiles && entry.name.startsWith(".")) continue;
+      const childVirtual = normalizeRelPath(cleanVirtual + "/" + entry.name);
+      if (isBlockedPath(childVirtual)) continue;
+      walk(path.join(absDir, entry.name), childVirtual, containmentRoot);
+    }
+  };
+  for (const configuredPath of roots) {
+    const clean = configuredPath.replace(/\/$/, "");
+    if (!clean || isBlockedPath(clean)) continue;
+    const external = resolveExternalPath(clean);
+    const abs = external || path.join(root, clean);
+    if (!fs.existsSync(abs)) continue;
+    let stats;
+    try {
+      stats = fs.statSync(abs);
+    } catch {
+      continue;
+    }
+    if (!stats.isDirectory()) continue;
+    if (!showHiddenFiles && clean.split("/").some((part) => part.startsWith(".") && part !== "." && part !== "..")) continue;
+    walk(abs, clean, external || !settings.projectOnly ? null : path.resolve(root));
+  }
+  return [...directories].sort((left, right) => left.localeCompare(right, "fr")).map((directoryPath) => ({ path: directoryPath + "/" }));
 }
 
 export function readMemoryFile(root, relPath) {
@@ -733,18 +822,45 @@ export function listStartupContextFiles(root = process.cwd(), settings = readMem
   const addFound = (abs, fileName, dir, source = "ancestor") => {
     const resolved = path.resolve(abs);
     if (seenAbs.has(resolved) || !fs.existsSync(resolved) || !fs.statSync(resolved).isFile()) return;
+    if (config.projectOnly && !realPathIsWithinRoot(resolvedRoot, resolved)) return;
     seenAbs.add(resolved);
     found.push({ abs: resolved, fileName, dir, source });
   };
-  for (const relPath of config.globalPaths || []) {
-    const abs = resolveExternalPath(relPath);
-    if (!abs) continue;
-    addFound(abs, path.basename(abs), path.dirname(abs), "global");
+  if (!config.projectOnly) {
+    for (const relPath of config.globalPaths || []) {
+      const abs = resolveExternalPath(relPath);
+      if (!abs) continue;
+      addFound(abs, path.basename(abs), path.dirname(abs), "global");
+    }
   }
-  for (const dir of ancestorDirsForRoot(resolvedRoot)) {
-    for (const fileName of config.fileNames) {
-      const abs = path.join(dir, fileName);
-      addFound(abs, fileName, dir, "ancestor");
+  if (config.projectOnly) {
+    const fileNames = new Set(config.fileNames);
+    let visitedDirectories = 0;
+    const visit = (dir) => {
+      if (visitedDirectories >= PROJECT_EXPLORER_MAX_FILES) return;
+      visitedDirectories += 1;
+      let entries = [];
+      try {
+        entries = fs.readdirSync(dir, { withFileTypes: true })
+          .sort((left, right) => left.name.localeCompare(right.name, "en"));
+      } catch {
+        return;
+      }
+      for (const entry of entries) {
+        if (entry.isDirectory()) {
+          if (!shouldSkipProjectDiscoveryDirectory(entry.name)) visit(path.join(dir, entry.name));
+        } else if (entry.isFile() && fileNames.has(entry.name)) {
+          addFound(path.join(dir, entry.name), entry.name, dir, "project");
+        }
+      }
+    };
+    visit(resolvedRoot);
+  } else {
+    for (const dir of ancestorDirsForRoot(resolvedRoot)) {
+      for (const fileName of config.fileNames) {
+        const abs = path.join(dir, fileName);
+        addFound(abs, fileName, dir, "ancestor");
+      }
     }
   }
   return found.map((item, index) => {
@@ -799,10 +915,7 @@ export function deleteStartupContextFile(root = process.cwd(), order = 0, settin
   const abs = path.resolve(found.startupContext.absolutePath);
   if (!fs.existsSync(abs) || !fs.statSync(abs).isFile()) throw new Error(`Startup context file not found: ${startupContext.displayPath}`);
   if (path.extname(abs).toLowerCase() !== ".md") throw new Error(`Only Markdown startup context files can be deleted: ${startupContext.displayPath}`);
-  const backupRel = buildBackupPath(startupContext.displayPath);
-  const backupAbs = path.join(root, backupRel);
-  fs.mkdirSync(path.dirname(backupAbs), { recursive: true });
-  fs.copyFileSync(abs, backupAbs);
+  const { backupRel } = createManagedBackup(root, abs, startupContext.displayPath);
   fs.unlinkSync(abs);
   return { order: startupContext.order, path: startupContext.displayPath, deleted: true, backupPath: backupRel, startupContext };
 }
@@ -811,17 +924,19 @@ export function listStartupSkillFolders(root = process.cwd(), settings = readMem
   const config = normalizeStartupSkillSettings(settings.startupSkills);
   if (!config.enabled) return [];
   const resolvedRoot = path.resolve(root);
-  const dirs = ancestorDirsForRoot(resolvedRoot);
+  const dirs = config.projectOnly ? [resolvedRoot] : ancestorDirsForRoot(resolvedRoot);
   const found = [];
   const seen = new Set();
   for (const dir of dirs) {
     for (const folderName of config.folderNames) {
       const abs = path.join(dir, folderName);
       if (seen.has(abs) || !fs.existsSync(abs) || !fs.statSync(abs).isDirectory()) continue;
+      if (config.projectOnly && !realPathIsWithinRoot(resolvedRoot, abs)) continue;
       seen.add(abs);
-      found.push({ abs, dir, folderName, skills: startupSkillNamesInFolder(abs), readOnly: false });
+      const containmentRoot = config.projectOnly ? resolvedRoot : null;
+      found.push({ abs, dir, folderName, skills: startupSkillNamesInFolder(abs, containmentRoot), readOnly: false });
 
-      for (const nested of startupSkillNamespaceFolders(abs, folderName)) {
+      for (const nested of startupSkillNamespaceFolders(abs, folderName, containmentRoot)) {
         if (seen.has(nested.abs)) continue;
         seen.add(nested.abs);
         found.push({ ...nested, dir, readOnly: true });
@@ -839,10 +954,14 @@ export function listStartupSkillFolders(root = process.cwd(), settings = readMem
   }));
 }
 
-function startupSkillNamesInFolder(abs) {
+function startupSkillNamesInFolder(abs, containmentRoot = null) {
   const entries = fs.readdirSync(abs, { withFileTypes: true });
   const skills = entries
-    .filter((entry) => entry.isDirectory() && !entry.name.startsWith(".") && fs.existsSync(path.join(abs, entry.name, "SKILL.md")))
+    .filter((entry) => {
+      if (!entry.isDirectory() || entry.name.startsWith(".")) return false;
+      const skillPath = path.join(abs, entry.name, "SKILL.md");
+      return fs.existsSync(skillPath) && (!containmentRoot || realPathIsWithinRoot(containmentRoot, skillPath));
+    })
     .map((entry) => entry.name)
     .sort((a, b) => a.localeCompare(b, "fr"));
   const looseFiles = entries
@@ -852,7 +971,7 @@ function startupSkillNamesInFolder(abs) {
   return [...new Set([...skills, ...looseFiles])];
 }
 
-function startupSkillNamespaceFolders(abs, folderName) {
+function startupSkillNamespaceFolders(abs, folderName, containmentRoot = null) {
   return fs.readdirSync(abs, { withFileTypes: true })
     .filter((entry) => entry.isDirectory() && entry.name.startsWith("."))
     .map((entry) => {
@@ -860,7 +979,7 @@ function startupSkillNamespaceFolders(abs, folderName) {
       return {
         abs: nestedAbs,
         folderName: `${folderName}/${entry.name}`,
-        skills: startupSkillNamesInFolder(nestedAbs),
+        skills: startupSkillNamesInFolder(nestedAbs, containmentRoot),
       };
     })
     .filter((item) => item.skills.length)
@@ -882,26 +1001,7 @@ function withProjectAgentInstructionPaths(root, settings = defaultMemoryWebappSe
 }
 
 function listProjectAgentInstructionPaths(root = process.cwd()) {
-  const resolvedRoot = path.resolve(root);
-  const found = [];
-  const walk = (dir) => {
-    let entries = [];
-    try {
-      entries = fs.readdirSync(dir, { withFileTypes: true });
-    } catch {
-      return;
-    }
-    for (const entry of entries) {
-      if (entry.isDirectory()) {
-        if (PROJECT_EXPLORER_SKIP_DIRS.has(entry.name) || entry.name === ".context-room") continue;
-        walk(path.join(dir, entry.name));
-      } else if (entry.isFile() && entry.name === "AGENTS.md") {
-        found.push(path.relative(resolvedRoot, path.join(dir, entry.name)).replaceAll(path.sep, "/"));
-      }
-    }
-  };
-  walk(resolvedRoot);
-  return found.sort((a, b) => a.localeCompare(b, "fr"));
+  return discoverProjectAgentInstructionPaths(root).filter((relPath) => path.basename(relPath) === "AGENTS.md");
 }
 
 function withStartupSkillExternalPaths(root, settings = defaultMemoryWebappSettings()) {
@@ -973,6 +1073,7 @@ export function readStartupSkillFile(root = process.cwd(), folderOrder = 0, skil
       kind: "startup-skill",
       folder: folder.displayPath,
       skillName: requestedName,
+      readOnly: Boolean(folder.readOnly),
       explorerRoot: startupSkillExplorerRootPath(root, folder.order, requestedName, settings).replace(/\/$/, ""),
     },
   };
@@ -990,6 +1091,7 @@ export function writeStartupSkillFile(root = process.cwd(), folderOrder = 0, ski
     kind: "startup-skill",
     folder: folder.displayPath,
     skillName: requestedName,
+    readOnly: Boolean(folder.readOnly),
     explorerRoot: startupSkillExplorerRootPath(root, folder.order, requestedName, settings).replace(/\/$/, ""),
   });
 }
@@ -1019,14 +1121,10 @@ export function deleteStartupSkill(root = process.cwd(), folderOrder = 0, skillN
   const skillDir = path.resolve(folderAbs, requestedName);
   const isDirectorySkill = path.basename(resolvedAbs) === "SKILL.md" && path.dirname(resolvedAbs) === skillDir;
   const backupSourceAbs = isDirectorySkill ? skillDir : resolvedAbs;
-  const backupRel = buildBackupPath(displayPath(backupSourceAbs));
-  const backupAbs = path.join(root, backupRel);
-  fs.mkdirSync(path.dirname(backupAbs), { recursive: true });
+  const { backupRel } = createManagedBackup(root, backupSourceAbs, displayPath(backupSourceAbs), { directory: isDirectorySkill });
   if (isDirectorySkill) {
-    fs.cpSync(backupSourceAbs, backupAbs, { recursive: true, errorOnExist: false });
     fs.rmSync(skillDir, { recursive: true, force: false });
   } else {
-    fs.copyFileSync(resolvedAbs, backupAbs);
     fs.unlinkSync(resolvedAbs);
   }
   return { folder: folder.order, skillName: requestedName, deleted: true, backupPath: backupRel };
@@ -1040,6 +1138,7 @@ export function listStartupHookFiles(root = process.cwd(), settings = readMemory
   const pushHook = (abs, source, sourceLabel, metadata = {}) => {
     const resolved = path.resolve(abs);
     if (seen.has(resolved) || !fs.existsSync(resolved) || !fs.statSync(resolved).isFile()) return;
+    if (config.projectOnly && !["git-hooks", "core-hooks-path"].includes(source) && !realPathIsWithinRoot(root, resolved)) return;
     if (resolved.endsWith(".sample")) return;
     if (path.basename(resolved) === "package.json" && !packageJsonHasHookConfig(resolved)) return;
     const summary = summarizeStartupHook(resolved, source, sourceLabel, metadata);
@@ -1164,6 +1263,7 @@ function hookManagerCandidates(root, config) {
     const abs = path.resolve(resolvedRoot, clean.replace(/\/$/, ""));
     if (abs !== resolvedRoot && !abs.startsWith(`${resolvedRoot}${path.sep}`)) return [];
     if (!fs.existsSync(abs)) return [];
+    if (config.projectOnly && !realPathIsWithinRoot(resolvedRoot, abs)) return [];
     const stats = fs.statSync(abs);
     return [{
       abs,
@@ -1181,10 +1281,12 @@ function agentHookCandidates(root, config) {
     const resolved = path.resolve(hook.abs);
     const key = `${hook.source}:${hook.event || ""}:${resolved}`;
     if (seen.has(key) || !fs.existsSync(resolved) || !fs.statSync(resolved).isFile()) return;
+    if (config.projectOnly && !realPathIsWithinRoot(root, resolved)) return;
     seen.add(key);
     hooks.push({ ...hook, abs: resolved });
   };
-  for (const base of ancestorDirsForRoot(root)) {
+  const bases = config.projectOnly ? [path.resolve(root)] : ancestorDirsForRoot(root);
+  for (const base of bases) {
     for (const source of config.agentHookSources || []) {
       for (const relPath of source.paths || []) {
         const clean = normalizeRelPath(relPath);
@@ -1486,6 +1588,86 @@ function safeRealPath(value) {
   }
 }
 
+function pathEntryExists(value) {
+  try {
+    fs.lstatSync(path.resolve(value));
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function nearestExistingPath(value) {
+  let current = path.resolve(value);
+  while (!pathEntryExists(current)) {
+    const parent = path.dirname(current);
+    if (parent === current) return null;
+    current = parent;
+  }
+  return current;
+}
+
+function projectPathIsContained(root, candidate, { allowMissing = false } = {}) {
+  const resolvedRoot = path.resolve(root);
+  const resolvedCandidate = path.resolve(candidate);
+  if (resolvedCandidate !== resolvedRoot && !resolvedCandidate.startsWith(`${resolvedRoot}${path.sep}`)) return false;
+  let canonicalRoot;
+  try {
+    canonicalRoot = fs.realpathSync(resolvedRoot);
+  } catch {
+    return false;
+  }
+  const anchor = pathEntryExists(resolvedCandidate)
+    ? resolvedCandidate
+    : allowMissing
+      ? nearestExistingPath(resolvedCandidate)
+      : null;
+  if (!anchor) return false;
+  try {
+    const canonicalAnchor = fs.realpathSync(anchor);
+    return canonicalAnchor === canonicalRoot || canonicalAnchor.startsWith(`${canonicalRoot}${path.sep}`);
+  } catch {
+    return false;
+  }
+}
+
+function assertProjectPathContained(root, candidate, { allowMissing = false, label = candidate } = {}) {
+  if (!projectPathIsContained(root, candidate, { allowMissing })) {
+    throw new Error(`Path escapes repository root through a symbolic link: ${label}`);
+  }
+  return path.resolve(candidate);
+}
+
+function projectPathHasSymlinkComponent(root, candidate) {
+  const resolvedRoot = path.resolve(root);
+  const resolvedCandidate = path.resolve(candidate);
+  if (resolvedCandidate !== resolvedRoot && !resolvedCandidate.startsWith(`${resolvedRoot}${path.sep}`)) return true;
+  const rel = path.relative(resolvedRoot, resolvedCandidate);
+  let current = resolvedRoot;
+  for (const segment of rel.split(path.sep).filter(Boolean)) {
+    current = path.join(current, segment);
+    if (!pathEntryExists(current)) break;
+    try {
+      if (fs.lstatSync(current).isSymbolicLink()) return true;
+    } catch {
+      return true;
+    }
+  }
+  return false;
+}
+
+function assertManagedProjectPath(root, candidate, label = candidate) {
+  assertProjectPathContained(root, candidate, { allowMissing: true, label });
+  if (projectPathHasSymlinkComponent(root, candidate)) {
+    throw new Error(`Managed Context Room path cannot use symbolic links: ${label}`);
+  }
+  return path.resolve(candidate);
+}
+
+function realPathIsWithinRoot(root, candidate) {
+  return projectPathIsContained(root, candidate);
+}
+
 function gitTopLevel(root) {
   return cachedGitTopLevel(root);
 }
@@ -1512,13 +1694,17 @@ function resolveStartupSkillFile(root, folderOrder, skillName, settings = readMe
   const folder = listStartupSkillFolders(root, settings).find((item) => item.order === normalizedOrder);
   if (!folder || !requestedName || !folder.skills.includes(requestedName)) throw new Error(`Startup skill not found: ${skillName}`);
   const folderAbs = path.resolve(folder.absolutePath);
+  const projectOnly = normalizeStartupSkillSettings(settings.startupSkills).projectOnly === true;
   const candidates = [
     path.join(folderAbs, requestedName, "SKILL.md"),
     path.join(folderAbs, `${requestedName}.md`),
   ];
   const abs = candidates.find((candidate) => {
     const resolved = path.resolve(candidate);
-    return (resolved === folderAbs || resolved.startsWith(`${folderAbs}${path.sep}`)) && fs.existsSync(resolved) && fs.statSync(resolved).isFile();
+    return (resolved === folderAbs || resolved.startsWith(`${folderAbs}${path.sep}`))
+      && fs.existsSync(resolved)
+      && fs.statSync(resolved).isFile()
+      && (!projectOnly || projectPathIsContained(root, resolved));
   });
   if (!abs) throw new Error(`Startup skill file not found: ${skillName}`);
   return { folder, requestedName, abs };
@@ -1611,6 +1797,7 @@ export function writeMemoryFile(root, relPath, content) {
     throw new Error("Content is too large for the local context room");
   }
   const normalized = normalizeRelPath(relPath);
+  const projectOnly = !resolveExternalPath(normalized) && effectiveMemoryWebappSettings(root).projectOnly === true;
   validateEditableContent(normalized, content);
   if (isCronJobVirtualPath(normalized)) return writeCronJobVirtualFile(root, normalized, content);
   if (isCronJobMarkdownPath(normalized)) return writeCronJobMarkdownFile(root, normalized, content);
@@ -1619,14 +1806,12 @@ export function writeMemoryFile(root, relPath, content) {
   let backupPath = null;
 
   if (existed) {
-    const backupRel = buildBackupPath(normalized);
-    const backupAbs = path.join(root, backupRel);
-    fs.mkdirSync(path.dirname(backupAbs), { recursive: true });
-    fs.copyFileSync(abs, backupAbs);
+    const { backupRel } = createManagedBackup(root, abs, normalized);
     backupPath = backupRel;
   }
 
   fs.mkdirSync(path.dirname(abs), { recursive: true });
+  if (projectOnly) assertProjectPathContained(root, abs, { allowMissing: true, label: normalized });
   fs.writeFileSync(abs, content, "utf8");
   const stats = fs.statSync(abs);
   return {
@@ -1657,9 +1842,11 @@ export function createFolder(root, { path: relPath } = {}) {
   if (!normalized) throw new Error("Folder path is required");
   const alreadyAllowed = isAllowedFolderPath(normalized, settings);
   const abs = alreadyAllowed ? resolveMemoryFolderPath(root, normalized, settings) : resolveCreatableRepoPath(root, normalized);
+  const external = resolveExternalPath(normalized);
   if (fs.existsSync(abs)) throw new Error(`Folder already exists: ${normalized}`);
   if (!alreadyAllowed) allowCreatedMemoryPath(root, normalized + "/");
   fs.mkdirSync(abs, { recursive: true });
+  if (!external && (!alreadyAllowed || settings.projectOnly)) assertProjectPathContained(root, abs, { label: normalized });
   return { path: normalized + "/", existed: false };
 }
 
@@ -1669,6 +1856,45 @@ function allowCreatedMemoryPath(root, relPath) {
   const allowedPaths = appendUniquePath(settings.allowedPaths || [], normalized);
   const watchAllow = appendUniquePath(settings.watchAllow || [], normalized);
   writeMemoryWebappSettings(root, { ...settings, allowedPaths, watchAllow });
+}
+
+export function writeFolderWatchRule(root = process.cwd(), { path: relPath, mode = "recursive-live" } = {}) {
+  const settings = readMemoryWebappSettings(root);
+  const rulePath = normalizeWatchRulePath(relPath);
+  if (!rulePath) throw new Error("Folder watch path must be a safe relative or configured external path");
+  if (!WATCH_RULE_MODES.includes(mode)) throw new Error(`Folder watch mode must be one of: ${WATCH_RULE_MODES.join(", ")}`);
+  if (!isAllowedFolderPath(rulePath, settings)) throw new Error(`Folder watch path is not covered by allowedPaths: ${rulePath}`);
+  const absPath = resolveMemoryFolderPath(root, rulePath, settings);
+  if (!fs.existsSync(absPath) || !fs.statSync(absPath).isDirectory()) throw new Error(`Folder watch path does not exist: ${rulePath}`);
+
+  const rule = { path: rulePath, mode };
+  if (CURRENT_FILE_WATCH_RULE_MODES.has(mode)) {
+    const direct = mode === "direct-current";
+    const rootPath = rulePath.replace(/\/$/, "");
+    rule.files = listMemoryFiles(root)
+      .map((file) => normalizeRelPath(file.path))
+      .filter((filePath) => watchRuleContainsPath(rulePath, filePath))
+      .filter((filePath) => !direct || parentPathForWatch(filePath) === rootPath)
+      .sort((left, right) => left.localeCompare(right, "en"));
+  }
+
+  const normalizedRule = normalizeWatchRule(rule);
+  const watchAllow = (settings.watchAllow || []).filter((item) => normalizeRelPath(item).replace(/\/$/, "") !== rulePath.replace(/\/$/, ""));
+  const watchRules = sanitizeWatchRules([...(settings.watchRules || []).filter((item) => normalizeWatchRulePath(item.path) !== rulePath), normalizedRule]);
+  const saved = writeMemoryWebappSettings(root, { ...settings, watchAllow, watchRules });
+  return { rule: saved.watchRules.find((item) => item.path === rulePath), matchedFiles: normalizedRule.files?.length ?? null, settings: saved };
+}
+
+export function removeFolderWatchRule(root = process.cwd(), { path: relPath } = {}) {
+  const settings = readMemoryWebappSettings(root);
+  const rulePath = normalizeWatchRulePath(relPath);
+  if (!rulePath) throw new Error("Folder watch path must be a safe relative or configured external path");
+  const cleanPath = rulePath.replace(/\/$/, "");
+  const watchAllow = (settings.watchAllow || []).filter((item) => normalizeRelPath(item).replace(/\/$/, "") !== cleanPath);
+  const watchRules = (settings.watchRules || []).filter((item) => normalizeWatchRulePath(item.path) !== rulePath);
+  const removed = watchAllow.length !== (settings.watchAllow || []).length || watchRules.length !== (settings.watchRules || []).length;
+  const saved = removed ? writeMemoryWebappSettings(root, { ...settings, watchAllow, watchRules }) : settings;
+  return { path: rulePath, removed, settings: saved };
 }
 
 function appendUniquePath(list, relPath) {
@@ -1690,6 +1916,7 @@ function resolveCreatableRepoPath(root, relPath) {
   const resolvedRoot = path.resolve(root);
   const abs = path.resolve(resolvedRoot, normalized);
   if (abs !== resolvedRoot && !abs.startsWith(`${resolvedRoot}${path.sep}`)) throw new Error(`Path escapes repository root: ${relPath}`);
+  assertProjectPathContained(resolvedRoot, abs, { allowMissing: true, label: relPath });
   return abs;
 }
 
@@ -1697,10 +1924,14 @@ function resolveMemoryFolderPath(root, relPath, settings = effectiveMemoryWebapp
   const normalized = normalizeRelPath(String(relPath || "")).replace(/\/$/, "");
   if (!isAllowedFolderPath(normalized, settings)) throw new Error(`Path not allowed in context room: ${relPath}`);
   const external = resolveExternalPath(normalized);
-  if (external) return external;
+  if (external) {
+    assertExternalPathContained(normalized, settings, { allowMissing: true });
+    return external;
+  }
   const resolvedRoot = path.resolve(root);
   const abs = path.resolve(resolvedRoot, normalized);
   if (abs !== resolvedRoot && !abs.startsWith(`${resolvedRoot}${path.sep}`)) throw new Error(`Path escapes repository root: ${relPath}`);
+  if (settings.projectOnly) assertProjectPathContained(resolvedRoot, abs, { allowMissing: true, label: relPath });
   return abs;
 }
 
@@ -1722,7 +1953,7 @@ export function applyMarkdownTemplateToFile(root, { path: relPath, title = "New 
   return writeMemoryFile(root, normalized, content);
 }
 
-export function renderExplorerContextMenuMarkup({ targetPath = "", directory = "", selectionCount = 1, templates = DEFAULT_MARKDOWN_TEMPLATES, settings = defaultMemoryWebappSettings() } = {}) {
+export function renderExplorerContextMenuMarkup({ targetPath = "", targetKind = "file", directory = "", selectionCount = 1, templates = DEFAULT_MARKDOWN_TEMPLATES, settings = defaultMemoryWebappSettings() } = {}) {
   const normalizedTarget = normalizeRelPath(String(targetPath || ""));
   const cleanDirectory = normalizeRelPath(String(directory || "")).replace(/\/$/, "");
   const directoryLabel = cleanDirectory || "project root";
@@ -1733,11 +1964,21 @@ export function renderExplorerContextMenuMarkup({ targetPath = "", directory = "
   const createActions = '<button class="secondary" type="button" data-context-new-file>New file</button>' +
     '<button class="secondary" type="button" data-context-new-folder>New folder</button>';
   const targetActions = normalizedTarget
-    ? '<button class="secondary" type="button" data-context-watch>Watch</button>' +
+    ? '<button class="secondary" type="button" data-context-watch>' + (targetKind === "folder" ? 'Watch options…' : 'Watch') + '</button>' +
       createActions +
       '<button class="secondary" type="button" data-context-select>Select</button>' +
       '<button class="secondary danger-action" type="button" data-context-delete>Delete</button>'
     : createActions;
+  const selectedWatchMode = exactFolderWatchMode(normalizedTarget, settings);
+  const watchModeForm = normalizedTarget && targetKind === "folder"
+    ? '<div class="explorer-context-form" data-context-watch-mode-form hidden>' +
+        '<div class="explorer-context-title"><span>Watch folder</span><code>' + escapeHtmlServer(normalizedTarget) + '</code></div>' +
+        '<div class="watch-mode-options" role="radiogroup" aria-label="Folder watch mode">' + WATCH_RULE_MODE_OPTIONS.map((option) =>
+          '<label class="watch-mode-option"><input type="radio" name="contextWatchMode" value="' + option.id + '" ' + (option.id === selectedWatchMode ? 'checked' : '') + ' /><span><strong>' + escapeHtmlServer(option.label) + '</strong><small>' + escapeHtmlServer(option.description) + '</small></span></label>'
+        ).join("") + '</div>' +
+        '<div class="explorer-context-actions form-actions"><button id="contextCancelWatchMode" class="secondary" type="button">Cancel</button><button id="contextApplyWatchMode" class="primary" type="button">Watch</button></div>' +
+      '</div>'
+    : '';
   return '<div class="explorer-context-title"><span>Actions</span><code>' + escapeHtmlServer(selectionLabel) + '</code></div>' +
     '<div class="explorer-context-actions menu-actions" data-context-action-list>' +
       targetActions +
@@ -1754,7 +1995,7 @@ export function renderExplorerContextMenuMarkup({ targetPath = "", directory = "
       '<label class="explorer-context-label" for="contextFolderPath">Path</label>' +
       '<input id="contextFolderPath" placeholder="path/to/folder" value="' + escapeHtmlServer(defaultFolderPath) + '" />' +
       '<div class="explorer-context-actions form-actions"><button id="contextCancelFolder" class="secondary" type="button" title="Cancel" aria-label="Cancel">Cancel</button><button id="contextCreateFolder" class="primary" type="button">Create</button></div>' +
-    '</div>';
+    '</div>' + watchModeForm;
 }
 
 function defaultFolderPathForDirectory(directory, title = "New folder") {
@@ -1845,7 +2086,7 @@ export function deleteMemoryPaths(root, relPaths = []) {
       continue;
     }
     if (!isAllowedFolderPath(normalized, settings)) throw new Error(`Path not allowed in context room: ${relPath}`);
-    const absDir = path.resolve(root, normalized);
+    const absDir = resolveMemoryFolderPath(root, normalized, settings);
     if (!fs.existsSync(absDir)) continue;
     if (!fs.statSync(absDir).isDirectory()) throw new Error(`Not a folder: ${relPath}`);
     const files = walkTextFiles(absDir, root, settings).filter((file) => isAllowedMemoryPath(file, settings));
@@ -1865,7 +2106,20 @@ export function readFileDiff(root, relPath) {
   const normalized = normalizeRelPath(relPath);
   const abs = resolveMemoryPath(root, normalized);
   if (resolveExternalPath(normalized)) {
-    return { path: normalized, changed: false, additions: 0, deletions: 0, patch: "", available: false, reason: "Git diff is unavailable for files outside the repo."};
+    const review = readReviewBaseFile(root, normalized);
+    const changed = review.available && review.changeKind !== "unchanged";
+    const baseLines = review.baseContent ? String(review.baseContent).split("\n").length : 0;
+    const currentLines = review.currentContent ? String(review.currentContent).split("\n").length : 0;
+    return {
+      path: normalized,
+      changed,
+      additions: changed ? Math.max(0, currentLines - baseLines) : 0,
+      deletions: changed ? Math.max(0, baseLines - currentLines) : 0,
+      patch: "",
+      available: review.available,
+      external: true,
+      reason: review.available ? "Reviewed against the last Context Room baseline because Git does not own this file." : review.reason,
+    };
   }
   if (!gitTopLevelRoot(root)) {
     return { path: normalized, changed: false, additions: 0, deletions: 0, patch: "", available: false, reason: "Git diff is unavailable outside a Git repository."};
@@ -1951,14 +2205,16 @@ export function readReviewBaseFile(root, relPath) {
   if (startupFile) return readInternalReviewBaseFile(root, startupFile);
   if (resolveExternalPath(normalized)) {
     const file = readMemoryFile(root, normalized);
+    const internalBase = readInternalReviewBaseFile(root, file);
+    if (internalBase.baseline === "review") return internalBase;
     return {
       path: normalized,
       baseContent: "",
       currentContent: file.content,
       currentHash: file.contentHash,
-      changeKind: "external",
-      available: false,
-      reason: "Inline Git review is unavailable for files outside the repo.",
+      changeKind: file.exists ? "added" : "unchanged",
+      available: true,
+      baseline: "context-room",
     };
   }
   const current = readMemoryFile(root, normalized);
@@ -2131,7 +2387,23 @@ function buildNewFileDiff(root, normalized, abs) {
 export function revertMemoryFile(root, relPath) {
   const normalized = normalizeRelPath(relPath);
   if (!normalized) throw new Error("Path is required");
-  if (resolveExternalPath(normalized)) throw new Error("Git revert is unavailable for files outside the repo.");
+  if (resolveExternalPath(normalized)) {
+    if (!isAllowedMemoryPath(normalized, readMemoryWebappSettings(root))) throw new Error(`Path not allowed in context room: ${relPath}`);
+    const review = readReviewBaseFile(root, normalized);
+    const abs = resolveMemoryPath(root, normalized);
+    if (!review.available || review.changeKind === "unchanged") return { path: normalized, reverted: false, deleted: false, reason: "No Context Room baseline change for this file." };
+    if (review.changeKind === "added") {
+      let backupPath = null;
+      if (fs.existsSync(abs)) {
+        if (!fs.statSync(abs).isFile()) throw new Error(`Not a file: ${normalized}`);
+        backupPath = createManagedBackup(root, abs, normalized).backupRel;
+        fs.unlinkSync(abs);
+      }
+      return { path: normalized, reverted: true, deleted: true, backupPath };
+    }
+    const restored = writeMemoryFile(root, normalized, review.baseContent);
+    return { path: normalized, reverted: true, deleted: false, backupPath: restored.backupPath };
+  }
   if (!isAllowedMemoryPath(normalized, readMemoryWebappSettings(root))) throw new Error(`Path not allowed in context room: ${relPath}`);
   const abs = resolveMemoryPath(root, normalized);
   try {
@@ -2154,6 +2426,7 @@ export function revertMemoryFile(root, relPath) {
 
 export function readDocReviewState(root = process.cwd()) {
   const statePath = path.join(root, DOCQA_REVIEW_STATE);
+  assertManagedProjectPath(root, statePath, DOCQA_REVIEW_STATE);
   if (!fs.existsSync(statePath)) return { version: 1, reviews: {} };
   try {
     const parsed = JSON.parse(fs.readFileSync(statePath, "utf8"));
@@ -2165,12 +2438,16 @@ export function readDocReviewState(root = process.cwd()) {
 
 function writeDocReviewState(root, state) {
   const statePath = path.join(root, DOCQA_REVIEW_STATE);
+  assertManagedProjectPath(root, statePath, DOCQA_REVIEW_STATE);
   fs.mkdirSync(path.dirname(statePath), { recursive: true });
+  assertManagedProjectPath(root, statePath, DOCQA_REVIEW_STATE);
   fs.writeFileSync(statePath, JSON.stringify(state, null, 2) + "\n", "utf8");
 }
 
 export function readGlobalReviewLedger(root = process.cwd()) {
+  const ledgerRoot = globalReviewLedgerRoot(root);
   const ledgerPath = globalReviewLedgerPath(root);
+  assertManagedProjectPath(ledgerRoot, ledgerPath, DOCQA_GLOBAL_REVIEW_LEDGER);
   if (!fs.existsSync(ledgerPath)) return { version: 1, reviews: {} };
   try {
     const parsed = JSON.parse(fs.readFileSync(ledgerPath, "utf8"));
@@ -2181,8 +2458,11 @@ export function readGlobalReviewLedger(root = process.cwd()) {
 }
 
 function writeGlobalReviewLedger(root, ledger) {
+  const ledgerRoot = globalReviewLedgerRoot(root);
   const ledgerPath = globalReviewLedgerPath(root);
+  assertManagedProjectPath(ledgerRoot, ledgerPath, DOCQA_GLOBAL_REVIEW_LEDGER);
   fs.mkdirSync(path.dirname(ledgerPath), { recursive: true });
+  assertManagedProjectPath(ledgerRoot, ledgerPath, DOCQA_GLOBAL_REVIEW_LEDGER);
   fs.writeFileSync(ledgerPath, JSON.stringify(ledger, null, 2) + "\n", "utf8");
 }
 
@@ -2214,6 +2494,9 @@ function resourceStateForReviewFile(file) {
 
 function resourceVersionForReviewFile(root, relPath, file, review = null) {
   if (resourceStateForReviewFile(file) === "present") return null;
+  if (review?.resourceState === "absent" && typeof review.resourceVersion === "string" && review.resourceVersion) {
+    return review.resourceVersion;
+  }
   try {
     const revision = execFileSync("git", ["log", "-1", "--format=%H", "--", normalizeRelPath(relPath)], { cwd: root, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).trim();
     if (revision) return `git-path:${revision}`;
@@ -2305,10 +2588,25 @@ function reviewBaselinePathFor(relPath) {
   return path.posix.join(DOCQA_REVIEW_BASELINES, backupSafePath(normalizeRelPath(relPath)) + ".baseline");
 }
 
+function preflightDocReviewMutationPaths(root, relPath = "", { baseline = false, globalLedger = false } = {}) {
+  const statePath = path.join(root, DOCQA_REVIEW_STATE);
+  assertManagedProjectPath(root, statePath, DOCQA_REVIEW_STATE);
+  if (baseline) {
+    const baselinePath = reviewBaselinePathFor(relPath);
+    assertManagedProjectPath(root, path.join(root, baselinePath), baselinePath);
+  }
+  if (globalLedger) {
+    const ledgerRoot = globalReviewLedgerRoot(root);
+    assertManagedProjectPath(ledgerRoot, globalReviewLedgerPath(root), DOCQA_GLOBAL_REVIEW_LEDGER);
+  }
+}
+
 function writeDocReviewBaselineFile(root, relPath, content) {
   const baselinePath = reviewBaselinePathFor(relPath);
   const abs = path.join(root, baselinePath);
+  assertManagedProjectPath(root, abs, baselinePath);
   fs.mkdirSync(path.dirname(abs), { recursive: true });
+  assertManagedProjectPath(root, abs, baselinePath);
   fs.writeFileSync(abs, String(content || ""), "utf8");
   return {
     baselinePath,
@@ -2322,6 +2620,7 @@ function readDocReviewBaseline(root, relPath, review = null) {
   const baselinePath = normalizeRelPath(review?.baselinePath || "");
   if (!baselinePath || !baselinePath.startsWith(DOCQA_REVIEW_BASELINES + "/")) return null;
   const abs = path.join(root, baselinePath);
+  assertManagedProjectPath(root, abs, baselinePath);
   if (!fs.existsSync(abs) || !fs.statSync(abs).isFile()) return null;
   const content = fs.readFileSync(abs, "utf8");
   const baselineHash = hashContent(content);
@@ -2332,6 +2631,7 @@ function readDocReviewBaseline(root, relPath, review = null) {
 export function writeDocReviewBaseline(root, relPath, { note = "" } = {}) {
   const file = readReviewTrackedFile(root, relPath);
   const normalized = file.path;
+  preflightDocReviewMutationPaths(root, normalized, { baseline: true });
   const resourceState = resourceStateForReviewFile(file);
   const state = readDocReviewState(root);
   const existing = state.reviews[normalized] && typeof state.reviews[normalized] === "object" ? state.reviews[normalized] : {};
@@ -2356,6 +2656,7 @@ export function writeDocReviewBaselineContent(root, relPath, content, { note = "
   if (typeof content !== "string") throw new Error("Review baseline content must be a string");
   const file = readReviewTrackedFile(root, relPath);
   const normalized = file.path;
+  preflightDocReviewMutationPaths(root, normalized, { baseline: true });
   const resourceState = resourceStateForReviewFile(file);
   const resourceVersion = resourceVersionForReviewFile(root, normalized, file);
   const state = readDocReviewState(root);
@@ -2377,20 +2678,21 @@ export function writeDocReviewBaselineContent(root, relPath, content, { note = "
 export function writeDocReviewDecision(root, relPath, { status, note = "", expectedResourceState = null, expectedResourceVersion = null } = {}) {
   const file = readReviewTrackedFile(root, relPath);
   const normalized = file.path;
+  const allowedStatuses = new Set(["verified", "needs_changes", "snoozed"]);
+  if (status !== "unverified" && !allowedStatuses.has(status)) throw new Error(`Invalid review status: ${status}`);
+  preflightDocReviewMutationPaths(root, normalized, { baseline: status !== "unverified", globalLedger: true });
   const resourceState = resourceStateForReviewFile(file);
   const state = readDocReviewState(root);
   const existing = state.reviews[normalized] && typeof state.reviews[normalized] === "object" ? state.reviews[normalized] : null;
   const resourceVersion = resourceVersionForReviewFile(root, normalized, file, existing);
   if (expectedResourceState && resourceState !== expectedResourceState) throw new Error(`Review target changed before the decision was saved: ${normalized}`);
   if (expectedResourceVersion && resourceVersion !== expectedResourceVersion) throw new Error(`Review target version changed before the decision was saved: ${normalized}`);
-  const allowedStatuses = new Set(["verified", "needs_changes", "snoozed"]);
   if (status === "unverified") {
     delete state.reviews[normalized];
     writeDocReviewState(root, state);
     writeGlobalReviewDecision(root, normalized, file, { status: "unverified" });
     return { path: normalized, status: "unverified", note: "", reviewedAt: new Date().toISOString(), contentHash: hashContent(file.content), reviewHash: reviewContentHash(file.content), resourceState, resourceVersion };
   }
-  if (!allowedStatuses.has(status)) throw new Error(`Invalid review status: ${status}`);
   const baseline = writeDocReviewBaselineFile(root, normalized, file.content);
   const decision = {
     status,
@@ -2420,11 +2722,19 @@ function readReviewTrackedFile(root, relPath) {
 
 export function readCollaborationSessionState(root = process.cwd()) {
   const statePath = path.join(root, COLLAB_SESSION_STATE);
+  assertManagedProjectPath(root, statePath, COLLAB_SESSION_STATE);
   const fallback = defaultCollaborationSessionState(root);
   if (!fs.existsSync(statePath)) return fallback;
   try {
-    const sanitized = sanitizeCollaborationSessionState(JSON.parse(fs.readFileSync(statePath, "utf8")));
-    return { ...fallback, ...Object.fromEntries(Object.entries(sanitized).filter(([, value]) => value !== undefined)) };
+    const parsed = JSON.parse(fs.readFileSync(statePath, "utf8"));
+    const currentRoot = path.resolve(root);
+    if (parsed?.root && path.resolve(String(parsed.root)) !== currentRoot) return fallback;
+    const sanitized = sanitizeCollaborationSessionState(parsed);
+    return {
+      ...fallback,
+      ...Object.fromEntries(Object.entries(sanitized).filter(([, value]) => value !== undefined)),
+      root: currentRoot,
+    };
   } catch {
     return fallback;
   }
@@ -2433,13 +2743,16 @@ export function readCollaborationSessionState(root = process.cwd()) {
 export function writeCollaborationSessionState(root = process.cwd(), next = {}) {
   const state = { ...sanitizeCollaborationSessionState(next), root: path.resolve(root) };
   const statePath = path.join(root, COLLAB_SESSION_STATE);
+  assertManagedProjectPath(root, statePath, COLLAB_SESSION_STATE);
   fs.mkdirSync(path.dirname(statePath), { recursive: true });
+  assertManagedProjectPath(root, statePath, COLLAB_SESSION_STATE);
   fs.writeFileSync(statePath, JSON.stringify(state, null, 2) + "\n", "utf8");
   return state;
 }
 
 export function readAgentCommand(root = process.cwd()) {
   const commandPath = path.join(root, COLLAB_AGENT_COMMAND);
+  assertManagedProjectPath(root, commandPath, COLLAB_AGENT_COMMAND);
   if (!fs.existsSync(commandPath)) return { command: null };
   try {
     const command = sanitizeAgentCommand(root, JSON.parse(fs.readFileSync(commandPath, "utf8")));
@@ -2457,13 +2770,16 @@ export function writeAgentCommand(root = process.cwd(), next = {}) {
     source: next.source || "agent",
   });
   const commandPath = path.join(root, COLLAB_AGENT_COMMAND);
+  assertManagedProjectPath(root, commandPath, COLLAB_AGENT_COMMAND);
   fs.mkdirSync(path.dirname(commandPath), { recursive: true });
+  assertManagedProjectPath(root, commandPath, COLLAB_AGENT_COMMAND);
   fs.writeFileSync(commandPath, JSON.stringify(command, null, 2) + "\n", "utf8");
   return command;
 }
 
 export function readAgentAnnotations(root = process.cwd(), relPath = "") {
   const annotationPath = path.join(root, COLLAB_AGENT_ANNOTATIONS);
+  assertManagedProjectPath(root, annotationPath, COLLAB_AGENT_ANNOTATIONS);
   const state = readJsonFile(annotationPath, { version: 1, annotations: [] });
   const annotations = Array.isArray(state.annotations) ? state.annotations.map(sanitizeAgentAnnotation).filter(Boolean) : [];
   const normalized = normalizeRelPath(String(relPath || ""));
@@ -2485,16 +2801,19 @@ export function appendAgentAnnotation(root = process.cwd(), next = {}) {
   const settings = readMemoryWebappSettings(root);
   if (!isAllowedMemoryPath(annotation.path, settings)) throw new Error(`Path not allowed in context room: ${annotation.path}`);
   const annotationPath = path.join(root, COLLAB_AGENT_ANNOTATIONS);
+  assertManagedProjectPath(root, annotationPath, COLLAB_AGENT_ANNOTATIONS);
   const state = readJsonFile(annotationPath, { version: 1, annotations: [] });
   const annotations = Array.isArray(state.annotations) ? state.annotations.map(sanitizeAgentAnnotation).filter(Boolean) : [];
   annotations.push(annotation);
   fs.mkdirSync(path.dirname(annotationPath), { recursive: true });
+  assertManagedProjectPath(root, annotationPath, COLLAB_AGENT_ANNOTATIONS);
   fs.writeFileSync(annotationPath, JSON.stringify({ version: 1, annotations }, null, 2) + "\n", "utf8");
   return annotation;
 }
 
 export function resolveAgentAnnotation(root = process.cwd(), { id = "", path: relPath = "" } = {}) {
   const annotationPath = path.join(root, COLLAB_AGENT_ANNOTATIONS);
+  assertManagedProjectPath(root, annotationPath, COLLAB_AGENT_ANNOTATIONS);
   const state = readJsonFile(annotationPath, { version: 1, annotations: [] });
   const normalizedPath = normalizeRelPath(String(relPath || ""));
   const annotations = Array.isArray(state.annotations) ? state.annotations.map(sanitizeAgentAnnotation).filter(Boolean) : [];
@@ -2506,6 +2825,7 @@ export function resolveAgentAnnotation(root = process.cwd(), { id = "", path: re
   });
   if (!resolved) throw new Error(`Annotation not found: ${id}`);
   fs.mkdirSync(path.dirname(annotationPath), { recursive: true });
+  assertManagedProjectPath(root, annotationPath, COLLAB_AGENT_ANNOTATIONS);
   fs.writeFileSync(annotationPath, JSON.stringify({ version: 1, annotations: nextAnnotations }, null, 2) + "\n", "utf8");
   return resolved;
 }
@@ -2671,8 +2991,13 @@ function currentReviewFor(root, reviews, relPath, content, resourceState = "pres
     if (local.current && local.status === "verified") {
       if (review.status === "verified" && (review.contentHash !== contentHash || review.reviewHash !== reviewHash || review.baselineReviewHash !== baselineReviewHash || review.resourceState !== resourceState || review.resourceVersion !== resourceVersion)) {
         local = { ...local, contentHash, reviewHash, baselineReviewHash, resourceState, resourceVersion };
-        reviews[relPath] = { ...review, contentHash, reviewHash, baselineReviewHash, resourceState, resourceVersion };
-        try { writeDocReviewState(root, { version: 1, reviews }); } catch {}
+        try {
+          preflightDocReviewMutationPaths(root, relPath, { globalLedger: true });
+          reviews[relPath] = { ...review, contentHash, reviewHash, baselineReviewHash, resourceState, resourceVersion };
+          writeDocReviewState(root, { version: 1, reviews });
+          writeGlobalReviewDecision(root, relPath, { content, exists: resourceState === "present" }, local);
+        } catch {}
+        return local;
       }
       try { writeGlobalReviewDecision(root, relPath, { content, exists: resourceState === "present" }, local); } catch {}
       return local;
@@ -2738,6 +3063,16 @@ function normalizeHealthIssueForKey(issue = {}) {
   };
 }
 
+export function healthIssueCategory(issue = {}) {
+  const type = shortString(issue.type, 120).toLowerCase();
+  if (/^(broken_reference|broken_source)$/.test(type)) return "references";
+  if (type.includes("hook")) return "hooks";
+  if (/^(external_startup_context|internal_context_changed|internal_skill_changed|startup_context_review_required|startup_not_watched|startup_skill_review_required)$/.test(type)) return "startup";
+  if (/^(invalid_config|invalid_review_gate|missing_config|allowed_|watch_|review_|hub_|duplicate_hub_id|missing_templates)/.test(type)) return "configuration";
+  if (/^(external_file_|git_conflict|sensitive_changed|stale_verified)/.test(type)) return "review";
+  return "documentation";
+}
+
 export function healthIssueKey(issue = {}) {
   const normalized = normalizeHealthIssueForKey(issue);
   return hashContent([normalized.severity, normalized.type, normalized.path, normalized.message].join("\n")).slice(0, 24);
@@ -2748,7 +3083,9 @@ function healthAcknowledgementsPath(root = process.cwd()) {
 }
 
 export function readContextHealthAcknowledgements(root = process.cwd()) {
-  const state = readJsonFile(healthAcknowledgementsPath(root), { version: 1, issues: {} });
+  const statePath = healthAcknowledgementsPath(root);
+  assertManagedProjectPath(root, statePath, CONTEXT_HEALTH_ACKNOWLEDGEMENTS);
+  const state = readJsonFile(statePath, { version: 1, issues: {} });
   const issues = state && typeof state.issues === "object" && !Array.isArray(state.issues) ? state.issues : {};
   return { version: 1, updatedAt: state?.updatedAt || null, issues };
 }
@@ -2765,7 +3102,9 @@ function writeContextHealthAcknowledgements(root = process.cwd(), state = {}) {
     };
   }
   const statePath = healthAcknowledgementsPath(root);
+  assertManagedProjectPath(root, statePath, CONTEXT_HEALTH_ACKNOWLEDGEMENTS);
   fs.mkdirSync(path.dirname(statePath), { recursive: true });
+  assertManagedProjectPath(root, statePath, CONTEXT_HEALTH_ACKNOWLEDGEMENTS);
   fs.writeFileSync(statePath, JSON.stringify(clean, null, 2) + "\n", "utf8");
   return clean;
 }
@@ -2778,6 +3117,7 @@ function publicHealthIssue(issue, acknowledgements = readContextHealthAcknowledg
     ...issue,
     ...normalized,
     key,
+    category: healthIssueCategory(normalized),
     acknowledged: Boolean(acknowledgement),
     acknowledgedAt: acknowledgement?.acknowledgedAt || null,
     acknowledgementNote: acknowledgement?.note || "",
@@ -2787,8 +3127,7 @@ function publicHealthIssue(issue, acknowledgements = readContextHealthAcknowledg
 export function acknowledgeContextHealthIssue(root = process.cwd(), { key = "", note = "" } = {}) {
   const cleanKey = shortString(key, 128);
   if (!cleanKey) throw new Error("Health issue key is required.");
-  const currentIssues = buildDocumentationGraph(root).healthIssues.map((issue) => publicHealthIssue(issue, { version: 1, issues: {} }));
-  const issue = currentIssues.find((item) => item.key === cleanKey);
+  const issue = buildContextRoomDoctorReport(root).issues.find((item) => item.key === cleanKey);
   if (!issue) throw new Error("Health issue no longer exists.");
   const acknowledgements = readContextHealthAcknowledgements(root);
   acknowledgements.issues[cleanKey] = {
@@ -2984,10 +3323,7 @@ function writeCronJobVirtualFile(root, relPath, content) {
   const { data, abs } = readCronStore();
   const index = data.jobs.findIndex((job) => job?.id === id);
   if (index < 0) throw new Error(`Cron job introuvable: ${id}`);
-  const backupRel = buildBackupPath(HERMES_CRON_JOBS_FILE);
-  const backupAbs = path.join(root, backupRel);
-  fs.mkdirSync(path.dirname(backupAbs), { recursive: true });
-  fs.copyFileSync(abs, backupAbs);
+  const { backupRel } = createManagedBackup(root, abs, HERMES_CRON_JOBS_FILE);
 
   data.jobs[index] = parsed;
   data.updated_at = new Date().toISOString();
@@ -3013,11 +3349,9 @@ function writeCronJobMarkdownFile(root, relPath, content) {
   const { data, abs } = readCronStore();
   const index = data.jobs.findIndex((job) => job?.id === id);
   const now = new Date().toISOString();
-  const backupRel = buildBackupPath(HERMES_CRON_JOBS_FILE);
-  const backupAbs = path.join(root, backupRel);
+  let backupRel = null;
   if (abs && fs.existsSync(abs)) {
-    fs.mkdirSync(path.dirname(backupAbs), { recursive: true });
-    fs.copyFileSync(abs, backupAbs);
+    ({ backupRel } = createManagedBackup(root, abs, HERMES_CRON_JOBS_FILE));
   }
   const baseJob = index >= 0 ? data.jobs[index] : defaultCronJob(id, now);
   const nextJob = mergeCronMarkdownFields(baseJob, parsed, id);
@@ -3044,10 +3378,7 @@ function deleteCronJobMarkdownFile(root, relPath) {
   const { data, abs } = readCronStore();
   const index = data.jobs.findIndex((job) => job?.id === id);
   if (index < 0) return { deleted: false };
-  const backupRel = buildBackupPath(HERMES_CRON_JOBS_FILE);
-  const backupAbs = path.join(root, backupRel);
-  fs.mkdirSync(path.dirname(backupAbs), { recursive: true });
-  fs.copyFileSync(abs, backupAbs);
+  const { backupRel } = createManagedBackup(root, abs, HERMES_CRON_JOBS_FILE);
   data.jobs.splice(index, 1);
   data.updated_at = new Date().toISOString();
   fs.writeFileSync(abs, JSON.stringify(data, null, 2) + "\n", "utf8");
@@ -3210,7 +3541,7 @@ export function buildDocumentationGraph(root = process.cwd(), options = {}) {
     if (!file.exists || file.kind !== "markdown") continue;
     const abs = resolveExternalPath(file.path) || path.join(root, file.path);
     const content = fs.existsSync(abs) && fs.statSync(abs).isFile() && fs.statSync(abs).size <= MAX_FILE_BYTES ? fs.readFileSync(abs, "utf8") : "";
-    const metadata = parseDocMetadata(content, file.path);
+    const metadata = effectiveDocumentationMetadataForPath(parseDocMetadata(content, file.path), file.path);
     const watched = isWatchedPath(file.path, settings);
     const inHub = pathIsInHub(file.path, hubInfo.paths);
     const startup = startupRelPaths.has(file.path);
@@ -3239,7 +3570,7 @@ export function buildDocumentationGraph(root = process.cwd(), options = {}) {
     for (const reference of references) {
       edges.push({ from: node.id, to: `reference:${reference}`, type: "references", source: reference });
     }
-    if (metadata.present && metadata.kind === "canonical" && metadata.status === "current" && metadata.canonical_for) {
+    if (metadata.present && metadata.statusValid && metadata.kind === "canonical" && metadata.status === "current" && metadata.canonical_for) {
       const key = `${metadata.scope}:${metadata.canonical_for}`;
       if (!canonicalGroups.has(key)) canonicalGroups.set(key, []);
       canonicalGroups.get(key).push(file.path);
@@ -3284,16 +3615,19 @@ export function buildDocumentationGraph(root = process.cwd(), options = {}) {
 function graphIssuesForDocument({ root, file, content, metadata, watched, inHub, startup, references }) {
   const issues = [];
   if (metadata.parseError) issues.push({ type: "metadata_parse_error", severity: "high", message: `Cannot parse context_room metadata: ${metadata.parseError}.` });
-  if (metadata.present && ["canonical", "procedure", "agents"].includes(metadata.kind) && metadata.status === "current" && !metadata.last_verified) {
+  if (metadata.statusConflict === "target_path_current") issues.push({ type: "target_status_conflict", severity: "high", message: "Target-path documentation cannot declare current implemented truth." });
+  if (metadata.statusConflict === "record_path_current") issues.push({ type: "record_status_conflict", severity: "high", message: "Record documentation cannot declare current canonical truth." });
+  if (metadata.present && !metadata.statusValid) issues.push({ type: "invalid_metadata_status", severity: "high", message: "context_room.status must be current, draft, historical, or superseded." });
+  if (metadata.present && metadata.statusValid && ["canonical", "procedure", "agents"].includes(metadata.kind) && metadata.status === "current" && !metadata.last_verified) {
     issues.push({ type: "missing_last_verified", severity: watched ? "medium" : "low", message: "Current high-impact doc has no last_verified date." });
   }
   if (metadata.present && metadata.last_verified && Date.parse(metadata.last_verified) < Date.now() - 1000 * 60 * 60 * 24 * 120) {
     issues.push({ type: "stale_last_verified", severity: watched ? "medium" : "low", message: `last_verified is older than 120 days: ${metadata.last_verified}.` });
   }
-  if (metadata.present && metadata.kind === "canonical" && metadata.status === "current" && !metadata.canonical_for) {
+  if (metadata.present && metadata.statusValid && metadata.kind === "canonical" && metadata.status === "current" && !metadata.canonical_for) {
     issues.push({ type: "missing_canonical_for", severity: "medium", message: "Current canonical doc should declare canonical_for." });
   }
-  if (metadata.present && ["canonical", "procedure"].includes(metadata.kind) && metadata.status === "current" && metadata.sources.length === 0) {
+  if (metadata.present && metadata.statusValid && ["canonical", "procedure"].includes(metadata.kind) && metadata.status === "current" && metadata.sources.length === 0) {
     issues.push({ type: "missing_sources", severity: "low", message: "Current doc has no source files or links." });
   }
   for (const source of metadata.sources) {
@@ -3309,24 +3643,58 @@ function graphIssuesForDocument({ root, file, content, metadata, watched, inHub,
 export function buildConfigDiagnostics(root = process.cwd(), settings = readMemoryWebappSettings(root), files = listMemoryFiles(root), startupFiles = listStartupContextFiles(root, settings), hubInfo = collectHubPathMatchers(settings.hubSections || []), startupHooks = listStartupHookFiles(root, settings)) {
   const issues = [];
   const configPath = path.join(root, CONFIG_FILE);
+  const projectPathEscapes = (relPath) => {
+    if (!settings.projectOnly || resolveExternalPath(relPath)) return false;
+    const candidate = path.join(root, String(relPath || "").replace(/\/$/, ""));
+    return pathEntryExists(candidate) && !projectPathIsContained(root, candidate);
+  };
   if (!fs.existsSync(configPath)) issues.push({ type: "missing_config", severity: "critical", message: `${CONFIG_FILE} is missing.` });
   for (const relPath of settings.allowedPaths || []) {
-    if (resolveExternalPath(relPath)) continue;
-    if (!fs.existsSync(path.join(root, relPath.replace(/\/$/, "")))) issues.push({ type: "allowed_path_missing", severity: "low", message: `Allowed path does not exist: ${relPath}.` });
+    const externalPath = resolveExternalPath(relPath.replace(/\/$/, ""));
+    if (externalPath) {
+      if (!fs.existsSync(externalPath)) issues.push({ type: "allowed_path_missing", severity: "low", message: `Allowed external path does not exist: ${relPath}.` });
+      continue;
+    }
+    if (projectPathEscapes(relPath)) issues.push({ path: relPath, type: "allowed_path_symlink_escape", severity: "high", message: `Allowed path escapes the project through a symbolic link while projectOnly is enabled: ${relPath}.` });
+    else if (!fs.existsSync(path.join(root, relPath.replace(/\/$/, "")))) issues.push({ type: "allowed_path_missing", severity: "low", message: `Allowed path does not exist: ${relPath}.` });
   }
   for (const relPath of settings.watchAllow || []) {
     const covered = (settings.allowedPaths || []).some((allowed) => pathMatchesSetting(relPath, allowed) || pathMatchesSetting(allowed, relPath));
     if (!covered) issues.push({ type: "watch_not_allowed", severity: "high", message: `Watched path is not covered by allowedPaths: ${relPath}.` });
+    if (projectPathEscapes(relPath)) issues.push({ path: relPath, type: "watch_path_symlink_escape", severity: "high", message: `Watched path escapes the project through a symbolic link while projectOnly is enabled: ${relPath}.` });
+  }
+  for (const rule of settings.watchRules || []) {
+    const relPath = rule.path;
+    const covered = (settings.allowedPaths || []).some((allowed) => pathMatchesSetting(relPath, allowed) || pathMatchesSetting(allowed, relPath));
+    if (!covered) issues.push({ type: "watch_rule_not_allowed", severity: "high", message: `Folder watch rule is not covered by allowedPaths: ${relPath}.` });
+    if (resolveExternalPath(relPath) && !isAllowedFolderPath(relPath, settings)) issues.push({ type: "watch_rule_external_not_authorized", severity: "high", message: `External folder watch rule is not authorized by an explicit ~/... allowedPaths entry: ${relPath}.` });
+    const ruleAbs = resolveExternalPath(relPath.replace(/\/$/, ""));
+    if (ruleAbs && (!fs.existsSync(ruleAbs) || !fs.statSync(ruleAbs).isDirectory())) issues.push({ type: "watch_rule_path_missing", severity: "high", message: `Folder watch rule path is not an existing external folder: ${relPath}.` });
+    if (!ruleAbs) {
+      const projectRuleAbs = path.join(root, relPath.replace(/\/$/, ""));
+      if (!fs.existsSync(projectRuleAbs)) {
+        issues.push({ path: relPath, type: "watch_rule_path_missing", severity: "medium", message: `Folder watch rule path does not exist: ${relPath}.` });
+      } else if (!fs.statSync(projectRuleAbs).isDirectory()) {
+        issues.push({ path: relPath, type: "watch_rule_path_not_directory", severity: "high", message: `Folder watch rule path is not a directory: ${relPath}.` });
+      }
+    }
+    if (projectPathEscapes(relPath)) issues.push({ path: relPath, type: "watch_rule_symlink_escape", severity: "high", message: `Folder watch rule escapes the project through a symbolic link while projectOnly is enabled: ${relPath}.` });
+    for (const filePath of rule.files || []) {
+      if (!isAllowedMemoryPath(filePath, settings)) issues.push({ path: filePath, type: "watch_rule_file_not_allowed", severity: "high", message: `Folder watch snapshot contains a file outside allowedPaths: ${filePath}.` });
+      if (projectPathEscapes(filePath)) issues.push({ path: filePath, type: "watch_rule_file_symlink_escape", severity: "high", message: `Folder watch snapshot file escapes the project through a symbolic link while projectOnly is enabled: ${filePath}.` });
+    }
   }
   for (const relPath of settings.reviewPaths || []) {
     const covered = (settings.allowedPaths || []).some((allowed) => pathMatchesSetting(relPath, allowed) || pathMatchesSetting(allowed, relPath));
     if (!covered) issues.push({ type: "review_not_allowed", severity: "high", message: `Review path is not covered by allowedPaths: ${relPath}.` });
+    if (projectPathEscapes(relPath)) issues.push({ path: relPath, type: "review_path_symlink_escape", severity: "high", message: `Required-review path escapes the project through a symbolic link while projectOnly is enabled: ${relPath}.` });
   }
   const duplicateIds = hubInfo.ids.filter((id, index) => hubInfo.ids.indexOf(id) !== index);
   for (const id of [...new Set(duplicateIds)]) issues.push({ type: "duplicate_hub_id", severity: "medium", message: `Duplicate hub section/card id: ${id}.` });
   for (const relPath of hubInfo.paths) {
     const allowed = isAllowedMemoryPath(relPath, settings) || isAllowedFolderPath(relPath, settings);
     if (!allowed) issues.push({ type: "hub_path_not_allowed", severity: "high", message: `Hub path is outside allowedPaths: ${relPath}.` });
+    if (projectPathEscapes(relPath)) issues.push({ path: relPath, type: "hub_path_symlink_escape", severity: "high", message: `Hub path escapes the project through a symbolic link while projectOnly is enabled: ${relPath}.` });
   }
   if (!settings.markdownTemplates?.length) issues.push({ type: "missing_templates", severity: "medium", message: "No Markdown templates configured." });
   const filePaths = new Set(files.map((file) => file.path));
@@ -3361,11 +3729,31 @@ function sortHealthIssues(issues = []) {
 }
 
 export function buildContextRoomDoctorReport(root = process.cwd(), options = {}) {
-  const settings = options.settings || readMemoryWebappSettings(root);
-  const graph = options.graph || buildDocumentationGraph(root, { settings });
-  const docqa = options.docqa || buildDocQaReport(root, { settings });
-  const acknowledgements = readContextHealthAcknowledgements(root);
-  const issues = graph.healthIssues.map((issue) => publicHealthIssue(issue, acknowledgements));
+  const configurationIssues = [];
+  let settings = options.settings;
+  if (!settings) {
+    try {
+      settings = readMemoryWebappSettings(root);
+    } catch (error) {
+      settings = closedDiagnosticSettings();
+      configurationIssues.push({ type: "invalid_config", severity: "critical", message: error.message });
+    }
+  }
+  try {
+    readReviewGateSettings(root);
+  } catch (error) {
+    configurationIssues.push({ type: "invalid_review_gate", severity: "critical", message: error.message });
+  }
+  const invalidConfig = configurationIssues.some((issue) => issue.type === "invalid_config");
+  const graph = options.graph || (invalidConfig
+    ? buildDocumentationGraph(root, { settings, files: [], gitStatuses: new Map(), startupFiles: [], startupHooks: [] })
+    : buildDocumentationGraph(root, { settings }));
+  const docqa = options.docqa || (invalidConfig ? emptyDocQaReport() : buildDocQaReport(root, { settings }));
+  let acknowledgements = { issues: {} };
+  try {
+    acknowledgements = readContextHealthAcknowledgements(root);
+  } catch {}
+  const issues = [...configurationIssues, ...graph.healthIssues].map((issue) => publicHealthIssue(issue, acknowledgements));
   return {
     generatedAt: new Date().toISOString(),
     root: path.resolve(root),
@@ -3374,6 +3762,7 @@ export function buildContextRoomDoctorReport(root = process.cwd(), options = {})
       title: settings.title,
       allowedPaths: settings.allowedPaths.length,
       watchAllow: settings.watchAllow.length,
+      watchRules: (settings.watchRules || []).length,
       hubSections: settings.hubSections.length,
       markdownTemplates: settings.markdownTemplates.length,
       startupContext: settings.startupContext,
@@ -3383,6 +3772,51 @@ export function buildContextRoomDoctorReport(root = process.cwd(), options = {})
     graph: graph.summary,
     issues,
     acknowledgedIssues: issues.filter((issue) => issue.acknowledged).length,
+  };
+}
+
+function closedDiagnosticSettings() {
+  const settings = createDefaultProjectConfig({ allowedPaths: [], watchAllow: [] });
+  settings.projectOnly = true;
+  settings.reviewPaths = [];
+  settings.hubSections = [];
+  settings.customHubCards = [];
+  settings.startupContext = { enabled: false, projectOnly: true, fileNames: [], globalPaths: [] };
+  settings.startupSkills = { enabled: false, projectOnly: true, folderNames: [] };
+  settings.startupHooks = {
+    enabled: false,
+    editable: false,
+    projectOnly: true,
+    agentHooks: false,
+    codexHooks: false,
+    gitHooks: false,
+    hookManagers: false,
+    fileNames: [],
+    agentHookSources: [],
+    agentHookPaths: [],
+    codexPaths: [],
+    managerPaths: [],
+  };
+  return settings;
+}
+
+function emptyDocQaReport() {
+  return {
+    generatedAt: new Date().toISOString(),
+    summary: {
+      totalDocs: 0,
+      changedDocs: 0,
+      needsReview: 0,
+      requiredReview: 0,
+      deletedDocs: 0,
+      protectedDeletedDocs: 0,
+      deletedReviewKey: "",
+      critical: 0,
+      high: 0,
+      prompts: 0,
+      canonical: 0,
+    },
+    queue: [],
   };
 }
 
@@ -3402,7 +3836,20 @@ function buildDocQaReportFromSnapshot(root, snapshot = readDocQaSnapshot(root)) 
 }
 
 export function buildContextRoomReports(root = process.cwd()) {
-  const snapshot = readDocQaSnapshot(root);
+  let snapshot;
+  try {
+    snapshot = readDocQaSnapshot(root);
+  } catch {
+    const doctor = buildContextRoomDoctorReport(root);
+    return {
+      generatedAt: new Date().toISOString(),
+      docqa: emptyDocQaReport(),
+      doctor,
+      startupContext: [],
+      startupSkills: [],
+      startupHooks: [],
+    };
+  }
   const { settings, files, gitEntries, startupFiles } = snapshot;
   const gitStatuses = new Map([...gitEntries.entries()].map(([rel, entry]) => [rel, entry.status]));
   const startupHooks = listStartupHookFiles(root, settings);
@@ -3445,7 +3892,8 @@ export function buildAgentBrief(root = process.cwd(), { task = "", limit = 12 } 
   if (scored.length) {
     for (const { node } of scored) {
       const meta = node.metadata;
-      lines.push(`- ${node.path} (${meta.kind}, ${meta.status}, scope: ${meta.scope})${node.summary ? ` - ${node.summary}` : ""}`);
+      const status = ["target", "record"].includes(meta.truthState) ? meta.truthState : meta.present && meta.statusValid ? meta.status : "unclassified";
+      lines.push(`- ${node.path} (${meta.kind}, ${status}, scope: ${meta.scope})${node.summary ? ` - ${node.summary}` : ""}`);
     }
   } else {
     lines.push("- No matching docs. Start from the hub/index docs.");
@@ -3476,7 +3924,7 @@ function scoreBriefNode(node, terms = []) {
   if (node.startup) score += 80;
   if (node.metadata.kind === "agents") score += 55;
   if (node.metadata.kind === "index") score += 45;
-  if (node.metadata.status === "current") score += 25;
+  if (node.metadata.truthState === "current" && node.metadata.present && node.metadata.statusValid && node.metadata.status === "current") score += 25;
   if (node.watched) score += 15;
   if (node.inHub) score += 10;
   const haystack = [node.path, node.label, node.summary, node.metadata.scope, node.metadata.canonical_for, node.metadata.kind, ...node.metadata.sources].join(" ").toLowerCase();
@@ -3507,11 +3955,15 @@ export function computeDocIssues({ path: relPath, content = "", gitStatus = "", 
   const issues = [];
   const text = String(content);
   const docMetadata = metadata || parseDocMetadata(text, relPath);
+  const effectiveMetadata = effectiveDocumentationMetadataForPath(docMetadata, relPath);
   if (gitStatus.trim() && classification.sensitive) issues.push({ type: "sensitive_changed", severity: "critical", message: "Sensitive file changed: human review before canonical truth." });
   const todoCount = (text.match(/\b(TODO|FIXME|HACK|à clarifier|a verifier|à vérifier)\b|\[QUESTION\]|<!--\s*QUESTION\b/gi) || []).length;
   if (todoCount) issues.push({ type: "todo", severity: docMetadata.kind === "canonical" ? "high" : "medium", message: `${todoCount} TODO/question to consolidate.` });
   if (path.extname(normalizeRelPath(relPath)) === ".md" && gitStatus.trim() && !docMetadata.present) issues.push({ type: "missing_metadata", severity: "medium", message: "Missing context_room metadata." });
-  if (["agents", "canonical", "procedure"].includes(docMetadata.kind) && docMetadata.status === "current" && !docMetadata.last_verified && gitStatus.trim()) issues.push({ type: "missing_last_verified", severity: "medium", message: "Missing last_verified while the file is modified." });
+  if (docMetadata.present && !docMetadata.statusValid) issues.push({ type: "invalid_metadata_status", severity: "high", message: "context_room.status must be current, draft, historical, or superseded." });
+  if (effectiveMetadata.statusConflict === "target_path_current") issues.push({ type: "target_status_conflict", severity: "high", message: "Target-path documentation cannot declare current implemented truth." });
+  if (effectiveMetadata.statusConflict === "record_path_current") issues.push({ type: "record_status_conflict", severity: "high", message: "Record documentation cannot declare current canonical truth." });
+  if (!["target", "record"].includes(effectiveMetadata.truthState) && docMetadata.present && docMetadata.statusValid && ["agents", "canonical", "procedure"].includes(docMetadata.kind) && docMetadata.status === "current" && !docMetadata.last_verified && gitStatus.trim()) issues.push({ type: "missing_last_verified", severity: "medium", message: "Missing last_verified while the file is modified." });
   if (docMetadata.last_verified && Date.parse(docMetadata.last_verified) < Date.now() - 1000 * 60 * 60 * 24 * 120) issues.push({ type: "stale_verified", severity: "medium", message: `Old last_verified: ${docMetadata.last_verified}.` });
   if (classification.type === "daily" && /source of truth|canonique|vérité|source de vérité/i.test(text)) issues.push({ type: "temporary_truth_claim", severity: "high", message: "Temporary log presents itself as source of truth." });
   if (gitStatus.trim()) {
@@ -3532,8 +3984,8 @@ function invalidateAbsentReviewsForPresentFiles(root, reviewState, files) {
     delete reviewState.reviews[relPath];
     localChanged = true;
   }
-  if (localChanged) writeDocReviewState(root, reviewState);
   const ledger = readGlobalReviewLedger(root);
+  if (localChanged) writeDocReviewState(root, reviewState);
   let ledgerChanged = false;
   for (const [key, review] of Object.entries(ledger.reviews || {})) {
     if (review?.resourceState !== "absent" || !review.absolutePath || !fs.existsSync(review.absolutePath)) continue;
@@ -3604,10 +4056,15 @@ export function buildDocQaReport(root = process.cwd(), options = {}) {
     riskScore: item.riskScore + 90,
     issues: [{ type: "git_conflict", severity: "critical", message: "Unmerged Git deletion conflict requires individual review." }, ...item.issues],
   }));
-  const primaryQueue = [...gitQueue, ...deletedQueue, ...unmergedDeletedQueue, ...buildStartupContextReviewQueue(root, settings, reviewState, startupFiles)];
+  const startupContextQueue = buildStartupContextReviewQueue(root, settings, reviewState, startupFiles);
+  const startupSkillQueue = buildStartupSkillReviewQueue(root, settings, reviewState);
+  const specializedExternalPaths = new Set([...gitQueue, ...startupContextQueue, ...startupSkillQueue].map((item) => item.path));
+  const externalWatchQueue = buildExternalWatchReviewQueue(root, settings, reviewState, files)
+    .filter((item) => !specializedExternalPaths.has(item.path));
+  const primaryQueue = [...gitQueue, ...deletedQueue, ...unmergedDeletedQueue, ...startupContextQueue, ...externalWatchQueue];
   const primaryPaths = new Set(primaryQueue.map((item) => item.path));
-  const startupSkillQueue = buildStartupSkillReviewQueue(root, settings, reviewState).filter((item) => !primaryPaths.has(item.path));
-  const queue = [...primaryQueue, ...startupSkillQueue]
+  const uniqueStartupSkillQueue = startupSkillQueue.filter((item) => !primaryPaths.has(item.path));
+  const queue = [...primaryQueue, ...uniqueStartupSkillQueue]
   .sort((a, b) => compareReviewQueueItems(a, b, settings));
   return {
     generatedAt: new Date().toISOString(),
@@ -3616,7 +4073,7 @@ export function buildDocQaReport(root = process.cwd(), options = {}) {
       changedDocs: queue.filter((item) => item.gitStatus.trim()).length,
       needsReview: queue.length,
       requiredReview: queue.filter((item) => item.reviewRequired && !item.gitStatus.trim()).length,
-      deletedDocs: deletedQueue.length + (deletedPage.truncated ? 1 : 0),
+      deletedDocs: deletedQueue.length + externalWatchQueue.filter((item) => item.resourceState === "absent").length + (deletedPage.truncated ? 1 : 0),
       protectedDeletedDocs: deletedQueue.filter((item) => item.protected).length,
       deletedReviewKey: deletedReviewBatchKey(deletedQueue),
       critical: queue.filter((item) => item.issues.some((issue) => issue.severity === "critical")).length,
@@ -4020,6 +4477,9 @@ export function writeDeletedReviewBatchDecision(root, relPaths = [], {
     error.statusCode = 400;
     throw error;
   }
+  for (const relPath of requested) {
+    if (candidates.has(relPath)) preflightDocReviewMutationPaths(root, relPath, { baseline: true, globalLedger: true });
+  }
   const currentResourceVersions = readGitPathLastChangeRevisions(root, requested);
   const confirmed = [];
   const skipped = [...invalid];
@@ -4167,6 +4627,92 @@ function readGitPathLastChangeRevisions(root, relPaths = []) {
     } catch {}
   }
   return revisions;
+}
+
+function buildExternalWatchReviewQueue(root, settings, reviewState, files = listMemoryFiles(root)) {
+  const filesByPath = new Map(files
+    .filter((file) => resolveExternalPath(file.path) && isExplicitExternalAllowedMemoryPath(file.path, settings))
+    .map((file) => [file.path, file]));
+  const candidatePaths = new Set(
+    [...filesByPath.keys()].filter((filePath) => isWatchedPath(filePath, settings)),
+  );
+  for (const rule of settings.watchRules || []) {
+    for (const filePath of rule.files || []) {
+      if (resolveExternalPath(filePath) && isExplicitExternalAllowedMemoryPath(filePath, settings) && isWatchedPath(filePath, settings)) {
+        candidatePaths.add(filePath);
+      }
+    }
+  }
+  for (const filePath of Object.keys(reviewState.reviews || {})) {
+    if (resolveExternalPath(filePath) && isExplicitExternalAllowedMemoryPath(filePath, settings) && isWatchedPath(filePath, settings)) {
+      candidatePaths.add(filePath);
+    }
+  }
+
+  const queue = [];
+  let stateChanged = false;
+  const globalReviewLedger = readGlobalReviewLedger(root);
+  for (const filePath of [...candidatePaths].sort((left, right) => left.localeCompare(right, "en"))) {
+    let file;
+    try {
+      file = readMemoryFile(root, filePath);
+    } catch {
+      continue;
+    }
+    let existing = reviewState.reviews[filePath] && typeof reviewState.reviews[filePath] === "object"
+      ? reviewState.reviews[filePath]
+      : {};
+    let baseline = readDocReviewBaseline(root, filePath, existing);
+    if (file.exists && !baseline && !existing.status) {
+      const observed = observeReviewBaseline(root, file, reviewState, existing, "external watched file observed before review");
+      existing = observed.review;
+      baseline = observed.baseline;
+      stateChanged = true;
+    }
+    const resourceState = resourceStateForReviewFile(file);
+    const resourceVersion = resourceVersionForReviewFile(root, filePath, file, existing);
+    const review = currentReviewFor(root, reviewState.reviews, filePath, file.content, resourceState, resourceVersion, globalReviewLedger);
+    if (review?.status === "verified" && review.current) continue;
+    const baselineCurrent = Boolean(
+      baseline
+      && baseline.reviewHash === reviewContentHash(file.content)
+      && reviewResourceIdentityMatches(existing, resourceState, resourceVersion),
+    );
+    const changedSinceBaseline = !baselineCurrent;
+    const awaitingFirstDecision = !existing.status && (!baseline || !changedSinceBaseline);
+    const pendingDecision = Boolean(existing.status && existing.status !== "verified");
+    if (!changedSinceBaseline && !awaitingFirstDecision && !pendingDecision) continue;
+
+    const gitStatus = awaitingFirstDecision && file.exists ? "??" : changedSinceBaseline ? (file.exists ? "M" : "D") : "";
+    const classification = classifyDocPath(filePath);
+    const metadata = parseDocMetadata(file.content, filePath);
+    const issues = computeDocIssues({ path: filePath, content: file.content, gitStatus, metadata });
+    issues.unshift(awaitingFirstDecision
+      ? { type: "external_file_review_required", severity: "high", message: "External watched file requires its first Context Room review." }
+      : file.exists
+        ? { type: "external_file_changed", severity: "high", message: "External watched file changed after its last Context Room review." }
+        : { type: "external_file_deleted", severity: "high", message: "External watched file was deleted after its last Context Room review." });
+    queue.push({
+      path: filePath,
+      label: file.label || path.basename(filePath),
+      summary: file.summary || (awaitingFirstDecision ? "External file requires review." : file.exists ? "External file changed after review." : "External file was deleted after review."),
+      updatedAt: file.updatedAt,
+      classification,
+      metadata,
+      gitStatus,
+      initialReview: awaitingFirstDecision,
+      internalChange: changedSinceBaseline,
+      externalWatch: true,
+      reviewRequired: true,
+      issues,
+      riskScore: riskScoreFor({ classification, issues, gitStatus }) + 20,
+      review,
+      resourceState,
+      resourceVersion,
+    });
+  }
+  if (stateChanged) writeDocReviewState(root, reviewState);
+  return queue;
 }
 
 function buildStartupContextReviewQueue(root, settings, reviewState, startupFiles = listStartupContextFiles(root, settings)) {
@@ -4383,8 +4929,10 @@ export function createDefaultProjectConfig({ title = "Context Room", allowedPath
   return {
     $schema: CONFIG_SCHEMA_URL,
     title,
+    projectOnly: true,
     allowedPaths: sanitizePathList(allowedPaths),
     watchAllow: sanitizePathList(watchAllow),
+    watchRules: [],
     reviewPaths: [],
     reviewAgentInstructions: true,
     integrations: { hermes: false },
@@ -4402,36 +4950,599 @@ export function defaultMemoryWebappSettings() {
   return createDefaultProjectConfig();
 }
 
+export function inferProjectDocumentationSetup(root = process.cwd()) {
+  const projectRoot = path.resolve(root);
+  const skillRoots = [".codex/skills/", "skills/"]
+    .filter((relPath) => {
+      const abs = path.join(projectRoot, relPath.replace(/\/$/, ""));
+      return realPathIsWithinRoot(projectRoot, abs) && directoryContainsDocumentation(abs);
+    });
+  const skillDocumentationFiles = skillRoots.flatMap((relPath) =>
+    collectDocumentationFiles(path.join(projectRoot, relPath.replace(/\/$/, "")), projectRoot),
+  );
+  const discovered = discoverProjectDocumentationBoundaries(projectRoot);
+  const documentationRoots = discovered.documentationRoots
+    .filter((relPath) => !skillRoots.some((skillRoot) => pathMatchesSetting(relPath, skillRoot)));
+  const documentationDirectories = discovered.documentationDirectories
+    .filter((relPath) => !skillRoots.some((skillRoot) => pathMatchesSetting(relPath, skillRoot)));
+  const exactDocumentationFiles = discovered.exactDocumentationFiles
+    .filter((relPath) => !skillRoots.some((skillRoot) => pathMatchesSetting(relPath, skillRoot)));
+  const agentInstructionPaths = sanitizePathList(discoverProjectAgentInstructionPaths(projectRoot));
+  const rootDocuments = sanitizePathList(discoverRootDocumentationFiles(projectRoot));
+  const documentationFiles = [...new Set([
+    ...documentationRoots.flatMap((relPath) =>
+      collectDocumentationFiles(path.join(projectRoot, relPath.replace(/\/$/, "")), projectRoot, [], { allowTargetDirectory: true }),
+    ),
+    ...exactDocumentationFiles,
+  ])];
+  const files = [...new Set([...rootDocuments, ...documentationFiles, ...skillDocumentationFiles, ...agentInstructionPaths])]
+    .sort((left, right) => left.localeCompare(right, "en"));
+  const standalonePaths = [...new Set([...rootDocuments, ...exactDocumentationFiles, ...skillDocumentationFiles, ...agentInstructionPaths])]
+    .filter((relPath) => !documentationRoots.some((rootPath) => pathMatchesSetting(relPath, rootPath)));
+  const allowedPaths = sortProjectSetupPaths([...documentationRoots, ...standalonePaths]);
+  const hubSections = inferredDocumentationHubSections(files, documentationDirectories, documentationRoots, agentInstructionPaths, skillDocumentationFiles, projectRoot);
+
+  return {
+    allowedPaths,
+    watchAllow: [...allowedPaths],
+    hubSections,
+    documentationFiles: files,
+    documentationRoots,
+    documentationDirectories,
+    exactDocumentationFiles,
+    agentInstructionPaths,
+    skillRoots,
+    skillDocumentationFiles,
+  };
+}
+
+function assertExistingProjectRoot(root) {
+  const resolvedRoot = path.resolve(root);
+  if (!fs.existsSync(resolvedRoot) || !fs.statSync(resolvedRoot).isDirectory()) {
+    throw new Error(`Context Room root must be an existing directory: ${resolvedRoot}`);
+  }
+  try {
+    fs.realpathSync(resolvedRoot);
+  } catch {
+    throw new Error(`Context Room root cannot be resolved: ${resolvedRoot}`);
+  }
+  return resolvedRoot;
+}
+
+function managedContextRoomSetupTargets(root) {
+  return [
+    CONFIG_DIR,
+    CONFIG_FILE,
+    REVIEW_GATE_FILE,
+    AGENT_CONTEXT_FILE,
+    AGENT_CONTEXT_DIR,
+    LEGACY_AGENT_CONTEXT_FILE,
+    ...AGENT_CONTEXT_ASSET_FILENAMES.map((fileName) => `${AGENT_CONTEXT_DIR}/${fileName}`),
+  ].map((relPath) => ({ relPath, abs: path.join(root, relPath) }));
+}
+
+function assertContextRoomSetupPaths(root) {
+  const projectRoot = assertExistingProjectRoot(root);
+  for (const target of managedContextRoomSetupTargets(projectRoot)) {
+    assertManagedProjectPath(projectRoot, target.abs, target.relPath);
+  }
+  return projectRoot;
+}
+
 export function initializeContextRoomProject(root = process.cwd(), options = {}) {
-  const existing = fs.existsSync(path.join(root, MEMORY_WEBAPP_SETTINGS)) ? readMemoryWebappSettings(root) : {};
-  const title = options.title || existing.title || path.basename(path.resolve(root)) || "Context Room";
-  const allowedPaths = options.allowedPaths?.length ? options.allowedPaths : existing.allowedPaths?.length ? existing.allowedPaths : inferAllowedPathsForRoot(root);
-  const watchAllow = options.watchAllow?.length ? options.watchAllow : existing.watchAllow?.length ? existing.watchAllow : [];
-  const config = normalizeMemoryWebappSettings({ ...createDefaultProjectConfig({ title, allowedPaths, watchAllow }), ...existing, title, allowedPaths, watchAllow });
-  const saved = writeMemoryWebappSettings(root, config);
-  if (!fs.existsSync(path.join(root, REVIEW_GATE_FILE))) writeReviewGateSettings(root, DEFAULT_REVIEW_GATE);
-  const agentContext = syncContextRoomAgentContext(root);
-  ensureRuntimeGitExcludes(root);
-  return { config: saved, configPath: path.join(root, MEMORY_WEBAPP_SETTINGS), agentContextPath: agentContext.entryPath };
+  const projectRoot = assertContextRoomSetupPaths(root);
+  const configPath = path.join(projectRoot, MEMORY_WEBAPP_SETTINGS);
+  if (fs.existsSync(path.join(projectRoot, REVIEW_GATE_FILE))) readReviewGateSettings(projectRoot);
+  const configExists = fs.existsSync(configPath);
+  let existingRaw = {};
+  let existing = {};
+  if (configExists) {
+    existingRaw = readProjectConfigRaw(projectRoot);
+    existing = normalizeMemoryWebappSettings(existingRaw, { ...defaultMemoryWebappSettings(), projectOnly: false });
+  }
+  const inferred = configExists ? {
+    allowedPaths: [],
+    watchAllow: [],
+    hubSections: [],
+    documentationFiles: [],
+    documentationRoots: [],
+    documentationDirectories: [],
+    exactDocumentationFiles: [],
+    agentInstructionPaths: [],
+    skillRoots: [],
+    skillDocumentationFiles: [],
+  } : inferProjectDocumentationSetup(projectRoot);
+  const title = options.title || existing.title || path.basename(projectRoot) || "Context Room";
+  const allowedPaths = sanitizePathList(options.allowedPaths?.length ? options.allowedPaths : configExists ? existing.allowedPaths : inferred.allowedPaths);
+  const inferredWatchAllow = inferred.watchAllow.filter((relPath) => allowedPaths.some((allowedPath) => pathMatchesSetting(relPath, allowedPath)));
+  const watchAllow = sanitizePathList(options.watchAllow?.length ? options.watchAllow : configExists ? existing.watchAllow : inferredWatchAllow);
+  if (options.watchAllow?.length || options.allowedPaths?.length) {
+    const uncoveredWatchPath = watchAllow.find((relPath) => !allowedPaths.some((allowedPath) => pathMatchesSetting(relPath, allowedPath)));
+    if (uncoveredWatchPath) throw new Error(`watchAllow path is not covered by allowedPaths: ${uncoveredWatchPath}`);
+  }
+  let saved;
+  if (configExists) {
+    const amended = { ...existingRaw };
+    if (options.title) amended.title = String(title).trim() || existing.title;
+    if (options.allowedPaths?.length) amended.allowedPaths = sanitizePathList(allowedPaths);
+    if (options.watchAllow?.length) amended.watchAllow = sanitizePathList(watchAllow);
+    if (JSON.stringify(amended) !== JSON.stringify(existingRaw)) {
+      fs.writeFileSync(configPath, JSON.stringify(amended, null, 2) + "\n", "utf8");
+    }
+    saved = normalizeMemoryWebappSettings(amended, { ...defaultMemoryWebappSettings(), projectOnly: false });
+  } else {
+    const defaults = createDefaultProjectConfig({ title, allowedPaths, watchAllow });
+    const inferredHubSections = filterInferredHubSectionsForAllowedPaths(inferred.hubSections, allowedPaths);
+    const inferredCards = flattenHubCards(inferredHubSections);
+    defaults.hubSections = inferredHubSections;
+    defaults.customHubCards = inferredCards.map((card) => ({ ...card, cards: undefined }));
+    defaults.hubCards = Object.fromEntries(inferredCards.map((card) => [card.id, card.enabled !== false]));
+    defaults.startupContext = {
+      ...defaults.startupContext,
+      enabled: inferred.agentInstructionPaths.length > 0,
+      projectOnly: true,
+      fileNames: [...new Set([...defaults.startupContext.fileNames, ...inferred.agentInstructionPaths.map((relPath) => path.basename(relPath))])],
+      globalPaths: [],
+    };
+    defaults.startupSkills = {
+      ...defaults.startupSkills,
+      enabled: inferred.skillRoots.length > 0,
+      projectOnly: true,
+    };
+    defaults.startupHooks = {
+      ...defaults.startupHooks,
+      projectOnly: true,
+    };
+    const config = normalizeMemoryWebappSettings(defaults);
+    saved = writeMemoryWebappSettings(projectRoot, config);
+  }
+  if (!fs.existsSync(path.join(projectRoot, REVIEW_GATE_FILE))) writeReviewGateSettings(projectRoot, DEFAULT_REVIEW_GATE);
+  const agentContext = syncContextRoomAgentContext(projectRoot);
+  ensureRuntimeGitExcludes(projectRoot);
+  return {
+    config: saved,
+    configPath,
+    agentContextPath: agentContext.entryPath,
+    documentationPaths: inferred.documentationFiles,
+    discoverySkipped: configExists,
+    fresh: !configExists,
+  };
+}
+
+function filterInferredHubSectionsForAllowedPaths(sections = [], allowedPaths = []) {
+  const allowed = sanitizePathList(allowedPaths);
+  const filterCard = (card) => {
+    const paths = hubCardPaths(card).filter((relPath) =>
+      allowed.some((allowedPath) => pathMatchesSetting(relPath, allowedPath)),
+    );
+    const cards = (card.cards || []).map(filterCard).filter(Boolean);
+    if (!paths.length && !cards.length) return null;
+    const filtered = { ...card, cards };
+    delete filtered.path;
+    delete filtered.paths;
+    if (paths.length === 1) filtered.path = paths[0];
+    else if (paths.length > 1) filtered.paths = paths;
+    return filtered;
+  };
+  return sections.map((section) => ({
+    ...section,
+    cards: (section.cards || []).map(filterCard).filter(Boolean),
+  })).filter((section) => section.cards.length);
+}
+
+function discoverProjectDocumentationBoundaries(root) {
+  const documentationRoots = [];
+  const documentationDirectories = [];
+  const exactDocumentationFiles = [];
+  const visit = (dir, depth = 0) => {
+    if (depth > 4) return;
+    let entries = [];
+    try {
+      entries = fs.readdirSync(dir, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const entry of entries) {
+      if (!entry.isDirectory() || shouldSkipProjectDiscoveryDirectory(entry.name)) continue;
+      const abs = path.join(dir, entry.name);
+      const rel = normalizeRelPath(path.relative(root, abs));
+      if (PROJECT_DOCUMENTATION_DIR_NAMES.has(entry.name.toLowerCase())) {
+        const strongDocumentationRoot = PROJECT_STRONG_DOCUMENTATION_DIR_NAMES.has(entry.name.toLowerCase());
+        const documentationOnly = directoryIsDocumentationOnly(abs, { allowTargetDirectory: strongDocumentationRoot });
+        const allowTargetDirectory = strongDocumentationRoot || documentationOnly;
+        const documentationFiles = collectDocumentationFiles(abs, root, [], { allowTargetDirectory });
+        if (!documentationFiles.length) continue;
+        const directoryPath = rel.replace(/\/$/, "") + "/";
+        documentationDirectories.push(directoryPath);
+        if (documentationOnly) documentationRoots.push(directoryPath);
+        else exactDocumentationFiles.push(...documentationFiles);
+        continue;
+      }
+      visit(abs, depth + 1);
+    }
+  };
+  visit(root);
+  const uniqueSorted = (items) => [...new Set(sanitizePathList(items))]
+    .sort((left, right) => left.localeCompare(right, "en"));
+  return {
+    documentationRoots: uniqueSorted(documentationRoots),
+    documentationDirectories: uniqueSorted(documentationDirectories),
+    exactDocumentationFiles: uniqueSorted(exactDocumentationFiles),
+  };
+}
+
+function discoverRootDocumentationFiles(root) {
+  try {
+    return fs.readdirSync(root, { withFileTypes: true })
+      .filter((entry) => entry.isFile() && isRootDocumentationFileName(entry.name))
+      .map((entry) => entry.name)
+      .sort((left, right) => left.localeCompare(right, "en"));
+  } catch {
+    return [];
+  }
+}
+
+function discoverProjectAgentInstructionPaths(root) {
+  const found = [];
+  let visitedDirectories = 0;
+  const visit = (dir) => {
+    if (visitedDirectories >= PROJECT_EXPLORER_MAX_FILES) return;
+    visitedDirectories += 1;
+    let entries = [];
+    try {
+      entries = fs.readdirSync(dir, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const entry of entries) {
+      if (entry.isDirectory()) {
+        if (shouldSkipProjectDiscoveryDirectory(entry.name)) continue;
+        visit(path.join(dir, entry.name));
+      } else if (entry.isFile() && PROJECT_AGENT_INSTRUCTION_NAMES.has(entry.name)) {
+        found.push(normalizeRelPath(path.relative(root, path.join(dir, entry.name))));
+      }
+    }
+  };
+  visit(root);
+  return [...new Set(found)].sort((left, right) => left.localeCompare(right, "en"));
+}
+
+function collectDocumentationFiles(dir, root, results = [], { allowTargetDirectory = false } = {}) {
+  if (results.length >= 5000) return results;
+  let entries = [];
+  try {
+    entries = fs.readdirSync(dir, { withFileTypes: true });
+  } catch {
+    return results;
+  }
+  for (const entry of entries) {
+    if (results.length >= 5000) break;
+    if (entry.isDirectory()) {
+      if (shouldSkipProjectDiscoveryDirectory(entry.name, { allowTargetDirectory })) continue;
+      collectDocumentationFiles(path.join(dir, entry.name), root, results, { allowTargetDirectory });
+    } else if (entry.isFile() && isDocumentationFileName(entry.name)) {
+      const relPath = normalizeRelPath(path.relative(root, path.join(dir, entry.name)));
+      if (isSafeDiscoveredDocumentationPath(relPath)) results.push(relPath);
+    }
+  }
+  return results;
+}
+
+function directoryContainsDocumentation(dir, { allowTargetDirectory = false } = {}) {
+  if (!fs.existsSync(dir)) return false;
+  try {
+    if (!fs.statSync(dir).isDirectory()) return false;
+  } catch {
+    return false;
+  }
+  const pending = [dir];
+  let visited = 0;
+  while (pending.length && visited < 1000) {
+    const current = pending.shift();
+    visited += 1;
+    let entries = [];
+    try {
+      entries = fs.readdirSync(current, { withFileTypes: true });
+    } catch {
+      continue;
+    }
+    for (const entry of entries) {
+      if (entry.isFile() && isDocumentationFileName(entry.name)) {
+        const relPath = normalizeRelPath(path.relative(dir, path.join(current, entry.name)));
+        if (isSafeDiscoveredDocumentationPath(relPath)) return true;
+      }
+      if (entry.isDirectory() && !shouldSkipProjectDiscoveryDirectory(entry.name, { allowTargetDirectory })) pending.push(path.join(current, entry.name));
+    }
+  }
+  return false;
+}
+
+function directoryIsDocumentationOnly(dir, { allowTargetDirectory = false } = {}) {
+  const pending = [dir];
+  let foundDocumentation = false;
+  let visited = 0;
+  while (pending.length && visited < 5000) {
+    const current = pending.shift();
+    visited += 1;
+    let entries = [];
+    try {
+      entries = fs.readdirSync(current, { withFileTypes: true });
+    } catch {
+      return false;
+    }
+    for (const entry of entries) {
+      if (entry.isDirectory()) {
+        if (!shouldSkipProjectDiscoveryDirectory(entry.name, { allowTargetDirectory })) pending.push(path.join(current, entry.name));
+        continue;
+      }
+      if (!entry.isFile() || PROJECT_EXPLORER_SKIP_DIRS.has(entry.name)) continue;
+      const relPath = normalizeRelPath(path.relative(dir, path.join(current, entry.name)));
+      if (isDocumentationFileName(entry.name) && isSafeDiscoveredDocumentationPath(relPath)) {
+        foundDocumentation = true;
+        continue;
+      }
+      if (!isBlockedPath(relPath)) return false;
+    }
+  }
+  return foundDocumentation && pending.length === 0;
+}
+
+function shouldSkipProjectDiscoveryDirectory(name, { allowTargetDirectory = false } = {}) {
+  return name === ".context-room"
+    || PROJECT_DOCUMENTATION_VENDOR_DIR_NAMES.has(name.toLowerCase())
+    || (PROJECT_EXPLORER_SKIP_DIRS.has(name) && !(allowTargetDirectory && name.toLowerCase() === "target"))
+    || (name.startsWith(".") && name !== ".codex");
+}
+
+function isSafeDiscoveredDocumentationPath(relPath) {
+  const normalized = normalizeRelPath(String(relPath || ""));
+  return Boolean(normalized)
+    && !normalized.startsWith("../")
+    && !normalized.includes("/../")
+    && !path.isAbsolute(normalized)
+    && !isBlockedPath(normalized);
+}
+
+function isDocumentationFileName(fileName) {
+  return PROJECT_DOCUMENTATION_EXTENSIONS.has(path.extname(fileName).toLowerCase());
+}
+
+function isRootDocumentationFileName(fileName) {
+  const extension = path.extname(fileName).toLowerCase();
+  if ([".md", ".mdx"].includes(extension)) return true;
+  if (![".html", ".htm"].includes(extension)) return false;
+  return /(?:^|[-_])(docs?|documentation|guide|handbook|architecture|runbook|decision|research|incident)(?:[-_.]|$)/i.test(fileName);
+}
+
+function inferredDocumentationHubSections(files, documentationDirectories, documentationRoots, agentInstructionPaths, skillDocumentationFiles, root) {
+  const instructions = new Set(agentInstructionPaths);
+  const skillDocuments = new Set(skillDocumentationFiles);
+  const startHere = [];
+  const current = [];
+  const target = [];
+  const records = [];
+  const unclassified = [];
+
+  for (const relPath of files) {
+    if (instructions.has(relPath) || skillDocuments.has(relPath)) continue;
+    const declaredMetadata = documentationMetadataForSetup(root, relPath);
+    const recordPath = isDocumentationRecordPath(relPath, declaredMetadata);
+    const targetPath = !recordPath && isDocumentationTargetPath(relPath);
+    const metadata = effectiveDocumentationMetadataForPath(declaredMetadata, relPath);
+    if (recordPath) {
+      records.push(relPath);
+    } else if (targetPath) {
+      target.push(relPath);
+    } else if (isDocumentationStartPath(relPath, documentationDirectories)) {
+      startHere.push(relPath);
+    } else if (metadata.present && metadata.statusValid && metadata.status === "current") {
+      current.push(relPath);
+    } else {
+      unclassified.push(relPath);
+    }
+  }
+
+  const sections = [
+    {
+      id: "start-here",
+      title: "Start here",
+      cards: inferredHubCardsForFiles(startHere, "start", "Project entry point or documentation index."),
+    },
+    {
+      id: "current-documentation",
+      title: "Current documentation",
+      cards: inferredHubCardsForFiles(current, "current", "Project documentation explicitly marked current."),
+    },
+    {
+      id: "target-documentation",
+      title: "Target documentation",
+      cards: inferredHubCardsForFiles(target, "target", "Explicit target truth. Do not treat this as implemented behavior."),
+    },
+    {
+      id: "records",
+      title: "Decisions, research, and incidents",
+      cards: inferredRecordHubCards(records, documentationRoots),
+    },
+    {
+      id: "documentation-to-classify",
+      title: "Documentation to classify",
+      cards: inferredHubCardsForFiles(unclassified, "docs", "Existing documentation whose truth state should be verified."),
+    },
+    {
+      id: "agent-guidance",
+      title: "Agent guidance",
+      cards: [
+        ...inferredHubCardsForFiles(agentInstructionPaths, "agent", "Project-owned agent instructions."),
+        ...inferredHubCardsForFiles(skillDocumentationFiles, "skill", "Project-local skill instructions and documentation references."),
+      ],
+    },
+  ];
+  return sections.filter((section) => section.cards.length).map(normalizeHubSectionDefinition).filter(Boolean);
+}
+
+function documentationMetadataForSetup(root, relPath) {
+  if (!/[.]mdx?$/i.test(relPath)) return { present: false, statusValid: false, status: "", kind: "" };
+  try {
+    const abs = path.join(root, relPath);
+    const stats = fs.statSync(abs);
+    if (!stats.isFile() || stats.size > MAX_FILE_BYTES) return { present: false, statusValid: false, status: "", kind: "" };
+    return parseDocMetadata(fs.readFileSync(abs, "utf8"), relPath);
+  } catch {
+    return { present: false, statusValid: false, status: "", kind: "" };
+  }
+}
+
+function isDocumentationStartPath(relPath, documentationRoots) {
+  const normalized = normalizeRelPath(relPath);
+  const base = path.basename(normalized).toLowerCase();
+  if (!normalized.includes("/") && ["readme", "readme.md", "readme.mdx"].includes(base)) return true;
+  return documentationRoots.some((rootPath) => {
+    const rootClean = rootPath.replace(/\/$/, "");
+    return path.dirname(normalized) === rootClean && ["index.md", "index.mdx", "readme.md", "readme.mdx"].includes(base);
+  });
+}
+
+function isDocumentationTargetPath(relPath) {
+  const normalized = normalizeRelPath(relPath).toLowerCase();
+  const segments = normalized.split("/");
+  const base = path.basename(normalized).replace(/\.(?:md|mdx|html?)$/i, "");
+  return segments.slice(0, -1).some((segment) => ["_target", "target", "targets", "plans", "proposals", "roadmap"].includes(segment))
+    || ["target", "targets", "plans", "proposals", "roadmap"].includes(base)
+    || /(?:^|[_-])target$/.test(base);
+}
+
+function effectiveDocumentationMetadataForPath(metadata, relPath) {
+  const recordPath = isDocumentationRecordPath(relPath, metadata);
+  const targetPath = isDocumentationTargetPath(relPath);
+  const pathTruth = recordPath ? "record" : targetPath ? "target" : "";
+  if (pathTruth && metadata.present && metadata.statusValid && metadata.status === "current" && metadata.kind === "index") {
+    return { ...metadata, truthState: "current", pathTruthState: pathTruth };
+  }
+  if (pathTruth && metadata.present && metadata.statusValid && metadata.status === "current" && metadata.kind !== "index") {
+    return {
+      ...metadata,
+      declaredStatus: "current",
+      status: "",
+      truthState: pathTruth,
+      statusConflict: recordPath ? "record_path_current" : "target_path_current",
+    };
+  }
+  return {
+    ...metadata,
+    truthState: pathTruth || (metadata.present && metadata.statusValid ? metadata.status : "unclassified"),
+  };
+}
+
+function isDocumentationRecordPath(relPath, metadata = {}) {
+  const normalized = normalizeRelPath(relPath).toLowerCase();
+  const segments = normalized.split("/");
+  const base = path.basename(normalized).replace(/\.(?:md|mdx|html?)$/i, "");
+  return metadata.kind === "decision"
+    || (metadata.statusValid && ["historical", "superseded"].includes(metadata.status))
+    || segments.slice(0, -1).some((segment) => PROJECT_RECORD_DIR_NAMES.has(segment))
+    || ["research", "incident-report"].includes(base);
+}
+
+function inferredHubCardsForFiles(files, idPrefix, description) {
+  const groups = new Map();
+  for (const relPath of [...new Set(files)].sort((left, right) => left.localeCompare(right, "en"))) {
+    const parent = path.dirname(relPath).replaceAll(path.sep, "/");
+    const key = parent === "." ? relPath : parent;
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key).push(relPath);
+  }
+  return [...groups.entries()].map(([key, paths]) => ({
+    id: `${idPrefix}-${sanitizeHubCardId(key)}`,
+    title: paths.length === 1 ? humanizeDocumentationPath(paths[0]) : humanizeDocumentationPath(key),
+    description,
+    paths,
+  }));
+}
+
+function inferredRecordHubCards(files, documentationRoots = []) {
+  const groups = new Map();
+  const exactFiles = [];
+  for (const relPath of [...new Set(files)].sort((left, right) => left.localeCompare(right, "en"))) {
+    const segments = normalizeRelPath(relPath).split("/");
+    const recordIndex = segments.findIndex((segment) => PROJECT_RECORD_DIR_NAMES.has(segment.toLowerCase()));
+    if (recordIndex < 0) {
+      exactFiles.push(relPath);
+      continue;
+    }
+    const groupPath = segments.slice(0, recordIndex + 1).join("/") + "/";
+    if (documentationRoots.some((rootPath) => pathMatchesSetting(groupPath, rootPath))) groups.set(groupPath, true);
+    else exactFiles.push(relPath);
+  }
+  return [
+    ...[...groups.keys()].map((groupPath) => ({
+      id: `records-${sanitizeHubCardId(groupPath)}`,
+      title: humanizeDocumentationPath(groupPath),
+      description: "Non-canonical record. Promote durable truth to its owning current or target document.",
+      path: groupPath,
+      autoChildren: true,
+    })),
+    ...exactFiles.map((relPath) => ({
+      id: `records-${sanitizeHubCardId(relPath)}`,
+      title: humanizeDocumentationPath(relPath),
+      description: "Non-canonical record. Promote durable truth to its owning current or target document.",
+      path: relPath,
+    })),
+  ];
+}
+
+function humanizeDocumentationPath(relPath) {
+  const clean = normalizeRelPath(relPath).replace(/\/$/, "");
+  const base = path.basename(clean).replace(/\.(?:md|mdx|html?)$/i, "").replace(/(?:^|[_-])target$/i, "");
+  const words = base.replace(/^[_\.]+/, "").replace(/[-_]+/g, " ").trim();
+  return words ? words.charAt(0).toUpperCase() + words.slice(1) : "Documentation";
+}
+
+function sortProjectSetupPaths(paths) {
+  const unique = [...new Set(paths.map((item) => normalizeRelPath(item)).filter(Boolean))];
+  return unique.sort((left, right) => {
+    const rank = (value) => value.toLowerCase().startsWith("readme") ? 0 : PROJECT_AGENT_INSTRUCTION_NAMES.has(path.basename(value)) ? 1 : 2;
+    return rank(left) - rank(right) || left.localeCompare(right, "en");
+  });
 }
 
 export function syncContextRoomAgentContext(root = process.cwd()) {
-  const projectRoot = path.resolve(root);
+  const projectRoot = assertExistingProjectRoot(root);
   const sourceRoot = path.resolve(path.dirname(__filename), "..", "docs");
   const targetRoot = path.join(projectRoot, AGENT_CONTEXT_DIR);
   const assets = [
-    [path.join(sourceRoot, "features", "html-visual-documents.md"), "html-visual-documents.md"],
-    [path.join(sourceRoot, "features", "html-visual-patterns.md"), "html-visual-patterns.md"],
-    [path.join(sourceRoot, "context-room-visual-components.html"), "context-room-visual-components.html"],
-    [path.join(sourceRoot, "context-room-data-visual-components.html"), "context-room-data-visual-components.html"],
+    [path.join(sourceRoot, "agent-configuration.md"), AGENT_CONTEXT_ASSET_FILENAMES[0]],
+    [path.join(sourceRoot, "features", "html-visual-documents.md"), AGENT_CONTEXT_ASSET_FILENAMES[1]],
+    [path.join(sourceRoot, "features", "html-visual-patterns.md"), AGENT_CONTEXT_ASSET_FILENAMES[2]],
+    [path.join(sourceRoot, "context-room-visual-components.html"), AGENT_CONTEXT_ASSET_FILENAMES[3]],
+    [path.join(sourceRoot, "context-room-data-visual-components.html"), AGENT_CONTEXT_ASSET_FILENAMES[4]],
   ];
   const missing = assets.filter(([source]) => !fs.existsSync(source)).map(([source]) => source);
   if (missing.length) throw new Error(`Context Room agent context is incomplete: ${missing.join(", ")}`);
 
+  for (const target of managedContextRoomSetupTargets(projectRoot).filter((item) => item.relPath === AGENT_CONTEXT_FILE || item.relPath.startsWith(`${AGENT_CONTEXT_DIR}/`) || item.relPath === AGENT_CONTEXT_DIR)) {
+    assertManagedProjectPath(projectRoot, target.abs, target.relPath);
+  }
   fs.mkdirSync(targetRoot, { recursive: true });
-  const entry = `# Context Room HTML Visual Context
+  const entry = `# Context Room Agent Guide
 
-This file is generated by Context Room. Do not edit it; \`context-room init\` and \`context-room start\` refresh it from the installed version.
+This file is generated by Context Room. Do not edit it; \`context-room setup\`, \`context-room init\`, and \`context-room start\` refresh it from the installed version.
+
+## Set Up This Repository
+
+Fresh initialization discovers project-owned documentation, watches those real paths, and builds hub sections that keep current, target, and record material distinct. Treat that result as a safe first pass, not a substitute for reading the project.
+
+Before declaring setup complete:
+
+1. Read the root README, every applicable \`AGENTS.md\`, \`CLAUDE.md\`, or \`.hermes.md\`, and the existing documentation indexes.
+2. Inspect the project-owned documentation, runbooks, decisions, research, incident records, and local skills. Do not copy paths or state from another Context Room.
+3. Refine only \`.context-room/config.json\`: keep top-level \`projectOnly: true\` for physical project containment unless the owner explicitly requires a trusted, established symlink hub. False or omitted legacy mode can make configured external symlink targets readable and editable. Keep safe documentation in \`allowedPaths\`, then use \`context-room agent watch --root <project> --path <folder> --mode <mode>\` for explicit folder behavior. The default \`recursive-live\` mode reviews current and future files at any depth; choose a current-only or direct-only mode only when the project evidence requires that narrower scope. Keep exact files and legacy recursive-live folders in \`watchAllow\`, structured folder modes in \`watchRules\`, and organize \`hubSections\` around the project's real ownership and truth states.
+4. Preserve an existing configuration, including intentionally empty lists, and preserve the owner-controlled \`.context-room/review-gate.json\`.
+5. Keep current implementation truth separate from target plans and from research, history, decisions, and incidents. Never promote a target claim without implementation evidence.
+6. Run \`context-room doctor --root <project>\`, start without taking over another room, and verify \`/api/health\` reports the intended root.
+
+Read [Agent configuration](agent-context/agent-configuration.md) for the complete field ownership, setup, and verification contract.
+
+## HTML Visual Documents
 
 ## Goal
 
@@ -4507,6 +5618,7 @@ Read the rendered examples for composition and interaction, then inspect their s
 
 ## References
 
+- [Agent configuration](agent-context/agent-configuration.md): complete project setup and verification contract.
 - [HTML visual documents](agent-context/html-visual-documents.md): full usage and review contract.
 - [HTML visual patterns](agent-context/html-visual-patterns.md): classes, diagram grammar, and scale rules.
 - [Five diagram examples](agent-context/context-room-visual-components.html): complex ideas and relationships.
@@ -4514,7 +5626,7 @@ Read the rendered examples for composition and interaction, then inspect their s
 `;
   const legacyEntry = `# Context Room Agent Context
 
-Read [\`.context-room/README.md\`](../README.md) before creating or editing a visual HTML document.
+Read [\`.context-room/README.md\`](../README.md) before setting up Context Room or creating a visual HTML document.
 
 This compatibility file is generated by Context Room.
 `;
@@ -4522,10 +5634,17 @@ This compatibility file is generated by Context Room.
     [path.join(projectRoot, AGENT_CONTEXT_FILE), entry],
     [path.join(projectRoot, LEGACY_AGENT_CONTEXT_FILE), legacyEntry],
   ];
-  for (const [source, fileName] of assets) files.push([path.join(targetRoot, fileName), fs.readFileSync(source, "utf8")]);
+  for (const [source, fileName] of assets) {
+    const sourceContent = fs.readFileSync(source, "utf8");
+    const relocatedContent = /[.]md$/i.test(fileName)
+      ? sourceContent.replaceAll("../context-room-", "context-room-")
+      : sourceContent;
+    files.push([path.join(targetRoot, fileName), relocatedContent]);
+  }
 
   let updated = 0;
   for (const [target, content] of files) {
+    assertManagedProjectPath(projectRoot, target, path.relative(projectRoot, target));
     if (fs.existsSync(target) && fs.readFileSync(target, "utf8") === content) continue;
     fs.writeFileSync(target, content, "utf8");
     updated += 1;
@@ -4595,33 +5714,121 @@ function gitRootRelativePrefix(root) {
   return rel && rel !== "." ? rel.replace(/\/$/, "") + "/" : "";
 }
 
-function inferAllowedPathsForRoot(root) {
-  const candidates = ["docs/", "src/", "lib/", "app/", "test/", "tests/", "scripts/", "tools/", "memory/", "data/", "README.md", "AGENTS.md", "CLAUDE.md", ".hermes.md", "package.json"];
-  const existing = candidates.filter((candidate) => {
-    const clean = candidate.replace(/\/$/, "");
-    return fs.existsSync(path.join(root, clean));
-  });
-  return existing.length ? existing : ["docs/", "src/", "README.md"];
-}
-
 export function readMemoryWebappSettings(root = process.cwd()) {
   const defaults = defaultMemoryWebappSettings();
-  const settingsPath = path.join(root, MEMORY_WEBAPP_SETTINGS);
+  const projectRoot = assertExistingProjectRoot(root);
+  const settingsPath = path.join(projectRoot, MEMORY_WEBAPP_SETTINGS);
+  assertManagedProjectPath(projectRoot, settingsPath, MEMORY_WEBAPP_SETTINGS);
   if (!fs.existsSync(settingsPath)) return defaults;
-  try {
-    const parsed = JSON.parse(fs.readFileSync(settingsPath, "utf8"));
-    return normalizeMemoryWebappSettings(parsed, defaults);
-  } catch {
-    return defaults;
-  }
+  return normalizeMemoryWebappSettings(readProjectConfigRaw(projectRoot), { ...defaults, projectOnly: false });
 }
 
 export function writeMemoryWebappSettings(root = process.cwd(), next = {}) {
-  const settings = normalizeMemoryWebappSettings(next, readMemoryWebappSettings(root));
-  const settingsPath = path.join(root, MEMORY_WEBAPP_SETTINGS);
+  const projectRoot = assertExistingProjectRoot(root);
+  validateProjectConfigShape(next, "settings update");
+  const settings = normalizeMemoryWebappSettings(next, readMemoryWebappSettings(projectRoot));
+  const settingsPath = path.join(projectRoot, MEMORY_WEBAPP_SETTINGS);
+  assertManagedProjectPath(projectRoot, settingsPath, MEMORY_WEBAPP_SETTINGS);
   fs.mkdirSync(path.dirname(settingsPath), { recursive: true });
+  assertManagedProjectPath(projectRoot, settingsPath, MEMORY_WEBAPP_SETTINGS);
   fs.writeFileSync(settingsPath, JSON.stringify(settings, null, 2) + "\n", "utf8");
   return settings;
+}
+
+function readProjectConfigRaw(root) {
+  const target = path.join(root, MEMORY_WEBAPP_SETTINGS);
+  assertManagedProjectPath(root, target, MEMORY_WEBAPP_SETTINGS);
+  let parsed;
+  try {
+    parsed = JSON.parse(fs.readFileSync(target, "utf8"));
+  } catch (error) {
+    throw new Error(`Invalid Context Room config JSON at ${target}: ${error.message}`);
+  }
+  validateProjectConfigShape(parsed, target, { requireAllowedPaths: true });
+  return parsed;
+}
+
+function validateProjectConfigShape(raw, target = CONFIG_FILE, { requireAllowedPaths = false } = {}) {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+    throw new Error(`Invalid Context Room config at ${target}: the root value must be an object`);
+  }
+  const has = (object, key) => Object.prototype.hasOwnProperty.call(object, key);
+  const requireBoolean = (object, key, scope = "") => {
+    if (has(object, key) && typeof object[key] !== "boolean") throw new Error(`Invalid Context Room config at ${target}: ${scope}${key} must be a boolean`);
+  };
+  const requireObject = (object, key, scope = "") => {
+    if (has(object, key) && (!object[key] || typeof object[key] !== "object" || Array.isArray(object[key]))) {
+      throw new Error(`Invalid Context Room config at ${target}: ${scope}${key} must be an object`);
+    }
+  };
+  const requireStringArray = (object, key, scope = "") => {
+    if (!has(object, key)) return;
+    if (!Array.isArray(object[key]) || object[key].some((item) => typeof item !== "string")) {
+      throw new Error(`Invalid Context Room config at ${target}: ${scope}${key} must be an array of strings`);
+    }
+  };
+  if (requireAllowedPaths && !has(raw, "allowedPaths")) {
+    throw new Error(`Invalid Context Room config at ${target}: allowedPaths is required`);
+  }
+  for (const key of ["allowedPaths", "watchAllow", "reviewPaths"]) requireStringArray(raw, key);
+  if (has(raw, "watchRules")) {
+    if (!Array.isArray(raw.watchRules)) throw new Error(`Invalid Context Room config at ${target}: watchRules must be an array`);
+    for (const [index, rule] of raw.watchRules.entries()) {
+      if (!rule || typeof rule !== "object" || Array.isArray(rule)) throw new Error(`Invalid Context Room config at ${target}: watchRules[${index}] must be an object`);
+      if (typeof rule.path !== "string" || !rule.path.trim()) throw new Error(`Invalid Context Room config at ${target}: watchRules[${index}].path must be a non-empty string`);
+      if (!WATCH_RULE_MODES.includes(rule.mode)) throw new Error(`Invalid Context Room config at ${target}: watchRules[${index}].mode must be one of ${WATCH_RULE_MODES.join(", ")}`);
+      const normalizedRulePath = normalizeWatchRulePath(rule.path);
+      if (!normalizedRulePath) throw new Error(`Invalid Context Room config at ${target}: watchRules[${index}].path must stay inside an allowed Context Room path`);
+      requireStringArray(rule, "files", `watchRules[${index}].`);
+      if (CURRENT_FILE_WATCH_RULE_MODES.has(rule.mode) && !has(rule, "files")) {
+        throw new Error(`Invalid Context Room config at ${target}: watchRules[${index}].files is required for ${rule.mode}`);
+      }
+      if (CURRENT_FILE_WATCH_RULE_MODES.has(rule.mode)) {
+        const direct = rule.mode === "direct-current";
+        const rootPath = normalizedRulePath.replace(/\/$/, "");
+        const seenFiles = new Set();
+        for (const [fileIndex, filePath] of rule.files.entries()) {
+          const normalizedFile = sanitizePathList([filePath])[0] || "";
+          if (!normalizedFile) throw new Error(`Invalid Context Room config at ${target}: watchRules[${index}].files[${fileIndex}] is not a safe relative path`);
+          if (!watchRuleContainsPath(normalizedRulePath, normalizedFile)) throw new Error(`Invalid Context Room config at ${target}: watchRules[${index}].files[${fileIndex}] is outside ${normalizedRulePath}`);
+          if (direct && parentPathForWatch(normalizedFile) !== rootPath) throw new Error(`Invalid Context Room config at ${target}: watchRules[${index}].files[${fileIndex}] is not a direct child of ${normalizedRulePath}`);
+          if (seenFiles.has(normalizedFile)) throw new Error(`Invalid Context Room config at ${target}: watchRules[${index}].files contains a duplicate path: ${normalizedFile}`);
+          seenFiles.add(normalizedFile);
+        }
+      }
+    }
+  }
+  requireBoolean(raw, "projectOnly");
+  for (const key of ["hubSections", "customHubCards", "markdownTemplates"]) {
+    if (has(raw, key) && !Array.isArray(raw[key])) throw new Error(`Invalid Context Room config at ${target}: ${key} must be an array`);
+  }
+  requireObject(raw, "hubCards");
+  requireObject(raw, "integrations");
+  requireBoolean(raw, "reviewAgentInstructions");
+  if (raw.integrations) requireBoolean(raw.integrations, "hermes", "integrations.");
+  for (const key of ["startupContext", "startupSkills", "startupHooks"]) requireObject(raw, key);
+  if (raw.startupContext) {
+    requireBoolean(raw.startupContext, "enabled", "startupContext.");
+    requireBoolean(raw.startupContext, "projectOnly", "startupContext.");
+    requireStringArray(raw.startupContext, "fileNames", "startupContext.");
+    requireStringArray(raw.startupContext, "globalPaths", "startupContext.");
+  }
+  if (raw.startupSkills) {
+    requireBoolean(raw.startupSkills, "enabled", "startupSkills.");
+    requireBoolean(raw.startupSkills, "projectOnly", "startupSkills.");
+    requireStringArray(raw.startupSkills, "folderNames", "startupSkills.");
+  }
+  if (raw.startupHooks) {
+    for (const key of ["enabled", "editable", "agentHooks", "codexHooks", "gitHooks", "hookManagers", "projectOnly"]) requireBoolean(raw.startupHooks, key, "startupHooks.");
+    for (const key of ["fileNames", "agentHookPaths", "codexPaths", "managerPaths"]) requireStringArray(raw.startupHooks, key, "startupHooks.");
+    if (has(raw.startupHooks, "agentHookSources")) {
+      if (!Array.isArray(raw.startupHooks.agentHookSources)) throw new Error(`Invalid Context Room config at ${target}: startupHooks.agentHookSources must be an array`);
+      for (const [index, source] of raw.startupHooks.agentHookSources.entries()) {
+        if (!source || typeof source !== "object" || Array.isArray(source)) throw new Error(`Invalid Context Room config at ${target}: startupHooks.agentHookSources[${index}] must be an object`);
+        requireStringArray(source, "paths", `startupHooks.agentHookSources[${index}].`);
+      }
+    }
+  }
 }
 
 export function readGlobalContextRoomPreferences(preferencesPath = null) {
@@ -4651,19 +5858,32 @@ export function readResolvedContextRoomSettings(root = process.cwd(), { preferen
 }
 
 export function readReviewGateSettings(root = process.cwd()) {
-  const target = path.join(root, REVIEW_GATE_FILE);
+  const projectRoot = assertExistingProjectRoot(root);
+  const target = path.join(projectRoot, REVIEW_GATE_FILE);
+  assertManagedProjectPath(projectRoot, target, REVIEW_GATE_FILE);
   if (!fs.existsSync(target)) return { operations: [...DEFAULT_REVIEW_GATE.operations] };
+  let parsed;
   try {
-    return normalizeReviewGateSettings(JSON.parse(fs.readFileSync(target, "utf8")));
-  } catch {
-    return { operations: [...DEFAULT_REVIEW_GATE.operations] };
+    parsed = JSON.parse(fs.readFileSync(target, "utf8"));
+  } catch (error) {
+    throw new Error(`Invalid Context Room review gate JSON at ${target}: ${error.message}`);
   }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed) || (Object.prototype.hasOwnProperty.call(parsed, "operations") && !Array.isArray(parsed.operations))) {
+    throw new Error(`Invalid Context Room review gate at ${target}: operations must be an array`);
+  }
+  return normalizeReviewGateSettings(parsed);
 }
 
 export function writeReviewGateSettings(root = process.cwd(), next = {}) {
+  if (!next || typeof next !== "object" || Array.isArray(next) || (Object.prototype.hasOwnProperty.call(next, "operations") && !Array.isArray(next.operations))) {
+    throw new Error("Invalid Context Room review gate: operations must be an array");
+  }
   const settings = normalizeReviewGateSettings(next);
-  const target = path.join(root, REVIEW_GATE_FILE);
+  const projectRoot = assertExistingProjectRoot(root);
+  const target = path.join(projectRoot, REVIEW_GATE_FILE);
+  assertManagedProjectPath(projectRoot, target, REVIEW_GATE_FILE);
   fs.mkdirSync(path.dirname(target), { recursive: true });
+  assertManagedProjectPath(projectRoot, target, REVIEW_GATE_FILE);
   fs.writeFileSync(target, JSON.stringify(settings, null, 2) + "\n", { encoding: "utf8", mode: 0o600 });
   fs.chmodSync(target, 0o600);
   return settings;
@@ -4826,7 +6046,7 @@ function materializeHubCardsForRoot(root, cards = [], settings = readMemoryWebap
 }
 
 function materializeHubCardForRoot(root, card, settings = readMemoryWebappSettings(root)) {
-  const existingPaths = hubCardPaths(card).filter((folderPath) => hubCardPathExists(root, folderPath));
+  const existingPaths = hubCardPaths(card).filter((folderPath) => hubCardPathExists(root, folderPath, settings));
   if (existingPaths.length === 0) return stripHubCardRuntimeFields(card);
   const { path: _path, paths: _paths, cards: _cards, ...rest } = card;
   return existingPaths.length === 1 ? { ...rest, path: existingPaths[0] } : { ...rest, paths: existingPaths };
@@ -4838,6 +6058,7 @@ function inferHubCardChildrenForRoot(root, card, settings = readMemoryWebappSett
     const cleanFolder = normalizeRelPath(folderPath).replace(/\/$/, "");
     if (!cleanFolder || resolveExternalPath(cleanFolder)) continue;
     const absDir = path.join(root, cleanFolder);
+    if (settings.projectOnly && !projectPathIsContained(root, absDir)) continue;
     if (!fs.existsSync(absDir) || !fs.statSync(absDir).isDirectory()) continue;
     const entries = fs.readdirSync(absDir, { withFileTypes: true })
       .filter((entry) => !entry.name.startsWith(".") && !SKIP_DIRS.has(entry.name))
@@ -4860,7 +6081,7 @@ function inferHubCardChildrenForRoot(root, card, settings = readMemoryWebappSett
       children.push({
         id: sanitizeHubCardId(`${card.id || cleanFolder}-${rel}`),
         title: entry.name,
-        description: summarizeFileAtPath(path.join(root, rel)),
+        description: summarizeFileAtPath(root, rel, settings),
         path: rel,
         enabled: true,
       });
@@ -4869,8 +6090,10 @@ function inferHubCardChildrenForRoot(root, card, settings = readMemoryWebappSett
   return materializeHubCardsForRoot(root, children, settings);
 }
 
-function summarizeFileAtPath(absPath) {
+function summarizeFileAtPath(root, relPath, settings = readMemoryWebappSettings(root)) {
   try {
+    const absPath = path.join(root, relPath);
+    if (settings.projectOnly && !projectPathIsContained(root, absPath)) return "";
     const stats = fs.statSync(absPath);
     if (!stats.isFile() || stats.size > MAX_FILE_BYTES) return "";
     return summarizeContent(fs.readFileSync(absPath, "utf8"));
@@ -4899,14 +6122,15 @@ function hubCardPaths(card) {
   return (card.paths || [card.path]).filter(Boolean);
 }
 
-function hubCardPathExists(root, folderPath) {
+function hubCardPathExists(root, folderPath, settings = readMemoryWebappSettings(root)) {
   const normalized = normalizeRelPath(folderPath);
   const asFolder = normalized.replace(/\/$/, "") + "/";
   const externalFolder = resolveExternalPath(asFolder);
   if (externalFolder) return fs.existsSync(externalFolder);
   const externalExact = resolveExternalPath(normalized);
   if (externalExact) return fs.existsSync(externalExact);
-  return fs.existsSync(path.join(root, normalized)) || fs.existsSync(path.join(root, asFolder));
+  const candidates = [path.join(root, normalized), path.join(root, asFolder)];
+  return candidates.some((candidate) => fs.existsSync(candidate) && (!settings.projectOnly || projectPathIsContained(root, candidate)));
 }
 
 function normalizeMemoryWebappSettings(raw = {}, base = defaultMemoryWebappSettings()) {
@@ -4926,8 +6150,10 @@ function normalizeMemoryWebappSettings(raw = {}, base = defaultMemoryWebappSetti
   return {
     $schema: String(raw.$schema || base.$schema || CONFIG_SCHEMA_URL),
     title: String(raw.title || base.title || "Context Room").trim() || "Context Room",
+    projectOnly: Boolean(raw.projectOnly ?? base.projectOnly ?? false),
     allowedPaths: sanitizePathList(raw.allowedPaths ?? base.allowedPaths ?? ALLOWED_PREFIXES),
     watchAllow: sanitizePathList(raw.watchAllow ?? base.watchAllow),
+    watchRules: sanitizeWatchRules(raw.watchRules ?? base.watchRules ?? []),
     reviewPaths: sanitizePathList(raw.reviewPaths ?? base.reviewPaths ?? []),
     reviewAgentInstructions: Boolean(raw.reviewAgentInstructions ?? base.reviewAgentInstructions ?? true),
     integrations: { hermes: Boolean(raw.integrations?.hermes ?? base.integrations?.hermes ?? false) },
@@ -4952,7 +6178,8 @@ function normalizeAppearanceSettings(value = {}) {
 }
 
 function normalizeStartupContextSettings(value = {}) {
-  const rawFileNames = Array.isArray(value.fileNames) ? value.fileNames : DEFAULT_STARTUP_CONTEXT.fileNames;
+  const explicitFileNames = Array.isArray(value.fileNames);
+  const rawFileNames = explicitFileNames ? value.fileNames : DEFAULT_STARTUP_CONTEXT.fileNames;
   const fileNames = [...new Set(rawFileNames
     .map((item) => path.basename(String(item || "").trim()))
     .filter((item) => item && !isBlockedPath(item) && isEditableTextFile(item))
@@ -4962,23 +6189,28 @@ function normalizeStartupContextSettings(value = {}) {
     .map((item) => normalizeRelPath(String(item || "")).replace(/\/$/, ""))
     .filter((item) => item.startsWith("~/") && !item.includes("/../") && !isBlockedPath(item) && isEditableTextFile(item))
   )];
-  return {
+  const normalized = {
     enabled: Boolean(value.enabled),
-    fileNames: fileNames.length ? fileNames : [...DEFAULT_STARTUP_CONTEXT.fileNames],
+    fileNames: explicitFileNames ? fileNames : [...DEFAULT_STARTUP_CONTEXT.fileNames],
     globalPaths,
   };
+  if (Object.prototype.hasOwnProperty.call(value, "projectOnly")) normalized.projectOnly = Boolean(value.projectOnly);
+  return normalized;
 }
 
 function normalizeStartupSkillSettings(value = {}) {
-  const rawFolderNames = Array.isArray(value.folderNames) ? value.folderNames : DEFAULT_STARTUP_SKILLS.folderNames;
+  const explicitFolderNames = Array.isArray(value.folderNames);
+  const rawFolderNames = explicitFolderNames ? value.folderNames : DEFAULT_STARTUP_SKILLS.folderNames;
   const folderNames = [...new Set(rawFolderNames
     .map((item) => normalizeRelPath(String(item || "")).replace(/\/$/, ""))
     .filter((item) => item && !item.startsWith("../") && !item.includes("/../") && !path.isAbsolute(item) && !isBlockedPath(item))
   )];
-  return {
+  const normalized = {
     enabled: value.enabled !== false,
-    folderNames: folderNames.length ? folderNames : [...DEFAULT_STARTUP_SKILLS.folderNames],
+    folderNames: explicitFolderNames ? folderNames : [...DEFAULT_STARTUP_SKILLS.folderNames],
   };
+  if (Object.prototype.hasOwnProperty.call(value, "projectOnly")) normalized.projectOnly = Boolean(value.projectOnly);
+  return normalized;
 }
 
 function defaultStartupHookSettings() {
@@ -4997,12 +6229,14 @@ function defaultAgentHookSources() {
 }
 
 function normalizeStartupHookSettings(value = {}) {
-  const rawFileNames = Array.isArray(value.fileNames) ? value.fileNames : DEFAULT_STARTUP_HOOKS.fileNames;
+  const explicitFileNames = Array.isArray(value.fileNames);
+  const rawFileNames = explicitFileNames ? value.fileNames : DEFAULT_STARTUP_HOOKS.fileNames;
   const fileNames = [...new Set(rawFileNames
     .map((item) => path.basename(String(item || "").trim()))
     .filter((item) => item && !isBlockedPath(item) && !item.endsWith(".sample"))
   )];
-  const rawManagerPaths = Array.isArray(value.managerPaths) ? value.managerPaths : DEFAULT_STARTUP_HOOKS.managerPaths;
+  const explicitManagerPaths = Array.isArray(value.managerPaths);
+  const rawManagerPaths = explicitManagerPaths ? value.managerPaths : DEFAULT_STARTUP_HOOKS.managerPaths;
   const managerPaths = [...new Set(rawManagerPaths
     .map((item) => normalizeRelPath(String(item || "")))
     .filter((item) => item && !item.startsWith("../") && !item.includes("/../") && !path.isAbsolute(item) && !isBlockedPath(item))
@@ -5011,19 +6245,21 @@ function normalizeStartupHookSettings(value = {}) {
   const agentHookPaths = [...new Set(agentHookSources.flatMap((source) => source.paths || []))];
   const codexPaths = agentHookPaths.filter((item) => item.includes(".codex/"));
   const agentHooks = value.agentHooks ?? value.codexHooks;
-  return {
+  const normalized = {
     enabled: value.enabled !== false,
     editable: Boolean(value.editable),
     agentHooks: agentHooks !== false,
     codexHooks: agentHooks !== false,
     gitHooks: value.gitHooks !== false,
     hookManagers: value.hookManagers !== false,
-    fileNames: fileNames.length ? fileNames : [...DEFAULT_STARTUP_HOOKS.fileNames],
+    fileNames: explicitFileNames ? fileNames : [...DEFAULT_STARTUP_HOOKS.fileNames],
     agentHookSources,
-    agentHookPaths: agentHookPaths.length ? agentHookPaths : [...DEFAULT_STARTUP_HOOKS.agentHookPaths],
-    codexPaths: codexPaths.length ? codexPaths : [...DEFAULT_STARTUP_HOOKS.codexPaths],
-    managerPaths: managerPaths.length ? managerPaths : [...DEFAULT_STARTUP_HOOKS.managerPaths],
+    agentHookPaths,
+    codexPaths,
+    managerPaths: explicitManagerPaths ? managerPaths : [...DEFAULT_STARTUP_HOOKS.managerPaths],
   };
+  if (Object.prototype.hasOwnProperty.call(value, "projectOnly")) normalized.projectOnly = Boolean(value.projectOnly);
+  return normalized;
 }
 
 function normalizeAgentHookSources(value = {}) {
@@ -5044,7 +6280,7 @@ function normalizeAgentHookSources(value = {}) {
         byId.set(id, { id, label, paths });
       }
     }
-    if (byId.size) return [...byId.values()];
+    return [...byId.values()];
   }
 
   const rawPaths = Array.isArray(value.agentHookPaths)
@@ -5078,7 +6314,7 @@ function agentHookSourcesFromPaths(paths = []) {
       byId.set(source.id, { id: source.id, label: source.label, paths: [relPath] });
     }
   }
-  return byId.size ? [...byId.values()].map((source) => ({ ...source, paths: [...new Set(source.paths)] })) : defaultAgentHookSources();
+  return [...byId.values()].map((source) => ({ ...source, paths: [...new Set(source.paths)] }));
 }
 
 function defaultAgentHookSourceForPath(relPath) {
@@ -5185,14 +6421,101 @@ function sanitizePathList(value) {
   return [...new Set(value.map((item) => normalizeRelPath(String(item || ""))).filter((item) => item && !item.startsWith("../") && !item.includes("/../") && !path.isAbsolute(item) && !isBlockedPath(item)))];
 }
 
+function normalizeWatchRulePath(value) {
+  const normalized = normalizeRelPath(String(value || "")).replace(/\/$/, "");
+  if (!normalized || normalized.startsWith("../") || normalized.includes("/../") || path.isAbsolute(normalized) || isBlockedPath(normalized)) return "";
+  return normalized + "/";
+}
+
+function parentPathForWatch(relPath) {
+  const normalized = normalizeRelPath(String(relPath || "")).replace(/\/$/, "");
+  const separator = normalized.lastIndexOf("/");
+  return separator < 0 ? "" : normalized.slice(0, separator);
+}
+
+function watchRuleContainsPath(rulePath, relPath) {
+  const rootPath = normalizeWatchRulePath(rulePath).replace(/\/$/, "");
+  const normalized = normalizeRelPath(String(relPath || "")).replace(/\/$/, "");
+  return Boolean(rootPath) && (normalized === rootPath || normalized.startsWith(rootPath + "/"));
+}
+
+function normalizeWatchRule(rule = {}) {
+  const rulePath = normalizeWatchRulePath(rule.path);
+  const mode = String(rule.mode || "").trim();
+  if (!rulePath || !WATCH_RULE_MODES.includes(mode)) return null;
+  const normalized = { path: rulePath, mode };
+  if (CURRENT_FILE_WATCH_RULE_MODES.has(mode)) {
+    const direct = mode === "direct-current";
+    const rootPath = rulePath.replace(/\/$/, "");
+    normalized.files = sanitizePathList(rule.files || [])
+      .filter((filePath) => watchRuleContainsPath(rulePath, filePath))
+      .filter((filePath) => !direct || parentPathForWatch(filePath) === rootPath)
+      .sort((left, right) => left.localeCompare(right, "en"));
+  }
+  return normalized;
+}
+
+function sanitizeWatchRules(value) {
+  if (!Array.isArray(value)) return [];
+  const byPath = new Map();
+  for (const rawRule of value) {
+    const rule = normalizeWatchRule(rawRule);
+    if (!rule) continue;
+    byPath.delete(rule.path);
+    byPath.set(rule.path, rule);
+  }
+  return [...byPath.values()].sort((left, right) => left.path.localeCompare(right.path, "en"));
+}
+
 function sanitizeExternalPathList(value) {
   if (!Array.isArray(value)) return [];
   return [...new Set(value.map((item) => normalizeRelPath(String(item || ""))).filter((item) => item && item.startsWith("~/") && !item.includes("/../") && !isBlockedPath(item)))];
 }
 
+function normalizeWatchSettingsInput(watchAllowOrSettings = [], watchRules = []) {
+  if (Array.isArray(watchAllowOrSettings)) {
+    return { watchAllow: watchAllowOrSettings, watchRules: Array.isArray(watchRules) ? watchRules : [] };
+  }
+  const settings = watchAllowOrSettings && typeof watchAllowOrSettings === "object" ? watchAllowOrSettings : {};
+  return {
+    watchAllow: Array.isArray(settings.watchAllow) ? settings.watchAllow : [],
+    watchRules: Array.isArray(settings.watchRules) ? settings.watchRules : [],
+  };
+}
+
+function exactFolderWatchMode(relPath, settings = defaultMemoryWebappSettings()) {
+  const rulePath = normalizeWatchRulePath(relPath);
+  if (!rulePath) return "recursive-live";
+  const structuredRule = sanitizeWatchRules(settings.watchRules || []).find((rule) => rule.path === rulePath);
+  return structuredRule?.mode || "recursive-live";
+}
+
+function matchingWatchRule(relPath, watchAllowOrSettings = [], watchRules = []) {
+  const normalized = normalizeRelPath(String(relPath || "")).replace(/\/$/, "");
+  if (!normalized) return null;
+  const settings = normalizeWatchSettingsInput(watchAllowOrSettings, watchRules);
+  const candidates = [];
+  for (const rawPattern of settings.watchAllow) {
+    const pattern = normalizeRelPath(String(rawPattern || ""));
+    const rootPath = pattern.replace(/\/$/, "");
+    if (!rootPath || !pathMatchesSetting(normalized, pattern)) continue;
+    candidates.push({ path: pattern, rootPath, mode: "recursive-live", legacy: true, exact: normalized === rootPath });
+  }
+  for (const rule of sanitizeWatchRules(settings.watchRules)) {
+    const rootPath = rule.path.replace(/\/$/, "");
+    if (!watchRuleContainsPath(rule.path, normalized)) continue;
+    candidates.push({ ...rule, rootPath, legacy: false, exact: normalized === rootPath });
+  }
+  candidates.sort((left, right) => right.rootPath.length - left.rootPath.length || Number(left.legacy) - Number(right.legacy));
+  const match = candidates[0] || null;
+  if (!match) return null;
+  if (match.mode === "recursive-live") return { ...match, watched: true };
+  if (match.mode === "direct-live") return { ...match, watched: parentPathForWatch(normalized) === match.rootPath };
+  return { ...match, watched: (match.files || []).includes(normalized) };
+}
+
 function isWatchedPath(relPath, settings = defaultMemoryWebappSettings()) {
-  const normalized = normalizeRelPath(relPath);
-  return settings.watchAllow.some((pattern) => pathMatchesSetting(normalized, pattern));
+  return Boolean(matchingWatchRule(relPath, settings)?.watched);
 }
 
 function isRequiredReviewPath(relPath, settings = defaultMemoryWebappSettings()) {
@@ -5209,16 +6532,23 @@ function pathMatchesSetting(relPath, pattern) {
   return normalizedPath === clean || normalizedPath.startsWith(clean + "/");
 }
 
-export function watchStateForPath(relPath, watchAllow = []) {
-  const clean = normalizeRelPath(relPath);
-  const normalizedWatch = (watchAllow || []).map((item) => normalizeRelPath(item));
-  if (normalizedWatch.includes(clean)) return "watched";
-  return normalizedWatch.some((pattern) => pathMatchesSetting(clean, pattern)) ? "watched-inherited" : "";
+export function watchStateForPath(relPath, watchAllowOrSettings = [], watchRules = []) {
+  const folderPath = normalizeRelPath(String(relPath || "")).endsWith("/");
+  const clean = normalizeRelPath(String(relPath || "")).replace(/\/$/, "");
+  const match = matchingWatchRule(relPath, watchAllowOrSettings, watchRules);
+  if (!match) return "";
+  if (match.exact) return "watched";
+  if (folderPath) {
+    if (match.mode === "recursive-live") return "watched-inherited";
+    if (match.mode === "recursive-current" && (match.files || []).some((filePath) => filePath.startsWith(clean + "/"))) return "watched-inherited";
+    return "";
+  }
+  return match.watched ? "watched-inherited" : "";
 }
 
-export function explorerWatchFilterMatches(relPath, filter = "all", watchAllow = []) {
-  if (filter === "watched") return Boolean(watchStateForPath(relPath, watchAllow));
-  if (filter === "unwatched") return !watchStateForPath(relPath, watchAllow);
+export function explorerWatchFilterMatches(relPath, filter = "all", watchAllowOrSettings = [], watchRules = []) {
+  if (filter === "watched") return Boolean(watchStateForPath(relPath, watchAllowOrSettings, watchRules));
+  if (filter === "unwatched") return !watchStateForPath(relPath, watchAllowOrSettings, watchRules);
   return true;
 }
 
@@ -5422,6 +6752,34 @@ function clearBackgroundCacheState(root) {
   }
 }
 
+export function contextRoomProjectId(root = process.cwd()) {
+  return createHash("sha256").update(safeRealPath(path.resolve(root))).digest("hex").slice(0, 24);
+}
+
+export async function selectAvailableContextRoomPort(preferredPort = DEFAULT_PORT, { host = "127.0.0.1", allowFallback = true, maxAttempts = 200 } = {}) {
+  const firstPort = Number(preferredPort);
+  if (!Number.isInteger(firstPort) || firstPort < 1 || firstPort > 65535) throw new Error(`Invalid Context Room port: ${preferredPort}`);
+  const attempts = Math.max(1, Math.min(Number(maxAttempts) || 1, 65536 - firstPort));
+  for (let offset = 0; offset < attempts; offset += 1) {
+    const port = firstPort + offset;
+    if (await contextRoomPortIsAvailable(port, host)) return port;
+    if (!allowFallback) throw new Error(`Context Room port ${port} is already in use. Choose another port or omit --port to select one automatically.`);
+  }
+  throw new Error(`No free Context Room port found from ${firstPort} to ${firstPort + attempts - 1}.`);
+}
+
+function contextRoomPortIsAvailable(port, host) {
+  return new Promise((resolve, reject) => {
+    const probe = net.createServer();
+    probe.unref();
+    probe.once("error", (error) => {
+      if (["EADDRINUSE", "EACCES"].includes(error.code)) resolve(false);
+      else reject(error);
+    });
+    probe.listen(port, host, () => probe.close(() => resolve(true)));
+  });
+}
+
 function requestInvalidatesBackgroundCaches(req) {
   if (!req || req.method === "GET") return false;
   try {
@@ -5436,12 +6794,13 @@ function watchBackgroundInputs(root) {
   const startedAt = Date.now();
   let timer = null;
   const watchers = [];
-  const scheduleInvalidation = (fileName) => {
+  const watchedTargets = new Set();
+  const scheduleInvalidation = (watchRoot, fileName) => {
     if (Date.now() - startedAt < 250) return;
     const relPath = fileName == null ? "" : normalizeRelPath(String(fileName));
     if (BACKGROUND_WATCH_IGNORED_PATHS.has(relPath)) return;
     if (relPath === path.basename(resolvedRoot)) return;
-    const watchedPath = relPath ? path.resolve(resolvedRoot, relPath) : "";
+    const watchedPath = relPath ? path.resolve(watchRoot, relPath) : "";
     if (watchedPath && fs.existsSync(watchedPath) && fs.statSync(watchedPath).isDirectory()) return;
     clearTimeout(timer);
     timer = setTimeout(() => {
@@ -5452,8 +6811,11 @@ function watchBackgroundInputs(root) {
     timer.unref?.();
   };
   const addWatcher = (target, options = {}) => {
+    const resolvedTarget = path.resolve(target);
+    if (watchedTargets.has(resolvedTarget)) return true;
     try {
-      watchers.push(fs.watch(target, { persistent: false, ...options }, (_event, fileName) => scheduleInvalidation(fileName)));
+      watchers.push(fs.watch(resolvedTarget, { persistent: false, ...options }, (_event, fileName) => scheduleInvalidation(resolvedTarget, fileName)));
+      watchedTargets.add(resolvedTarget);
       return true;
     } catch {
       return false;
@@ -5465,6 +6827,17 @@ function watchBackgroundInputs(root) {
     const abs = path.resolve(file.startupContext?.absolutePath || "");
     if (!abs || abs === resolvedRoot || abs.startsWith(`${resolvedRoot}${path.sep}`)) continue;
     addWatcher(abs);
+  }
+  const settings = readMemoryWebappSettings(resolvedRoot);
+  for (const configuredPath of sanitizeExternalPathList(settings.allowedPaths || [])) {
+    const abs = resolveExternalPath(configuredPath.replace(/\/$/, ""));
+    if (!abs || !fs.existsSync(abs)) continue;
+    const stats = fs.statSync(abs);
+    if (stats.isDirectory()) {
+      if (!addWatcher(abs, { recursive: true })) addWatcher(abs);
+    } else if (stats.isFile()) {
+      addWatcher(abs);
+    }
   }
   return () => {
     clearTimeout(timer);
@@ -5493,12 +6866,35 @@ async function readBackgroundReports(root, { force = false } = {}) {
 }
 
 export function createMemoryServer({ root = process.cwd(), port = DEFAULT_PORT, globalPreferencesPath = null } = {}) {
+  const projectId = contextRoomProjectId(root);
   ensureBackgroundWorker(root, "files");
   void readBackgroundReports(root).catch(() => {});
   const lastSelectedPath = normalizeRelPath(readCollaborationSessionState(root).selectedPath || "");
   if (lastSelectedPath) void readBackgroundFileTask("file-diff", root, { path: lastSelectedPath }).catch(() => {});
   const stopBackgroundWatch = watchBackgroundInputs(root);
   const server = http.createServer(async (req, res) => {
+    res.setHeader("x-context-room-project", projectId);
+    const expectedProjectId = String(req.headers["x-context-room-project"] || "").trim();
+    const browserMutation = !["GET", "HEAD", "OPTIONS"].includes(req.method || "GET")
+      && Boolean(req.headers["sec-fetch-site"] || req.headers.origin || req.headers.referer);
+    if (!expectedProjectId && browserMutation) {
+      sendJson(res, 409, {
+        error: "Reload this Context Room tab before changing project state.",
+        code: "context_room_project_identity_required",
+        projectId,
+        root: path.resolve(root),
+      });
+      return;
+    }
+    if (expectedProjectId && expectedProjectId !== projectId) {
+      sendJson(res, 409, {
+        error: "This browser tab belongs to a different Context Room project. Reload before continuing.",
+        code: "context_room_project_changed",
+        projectId,
+        root: path.resolve(root),
+      });
+      return;
+    }
     try {
       await routeRequest(req, res, root, globalPreferencesPath);
     } catch (error) {
@@ -5512,7 +6908,7 @@ export function createMemoryServer({ root = process.cwd(), port = DEFAULT_PORT, 
     closeBackgroundWorkers(root);
     clearBackgroundCacheState(root);
   });
-  return { server, root, port };
+  return { server, root, port, projectId };
 }
 
 async function routeRequest(req, res, root, globalPreferencesPath = null) {
@@ -5530,7 +6926,12 @@ async function routeRequest(req, res, root, globalPreferencesPath = null) {
     if (startupSkillFolder && startupSkill) externalRoots.push(startupSkillExplorerRootPath(root, startupSkillFolder, startupSkill));
     if (startupContextOrder) externalRoots.push(startupContextExplorerPath(root, startupContextOrder));
     const appearance = readGlobalContextRoomPreferences(globalPreferencesPath).appearance;
-    sendJson(res, 200, { files: listExplorerFiles(root, { externalRoots, showHiddenFiles: appearance.showHiddenFiles !== false }), root });
+    const showHiddenFiles = appearance.showHiddenFiles !== false;
+    sendJson(res, 200, {
+      files: listExplorerFiles(root, { externalRoots, showHiddenFiles }),
+      directories: listExplorerDirectories(root, { externalRoots, showHiddenFiles }),
+      root,
+    });
     return;
   }
   if (req.method === "GET" && url.pathname === "/api/startup-context") {
@@ -5605,6 +7006,16 @@ async function routeRequest(req, res, root, globalPreferencesPath = null) {
     const preferences = writeGlobalContextRoomPreferences({ appearance: incoming.appearance }, globalPreferencesPath);
     const settings = { ...projectSettings, appearance: preferences.appearance, reviewGate: readReviewGateSettings(root) };
     sendJson(res, 200, { settings, hubCards: hubCardsForRoot(root, settings), hubSections: hubSectionsForRoot(root, settings), availableHubCards: settings.customHubCards });
+    return;
+  }
+  if (req.method === "POST" && url.pathname === "/api/watch-rule") {
+    const body = await readJsonBody(req);
+    sendJson(res, 200, writeFolderWatchRule(root, body));
+    return;
+  }
+  if (req.method === "DELETE" && url.pathname === "/api/watch-rule") {
+    const body = await readJsonBody(req);
+    sendJson(res, 200, removeFolderWatchRule(root, body));
     return;
   }
   if (req.method === "POST" && url.pathname === "/api/review-gate") {
@@ -5750,7 +7161,7 @@ async function routeRequest(req, res, root, globalPreferencesPath = null) {
     return;
   }
   if (req.method === "GET" && url.pathname === "/api/health") {
-    sendJson(res, 200, { ok: true, root, files: listMemoryFiles(root).length });
+    sendJson(res, 200, { ok: true, root, projectId: contextRoomProjectId(root), files: listMemoryFiles(root).length });
     return;
   }
 
@@ -5797,6 +7208,7 @@ function isProjectReadableMemoryPath(relPath, root = process.cwd()) {
   const resolvedRoot = path.resolve(root);
   const abs = path.resolve(resolvedRoot, normalized);
   if (abs === resolvedRoot || !abs.startsWith(`${resolvedRoot}${path.sep}`)) return false;
+  if (!projectPathIsContained(resolvedRoot, abs)) return false;
   if (!fs.existsSync(abs) || !fs.statSync(abs).isFile()) return false;
   return fs.statSync(abs).size <= MAX_FILE_BYTES;
 }
@@ -5804,7 +7216,9 @@ function isProjectReadableMemoryPath(relPath, root = process.cwd()) {
 function resolveProjectReadableMemoryPath(root, relPath) {
   const normalized = normalizeRelPath(String(relPath || ""));
   if (!isProjectReadableMemoryPath(normalized, root)) throw new Error(`Path not allowed in context room: ${relPath}`);
-  return path.resolve(root, normalized);
+  const abs = path.resolve(root, normalized);
+  assertProjectPathContained(root, abs, { label: relPath });
+  return abs;
 }
 
 function isSensitiveProjectFile(relPath) {
@@ -5825,6 +7239,7 @@ function readSensitiveProjectFile(root, relPath) {
   const resolvedRoot = path.resolve(root);
   const abs = path.resolve(resolvedRoot, normalized);
   if (abs === resolvedRoot || !abs.startsWith(`${resolvedRoot}${path.sep}`)) throw new Error(`Path not allowed in context room: ${relPath}`);
+  assertProjectPathContained(resolvedRoot, abs, { allowMissing: true, label: relPath });
   if (!fs.existsSync(abs)) {
     return { path: normalized, content: "", exists: false, updatedAt: null, chars: 0, contentHash: hashContent(""), readOnly: true, sensitive: true, redacted: true };
   }
@@ -5900,6 +7315,7 @@ function hasUnresolvedConflictMarkers(content) {
 
 function walkTextFiles(dir, root, settings = defaultMemoryWebappSettings()) {
   const results = [];
+  if (settings.projectOnly && !projectPathIsContained(root, dir)) return results;
   for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
     if (entry.name.startsWith(".") || SKIP_DIRS.has(entry.name)) continue;
     const abs = path.join(dir, entry.name);
@@ -5918,6 +7334,7 @@ function walkProjectExplorerTextFiles(root, { showHiddenFiles = true } = {}) {
   const results = [];
   const walk = (dir) => {
     if (results.length >= PROJECT_EXPLORER_MAX_FILES) return;
+    if (!projectPathIsContained(resolvedRoot, dir)) return;
     let entries = [];
     try {
       entries = fs.readdirSync(dir, { withFileTypes: true });
@@ -5953,6 +7370,7 @@ function isHiddenProjectPath(relPath) {
 
 function walkExternalTextFiles(dir, baseDir, virtualPrefix, settings = defaultMemoryWebappSettings()) {
   const results = [];
+  if (!projectPathIsContained(baseDir, dir)) return results;
   for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
     if (entry.name.startsWith(".") || SKIP_DIRS.has(entry.name)) continue;
     const abs = path.join(dir, entry.name);
@@ -5982,17 +7400,21 @@ function isAllowedExternalPath(relPath, settings = defaultMemoryWebappSettings()
   const normalized = normalizeRelPath(relPath).replace(/\/$/, "");
   if (!normalized || normalized.startsWith("../") || normalized.includes("/../") || path.isAbsolute(normalized)) return false;
   if (isBlockedPath(normalized)) return false;
-  return Boolean(externalPrefixForPath(normalized, settings));
+  return Boolean(externalPrefixForPath(normalized, settings))
+    && externalPathIsContained(normalized, settings, { allowMissing: true });
 }
 
 function isAllowedExternalMemoryPath(relPath, settings = defaultMemoryWebappSettings()) {
   const normalized = normalizeRelPath(relPath);
   if (!resolveExternalPath(normalized)) return false;
   if (normalized.startsWith("~/.hermes/")) {
-    return Boolean(settings.integrations?.hermes) && ALLOWED_EXTERNAL_PREFIXES.some((prefix) => normalized.startsWith(prefix));
+    return Boolean(settings.integrations?.hermes)
+      && ALLOWED_EXTERNAL_PREFIXES.some((prefix) => normalized.startsWith(prefix))
+      && externalPathIsContained(normalized, settings, { allowMissing: true });
   }
-  const allowed = sanitizeExternalPathList(settings.externalAllowedPaths || []);
-  return allowed.some((pattern) => pathMatchesSetting(normalized, pattern));
+  const allowed = configuredExternalAllowedPaths(settings);
+  return allowed.some((pattern) => pathMatchesSetting(normalized, pattern))
+    && externalPathIsContained(normalized, settings, { allowMissing: true });
 }
 
 function isAllowedExternalFolderPath(relPath, settings = defaultMemoryWebappSettings()) {
@@ -6000,19 +7422,82 @@ function isAllowedExternalFolderPath(relPath, settings = defaultMemoryWebappSett
   if (!normalized || normalized.startsWith("../") || normalized.includes("/../") || path.isAbsolute(normalized)) return false;
   if (isBlockedPath(normalized)) return false;
   if (normalized.startsWith("~/.hermes/")) {
-    return Boolean(settings.integrations?.hermes) && ALLOWED_EXTERNAL_PREFIXES.some((prefix) => pathMatchesSetting(normalized, prefix));
+    return Boolean(settings.integrations?.hermes)
+      && ALLOWED_EXTERNAL_PREFIXES.some((prefix) => pathMatchesSetting(normalized, prefix))
+      && externalPathIsContained(normalized, settings, { allowMissing: true });
   }
-  const allowed = sanitizeExternalPathList(settings.externalAllowedPaths || []);
-  return allowed.some((pattern) => pathMatchesSetting(normalized, pattern) || pathMatchesSetting(pattern, normalized));
+  const explicitAllowed = sanitizeExternalPathList(settings.allowedPaths || []);
+  if (explicitAllowed.some((pattern) => pathMatchesSetting(normalized, pattern))) {
+    return externalPathIsContained(normalized, settings, { allowMissing: true });
+  }
+  const transientAllowed = sanitizeExternalPathList(settings.externalAllowedPaths || []);
+  return transientAllowed.some((pattern) => pathMatchesSetting(normalized, pattern) || pathMatchesSetting(pattern, normalized))
+    && externalPathIsContained(normalized, settings, { allowMissing: true });
 }
 
 function externalPrefixForPath(relPath, settings = defaultMemoryWebappSettings()) {
   const normalized = normalizeRelPath(relPath).replace(/\/$/, "");
-  const prefixes = [...ALLOWED_EXTERNAL_PREFIXES, ...sanitizeExternalPathList(settings.externalAllowedPaths || [])];
-  return prefixes.find((prefix) => {
-    const clean = prefix.replace(/\/$/, "");
-    return normalized === clean || normalized.startsWith(`${clean}/`);
-  }) || null;
+  const integrationPrefixes = settings.integrations?.hermes
+    ? [
+        ...ALLOWED_EXTERNAL_PREFIXES,
+        ...HERMES_MEMORY_FILES.map((file) => file.path),
+        ...HERMES_CRON_FILES.map((file) => file.path),
+      ]
+    : [];
+  const prefixes = [...integrationPrefixes, ...configuredExternalAllowedPaths(settings)];
+  return prefixes
+    .filter((prefix) => {
+      const clean = prefix.replace(/\/$/, "");
+      return normalized === clean || normalized.startsWith(`${clean}/`);
+    })
+    .sort((left, right) => right.replace(/\/$/, "").length - left.replace(/\/$/, "").length)[0] || null;
+}
+
+function canonicalPathWithMissingTail(value) {
+  const resolved = path.resolve(value);
+  const anchor = nearestExistingPath(resolved);
+  if (!anchor) return null;
+  try {
+    return path.resolve(fs.realpathSync(anchor), path.relative(anchor, resolved));
+  } catch {
+    return null;
+  }
+}
+
+function externalPathIsContained(relPath, settings = defaultMemoryWebappSettings(), { allowMissing = false } = {}) {
+  const normalized = normalizeRelPath(String(relPath || "")).replace(/\/$/, "");
+  const prefix = externalPrefixForPath(normalized, settings);
+  const candidate = resolveExternalPath(normalized);
+  const root = prefix ? resolveExternalPath(prefix.replace(/\/$/, "")) : null;
+  if (!prefix || !candidate || !root) return false;
+  const resolvedCandidate = path.resolve(candidate);
+  const resolvedRoot = path.resolve(root);
+  if (resolvedCandidate !== resolvedRoot && !resolvedCandidate.startsWith(`${resolvedRoot}${path.sep}`)) return false;
+  if (!allowMissing && (!pathEntryExists(resolvedRoot) || !pathEntryExists(resolvedCandidate))) return false;
+  const canonicalRoot = canonicalPathWithMissingTail(resolvedRoot);
+  const canonicalCandidate = canonicalPathWithMissingTail(resolvedCandidate);
+  if (!canonicalRoot || !canonicalCandidate) return false;
+  return canonicalCandidate === canonicalRoot || canonicalCandidate.startsWith(`${canonicalRoot}${path.sep}`);
+}
+
+function assertExternalPathContained(relPath, settings = defaultMemoryWebappSettings(), { allowMissing = false } = {}) {
+  if (!externalPathIsContained(relPath, settings, { allowMissing })) {
+    throw new Error(`Path escapes configured external root through a symbolic link: ${relPath}`);
+  }
+  return resolveExternalPath(normalizeRelPath(String(relPath || "")));
+}
+
+function configuredExternalAllowedPaths(settings = defaultMemoryWebappSettings()) {
+  return sanitizeExternalPathList([
+    ...(settings.allowedPaths || []),
+    ...(settings.externalAllowedPaths || []),
+  ]);
+}
+
+function isExplicitExternalAllowedMemoryPath(relPath, settings = defaultMemoryWebappSettings()) {
+  const normalized = normalizeRelPath(relPath);
+  return sanitizeExternalPathList(settings.allowedPaths || []).some((pattern) => pathMatchesSetting(normalized, pattern))
+    && externalPathIsContained(normalized, settings, { allowMissing: true });
 }
 
 function pruneEmptyDirs(startDir, stopRoot) {
@@ -6067,6 +7552,18 @@ function summarizeContent(content) {
 function buildBackupPath(relPath) {
   const stamp = new Date().toISOString().replace(/[:.]/g, "-");
   return path.posix.join(".context-room/memory-webapp-backups", stamp, backupSafePath(relPath));
+}
+
+function createManagedBackup(root, sourceAbs, relPath, { directory = false } = {}) {
+  const backupRel = buildBackupPath(relPath);
+  const backupAbs = path.join(root, backupRel);
+  assertManagedProjectPath(root, backupAbs, backupRel);
+  fs.mkdirSync(path.dirname(backupAbs), { recursive: true });
+  assertManagedProjectPath(root, backupAbs, backupRel);
+  if (directory) fs.cpSync(sourceAbs, backupAbs, { recursive: true, errorOnExist: false });
+  else fs.copyFileSync(sourceAbs, backupAbs);
+  assertManagedProjectPath(root, backupAbs, backupRel);
+  return { backupRel, backupAbs };
 }
 
 function resolveExternalPath(relPath) {
@@ -6478,6 +7975,7 @@ export function renderAppHtml() {
     .watch-filter:hover { color: var(--text); background: var(--surface-card-hover); }
     .watch-filter.active { color: var(--on-accent); border-color: transparent; background: linear-gradient(135deg, var(--accent), var(--accent-2)); }
     .explorer-context-menu { position: fixed; z-index: 80; width: min(248px, calc(100vw - 24px)); border: 1px solid color-mix(in srgb, var(--accent) 24%, transparent); border-radius: 14px; background: var(--surface-floating); box-shadow: 0 18px 48px rgba(0,0,0,0.38); backdrop-filter: blur(20px); padding: var(--space-2); display: grid; gap: var(--space-2); }
+    .explorer-context-menu.watch-mode-open { width: min(440px, calc(100vw - 24px)); }
     .explorer-context-menu[hidden] { display: none; }
     .explorer-context-title { display: grid; gap: 2px; color: var(--label-strong); font-size: 11px; font-weight: 900; padding: 2px 4px; }
     .explorer-context-title code { color: var(--accent); font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 10px; font-weight: 700; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -6493,6 +7991,14 @@ export function renderAppHtml() {
     .explorer-context-actions.menu-actions { grid-template-columns: 1fr; }
     .explorer-context-actions.form-actions { grid-template-columns: 1fr 1fr; gap: 8px; }
     .explorer-context-menu .explorer-context-actions button { padding: 8px 10px; border-radius: 10px; font-size: 12px; line-height: 1.2; }
+    .watch-mode-options { display: grid; gap: 6px; }
+    .watch-mode-option { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 9px; align-items: start; border: 1px solid var(--line); border-radius: 9px; padding: 9px; background: var(--surface-card); color: var(--text); cursor: pointer; }
+    .watch-mode-option:hover { border-color: color-mix(in srgb, var(--accent) 42%, var(--line)); background: var(--surface-card-hover); }
+    .watch-mode-option:has(input:checked) { border-color: color-mix(in srgb, var(--accent) 64%, var(--line)); background: color-mix(in srgb, var(--accent) 11%, var(--surface-card)); }
+    .watch-mode-option input { width: auto; margin: 2px 0 0; accent-color: var(--accent); }
+    .watch-mode-option span { display: grid; gap: 2px; min-width: 0; }
+    .watch-mode-option strong { font-size: 11px; line-height: 1.3; }
+    .watch-mode-option small { color: var(--muted); font-size: 10px; line-height: 1.35; }
     select option { color: #111827; background: #ffffff; }
     select option:checked { color: #07101e; background: #93c5fd; }
 	    .empty-template-actions { display: grid; grid-template-columns: minmax(150px, 240px); gap: 8px; align-items: center; }
@@ -6604,9 +8110,15 @@ export function renderAppHtml() {
 	    .context-health-alert { display: flex; align-items: center; justify-content: space-between; gap: 12px; border: 1px solid color-mix(in srgb, var(--accent) 24%, transparent); border-radius: 14px; background: color-mix(in srgb, var(--accent) 8%, transparent); padding: 10px 12px; color: var(--text); }
 	    .context-health-alert strong { font-size: 14px; line-height: 1.2; }
 	    .context-health-alert span { color: var(--muted); font-size: 12px; white-space: nowrap; }
+	    .context-health-controls { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; }
+	    .context-health-filter { display: grid; gap: 4px; color: var(--muted); font-size: 10px; font-weight: 850; letter-spacing: 0.06em; text-transform: uppercase; }
+	    .context-health-filter select { width: 100%; min-width: 0; border: 1px solid var(--line); border-radius: 9px; background: var(--surface-card); color: var(--text); padding: 7px 9px; font: 11px/1.3 ui-monospace, SFMono-Regular, Menlo, monospace; text-transform: none; letter-spacing: 0; }
+	    .context-health-issue-list { max-height: min(42vh, 420px); overflow: auto; padding-right: 2px; }
 	    .context-health-issue { display: flex; align-items: flex-start; justify-content: space-between; gap: 10px; }
+	    .context-health-issue.acknowledged { opacity: 0.72; }
 	    .context-health-issue-copy { min-width: 0; line-height: 1.35; }
 	    .context-health-ok { min-height: 30px; padding: 6px 10px; border-radius: 10px; flex: 0 0 auto; }
+	    .context-health-ok-badge { flex: 0 0 auto; color: var(--good); }
 	    .docqa-actions { display: flex; gap: 8px; flex-wrap: wrap; }
     .markdown-tools { padding: var(--panel-body-padding); display: grid; gap: var(--space-4); }
     .markdown-create { max-width: 1120px; margin: 0 auto; display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); gap: var(--space-4); align-items: start; }
@@ -6669,6 +8181,12 @@ export function renderAppHtml() {
     .settings-field textarea { min-height: 118px; height: 118px; resize: vertical; }
     .settings-field.large textarea { min-height: 150px; height: 150px; }
     .settings-field-note, .settings-help { margin: -2px 0 0; color: var(--muted); font-size: 12px; line-height: 1.45; }
+    .watch-rule-list { display: grid; gap: 7px; }
+    .watch-rule-row { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 10px; align-items: center; border: 1px solid var(--line); border-radius: 10px; padding: 10px; background: var(--surface-card); }
+    .watch-rule-copy { display: grid; gap: 3px; min-width: 0; }
+    .watch-rule-copy strong { font-size: 12px; line-height: 1.3; }
+    .watch-rule-copy code { color: var(--accent); font: 10px/1.3 ui-monospace, SFMono-Regular, Menlo, monospace; overflow-wrap: anywhere; }
+    .watch-rule-copy small { color: var(--muted); font-size: 10px; line-height: 1.35; }
     .settings-toggle { position: relative; display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 12px; align-items: center; min-height: 64px; padding: 12px; border: 1px solid color-mix(in srgb, var(--line) 88%, transparent); border-radius: 16px; background: color-mix(in srgb, var(--surface-reader) 64%, var(--surface-card)); color: var(--text); cursor: pointer; text-transform: none; letter-spacing: 0; font-size: inherit; font-weight: inherit; }
     .settings-toggle:hover { border-color: color-mix(in srgb, var(--accent) 38%, transparent); background: var(--surface-card-hover); }
     .settings-toggle input { position: absolute; opacity: 0; pointer-events: none; }
@@ -6984,7 +8502,7 @@ export function renderAppHtml() {
     .external-review-block.change { display: block; position: relative; margin: 0; padding: 0; border-radius: 0 10px 10px 0; background: linear-gradient(90deg, rgba(125,211,252,0.06), rgba(125,211,252,0.018) 72%, transparent); box-shadow: inset 2px 0 0 rgba(125,211,252,0.46); }
     .external-review-block.attention { outline: 2px solid rgba(139,211,255,0.82); outline-offset: 2px; animation: externalReviewAttention 1.4s ease; }
     .external-review-block.resolved { color: rgba(226,236,255,0.86); margin: 0; padding: 0; border-radius: 0 10px 10px 0; background: rgba(148,163,184,0.035); box-shadow: inset 2px 0 0 rgba(148,163,184,0.22); transition: min-height 180ms ease, background 220ms ease; }
-    .external-review-block.resolved.settling { overflow: hidden; transition: height 2s ease, min-height 2s ease, margin 2s ease, padding 2s ease, background 220ms ease, box-shadow 220ms ease; }
+    .external-review-block.resolved.settling { overflow: hidden; transition: height 180ms ease, min-height 180ms ease, margin 180ms ease, padding 180ms ease, background 180ms ease, box-shadow 180ms ease; }
     .external-review-block.resolved.accept { box-shadow: inset 2px 0 0 rgba(93,244,143,0.46); background: rgba(48,215,111,0.06); }
     .external-review-block.resolved.reject { box-shadow: inset 2px 0 0 rgba(255,140,157,0.42); background: rgba(255,86,117,0.055); }
     .external-review-block.resolved.settled { margin: 0; padding: 0; box-shadow: inset 0 0 0 transparent; background: transparent; }
@@ -7076,6 +8594,7 @@ export function renderAppHtml() {
     @media (prefers-reduced-motion: reduce) { *, *::before, *::after { animation: none !important; transition: none !important; } }
     @media (max-width: 980px) {
       body { overflow: hidden; }
+	  .context-health-controls { grid-template-columns: 1fr; }
       .app, .app.sidebar-collapsed { grid-template-columns: 1fr; height: 100dvh; overflow: hidden; padding-top: 56px; }
       aside { position: fixed; z-index: 30; top: 0; left: 0; right: 0; height: min(62dvh, 560px); max-height: min(62dvh, 560px); border-right: 0; border-bottom: 1px solid var(--line); padding: var(--space-3); overflow: auto; box-shadow: 0 18px 60px rgba(0,0,0,0.42); }
       .app.sidebar-collapsed aside { height: 56px; max-height: 56px; padding: var(--space-2) var(--space-3); overflow: hidden; }
@@ -7443,13 +8962,14 @@ export function renderAppHtml() {
               </header>
               <div id="reviewQueue" class="review-list"></div>
             </section>
-            <section id="contextHealthPanel" class="docqa-panel" hidden>
+            <section id="contextHealthPanel" class="docqa-panel">
               <header>
                 <div>
                   <h2>Context health</h2>
                 </div>
+                <button id="refreshContextHealth" class="file-action" type="button" title="Run every health check again and show all results">Refresh all</button>
               </header>
-              <div id="contextHealth" class="markdown-tools"></div>
+              <div id="contextHealth" class="markdown-tools"><div class="issue">Analyzing project context...</div></div>
             </section>
           </div>
           <div id="hubFolders" class="hub-folders"></div>
@@ -7484,13 +9004,18 @@ export function renderAppHtml() {
   <div id="explorerContextMenu" class="explorer-context-menu" hidden></div>
 	  <div id="agentToast" class="agent-toast" hidden></div>
 	<script>
-		const state = { root: null, files: [], startupContextFiles: [], startupSkillFolders: [], startupHookFiles: [], startupHooksHelpOpen: false, startupHookFilter: "all", hubDisclosuresOpen: new Set(), activeStartupSkillExplorer: null, activeStartupContextExplorer: null, startupSkillCreateFolder: null, startupContextContextTarget: null, selectedStartupContext: null, docqa: null, doctor: null, backgroundReportRenderKey: "", settings: null, settingsOpen: false, settingsSection: "review", page: "hub", pendingMarkdown: null, availableHubCards: [], hubFolders: [], hubSections: [], rootHubSections: [], activeHubCardId: null, selectedReview: null, deletionBatchExpanded: false, deletionBatchLoading: false, deletionBatchItems: [], deletionBatchKey: "", deletionBatchReportedCount: 0, deletionBatchError: "", selectedDeletionReviews: new Set(), reviewModePath: null, reviewModeStatus: null, reviewSessions: {}, reviewFinalizationPromise: null, selected: null, selectedReadOnly: false, selectedDiff: null, fileLoadError: null, fileConflict: null, externalChange: null, conflictCompare: false, conflictMergeText: null, conflictMergeKey: "", conflictMergeMode: "auto", diffCollapsed: false, saved: "", savedHash: null, dirty: false, mode: "view", homeView: "root", planetStack: ["root"], filePanel: false, history: [], historyIndex: -1, pathFilters: [], explorerWatchFilter: "all", explorerRenderKey: "", explorerSearchFrame: 0, selectedForDelete: new Set(), selectionRequest: 0, openingFilePath: null, fileContentReadyPath: null, mobileSidebarTouched: false, sessionStateTimer: null, agentCommandTimer: null, lastAgentCommandId: "", pendingAgentCommand: null, agentAnnotations: {}, userActiveAt: 0, userScrollIntentAt: 0, refreshInFlight: false, reportsRefreshInFlight: false, backgroundRefreshTimer: null, filePrefetches: new Map(), prefetchTimer: null, prefetchPath: "", lastDiffRefreshAt: 0, lastReportRefreshAt: 0, lastFullRefreshAt: 0, navigationRestoreAttempted: false, bootStartedAt: Date.now(), bootMilestones: {}, markdownHighlightFrame: 0, markdownHighlightText: "", markdownHighlightLastText: "", docLinkModifierActive: false, expanded: new Set(["data", "automations", "integrations", "skills", "tools", "~", "~/.hermes", "~/.hermes/memories", "~/.hermes/skills"]) };
+		const state = { root: null, projectId: null, projectReloading: false, files: [], directories: [], startupContextFiles: [], startupSkillFolders: [], startupHookFiles: [], startupHooksHelpOpen: false, startupHookFilter: "all", hubDisclosuresOpen: new Set(), activeStartupSkillExplorer: null, activeStartupContextExplorer: null, startupSkillCreateFolder: null, startupContextContextTarget: null, selectedStartupContext: null, docqa: null, doctor: null, backgroundReportRenderKey: "", contextHealthStatusFilter: "open", contextHealthSeverityFilter: "triggered", contextHealthCategoryFilter: "all", contextHealthRefreshing: false, settings: null, settingsOpen: false, settingsSection: "review", page: "hub", pendingMarkdown: null, availableHubCards: [], hubFolders: [], hubSections: [], rootHubSections: [], activeHubCardId: null, selectedReview: null, deletionBatchExpanded: false, deletionBatchLoading: false, deletionBatchItems: [], deletionBatchKey: "", deletionBatchReportedCount: 0, deletionBatchError: "", selectedDeletionReviews: new Set(), reviewModePath: null, reviewModeStatus: null, reviewSessions: {}, reviewFinalizationPromise: null, selected: null, selectedReadOnly: false, selectedDiff: null, fileLoadError: null, fileConflict: null, externalChange: null, conflictCompare: false, conflictMergeText: null, conflictMergeKey: "", conflictMergeMode: "auto", diffCollapsed: false, saved: "", savedHash: null, dirty: false, mode: "view", homeView: "root", planetStack: ["root"], filePanel: false, history: [], historyIndex: -1, pathFilters: [], explorerWatchFilter: "all", explorerRenderKey: "", explorerSearchFrame: 0, selectedForDelete: new Set(), selectionRequest: 0, openingFilePath: null, fileContentReadyPath: null, mobileSidebarTouched: false, sessionStateTimer: null, agentCommandTimer: null, lastAgentCommandId: "", pendingAgentCommand: null, agentAnnotations: {}, userActiveAt: 0, userScrollIntentAt: 0, refreshInFlight: false, reportsRefreshInFlight: false, backgroundRefreshTimer: null, filePrefetches: new Map(), prefetchTimer: null, prefetchPath: "", lastDiffRefreshAt: 0, lastReportRefreshAt: 0, lastFullRefreshAt: 0, navigationRestoreAttempted: false, bootStartedAt: Date.now(), bootMilestones: {}, markdownHighlightFrame: 0, markdownHighlightText: "", markdownHighlightLastText: "", docLinkModifierActive: false, expanded: new Set(["data", "automations", "integrations", "skills", "tools", "~", "~/.hermes", "~/.hermes/memories", "~/.hermes/skills"]) };
 	const VERIFY_CONFIRM_STORAGE_KEY = "context-room:skip-mark-verified-confirm";
 const NAVIGATION_STATE_STORAGE_PREFIX = "context-room:navigation:";
-const AGENT_COMMAND_ACK_STORAGE_KEY = "context-room:last-agent-command-id";
+const AGENT_COMMAND_ACK_STORAGE_PREFIX = "context-room:last-agent-command-id:";
 const AGENT_COMMAND_MAX_AGE_MS = 60_000;
 const FILE_THEMES = ${JSON.stringify(FILE_THEME_OPTIONS)};
 const DEFAULT_FILE_THEME = "${DEFAULT_FILE_THEME}";
+const WATCH_RULE_MODES = ${JSON.stringify(WATCH_RULE_MODES)};
+const WATCH_RULE_MODE_OPTIONS = ${JSON.stringify(WATCH_RULE_MODE_OPTIONS)};
+const CONTEXT_HEALTH_STATUS_OPTIONS = [{ id: "open", label: "Open" }, { id: "all", label: "Open + OK" }, { id: "acknowledged", label: "OK only" }];
+const CONTEXT_HEALTH_SEVERITY_OPTIONS = [{ id: "triggered", label: "Triggered" }, { id: "all", label: "All severities" }, { id: "critical", label: "Critical" }, { id: "high", label: "High" }, { id: "medium", label: "Medium" }, { id: "low", label: "Low" }];
+const CONTEXT_HEALTH_CATEGORY_OPTIONS = [{ id: "all", label: "All areas" }, { id: "configuration", label: "Configuration" }, { id: "documentation", label: "Documentation" }, { id: "references", label: "References" }, { id: "review", label: "Review safety" }, { id: "startup", label: "Startup context" }, { id: "hooks", label: "Hooks" }];
 const SETTINGS_SECTION_IDS = ["review", "startup", "appearance", "templates", "hub"];
 const MAIN_FILE_PATHS = new Set([
   "~/.hermes/memories/USER.md",
@@ -7524,11 +9049,24 @@ const el = (id) => document.getElementById(id);
 async function api(path, options) {
   const attempts = options ? 1 : 3;
   const requestOptions = options ? { cache: "no-store", ...options } : { cache: "no-store" };
+  const headers = new Headers(requestOptions.headers || {});
+  if (state.projectId) headers.set("x-context-room-project", state.projectId);
+  requestOptions.headers = headers;
   let lastError = null;
   for (let attempt = 1; attempt <= attempts; attempt += 1) {
     try {
       const res = await fetch(path, requestOptions);
+      const responseProjectId = res.headers.get("x-context-room-project") || "";
+      if (state.projectId && responseProjectId && responseProjectId !== state.projectId) {
+        handleContextRoomProjectChange();
+        throw new Error("Context Room project changed; reloading this tab.");
+      }
+      if (!state.projectId && responseProjectId) state.projectId = responseProjectId;
       const json = await res.json();
+      if (res.status === 409 && ["context_room_project_changed", "context_room_project_identity_required"].includes(json.code)) {
+        handleContextRoomProjectChange();
+        throw new Error(json.error || "Context Room project changed; reloading this tab.");
+      }
       if (!res.ok) throw new Error(json.error || "request failed");
       return json;
     } catch (error) {
@@ -7539,6 +9077,13 @@ async function api(path, options) {
     }
   }
   throw lastError || new Error("request failed");
+}
+
+function handleContextRoomProjectChange() {
+  if (state.projectReloading) return;
+  state.projectReloading = true;
+  setStatus("project changed on this port · reloading safely");
+  window.location.reload();
 }
 
 function prefetchFile(path) {
@@ -7671,7 +9216,14 @@ function readPersistedNavigationState(root = state.root) {
   try {
     const raw = JSON.parse(window.localStorage?.getItem(key) || "null");
     if (!raw || raw.version !== 1) return null;
+    if (!raw.root || !raw.projectId) return null;
+    if (raw.root !== root) return null;
+    if (!state.projectId || raw.projectId !== state.projectId) return null;
     const page = ["hub", "file", "settings", "new-doc"].includes(raw.page) ? raw.page : "hub";
+    const rawPathFilters = Array.isArray(raw.pathFilters) ? raw.pathFilters.map(normalizeUiPath).filter(Boolean).slice(0, 20) : [];
+    const pathFilters = rawPathFilters.filter((filter) => state.files.some((file) => pathMatchesFilter(file.path, filter)));
+    const rawSearchText = typeof raw.searchText === "string" ? raw.searchText.slice(0, 300) : "";
+    const searchText = rawSearchText === folderFilterSearchQuery(rawPathFilters) ? folderFilterSearchQuery(pathFilters) : rawSearchText;
     return {
       version: 1,
       page,
@@ -7681,8 +9233,8 @@ function readPersistedNavigationState(root = state.root) {
       diffCollapsed: typeof raw.diffCollapsed === "boolean" ? raw.diffCollapsed : null,
       selectedReview: normalizeUiPath(raw.selectedReview || ""),
       explorerFilter: ["all", "watched", "unwatched"].includes(raw.explorerFilter) ? raw.explorerFilter : "all",
-      searchText: typeof raw.searchText === "string" ? raw.searchText.slice(0, 300) : "",
-      pathFilters: Array.isArray(raw.pathFilters) ? raw.pathFilters.map(normalizeUiPath).filter(Boolean).slice(0, 20) : [],
+      searchText,
+      pathFilters,
       activeHubCardId: typeof raw.activeHubCardId === "string" ? raw.activeHubCardId : null,
       settingsSection: SETTINGS_SECTION_IDS.includes(raw.settingsSection) ? raw.settingsSection : "review",
       pendingMarkdown: raw.pendingMarkdown && typeof raw.pendingMarkdown === "object" ? raw.pendingMarkdown : null,
@@ -7699,6 +9251,8 @@ function persistNavigationState() {
   try {
     window.localStorage?.setItem(key, JSON.stringify({
       version: 1,
+      root: state.root,
+      projectId: state.projectId,
       page: state.page,
       selectedPath: state.selected || null,
       startup: startupSelectionRequest(),
@@ -7890,6 +9444,7 @@ function startAgentCommandPolling() {
 }
 
 async function pollAgentCommand() {
+  if (!state.root) return;
   const data = await api("/api/agent/command");
   const command = data.command;
   if (!command?.id || command.id === state.lastAgentCommandId) return;
@@ -7902,15 +9457,23 @@ async function pollAgentCommand() {
 }
 
 function readLastAgentCommandId() {
-  try { return window.localStorage?.getItem(AGENT_COMMAND_ACK_STORAGE_KEY) || ""; }
+  const key = agentCommandAckStorageKey();
+  if (!key) return "";
+  try { return window.localStorage?.getItem(key) || ""; }
   catch { return ""; }
 }
 
 function rememberAgentCommandId(id) {
   state.lastAgentCommandId = id || "";
+  const key = agentCommandAckStorageKey();
+  if (!key) return;
   try {
-    if (id) window.localStorage?.setItem(AGENT_COMMAND_ACK_STORAGE_KEY, id);
+    if (id) window.localStorage?.setItem(key, id);
   } catch {}
+}
+
+function agentCommandAckStorageKey() {
+  return state.root ? AGENT_COMMAND_ACK_STORAGE_PREFIX + state.root : "";
 }
 
 function isStaleAgentCommand(command) {
@@ -8155,8 +9718,20 @@ function groupMainFiles(files) {
   return groups;
 }
 
-function buildTree(files) {
+function buildTree(files, directories = []) {
   const root = { name: "", path: "", type: "folder", children: new Map(), file: null };
+  for (const directory of directories || []) {
+    const directoryPath = normalizeUiPath(typeof directory === "string" ? directory : directory?.path || "").replace(/\/$/, "");
+    if (!directoryPath) continue;
+    const parts = directoryPath.split("/").filter(Boolean);
+    let node = root;
+    let current = "";
+    for (const part of parts) {
+      current = current ? current + "/" + part : part;
+      if (!node.children.has(part)) node.children.set(part, { name: part, path: current, type: "folder", children: new Map(), file: null });
+      node = node.children.get(part);
+    }
+  }
   for (const file of files) {
     const parts = file.path.split("/");
     let node = root;
@@ -8185,7 +9760,7 @@ function visibleFiles() {
   return state.files.filter((file) => {
     if (file.startupContext) return false;
     const inScope = !filters.length || filters.some((filter) => pathMatchesFilter(file.path, filter));
-    const matchesWatchFilter = explorerWatchFilterMatches(file.path, state.explorerWatchFilter, state.settings?.watchAllow || []);
+    const matchesWatchFilter = explorerWatchFilterMatches(file.path, state.explorerWatchFilter, state.settings || {});
     const haystack = (file.path + " " + file.label + " " + file.category).toLowerCase();
     const normalizedQuery = q.replace(/\/$/, "");
     const matchesQuery = !q
@@ -8193,6 +9768,24 @@ function visibleFiles() {
       || haystack.includes(q)
       || (normalizedQuery !== q && haystack.includes(normalizedQuery));
     return inScope && matchesWatchFilter && matchesQuery;
+  });
+}
+
+function visibleExplorerDirectories(files = []) {
+  const q = el("search").value.toLowerCase().trim();
+  const normalizedQuery = q.replace(/\/$/, "");
+  const filters = state.pathFilters || [];
+  return (state.directories || []).filter((directory) => {
+    const clean = normalizeUiPath(directory?.path || directory).replace(/\/$/, "");
+    if (!clean) return false;
+    const inScope = !filters.length || filters.some((filter) => {
+      const filterPath = normalizeUiPath(filter).replace(/\/$/, "");
+      return clean === filterPath || clean.startsWith(filterPath + "/") || filterPath.startsWith(clean + "/");
+    });
+    const watchMatch = explorerWatchFilterMatches(clean + "/", state.explorerWatchFilter, state.settings || {});
+    const hasVisibleChild = files.some((file) => file.path.startsWith(clean + "/"));
+    const matchesQuery = !q || clean.toLowerCase().includes(q) || clean.toLowerCase().includes(normalizedQuery) || hasVisibleChild;
+    return inScope && watchMatch && matchesQuery;
   });
 }
 
@@ -8240,15 +9833,16 @@ function updateExplorerWatchFilterButtons() {
 }
 
 function explorerWatchCounts() {
-  const watchAllow = state.settings?.watchAllow || [];
+  const watchSettings = state.settings || {};
   const files = (state.files || []).filter((file) => !file.startupContext);
-  const watched = files.filter((file) => Boolean(watchStateForPath(file.path, watchAllow))).length;
+  const watched = files.filter((file) => Boolean(watchStateForPath(file.path, watchSettings))).length;
   return { all: files.length, watched, unwatched: Math.max(0, files.length - watched) };
 }
 
 function explorerRenderKey(files) {
   return JSON.stringify({
     files: files.map((file) => [file.path, file.label, file.category]),
+    directories: visibleExplorerDirectories(files).map((directory) => directory.path),
     selected: state.selected,
     selectedForDelete: [...state.selectedForDelete].sort(),
     expanded: [...state.expanded].sort(),
@@ -8256,6 +9850,7 @@ function explorerRenderKey(files) {
     pathFilters: state.pathFilters || [],
     watchFilter: state.explorerWatchFilter,
     watchAllow: state.settings?.watchAllow || [],
+    watchRules: state.settings?.watchRules || [],
     activeStartupSkill: state.activeStartupSkillExplorer,
     activeStartupContext: state.activeStartupContextExplorer,
   });
@@ -8271,8 +9866,8 @@ function renderFiles({ force = false } = {}) {
     return;
   }
   state.explorerRenderKey = nextKey;
-  const tree = buildTree(files);
-  el("files").innerHTML = files.length ? renderTreeChildren(tree, 0) : renderExplorerEmptyState();
+  const tree = buildTree(files, visibleExplorerDirectories(files));
+  el("files").innerHTML = tree.children.size ? renderTreeChildren(tree, 0) : renderExplorerEmptyState();
   updateExplorerWatchFilterButtons();
   updateSelectionBar();
 }
@@ -8379,11 +9974,18 @@ function renderExplorerContextMenu(x, y) {
   const createActions = '<button class="secondary" type="button" data-context-new-file>New file</button>' +
     '<button class="secondary" type="button" data-context-new-folder>New folder</button>';
   const targetActions = target.path
-    ? '<button class="secondary" type="button" data-context-watch>Watch</button>' +
+    ? '<button class="secondary" type="button" data-context-watch>' + (target.kind === "folder" ? 'Watch options…' : 'Watch') + '</button>' +
       createActions +
       '<button class="secondary" type="button" data-context-select>Select</button>' +
       '<button class="secondary danger-action" type="button" data-context-delete>Delete</button>'
     : createActions;
+  const watchModeForm = target.path && target.kind === "folder"
+    ? '<div class="explorer-context-form" data-context-watch-mode-form hidden>' +
+        '<div class="explorer-context-title"><span>Watch folder</span><code>' + escapeHtml(selectionPathForExplorerTarget(target)) + '</code></div>' +
+        renderWatchModeOptions("contextWatchMode", exactUiFolderWatchMode(selectionPathForExplorerTarget(target), state.settings)) +
+        '<div class="explorer-context-actions form-actions"><button id="contextCancelWatchMode" class="secondary" type="button">Cancel</button><button id="contextApplyWatchMode" class="primary" type="button">Watch</button></div>' +
+      '</div>'
+    : '';
   menu.innerHTML = '<div class="explorer-context-title"><span>Actions</span><code>' + escapeHtml(label) + '</code></div>' +
     '<div class="explorer-context-actions menu-actions" data-context-action-list>' +
       targetActions +
@@ -8400,7 +10002,7 @@ function renderExplorerContextMenu(x, y) {
       '<label class="explorer-context-label" for="contextFolderPath">Path</label>' +
       '<input id="contextFolderPath" placeholder="path/to/folder" value="' + escapeHtml(defaultFolderPathForDirectory(target.directory)) + '" />' +
       '<div class="explorer-context-actions form-actions"><button id="contextCancelFolder" class="secondary" type="button" title="Cancel" aria-label="Cancel">Cancel</button><button id="contextCreateFolder" class="primary" type="button">Create</button></div>' +
-    '</div>';
+    '</div>' + watchModeForm;
   menu.hidden = false;
   menu.style.left = x + "px";
   menu.style.top = y + "px";
@@ -8419,6 +10021,25 @@ function renderExplorerContextMenu(x, y) {
   el("contextCancelMarkdown")?.addEventListener("click", hideExplorerContextMenu);
   el("contextCreateFolder")?.addEventListener("click", () => createFolderFromContextMenu().catch((error) => setStatus(error.message)));
   el("contextCancelFolder")?.addEventListener("click", hideExplorerContextMenu);
+  el("contextApplyWatchMode")?.addEventListener("click", () => applyExplorerFolderWatchMode().catch((error) => setStatus(error.message)));
+  el("contextCancelWatchMode")?.addEventListener("click", hideExplorerContextMenu);
+}
+
+function exactUiFolderWatchMode(relPath, settings = {}) {
+  const cleanPath = normalizeUiPath(relPath).replace(/\/$/, "");
+  if (!cleanPath) return "recursive-live";
+  const structuredRule = (settings.watchRules || []).find((rule) => {
+    const rulePath = normalizeUiPath(rule?.path || "").replace(/\/$/, "");
+    return rulePath === cleanPath && WATCH_RULE_MODES.includes(rule?.mode);
+  });
+  return structuredRule?.mode || "recursive-live";
+}
+
+function renderWatchModeOptions(name = "watchMode", selectedMode = "recursive-live") {
+  const activeMode = WATCH_RULE_MODES.includes(selectedMode) ? selectedMode : "recursive-live";
+  return '<div class="watch-mode-options" role="radiogroup" aria-label="Folder watch mode">' + WATCH_RULE_MODE_OPTIONS.map((option) =>
+    '<label class="watch-mode-option"><input type="radio" name="' + escapeHtml(name) + '" value="' + escapeHtml(option.id) + '" ' + (option.id === activeMode ? 'checked' : '') + ' /><span><strong>' + escapeHtml(option.label) + '</strong><small>' + escapeHtml(option.description) + '</small></span></label>'
+  ).join("") + '</div>';
 }
 
 function openExplorerEmptyContextMenu(event) {
@@ -8432,9 +10053,12 @@ function hideContextCreationForms() {
   const actionList = document.querySelector("[data-context-action-list]");
   const fileForm = document.querySelector("[data-context-new-file-form]");
   const folderForm = document.querySelector("[data-context-new-folder-form]");
+  const watchModeForm = document.querySelector("[data-context-watch-mode-form]");
   if (actionList) actionList.hidden = false;
   if (fileForm) fileForm.hidden = true;
   if (folderForm) folderForm.hidden = true;
+  if (watchModeForm) watchModeForm.hidden = true;
+  el("explorerContextMenu")?.classList.remove("watch-mode-open");
 }
 
 function showContextNewFileForm() {
@@ -8460,6 +10084,18 @@ function showContextNewFolderForm() {
   el("contextFolderPath")?.select();
 }
 
+function showContextWatchModeForm() {
+  hideContextCreationForms();
+  const actionList = document.querySelector("[data-context-action-list]");
+  const form = document.querySelector("[data-context-watch-mode-form]");
+  if (actionList) actionList.hidden = true;
+  if (!form) return;
+  form.hidden = false;
+  el("explorerContextMenu")?.classList.add("watch-mode-open");
+  clampContextMenuToViewport(el("explorerContextMenu"));
+  form.querySelector('input[name="contextWatchMode"]:checked')?.focus();
+}
+
 function clampContextMenuToViewport(menu) {
   window.requestAnimationFrame(() => {
     const rect = menu.getBoundingClientRect();
@@ -8472,7 +10108,10 @@ function clampContextMenuToViewport(menu) {
 
 function hideExplorerContextMenu() {
   const menu = el("explorerContextMenu");
-  if (menu) menu.hidden = true;
+  if (menu) {
+    menu.hidden = true;
+    menu.classList.remove("watch-mode-open");
+  }
 }
 
 function selectionPathForExplorerTarget(target) {
@@ -8499,8 +10138,38 @@ function selectExplorerContextTarget() {
 async function watchExplorerContextTarget() {
   const selectionPath = contextTargetSelectionPath();
   if (!selectionPath) return;
+  if (state.explorerContextTarget?.kind === "folder") {
+    showContextWatchModeForm();
+    return;
+  }
   hideExplorerContextMenu();
   await updateWatchSelection(selectionPath, "allow");
+}
+
+async function applyExplorerFolderWatchMode() {
+  const selectionPath = contextTargetSelectionPath();
+  if (!selectionPath || state.explorerContextTarget?.kind !== "folder") return;
+  const mode = document.querySelector('input[name="contextWatchMode"]:checked')?.value || "recursive-live";
+  const button = el("contextApplyWatchMode");
+  if (button) {
+    button.disabled = true;
+    button.textContent = "Watching...";
+  }
+  try {
+    const result = await api("/api/watch-rule", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ path: selectionPath, mode }),
+    });
+    hideExplorerContextMenu();
+    await refreshAfterWatchMutation(result.settings, "folder watch updated");
+  } catch (error) {
+    if (button?.isConnected) {
+      button.disabled = false;
+      button.textContent = "Watch";
+    }
+    throw error;
+  }
 }
 
 async function deleteExplorerContextTarget() {
@@ -8669,7 +10338,7 @@ function renderTreeNode(node, depth) {
   if (node.type === "file") {
     const file = node.file || { path: node.path, label: node.name };
     const selected = state.selectedForDelete.has(file.path);
-    const watchClass = watchStateForPath(file.path, state.settings?.watchAllow || []);
+    const watchClass = watchStateForPath(file.path, state.settings || {});
     return '<div class="tree-node tree-entry ' + [selected ? "selected" : "", watchClass].filter(Boolean).join(" ") + '">' +
       '<button class="tree-row file ' + (state.selected === file.path ? "active" : "") + '" style="padding-left:' + (depth * 12 + 7) + 'px" data-file-path="' + escapeHtml(file.path) + '" title="open · right-click for actions · ⌘-click to select">' +
         '<span class="twisty"></span><span class="icon">' + iconForPath(file.path) + '</span><span class="tree-name">' + escapeHtml(file.label || node.name) + '</span>' +
@@ -8679,7 +10348,7 @@ function renderTreeNode(node, depth) {
   const open = state.expanded.has(node.path);
   const selectPath = node.path + "/";
   const selected = state.selectedForDelete.has(selectPath);
-  const watchClass = watchStateForPath(selectPath, state.settings?.watchAllow || []);
+  const watchClass = watchStateForPath(selectPath, state.settings || {});
   return '<div class="tree-node">' +
     '<div class="tree-entry ' + [selected ? "selected" : "", watchClass].filter(Boolean).join(" ") + '">' +
       '<button class="tree-row folder" style="padding-left:' + (depth * 12 + 7) + 'px" data-folder-path="' + escapeHtml(node.path) + '" title="open · right-click for actions · ⌘-click to select">' +
@@ -8690,16 +10359,56 @@ function renderTreeNode(node, depth) {
   '</div>';
 }
 
-function watchStateForPath(relPath, watchAllow = []) {
-  const clean = normalizeUiPath(relPath);
-  const exact = (watchAllow || []).map(normalizeUiPath).includes(clean);
-  if (exact) return "watched";
-  return (watchAllow || []).some((pattern) => pathMatchesUiSetting(clean, pattern)) ? "watched-inherited" : "";
+function parentUiWatchPath(relPath) {
+  const clean = normalizeUiPath(relPath).replace(/\/$/, "");
+  const separator = clean.lastIndexOf("/");
+  return separator < 0 ? "" : clean.slice(0, separator);
 }
 
-function explorerWatchFilterMatches(relPath, filter = "all", watchAllow = []) {
-  if (filter === "watched") return Boolean(watchStateForPath(relPath, watchAllow));
-  if (filter === "unwatched") return !watchStateForPath(relPath, watchAllow);
+function matchingUiWatchRule(relPath, watchAllowOrSettings = [], watchRules = []) {
+  const clean = normalizeUiPath(relPath).replace(/\/$/, "");
+  if (!clean) return null;
+  const settings = Array.isArray(watchAllowOrSettings)
+    ? { watchAllow: watchAllowOrSettings, watchRules: Array.isArray(watchRules) ? watchRules : [] }
+    : (watchAllowOrSettings || {});
+  const candidates = [];
+  for (const rawPattern of settings.watchAllow || []) {
+    const pattern = normalizeUiPath(rawPattern);
+    const rootPath = pattern.replace(/\/$/, "");
+    if (!rootPath || !pathMatchesUiSetting(clean, pattern)) continue;
+    candidates.push({ rootPath, mode: "recursive-live", legacy: true, exact: clean === rootPath });
+  }
+  for (const rawRule of settings.watchRules || []) {
+    const mode = String(rawRule?.mode || "");
+    const rootPath = normalizeUiPath(rawRule?.path || "").replace(/\/$/, "");
+    if (!rootPath || !WATCH_RULE_MODES.includes(mode) || !pathMatchesUiSetting(clean, rootPath)) continue;
+    candidates.push({ rootPath, mode, files: (rawRule.files || []).map((item) => normalizeUiPath(item).replace(/\/$/, "")), legacy: false, exact: clean === rootPath });
+  }
+  candidates.sort((left, right) => right.rootPath.length - left.rootPath.length || Number(left.legacy) - Number(right.legacy));
+  const match = candidates[0] || null;
+  if (!match) return null;
+  if (match.mode === "recursive-live") return { ...match, watched: true };
+  if (match.mode === "direct-live") return { ...match, watched: parentUiWatchPath(clean) === match.rootPath };
+  return { ...match, watched: match.files.includes(clean) };
+}
+
+function watchStateForPath(relPath, watchAllowOrSettings = [], watchRules = []) {
+  const folderPath = normalizeUiPath(relPath).endsWith("/");
+  const clean = normalizeUiPath(relPath).replace(/\/$/, "");
+  const match = matchingUiWatchRule(relPath, watchAllowOrSettings, watchRules);
+  if (!match) return "";
+  if (match.exact) return "watched";
+  if (folderPath) {
+    if (match.mode === "recursive-live") return "watched-inherited";
+    if (match.mode === "recursive-current" && match.files.some((filePath) => filePath.startsWith(clean + "/"))) return "watched-inherited";
+    return "";
+  }
+  return match.watched ? "watched-inherited" : "";
+}
+
+function explorerWatchFilterMatches(relPath, filter = "all", watchAllowOrSettings = [], watchRules = []) {
+  if (filter === "watched") return Boolean(watchStateForPath(relPath, watchAllowOrSettings, watchRules));
+  if (filter === "unwatched") return !watchStateForPath(relPath, watchAllowOrSettings, watchRules);
   return true;
 }
 
@@ -8880,14 +10589,27 @@ function applyInitialReportsWhenReady(reportsRequest) {
   }).catch(() => scheduleBackgroundRefresh({ forceReports: true }));
 }
 
+function acceptContextRoomRoot(nextRoot) {
+  if (!nextRoot) return;
+  if (!state.root) {
+    state.root = nextRoot;
+    state.lastAgentCommandId = readLastAgentCommandId();
+    return;
+  }
+  if (state.root === nextRoot) return;
+  handleContextRoomProjectChange();
+  throw new Error("Context Room root changed; reloading this tab.");
+}
+
 async function loadFiles(options = {}) {
   setStatus("chargement...");
   if (options.initial) state.bootMilestones.requestsStarted = Date.now() - state.bootStartedAt;
   const reportsRequest = options.initial ? api("/api/reports") : null;
   const [data, settingsData] = await Promise.all([api(filesApiPath()), api("/api/settings")]);
   if (options.initial) state.bootMilestones.coreDataReady = Date.now() - state.bootStartedAt;
-  state.root = data.root || state.root;
+  acceptContextRoomRoot(data.root);
   state.files = data.files;
+  state.directories = data.directories || [];
   applySettingsPayload(settingsData);
   state.lastFullRefreshAt = Date.now();
   const clearedMissingSelection = reconcileMissingSelectedFile();
@@ -9573,29 +11295,77 @@ function renderContextHealth() {
   const holder = el("contextHealth");
   const panel = el("contextHealthPanel");
   if (!holder || !state.doctor) return;
-  const issues = (state.doctor.issues || []).filter((issue) => ["critical", "high", "medium"].includes(issue.severity) && !issue.acknowledged);
-  if (!issues.length) {
-    holder.innerHTML = "";
-    if (panel) panel.hidden = true;
-    return;
-  }
   if (panel) panel.hidden = false;
+  const refreshButton = el("refreshContextHealth");
+  if (refreshButton) {
+    refreshButton.disabled = state.contextHealthRefreshing;
+    refreshButton.textContent = state.contextHealthRefreshing ? "Refreshing..." : "Refresh all";
+  }
+  const allIssues = state.doctor.issues || [];
+  const issues = allIssues.filter(contextHealthIssueMatchesFilters);
   const counts = issues.reduce((acc, issue) => {
     acc[issue.severity] = (acc[issue.severity] || 0) + 1;
     return acc;
   }, {});
-  const countLabel = ["critical", "high", "medium"].filter((severity) => counts[severity]).map((severity) => counts[severity] + " " + severity).join(" · ");
-  holder.innerHTML = '<div class="context-health-alert"><strong>' + issues.length + ' issue' + (issues.length > 1 ? 's' : '') + ' triggered</strong><span>' + escapeHtml(countLabel) + '</span></div>' +
-    '<div class="issue-list compact">' + issues.slice(0, 5).map(renderContextHealthIssue).join("") + (issues.length > 5 ? '<div class="issue">+' + (issues.length - 5) + ' more in doctor.</div>' : '') + '</div>';
+  const countLabel = ["critical", "high", "medium", "low"].filter((severity) => counts[severity]).map((severity) => counts[severity] + " " + severity).join(" · ") || "No matching issue";
+  holder.innerHTML = '<div class="context-health-controls" aria-label="Context health filters">' +
+    renderContextHealthFilter("status", "State", CONTEXT_HEALTH_STATUS_OPTIONS, state.contextHealthStatusFilter) +
+    renderContextHealthFilter("severity", "Severity", CONTEXT_HEALTH_SEVERITY_OPTIONS, state.contextHealthSeverityFilter) +
+    renderContextHealthFilter("category", "Area", CONTEXT_HEALTH_CATEGORY_OPTIONS, state.contextHealthCategoryFilter) +
+    '</div>' +
+    '<div class="context-health-alert"><strong>' + issues.length + ' of ' + allIssues.length + ' issue' + (allIssues.length === 1 ? '' : 's') + ' shown</strong><span>' + escapeHtml(countLabel) + '</span></div>' +
+    '<div class="issue-list compact context-health-issue-list">' + (issues.length ? issues.map(renderContextHealthIssue).join("") : '<div class="issue">No health issues match these filters.</div>') + '</div>';
+  holder.querySelectorAll("[data-health-filter]").forEach((select) => select.addEventListener("change", () => {
+    const field = select.dataset.healthFilter;
+    if (field === "status") state.contextHealthStatusFilter = select.value;
+    if (field === "severity") state.contextHealthSeverityFilter = select.value;
+    if (field === "category") state.contextHealthCategoryFilter = select.value;
+    renderContextHealth();
+  }));
   holder.querySelectorAll("[data-health-ack]").forEach((button) => button.addEventListener("click", () => acknowledgeContextHealthIssueFromPanel(button.dataset.healthAck).catch((error) => setStatus(error.message))));
+}
+
+function renderContextHealthFilter(field, label, options, selected) {
+  return '<label class="context-health-filter">' + escapeHtml(label) + '<select data-health-filter="' + escapeHtml(field) + '">' + options.map((option) => '<option value="' + escapeHtml(option.id) + '" ' + (option.id === selected ? 'selected' : '') + '>' + escapeHtml(option.label) + '</option>').join("") + '</select></label>';
+}
+
+function contextHealthIssueMatchesFilters(issue) {
+  const statusMatches = state.contextHealthStatusFilter === "all"
+    || (state.contextHealthStatusFilter === "acknowledged" ? issue.acknowledged : !issue.acknowledged);
+  const severityMatches = state.contextHealthSeverityFilter === "all"
+    || (state.contextHealthSeverityFilter === "triggered" ? ["critical", "high", "medium"].includes(issue.severity) : issue.severity === state.contextHealthSeverityFilter);
+  const categoryMatches = state.contextHealthCategoryFilter === "all" || (issue.category || "documentation") === state.contextHealthCategoryFilter;
+  return statusMatches && severityMatches && categoryMatches;
 }
 
 function renderContextHealthIssue(issue) {
   const label = (issue.path ? issue.path + ": " : "") + issue.message;
-  return '<div class="issue context-health-issue ' + escapeHtml(issue.severity) + '">' +
+  const acknowledgement = issue.acknowledged
+    ? '<span class="chip context-health-ok-badge" title="Marked OK' + (issue.acknowledgedAt ? ' on ' + escapeHtml(issue.acknowledgedAt) : '') + '">OK</span>'
+    : '<button class="file-action context-health-ok" type="button" data-health-ack="' + escapeHtml(issue.key || "") + '" title="Hide this issue unless it changes">OK</button>';
+  return '<div class="issue context-health-issue ' + escapeHtml(issue.severity) + (issue.acknowledged ? ' acknowledged' : '') + '">' +
     '<div class="context-health-issue-copy"><strong>[' + escapeHtml(issue.severity) + ']</strong> ' + escapeHtml(label) + '</div>' +
-    '<button class="file-action context-health-ok" type="button" data-health-ack="' + escapeHtml(issue.key || "") + '" title="Hide this issue unless it changes">OK</button>' +
+    acknowledgement +
     '</div>';
+}
+
+async function refreshContextHealthAnalysis() {
+  if (state.contextHealthRefreshing) return;
+  state.contextHealthRefreshing = true;
+  state.contextHealthStatusFilter = "all";
+  state.contextHealthSeverityFilter = "all";
+  state.contextHealthCategoryFilter = "all";
+  renderContextHealth();
+  setStatus("reanalyzing all context health checks...");
+  try {
+    const reports = await api("/api/reports?fresh=1");
+    applyBackgroundReportPayload(reports);
+    state.lastReportRefreshAt = Date.now();
+    setStatus((state.doctor?.issues?.length || 0) + " health issue" + ((state.doctor?.issues?.length || 0) === 1 ? "" : "s") + " analyzed");
+  } finally {
+    state.contextHealthRefreshing = false;
+    renderDocQaDashboard();
+  }
 }
 
 async function acknowledgeContextHealthIssueFromPanel(key) {
@@ -10054,7 +11824,7 @@ function initialReviewNoticeForSelectedFile() {
   if (!state.selected || state.reviewModePath !== state.selected) return "";
   const reviewItem = state.docqa?.queue?.find((item) => item.path === state.selected);
   if (!reviewItem?.initialReview) return "";
-  return '<div class="issue initial-review-notice"><strong>First review</strong><span>No previous baseline exists for this first review. Review the current document as a whole; requesting changes will not modify the file.</span></div>';
+  return '<div class="issue initial-review-notice"><strong>First review</strong> <span>No previous baseline exists for this first review. Review the current document as a whole; requesting changes will not modify the file.</span></div>';
 }
 
 function nextReviewActionForSelectedFile() {
@@ -10185,6 +11955,14 @@ function renderSettingsPanel() {
   const holder = el("settingsPanel");
   if (!holder || !state.settings) return;
   const watchAllow = (state.settings.watchAllow || []).join("\n");
+  const watchRules = state.settings.watchRules || [];
+  const watchRulesMarkup = watchRules.length
+    ? '<div class="watch-rule-list">' + watchRules.map((rule) => {
+        const option = WATCH_RULE_MODE_OPTIONS.find((item) => item.id === rule.mode);
+        const snapshot = Array.isArray(rule.files) ? rule.files.length + ' frozen file' + (rule.files.length === 1 ? '' : 's') : 'live rule';
+        return '<div class="watch-rule-row"><span class="watch-rule-copy"><strong>' + escapeHtml(option?.label || rule.mode) + '</strong><code>' + escapeHtml(rule.path) + '</code><small>' + escapeHtml(snapshot) + '</small></span><button class="selection-action danger-action" type="button" data-remove-watch-rule="' + escapeHtml(rule.path) + '" title="Remove folder watch rule">×</button></div>';
+      }).join("") + '</div>'
+    : '<span class="settings-field-note">No explicit folder mode rules. Legacy watched folders remain recursive and live.</span>';
   const reviewPaths = (state.settings.reviewPaths || []).join("\n");
   const reviewGateOperations = state.settings.reviewGate?.operations || [];
   const startupContext = state.settings.startupContext || { enabled: false, fileNames: ["AGENTS.md", "CLAUDE.md"], globalPaths: [] };
@@ -10199,7 +11977,7 @@ function renderSettingsPanel() {
   const appearance = state.settings.appearance || { fileTheme: DEFAULT_FILE_THEME, autoOpenGitDiff: true, showHiddenFiles: true };
   const markdownTemplates = state.settings.markdownTemplates || [];
   const sections = state.settings.hubSections?.length ? state.settings.hubSections : [{ id: "main", title: "Main", cards: state.settings.customHubCards || state.availableHubCards || [] }];
-  const watchCount = (state.settings.watchAllow || []).length;
+  const watchCount = (state.settings.watchAllow || []).length + watchRules.length;
   const reviewPathCount = (state.settings.reviewPaths || []).length;
   const reviewGateCount = reviewGateOperations.length;
   const startupContextCount = (startupContext.fileNames || []).length + (startupContext.globalPaths || []).length;
@@ -10222,8 +12000,9 @@ function renderSettingsPanel() {
     copy: "Changed files listed here require human review before handoff.",
     pills: [watchCount + " watched", reviewPathCount + " required", reviewGateCount + " gates"],
     body: '<div class="settings-grid">' +
-      '<div class="settings-field large"><label for="watchAllow">Watched folders/files</label><span class="settings-field-note">One path per line.</span><textarea id="watchAllow" placeholder="docs/&#10;website/docs/">' + escapeHtml(watchAllow) + '</textarea></div>' +
+      '<div class="settings-field large"><label for="watchAllow">Simple watched folders/files</label><span class="settings-field-note">One path per line. Folder entries here use the recursive current-and-future default.</span><textarea id="watchAllow" placeholder="docs/&#10;website/docs/">' + escapeHtml(watchAllow) + '</textarea></div>' +
       '<div class="settings-field large"><label for="reviewPaths">Required review files</label><span class="settings-field-note">Important files that stay in review until verified, even without a Git diff.</span><textarea id="reviewPaths" placeholder="AGENTS.md&#10;docs/INDEX.md">' + escapeHtml(reviewPaths) + '</textarea></div>' +
+      '<div class="settings-field large"><label>Folder watch modes</label><span class="settings-field-note">Choose or replace these modes from the Explorer or agent CLI.</span>' + watchRulesMarkup + '</div>' +
     '</div>' +
     '<div class="review-gate-panel"><div class="review-gate-head"><div><h4>Block Git operations while review is pending</h4><p>Select one or several checkpoints. This local owner policy is kept outside project config and is not writable through the agent CLI.</p></div><span class="review-gate-owner">Owner control</span></div>' +
       '<div class="review-gate-options" role="group" aria-label="Git operations blocked by pending review">' +
@@ -10291,6 +12070,7 @@ function renderSettingsPanel() {
   el("addMarkdownTemplate")?.addEventListener("click", addMarkdownTemplateEditor);
   el("addHubSection")?.addEventListener("click", addHubSectionEditor);
   el("fileTheme")?.addEventListener("change", previewSelectedFileTheme);
+  holder.querySelectorAll("[data-remove-watch-rule]").forEach((button) => button.addEventListener("click", () => removeWatchRuleFromSettings(button.dataset.removeWatchRule).catch((error) => setStatus(error.message))));
   previewSelectedFileTheme();
   el("saveSettings")?.addEventListener("click", () => saveSettings().catch((error) => setStatus(error.message)));
 }
@@ -10368,6 +12148,17 @@ function addHubCardEditor(holder) {
   wireHubSettingsButtons(holder.lastElementChild);
 }
 
+async function removeWatchRuleFromSettings(relPath) {
+  if (!relPath) return;
+  setStatus("removing folder watch rule...");
+  const result = await api("/api/watch-rule", {
+    method: "DELETE",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ path: relPath }),
+  });
+  await refreshAfterWatchMutation(result.settings, "folder watch rule removed");
+}
+
 async function saveSettings() {
   const watchAllow = linesFromTextarea("watchAllow");
   const reviewPaths = linesFromTextarea("reviewPaths");
@@ -10376,17 +12167,20 @@ async function saveSettings() {
   };
   const startupContext = {
     enabled: Boolean(el("startupContextEnabled")?.checked),
+    ...(Object.prototype.hasOwnProperty.call(state.settings?.startupContext || {}, "projectOnly") ? { projectOnly: Boolean(state.settings.startupContext.projectOnly) } : {}),
     fileNames: linesFromTextarea("startupContextFileNames"),
     globalPaths: linesFromTextarea("startupContextGlobalPaths"),
   };
   const startupSkills = {
     enabled: Boolean(el("startupSkillsEnabled")?.checked),
+    ...(Object.prototype.hasOwnProperty.call(state.settings?.startupSkills || {}, "projectOnly") ? { projectOnly: Boolean(state.settings.startupSkills.projectOnly) } : {}),
     folderNames: linesFromTextarea("startupSkillFolderNames"),
   };
   const agentHookSources = agentHookSourcesFromTextarea("startupAgentHookSources");
   const agentHookPaths = agentHookSources.flatMap((source) => source.paths || []);
   const startupHooks = {
     enabled: Boolean(el("startupHooksEnabled")?.checked),
+    ...(Object.prototype.hasOwnProperty.call(state.settings?.startupHooks || {}, "projectOnly") ? { projectOnly: Boolean(state.settings.startupHooks.projectOnly) } : {}),
     editable: Boolean(el("startupHooksEditable")?.checked),
     agentHooks: Boolean(el("startupAgentHooks")?.checked),
     codexHooks: Boolean(el("startupAgentHooks")?.checked),
@@ -10415,7 +12209,7 @@ async function saveSettings() {
       api("/api/settings", {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ settings: { watchAllow, reviewPaths, startupContext, startupSkills, startupHooks, appearance, markdownTemplates, hubCards, hubSections } }),
+        body: JSON.stringify({ settings: { watchAllow, watchRules: state.settings.watchRules || [], reviewPaths, startupContext, startupSkills, startupHooks, appearance, markdownTemplates, hubCards, hubSections } }),
       }),
       api("/api/review-gate", {
         method: "POST",
@@ -10438,6 +12232,7 @@ async function saveSettings() {
       api("/api/doctor"),
     ]);
     state.files = filesData.files || state.files;
+    state.directories = filesData.directories || state.directories;
     state.startupContextFiles = startupContextData.files || [];
     state.startupSkillFolders = startupSkillsData.folders || [];
     state.startupHookFiles = startupHooksData.files || [];
@@ -10517,70 +12312,161 @@ async function updateWatchSelection(path, action) {
     headers: { "content-type": "application/json" },
     body: JSON.stringify({ settings: { ...current, watchAllow } }),
   });
-  state.settings = result.settings;
-  applyFileTheme();
   state.availableHubCards = result.availableHubCards || state.availableHubCards;
   state.hubFolders = result.hubCards || state.hubFolders;
-  const [docqa, doctor] = await Promise.all([api("/api/docqa"), api("/api/doctor")]);
-  state.docqa = docqa;
-  state.doctor = doctor;
-  state.selectedReview = state.docqa.queue.find((item) => item.path === state.selectedReview)?.path || state.docqa.queue[0]?.path || null;
-  renderFiles();
-  if (state.page === "settings") renderSettingsPanel();
-  else renderDocQaDashboard();
-  setStatus(watchAllow.includes(clean) ? "path watched" : "path removed");
+  await refreshAfterWatchMutation(result.settings, watchAllow.includes(clean) ? "path watched" : "path removed");
 }
 
 async function addSelectedToWatch() {
   const selected = [...state.selectedForDelete].map(normalizeUiPath).filter(Boolean);
   if (!selected.length) return;
-  const current = state.settings || { watchAllow: [], hubCards: {} };
-  const watchAllow = [...new Set([...(current.watchAllow || []), ...selected])];
-  setStatus("updating watch scope...");
-  const result = await api("/api/settings", {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({ settings: { ...current, watchAllow } }),
-  });
-  state.settings = result.settings;
-  applyFileTheme();
-  state.availableHubCards = result.availableHubCards || state.availableHubCards;
-  state.hubFolders = result.hubCards || state.hubFolders;
-  const [docqa, doctor] = await Promise.all([api("/api/docqa"), api("/api/doctor")]);
-  state.docqa = docqa;
-  state.doctor = doctor;
-  state.selectedReview = state.docqa.queue.find((item) => item.path === state.selectedReview)?.path || state.docqa.queue[0]?.path || null;
-  state.selectedForDelete.clear();
-  renderFiles();
-  if (state.page === "settings") renderSettingsPanel();
-  else renderDocQaDashboard();
-  setStatus(selected.length + " selected path" + (selected.length > 1 ? "s" : "") + " watched");
+  const folders = selected.filter((relPath) => relPath.endsWith("/"));
+  const files = selected.filter((relPath) => !relPath.endsWith("/"));
+  const apply = async (mode = "recursive-live") => {
+    setStatus("updating watch scope...");
+    let nextSettings = state.settings || { watchAllow: [], watchRules: [], hubCards: {} };
+    if (files.length) {
+      const watchAllow = [...new Set([...(nextSettings.watchAllow || []), ...files])];
+      const result = await api("/api/settings", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ settings: { ...nextSettings, watchAllow } }),
+      });
+      nextSettings = result.settings;
+      state.availableHubCards = result.availableHubCards || state.availableHubCards;
+      state.hubFolders = result.hubCards || state.hubFolders;
+    }
+    for (const folderPath of folders) {
+      const result = await api("/api/watch-rule", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ path: folderPath, mode }),
+      });
+      nextSettings = result.settings;
+    }
+    state.selectedForDelete.clear();
+    await refreshAfterWatchMutation(nextSettings, selected.length + " selected path" + (selected.length > 1 ? "s" : "") + " watched");
+  };
+  if (folders.length) {
+    showFolderWatchModeDialog(folders, apply);
+    return;
+  }
+  await apply();
 }
 
 async function removeSelectedFromWatch() {
   const selected = [...state.selectedForDelete].map(normalizeUiPath).filter(Boolean);
   if (!selected.length) return;
-  const current = state.settings || { watchAllow: [], hubCards: {} };
-  const watchAllow = (current.watchAllow || []).filter((path) => !selected.includes(normalizeUiPath(path)));
+  const folders = selected.filter((relPath) => relPath.endsWith("/"));
+  const files = selected.filter((relPath) => !relPath.endsWith("/"));
+  let nextSettings = state.settings || { watchAllow: [], watchRules: [], hubCards: {} };
   setStatus("updating watch scope...");
-  const result = await api("/api/settings", {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({ settings: { ...current, watchAllow } }),
-  });
-  state.settings = result.settings;
+  for (const folderPath of folders) {
+    const result = await api("/api/watch-rule", {
+      method: "DELETE",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ path: folderPath }),
+    });
+    nextSettings = result.settings;
+  }
+  if (files.length) {
+    const watchAllow = (nextSettings.watchAllow || []).filter((relPath) => !files.includes(normalizeUiPath(relPath)));
+    const result = await api("/api/settings", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ settings: { ...nextSettings, watchAllow } }),
+    });
+    nextSettings = result.settings;
+    state.availableHubCards = result.availableHubCards || state.availableHubCards;
+    state.hubFolders = result.hubCards || state.hubFolders;
+  }
+  state.selectedForDelete.clear();
+  await refreshAfterWatchMutation(nextSettings, selected.length + " selected path" + (selected.length > 1 ? "s" : "") + " removed from watch");
+}
+
+async function refreshAfterWatchMutation(settings, message) {
+  state.settings = settings;
   applyFileTheme();
-  state.availableHubCards = result.availableHubCards || state.availableHubCards;
-  state.hubFolders = result.hubCards || state.hubFolders;
   const [docqa, doctor] = await Promise.all([api("/api/docqa"), api("/api/doctor")]);
   state.docqa = docqa;
   state.doctor = doctor;
   state.selectedReview = state.docqa.queue.find((item) => item.path === state.selectedReview)?.path || state.docqa.queue[0]?.path || null;
-  state.selectedForDelete.clear();
   renderFiles();
   if (state.page === "settings") renderSettingsPanel();
   else renderDocQaDashboard();
-  setStatus(selected.length + " selected path" + (selected.length > 1 ? "s" : "") + " removed from watch");
+  setStatus(message);
+}
+
+function showFolderWatchModeDialog(folderPaths, onApply) {
+  document.querySelector(".app")?.removeAttribute("inert");
+  document.querySelector(".confirm-backdrop")?.remove();
+  const returnFocus = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+  const backdrop = document.createElement("div");
+  const appShell = document.querySelector(".app");
+  let pending = false;
+  backdrop.className = "confirm-backdrop";
+  backdrop.innerHTML = '<section class="confirm-dialog" role="dialog" aria-modal="true" aria-label="Choose folder watch mode">' +
+    '<strong>Choose folder watch mode</strong>' +
+    '<p>' + folderPaths.length + ' selected folder' + (folderPaths.length > 1 ? 's' : '') + '. Git reviews files; live modes also include future eligible files.</p>' +
+    renderWatchModeOptions("bulkWatchMode") +
+    '<div class="confirm-actions"><button class="file-action" type="button" data-watch-mode-cancel>Cancel</button><button class="file-action primary" type="button" data-watch-mode-apply>Watch</button></div>' +
+  '</section>';
+  const close = ({ restoreFocus = true } = {}) => {
+    backdrop.remove();
+    appShell?.removeAttribute("inert");
+    document.removeEventListener("keydown", onKeydown);
+    if (restoreFocus && returnFocus?.isConnected) returnFocus.focus();
+  };
+  const onKeydown = (event) => {
+    if (event.key === "Escape") {
+      if (!pending) close();
+      return;
+    }
+    if (event.key !== "Tab") return;
+    const focusable = [...backdrop.querySelectorAll('button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])')];
+    if (!focusable.length) {
+      event.preventDefault();
+      return;
+    }
+    const first = focusable[0];
+    const last = focusable.at(-1);
+    if (event.shiftKey && document.activeElement === first) {
+      event.preventDefault();
+      last.focus();
+    } else if (!event.shiftKey && document.activeElement === last) {
+      event.preventDefault();
+      first.focus();
+    }
+  };
+  const cancelButton = backdrop.querySelector("[data-watch-mode-cancel]");
+  cancelButton?.addEventListener("click", () => {
+    if (!pending) close();
+  });
+  backdrop.addEventListener("click", (event) => {
+    if (event.target === backdrop && !pending) close();
+  });
+  backdrop.querySelector("[data-watch-mode-apply]")?.addEventListener("click", async (event) => {
+    const button = event.currentTarget;
+    pending = true;
+    button.disabled = true;
+    button.textContent = "Watching...";
+    if (cancelButton) cancelButton.disabled = true;
+    const mode = backdrop.querySelector('input[name="bulkWatchMode"]:checked')?.value || "recursive-live";
+    try {
+      await onApply(mode);
+      close();
+    } catch (error) {
+      pending = false;
+      button.disabled = false;
+      button.textContent = "Watch";
+      if (cancelButton) cancelButton.disabled = false;
+      setStatus(error.message);
+    }
+  });
+  document.addEventListener("keydown", onKeydown);
+  appShell?.setAttribute("inert", "");
+  document.body.appendChild(backdrop);
+  backdrop.querySelector('input[name="bulkWatchMode"]:checked')?.focus();
 }
 
 function linesFromTextarea(id) {
@@ -11155,7 +13041,7 @@ function planetItems(view) {
   }
   if (view.startsWith("folder:")) {
     const folderPath = view.slice(7);
-    const node = findTreeNode(buildTree(state.files), folderPath);
+    const node = findTreeNode(buildTree(state.files, state.directories), folderPath);
     if (!node) return [];
     return [...node.children.values()].sort(compareTreeNodes).map((child) => ({ kind: child.type, path: child.path }));
   }
@@ -12735,7 +14621,7 @@ function renderExternalReviewActions(change, { fileActionOptions = null } = {}) 
   const jumpAction = summary.pending && !visualHtmlReview
     ? '<button class="file-action external-choice bulk" type="button" data-external-review-jump="first" title="Jump to the first pending change">First change</button>'
     : "";
-  const bulkActions = summary.pending && (visualHtmlReview || summary.pending > 1 || summary.pendingLines > 1)
+  const bulkActions = summary.pending
     ? '<button class="file-action primary external-choice bulk" type="button" data-external-review-all="accept">Accept all</button>' +
       '<button class="file-action danger-action external-choice bulk" type="button" data-external-review-all="reject">Reject all</button>'
     : "";
@@ -13057,6 +14943,7 @@ async function finalizeExternalReview(settlePromise, blocks, viewState) {
 async function chooseExternalReviewBlock(decision, blockId) {
   const change = activeExternalChange();
   if (!change || !blockId || (decision !== "accept" && decision !== "reject")) return;
+  const previousDecisions = { ...(change.reviewDecisions || {}) };
   const viewState = captureEditorViewState({ anchorBlockId: blockId });
   viewState.visualAnchor = captureMarkdownVisualAnchor();
   change.reviewDecisions = { ...(change.reviewDecisions || {}), [blockId]: decision };
@@ -13076,12 +14963,17 @@ async function chooseExternalReviewBlock(decision, blockId) {
     return;
   }
   setStatus("saving reviewed change...");
-  await finalizeExternalReview(settlePromise, blocks, viewState);
+  try {
+    await finalizeExternalReview(settlePromise, blocks, viewState);
+  } catch (error) {
+    throw restoreExternalReviewAfterSaveFailure(change, previousDecisions, error);
+  }
 }
 
 async function chooseAllExternalReviewBlocks(decision) {
   const change = activeExternalChange();
   if (!change || (decision !== "accept" && decision !== "reject")) return;
+  const previousDecisions = { ...(change.reviewDecisions || {}) };
   const currentBlocks = buildExternalReviewBlocks(externalReviewBaseContent(change), change.diskContent || "", change.reviewDecisions || {});
   const pendingBlocks = currentBlocks.filter((block) => block.kind === "change" && !block.decision);
   if (!pendingBlocks.length) return;
@@ -13103,7 +14995,22 @@ async function chooseAllExternalReviewBlocks(decision) {
   const settlePromise = updatedInPlace
     ? settleExternalReviewBlocks(pendingBlocks.map((block) => block.id), viewState, { restoreScroll: false })
     : Promise.resolve();
-  await finalizeExternalReview(settlePromise, blocks, viewState);
+  try {
+    await finalizeExternalReview(settlePromise, blocks, viewState);
+  } catch (error) {
+    throw restoreExternalReviewAfterSaveFailure(change, previousDecisions, error);
+  }
+}
+
+function restoreExternalReviewAfterSaveFailure(change, previousDecisions, error) {
+  if (activeExternalChange() === change) {
+    change.reviewDecisions = { ...(previousDecisions || {}) };
+    renderViewer();
+    updateHeader();
+    updatePreview();
+  }
+  const message = String(error?.message || error || "request failed");
+  return new Error("review not saved · " + message);
 }
 
 function updateExternalReviewBlockInPlace(blocks, blockId, viewState) {
@@ -13216,7 +15123,13 @@ async function saveExternalReviewDecision(blocks, viewState) {
     if (state.selected === change.path) goHub();
     return;
   }
-  const result = await writeSelectedDiskFile(merged, change.path);
+  const diskContentAlreadyCurrent = merged === (change.diskContent || "");
+  if (!diskContentAlreadyCurrent && (state.selectedReadOnly || state.selectedStartupContext?.readOnly)) {
+    throw new Error("read-only file · rejecting reviewed changes requires write access");
+  }
+  const result = diskContentAlreadyCurrent
+    ? { contentHash: change.diskHash || state.savedHash, backupPath: "" }
+    : await writeSelectedDiskFile(merged, change.path);
   const shouldRecordReviewBaseline = change.source === "review" || change.source === "disk";
   if (shouldRecordReviewBaseline) await recordSelectedReviewBaseline(change.path, "inline review applied");
   resetConflictState();
@@ -13503,7 +15416,7 @@ function waitForExternalReviewBlockSettle(block) {
     const onTransitionEnd = (event) => {
       if (event.target === block && event.propertyName === "height") finish();
     };
-    const fallback = window.setTimeout(finish, 2400);
+    const fallback = window.setTimeout(finish, 350);
     block.addEventListener("transitionend", onTransitionEnd);
   });
 }
@@ -14441,7 +16354,7 @@ async function saveConflictMerge(merged) {
 
 async function saveCurrent(options = {}) {
   if (!state.selected) return;
-  if (state.selectedReadOnly) {
+  if (state.selectedReadOnly || state.selectedStartupContext?.readOnly) {
     setStatus("read-only file · add it to watched/allowed paths before editing");
     updateHeader();
     return;
@@ -14611,8 +16524,9 @@ async function refreshBackgroundReports(options = {}) {
     }
     let settingsChanged = false;
     if (filesData) {
+      acceptContextRoomRoot(filesData.root);
       state.files = filesData.files;
-      state.root = filesData.root || state.root;
+      state.directories = filesData.directories || [];
       state.lastFullRefreshAt = Date.now();
       if (!state.settingsOpen && settingsData) settingsChanged = applySettingsPayload(settingsData);
     }
@@ -14972,6 +16886,7 @@ el("explorerOpen")?.addEventListener("click", () => {
   syncSidebarToggleIcon();
 });
 el("refreshDocQa")?.addEventListener("click", () => loadFiles({ waitForBackground: true }).catch((error) => setStatus(error.message)));
+el("refreshContextHealth")?.addEventListener("click", () => refreshContextHealthAnalysis().catch((error) => setStatus(error.message)));
 document.querySelectorAll("[data-home-action]").forEach((button) => button.addEventListener("click", () => homeAction(button.dataset.homeAction)));
 document.querySelectorAll("[data-home-file]").forEach((button) => button.addEventListener("click", () => selectFile(button.dataset.homeFile).catch((error) => setStatus(error.message))));
 el("back").addEventListener("click", () => goHistory(-1).catch((error) => setStatus(error.message)));
@@ -15021,7 +16936,8 @@ window.setInterval(() => scheduleBackgroundRefresh(), 5_000);
 
 if (process.argv[1] === __filename) {
   const portArgIndex = process.argv.indexOf("--port");
-  const port = portArgIndex >= 0 ? Number(process.argv[portArgIndex + 1]) : DEFAULT_PORT;
+  const preferredPort = portArgIndex >= 0 ? Number(process.argv[portArgIndex + 1]) : DEFAULT_PORT;
+  const port = await selectAvailableContextRoomPort(preferredPort, { allowFallback: portArgIndex < 0 });
   const rootArgIndex = process.argv.indexOf("--root");
   const root = rootArgIndex >= 0 ? path.resolve(process.argv[rootArgIndex + 1]) : process.cwd();
   const { server } = createMemoryServer({ root, port });

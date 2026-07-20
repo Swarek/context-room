@@ -1,10 +1,10 @@
 ---
 context_room:
-  kind: reference
+  kind: canonical
   scope: context-room
   status: current
   canonical_for: HTML visual pattern contracts
-  last_verified: 2026-07-11
+  last_verified: 2026-07-19
   sources: [src/context_room.mjs, docs/features/html-visual-documents.md, docs/context-room-visual-components.html, docs/context-room-data-visual-components.html]
 ---
 

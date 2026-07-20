@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import assert from "node:assert/strict";
 import fs from "node:fs";
+import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import { execFileSync } from "node:child_process";
@@ -20,6 +21,8 @@ import {
   DIAGRAM_VISUAL_DOCUMENT_PATTERNS,
   FILE_THEME_OPTIONS,
   VISUAL_DOCUMENT_PATTERNS,
+  WATCH_RULE_MODES,
+  WATCH_RULE_MODE_OPTIONS,
   acknowledgeContextHealthIssue,
   appendAgentAnnotation,
   applyMarkdownTemplateToFile,
@@ -35,13 +38,18 @@ import {
   createMarkdownFile,
   createMemoryServer,
   createDefaultProjectConfig,
+  computeDocIssues,
   deleteStartupContextFile,
   deleteMemoryPaths,
   deleteStartupSkill,
   ensureRuntimeGitExcludes,
+  explorerWatchFilterMatches,
+  healthIssueCategory,
   hubSectionsForRoot,
+  inferProjectDocumentationSetup,
   initializeContextRoomProject,
   isAllowedMemoryPath,
+  listExplorerDirectories,
   listExplorerFiles,
   listMemoryFiles,
   listStartupContextFiles,
@@ -67,6 +75,8 @@ import {
   renderExplorerContextMenuMarkup,
   renderReviewSummary,
   renderTemplateOptionsMarkup,
+  removeFolderWatchRule,
+  selectAvailableContextRoomPort,
   syncContextRoomAgentContext,
   syncContextRoomGitHooks,
   revertMemoryFile,
@@ -79,11 +89,38 @@ import {
   writeCollaborationSessionState,
   writeDocReviewDecision,
   writeGlobalContextRoomPreferences,
+  writeMemoryFile,
+  writeMemoryWebappSettings,
+  writeFolderWatchRule,
   writeReviewGateSettings,
+  watchStateForPath,
 } from "../src/context_room.mjs";
 
 function makeRoot() {
   return fs.mkdtempSync(path.join(os.tmpdir(), "context-room-"));
+}
+
+function makeFolderWatchRoot({ watchAllow = [] } = {}) {
+  const root = makeRoot();
+  fs.mkdirSync(path.join(root, "docs", "nested"), { recursive: true });
+  fs.writeFileSync(path.join(root, "docs", "direct.md"), "# Direct\n");
+  fs.writeFileSync(path.join(root, "docs", "delete.md"), "# Delete\n");
+  fs.writeFileSync(path.join(root, "docs", "nested", "existing.md"), "# Existing nested\n");
+  execFileSync("git", ["init"], { cwd: root, stdio: "ignore" });
+  execFileSync("git", ["config", "user.email", "context-room@example.test"], { cwd: root, stdio: "ignore" });
+  execFileSync("git", ["config", "user.name", "Context Room Test"], { cwd: root, stdio: "ignore" });
+  initializeContextRoomProject(root, { allowedPaths: ["docs/"], watchAllow });
+  execFileSync("git", ["add", "."], { cwd: root, stdio: "ignore" });
+  execFileSync("git", ["commit", "-m", "initial"], { cwd: root, stdio: "ignore" });
+  return root;
+}
+
+function mutateFolderWatchFixture(root) {
+  fs.writeFileSync(path.join(root, "docs", "direct.md"), "# Direct\n\nChanged.\n");
+  fs.writeFileSync(path.join(root, "docs", "nested", "existing.md"), "# Existing nested\n\nChanged.\n");
+  fs.writeFileSync(path.join(root, "docs", "later-direct.md"), "# Later direct\n");
+  fs.mkdirSync(path.join(root, "docs", "later-folder", "deeper"), { recursive: true });
+  fs.writeFileSync(path.join(root, "docs", "later-folder", "deeper", "later-deep.md"), "# Later deep\n");
 }
 
 function extractInlineAppScript(html) {
@@ -247,11 +284,36 @@ test("default config is project-agnostic and supports cards, nested cards, allow
   assert.ok(config.hubSections[0].cards.some((card) => (card.cards || []).length > 0));
 });
 
+test("config schema accepts external home paths through exactly one allowed-path branch", () => {
+  const schema = JSON.parse(fs.readFileSync(path.resolve("schemas/config.schema.json"), "utf8"));
+  const matchesStringSchema = (value, rule) => {
+    if (rule.$ref) return matchesStringSchema(value, schema.$defs[rule.$ref.split("/").at(-1)]);
+    if (rule.oneOf) return rule.oneOf.filter((branch) => matchesStringSchema(value, branch)).length === 1;
+    if (rule.type === "string" && typeof value !== "string") return false;
+    if (rule.minLength && value.length < rule.minLength) return false;
+    if (rule.pattern && !(new RegExp(rule.pattern).test(value))) return false;
+    if (rule.not?.pattern && new RegExp(rule.not.pattern).test(value)) return false;
+    return true;
+  };
+  const homePath = "~/shared-project-docs/";
+  const allowedPath = schema.$defs.allowedPath;
+
+  assert.equal(matchesStringSchema(homePath, schema.$defs.projectPath), false);
+  assert.equal(matchesStringSchema(homePath, schema.$defs.homePath), true);
+  assert.equal(matchesStringSchema(homePath, allowedPath), true);
+  assert.equal(schema.properties.allowedPaths.items.$ref, "#/$defs/allowedPath");
+  assert.equal(schema.properties.watchAllow.items.$ref, "#/$defs/allowedPath");
+  assert.equal(schema.$defs.watchRule.properties.path.$ref, "#/$defs/allowedPath");
+  assert.equal(matchesStringSchema(homePath, schema.$defs.watchRule.properties.path), true);
+  assert.equal(matchesStringSchema(homePath + "guide.md", schema.$defs.watchRule.properties.files.items), true);
+});
+
 test("init writes a reusable project config without LifeOS-specific paths", () => {
   const root = makeRoot();
   fs.mkdirSync(path.join(root, "docs"));
   fs.mkdirSync(path.join(root, "src"));
   fs.writeFileSync(path.join(root, "README.md"), "# Demo\n");
+  fs.writeFileSync(path.join(root, "docs", "index.md"), "# Documentation\n");
 
   const result = initializeContextRoomProject(root, { title: "Demo", preset: "generic" });
   const configPath = path.join(root, CONFIG_FILE);
@@ -261,7 +323,8 @@ test("init writes a reusable project config without LifeOS-specific paths", () =
   assert.equal(saved.title, "Demo");
   assert.match(saved.$schema, /schemas\/config\.schema\.json$/);
   assert.ok(saved.allowedPaths.includes("docs/"));
-  assert.ok(saved.allowedPaths.includes("src/"));
+  assert.equal(saved.allowedPaths.includes("src/"), false);
+  assert.ok(saved.watchAllow.includes("docs/"));
   assert.equal("appearance" in saved, false);
   assert.equal(JSON.stringify(saved).includes("Life OS"), false);
   assert.equal(JSON.stringify(saved).includes(".lifeos"), false);
@@ -274,6 +337,910 @@ test("init writes a reusable project config without LifeOS-specific paths", () =
   assert.equal(fs.existsSync(path.join(root, AGENT_CONTEXT_DIR, "context-room-data-visual-components.html")), true);
 });
 
+test("fresh init infers an EchoDesk-style documentation room without exposing source as editable", () => {
+  const root = makeRoot();
+  fs.mkdirSync(path.join(root, "docs", "product"), { recursive: true });
+  fs.mkdirSync(path.join(root, "docs", "decisions"), { recursive: true });
+  fs.mkdirSync(path.join(root, "docs", "research"), { recursive: true });
+  fs.mkdirSync(path.join(root, "docs", "incidents"), { recursive: true });
+  fs.mkdirSync(path.join(root, "skills", "review-docs"), { recursive: true });
+  fs.mkdirSync(path.join(root, "src"), { recursive: true });
+  fs.writeFileSync(path.join(root, "README.md"), "# EchoDesk\n");
+  fs.writeFileSync(path.join(root, "AGENTS.md"), "# EchoDesk agents\n");
+  fs.writeFileSync(path.join(root, "docs", "index.md"), `---
+context_room:
+  kind: index
+  scope: echodesk
+  status: current
+  canonical_for: documentation-navigation
+  last_verified: 2026-07-19
+  sources: [README.md]
+---
+
+# EchoDesk documentation
+`);
+  fs.writeFileSync(path.join(root, "docs", "documentation-system.md"), `---
+context_room:
+  kind: canonical
+  scope: echodesk
+  status: current
+  canonical_for: documentation-system
+  last_verified: 2026-07-19
+  sources: [docs/index.md]
+---
+
+# Documentation system
+`);
+  fs.writeFileSync(path.join(root, "docs", "product", "product_target.md"), `---
+context_room:
+  kind: canonical
+  scope: echodesk
+  status: draft
+  canonical_for: product
+  sources: []
+---
+
+# Product target
+`);
+  fs.writeFileSync(path.join(root, "docs", "decisions", "index.md"), "# Decisions\n");
+  fs.writeFileSync(path.join(root, "docs", "research", "index.md"), "# Research\n");
+  fs.writeFileSync(path.join(root, "docs", "incidents", "index.md"), "# Incidents\n");
+  fs.writeFileSync(path.join(root, "skills", "review-docs", "SKILL.md"), "# Review docs\n");
+  fs.writeFileSync(path.join(root, "src", "app.mjs"), "export const app = true;\n");
+
+  const inferred = inferProjectDocumentationSetup(root);
+  const initialized = initializeContextRoomProject(root, { title: "EchoDesk" });
+  const sectionIds = inferred.hubSections.map((section) => section.id);
+  const hubIds = inferred.hubSections.flatMap((section) => section.cards.map((card) => card.id));
+
+  assert.deepEqual(inferred.allowedPaths, ["README.md", "AGENTS.md", "docs/", "skills/review-docs/SKILL.md"]);
+  assert.deepEqual(inferred.watchAllow, inferred.allowedPaths);
+  assert.equal(inferred.allowedPaths.some((relPath) => /^(?:src|lib|app|test|tests|scripts)\//.test(relPath)), false);
+  assert.deepEqual(sectionIds, ["start-here", "current-documentation", "target-documentation", "records", "agent-guidance"]);
+  assert.ok(inferred.hubSections.every((section) => section.cards.length > 0));
+  assert.equal(hubIds.some((id) => ["source", "tests", "scripts", "context"].includes(id)), false);
+  assert.equal(initialized.config.startupContext.projectOnly, true);
+  assert.equal(initialized.config.startupContext.enabled, true);
+  assert.equal(initialized.config.startupSkills.projectOnly, true);
+  assert.equal(initialized.config.startupSkills.enabled, true);
+  assert.equal(initialized.config.startupHooks.projectOnly, true);
+});
+
+test("repeated init preserves intentionally empty owner settings, custom hub sections, and AGENTS bytes", () => {
+  const root = makeRoot();
+  const agentsBytes = Buffer.from("# Exact agent instructions\r\nKeep these bytes.\r\n", "utf8");
+  fs.mkdirSync(path.join(root, "docs"), { recursive: true });
+  fs.writeFileSync(path.join(root, "docs", "index.md"), "# Docs\n");
+  fs.writeFileSync(path.join(root, "AGENTS.md"), agentsBytes);
+  initializeContextRoomProject(root, { title: "First setup" });
+
+  const configPath = path.join(root, CONFIG_FILE);
+  const ownerConfig = JSON.parse(fs.readFileSync(configPath, "utf8"));
+  ownerConfig.title = "Owner title";
+  ownerConfig.allowedPaths = ["AGENTS.md"];
+  ownerConfig.watchAllow = [];
+  ownerConfig.reviewPaths = [];
+  ownerConfig.hubSections = [{
+    id: "owner-section",
+    title: "Owner section",
+    extensionData: { owner: "project" },
+    cards: [{ id: "owner-agents", title: "Owner agents", path: "AGENTS.md" }],
+  }];
+  ownerConfig.extensionData = { setup: "preserve-me" };
+  ownerConfig.startupContext.extensionMode = "owner-defined";
+  const ownerConfigBytes = Buffer.from(JSON.stringify(ownerConfig, null, 4) + "\r\n", "utf8");
+  fs.writeFileSync(configPath, ownerConfigBytes);
+
+  const repeated = initializeContextRoomProject(root);
+
+  assert.equal(repeated.fresh, false);
+  assert.equal(repeated.discoverySkipped, true);
+  assert.deepEqual(repeated.documentationPaths, []);
+  assert.equal(repeated.config.title, "Owner title");
+  assert.deepEqual(repeated.config.allowedPaths, ["AGENTS.md"]);
+  assert.deepEqual(repeated.config.watchAllow, []);
+  assert.deepEqual(repeated.config.reviewPaths, []);
+  assert.deepEqual(repeated.config.hubSections.map((section) => section.id), ["owner-section"]);
+  assert.deepEqual(repeated.config.hubSections[0].cards.map((card) => card.id), ["owner-agents"]);
+  assert.deepEqual(fs.readFileSync(configPath), ownerConfigBytes);
+  assert.deepEqual(fs.readFileSync(path.join(root, "AGENTS.md")), agentsBytes);
+
+  initializeContextRoomProject(root, { title: "Amended title" });
+  const amended = JSON.parse(fs.readFileSync(configPath, "utf8"));
+  assert.equal(amended.title, "Amended title");
+  assert.deepEqual(amended.extensionData, { setup: "preserve-me" });
+  assert.equal(amended.startupContext.extensionMode, "owner-defined");
+  assert.deepEqual(amended.hubSections[0].extensionData, { owner: "project" });
+});
+
+test("init refuses malformed project config without overwriting it", () => {
+  const root = makeRoot();
+  const configPath = path.join(root, CONFIG_FILE);
+  const malformed = Buffer.from('{\n  "title": "Broken",\n', "utf8");
+  fs.mkdirSync(path.dirname(configPath), { recursive: true });
+  fs.writeFileSync(configPath, malformed);
+
+  assert.throws(
+    () => initializeContextRoomProject(root, { title: "Replacement" }),
+    /Invalid Context Room config JSON/,
+  );
+  assert.deepEqual(fs.readFileSync(configPath), malformed);
+  assert.equal(fs.existsSync(path.join(root, REVIEW_GATE_FILE)), false);
+  assert.equal(fs.existsSync(path.join(root, AGENT_CONTEXT_FILE)), false);
+});
+
+test("fresh project containment blocks allowed-path symlink escapes while legacy configs remain compatible", () => {
+  const external = makeRoot();
+  fs.writeFileSync(path.join(external, "guide.md"), "# External guide\n");
+
+  const root = makeRoot();
+  fs.symlinkSync(external, path.join(root, "docs"), "dir");
+  const initialized = initializeContextRoomProject(root, { allowedPaths: ["docs/"], watchAllow: ["docs/"] });
+
+  assert.equal(initialized.config.projectOnly, true);
+  assert.equal(listMemoryFiles(root).some((file) => file.path === "docs/guide.md"), false);
+  assert.equal(listExplorerFiles(root).some((file) => file.path === "docs/guide.md"), false);
+  assert.throws(() => readMemoryFile(root, "docs/guide.md"), /symbolic link/);
+  assert.throws(() => writeMemoryFile(root, "docs/guide.md", "changed\n"), /symbolic link/);
+  assert.throws(() => createMarkdownFile(root, { path: "docs/new.md" }), /symbolic link/);
+  assert.throws(() => createFolder(root, { path: "docs/new-folder" }), /symbolic link/);
+  assert.throws(() => deleteMemoryPaths(root, ["docs/guide.md"]), /symbolic link/);
+  const isolatedSettings = readMemoryWebappSettings(root);
+  isolatedSettings.hubSections = [{ id: "docs", title: "Docs", cards: [{ id: "docs", title: "Docs", path: "docs/", autoChildren: true }] }];
+  writeMemoryWebappSettings(root, isolatedSettings);
+  const isolatedHub = hubSectionsForRoot(root, readMemoryWebappSettings(root));
+  assert.deepEqual(isolatedHub[0].cards[0].cards || [], []);
+  assert.doesNotMatch(JSON.stringify(isolatedHub), /External guide/);
+  const isolatedDoctor = buildContextRoomDoctorReport(root);
+  assert.ok(isolatedDoctor.issues.some((issue) => issue.type === "allowed_path_symlink_escape" && issue.path === "docs/"));
+  assert.ok(isolatedDoctor.issues.some((issue) => issue.type === "watch_path_symlink_escape" && issue.path === "docs/"));
+  assert.ok(isolatedDoctor.issues.some((issue) => issue.type === "hub_path_symlink_escape" && issue.path === "docs/"));
+  assert.equal(fs.readFileSync(path.join(external, "guide.md"), "utf8"), "# External guide\n");
+  assert.equal(fs.existsSync(path.join(external, "new.md")), false);
+
+  const legacyRoot = makeRoot();
+  fs.symlinkSync(external, path.join(legacyRoot, "docs"), "dir");
+  fs.mkdirSync(path.join(legacyRoot, CONFIG_DIR), { recursive: true });
+  const legacyConfig = {
+    title: "Legacy symlink hub",
+    allowedPaths: ["docs/"],
+    watchAllow: [],
+    reviewPaths: [],
+    startupContext: { enabled: false, fileNames: [], globalPaths: [] },
+    startupSkills: { enabled: false, folderNames: [] },
+    startupHooks: { enabled: false, fileNames: [], agentHookSources: [], managerPaths: [] },
+  };
+  const legacyBytes = Buffer.from(JSON.stringify(legacyConfig, null, 2) + "\n");
+  fs.writeFileSync(path.join(legacyRoot, CONFIG_FILE), legacyBytes);
+
+  assert.equal(readMemoryWebappSettings(legacyRoot).projectOnly, false);
+  assert.equal(readMemoryFile(legacyRoot, "docs/guide.md").content, "# External guide\n");
+  assert.ok(listMemoryFiles(legacyRoot).some((file) => file.path === "docs/guide.md"));
+  const repeatedLegacy = initializeContextRoomProject(legacyRoot);
+  assert.equal(repeatedLegacy.config.projectOnly, false);
+  assert.deepEqual(fs.readFileSync(path.join(legacyRoot, CONFIG_FILE)), legacyBytes);
+});
+
+test("settings API preserves fresh and legacy project containment modes", async (t) => {
+  const freshRoot = makeRoot();
+  initializeContextRoomProject(freshRoot, { allowedPaths: [], watchAllow: [] });
+  const freshServer = createMemoryServer({ root: freshRoot }).server;
+  await new Promise((resolve) => freshServer.listen(0, "127.0.0.1", resolve));
+  t.after(() => freshServer.close());
+  const freshSettings = readMemoryWebappSettings(freshRoot);
+  const freshPayload = { ...freshSettings, title: "Fresh updated" };
+  delete freshPayload.projectOnly;
+  const freshResponse = await fetch(`http://127.0.0.1:${freshServer.address().port}/api/settings`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ settings: freshPayload }),
+  });
+  assert.equal(freshResponse.status, 200);
+  assert.equal((await freshResponse.json()).settings.projectOnly, true);
+  assert.equal(JSON.parse(fs.readFileSync(path.join(freshRoot, CONFIG_FILE), "utf8")).projectOnly, true);
+
+  const legacyRoot = makeRoot();
+  fs.mkdirSync(path.join(legacyRoot, CONFIG_DIR), { recursive: true });
+  fs.writeFileSync(path.join(legacyRoot, CONFIG_FILE), JSON.stringify({
+    title: "Legacy",
+    allowedPaths: [],
+    watchAllow: [],
+    reviewPaths: [],
+  }, null, 2) + "\n");
+  const legacyServer = createMemoryServer({ root: legacyRoot }).server;
+  await new Promise((resolve) => legacyServer.listen(0, "127.0.0.1", resolve));
+  t.after(() => legacyServer.close());
+  const legacySettings = readMemoryWebappSettings(legacyRoot);
+  assert.equal(legacySettings.projectOnly, false);
+  const legacyPayload = { ...legacySettings, title: "Legacy updated" };
+  delete legacyPayload.projectOnly;
+  const legacyResponse = await fetch(`http://127.0.0.1:${legacyServer.address().port}/api/settings`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ settings: legacyPayload }),
+  });
+  assert.equal(legacyResponse.status, 200);
+  assert.equal((await legacyResponse.json()).settings.projectOnly, false);
+  assert.equal(JSON.parse(fs.readFileSync(path.join(legacyRoot, CONFIG_FILE), "utf8")).projectOnly, false);
+});
+
+test("setup and direct managed writers reject Context Room state symlink escapes", () => {
+  const cases = [
+    { relPath: CONFIG_DIR, directory: true },
+    { relPath: CONFIG_FILE, content: "{}\n" },
+    { relPath: REVIEW_GATE_FILE, content: '{"operations":[]}\n' },
+    { relPath: AGENT_CONTEXT_FILE, content: "external guide\n" },
+    { relPath: AGENT_CONTEXT_DIR, directory: true },
+    { relPath: `${AGENT_CONTEXT_DIR}/agent-configuration.md`, content: "external configuration\n" },
+  ];
+
+  for (const fixture of cases) {
+    const root = makeRoot();
+    const external = makeRoot();
+    const linkPath = path.join(root, fixture.relPath);
+    fs.mkdirSync(path.dirname(linkPath), { recursive: true });
+    const target = fixture.directory ? path.join(external, "target") : path.join(external, path.basename(fixture.relPath));
+    if (fixture.directory) fs.mkdirSync(target, { recursive: true });
+    else fs.writeFileSync(target, fixture.content);
+    const before = fixture.directory ? fs.readdirSync(target) : fs.readFileSync(target);
+    fs.symlinkSync(target, linkPath, fixture.directory ? "dir" : "file");
+
+    assert.throws(() => initializeContextRoomProject(root, { title: "Must not escape" }), /symbolic link/);
+    if (fixture.directory) assert.deepEqual(fs.readdirSync(target), before);
+    else assert.deepEqual(fs.readFileSync(target), before);
+  }
+
+  const brokenRoot = makeRoot();
+  fs.mkdirSync(path.join(brokenRoot, CONFIG_DIR), { recursive: true });
+  const missingTarget = path.join(makeRoot(), "missing-config.json");
+  fs.symlinkSync(missingTarget, path.join(brokenRoot, CONFIG_FILE));
+  assert.throws(() => initializeContextRoomProject(brokenRoot), /symbolic link/);
+  assert.equal(fs.existsSync(missingTarget), false);
+
+  const directConfigRoot = makeRoot();
+  const directConfigExternal = path.join(makeRoot(), "config.json");
+  fs.writeFileSync(directConfigExternal, "{}\n");
+  fs.mkdirSync(path.join(directConfigRoot, CONFIG_DIR), { recursive: true });
+  fs.symlinkSync(directConfigExternal, path.join(directConfigRoot, CONFIG_FILE));
+  assert.throws(() => writeMemoryWebappSettings(directConfigRoot, createDefaultProjectConfig()), /symbolic link/);
+
+  const directGateRoot = makeRoot();
+  const directGateExternal = path.join(makeRoot(), "review-gate.json");
+  fs.writeFileSync(directGateExternal, '{"operations":[]}\n');
+  fs.mkdirSync(path.join(directGateRoot, CONFIG_DIR), { recursive: true });
+  fs.symlinkSync(directGateExternal, path.join(directGateRoot, REVIEW_GATE_FILE));
+  assert.throws(() => writeReviewGateSettings(directGateRoot, { operations: [] }), /symbolic link/);
+
+  const directAgentRoot = makeRoot();
+  const directAgentExternal = makeRoot();
+  fs.mkdirSync(path.join(directAgentRoot, CONFIG_DIR), { recursive: true });
+  fs.symlinkSync(directAgentExternal, path.join(directAgentRoot, AGENT_CONTEXT_DIR), "dir");
+  assert.throws(() => syncContextRoomAgentContext(directAgentRoot), /symbolic link/);
+});
+
+test("managed runtime state rejects internal and external symbolic-link aliases", () => {
+  const cases = [
+    {
+      relPath: ".context-room/review-state.json",
+      invoke: (root) => writeDocReviewBaseline(root, "docs/guide.md"),
+    },
+    {
+      relPath: ".context-room/review-baselines",
+      directory: true,
+      invoke: (root) => writeDocReviewBaseline(root, "docs/guide.md"),
+    },
+    {
+      relPath: ".context-room/review-ledger.json",
+      invoke: (root) => writeDocReviewDecision(root, "docs/guide.md", { status: "verified" }),
+    },
+    {
+      relPath: ".context-room/session-state.json",
+      invoke: (root) => writeCollaborationSessionState(root, { page: "hub" }),
+    },
+    {
+      relPath: ".context-room/agent-command.json",
+      invoke: (root) => writeAgentCommand(root, { action: "navigate", path: "docs/guide.md" }),
+    },
+    {
+      relPath: ".context-room/agent-annotations.json",
+      invoke: (root) => appendAgentAnnotation(root, { path: "docs/guide.md", note: "Review this." }),
+    },
+    {
+      relPath: ".context-room/health-acknowledgements.json",
+      invoke: (root) => {
+        const issue = buildContextRoomDoctorReport(root).issues.find((item) => item.type === "broken_source");
+        assert.ok(issue?.key);
+        return acknowledgeContextHealthIssue(root, { key: issue.key, note: "Unsafe alias must not be followed." });
+      },
+    },
+    {
+      relPath: ".context-room/memory-webapp-backups",
+      directory: true,
+      invoke: (root) => writeMemoryFile(root, "docs/guide.md", "# Changed guide\n"),
+    },
+  ];
+
+  for (const fixture of cases) {
+    for (const targetKind of ["internal", "external"]) {
+      const root = makeRoot();
+      fs.mkdirSync(path.join(root, "docs"), { recursive: true });
+      const guideContent = `---
+context_room:
+  kind: canonical
+  scope: test
+  status: current
+  canonical_for: guide
+  last_verified: 2026-07-19
+  sources: [missing.md]
+---
+
+# Guide
+`;
+      fs.writeFileSync(path.join(root, "docs", "guide.md"), guideContent);
+      initializeContextRoomProject(root, { allowedPaths: ["docs/"], watchAllow: ["docs/"] });
+
+      const targetBase = targetKind === "internal" ? path.join(root, "docs") : makeRoot();
+      const target = path.join(targetBase, fixture.directory ? "runtime-state-target" : "runtime-state-target.json");
+      if (fixture.directory) {
+        fs.mkdirSync(target, { recursive: true });
+        fs.writeFileSync(path.join(target, "sentinel.txt"), "sentinel\n");
+      } else {
+        fs.writeFileSync(target, '{"sentinel":true}\n');
+      }
+      const statePath = path.join(root, fixture.relPath);
+      try {
+        const existing = fs.lstatSync(statePath);
+        if (existing.isDirectory()) fs.rmdirSync(statePath);
+        else fs.unlinkSync(statePath);
+      } catch {}
+      fs.mkdirSync(path.dirname(statePath), { recursive: true });
+      fs.symlinkSync(target, statePath, fixture.directory ? "dir" : "file");
+
+      assert.throws(() => fixture.invoke(root), /symbolic link/);
+      if (fixture.directory) assert.deepEqual(fs.readdirSync(target), ["sentinel.txt"]);
+      else assert.equal(fs.readFileSync(target, "utf8"), '{"sentinel":true}\n');
+      assert.equal(fs.readFileSync(path.join(root, "docs", "guide.md"), "utf8"), guideContent);
+    }
+  }
+});
+
+test("review decisions preflight the shared ledger before changing local verification state", () => {
+  const root = makeRoot();
+  fs.mkdirSync(path.join(root, "docs"), { recursive: true });
+  fs.writeFileSync(path.join(root, "docs", "guide.md"), "# Guide\n");
+  initializeContextRoomProject(root, { allowedPaths: ["docs/"], watchAllow: ["docs/"] });
+  const settings = readMemoryWebappSettings(root);
+  settings.reviewPaths = ["docs/guide.md"];
+  writeMemoryWebappSettings(root, settings);
+
+  const statePath = path.join(root, ".context-room/review-state.json");
+  const baselinesPath = path.join(root, ".context-room/review-baselines");
+  const ledgerPath = path.join(root, ".context-room/review-ledger.json");
+  assert.equal(fs.existsSync(statePath), false);
+  assert.equal(fs.existsSync(baselinesPath), false);
+  assert.equal(fs.existsSync(ledgerPath), false);
+  assert.ok(buildDocQaReport(root).queue.some((item) => item.path === "docs/guide.md"));
+
+  const externalLedger = path.join(makeRoot(), "review-ledger.json");
+  fs.writeFileSync(externalLedger, '{"sentinel":true}\n');
+  fs.symlinkSync(externalLedger, ledgerPath);
+
+  assert.throws(() => writeDocReviewDecision(root, "docs/guide.md", { status: "verified" }), /symbolic link/);
+  assert.equal(fs.readFileSync(externalLedger, "utf8"), '{"sentinel":true}\n');
+  assert.equal(fs.existsSync(statePath), false);
+  assert.equal(fs.existsSync(baselinesPath), false);
+
+  fs.unlinkSync(ledgerPath);
+  assert.ok(buildDocQaReport(root).queue.some((item) => item.path === "docs/guide.md"));
+});
+
+test("destructive startup deletions preserve their source when managed backup preflight fails", () => {
+  const cases = [
+    {
+      sourcePath: "AGENTS.md",
+      content: "# Project instructions\n",
+      invoke: (root) => {
+        const settings = readMemoryWebappSettings(root);
+        settings.startupContext = { enabled: true, projectOnly: true, fileNames: ["AGENTS.md"], globalPaths: [] };
+        const startup = listStartupContextFiles(root, settings).find((item) => item.startupContext?.fileName === "AGENTS.md" && item.startupContext?.absolutePath === path.join(root, "AGENTS.md"));
+        assert.ok(startup);
+        return deleteStartupContextFile(root, startup.startupContext.order, settings);
+      },
+    },
+    {
+      sourcePath: "skills/alpha/SKILL.md",
+      content: "# Alpha skill\n",
+      invoke: (root) => {
+        const settings = readMemoryWebappSettings(root);
+        settings.startupSkills = { enabled: true, projectOnly: true, folderNames: ["skills"] };
+        const folder = listStartupSkillFolders(root, settings).find((item) => item.skills.includes("alpha"));
+        assert.ok(folder);
+        return deleteStartupSkill(root, folder.order, "alpha", settings);
+      },
+    },
+  ];
+
+  for (const fixture of cases) {
+    const root = makeRoot();
+    const source = path.join(root, fixture.sourcePath);
+    fs.mkdirSync(path.dirname(source), { recursive: true });
+    fs.writeFileSync(source, fixture.content);
+    initializeContextRoomProject(root);
+
+    const externalBackups = makeRoot();
+    fs.writeFileSync(path.join(externalBackups, "sentinel.txt"), "sentinel\n");
+    const backupPath = path.join(root, ".context-room/memory-webapp-backups");
+    fs.symlinkSync(externalBackups, backupPath, "dir");
+
+    assert.throws(() => fixture.invoke(root), /symbolic link/);
+    assert.equal(fs.readFileSync(source, "utf8"), fixture.content);
+    assert.deepEqual(fs.readdirSync(externalBackups), ["sentinel.txt"]);
+  }
+});
+
+test("invalid project config and review gate fail closed for runtime operations and doctor", async (t) => {
+  const root = makeRoot();
+  fs.mkdirSync(path.join(root, CONFIG_DIR), { recursive: true });
+  fs.mkdirSync(path.join(root, "src"), { recursive: true });
+  fs.writeFileSync(path.join(root, CONFIG_FILE), JSON.stringify({ allowedPaths: null }) + "\n");
+
+  assert.throws(() => readMemoryWebappSettings(root), /allowedPaths must be an array/);
+  assert.throws(() => writeMemoryFile(root, "src/blocked.md", "blocked\n"), /allowedPaths must be an array/);
+  assert.throws(() => createMarkdownFile(root, { path: "src/blocked.md" }), /allowedPaths must be an array/);
+  assert.throws(() => deleteMemoryPaths(root, ["src/blocked.md"]), /allowedPaths must be an array/);
+  const invalidConfigDoctor = buildContextRoomDoctorReport(root);
+  assert.equal(invalidConfigDoctor.settings.allowedPaths, 0);
+  assert.ok(invalidConfigDoctor.issues.some((issue) => issue.type === "invalid_config" && issue.severity === "critical"));
+  assert.equal(fs.existsSync(path.join(root, "src", "blocked.md")), false);
+
+  const emptyConfigRoot = makeRoot();
+  fs.mkdirSync(path.join(emptyConfigRoot, CONFIG_DIR), { recursive: true });
+  fs.writeFileSync(path.join(emptyConfigRoot, CONFIG_FILE), "{}\n");
+  assert.throws(() => readMemoryWebappSettings(emptyConfigRoot), /allowedPaths is required/);
+  assert.ok(buildContextRoomDoctorReport(emptyConfigRoot).issues.some((issue) => issue.type === "invalid_config" && issue.severity === "critical"));
+
+  const runtimeRoot = makeRoot();
+  fs.mkdirSync(path.join(runtimeRoot, "src"), { recursive: true });
+  initializeContextRoomProject(runtimeRoot, { allowedPaths: ["docs/"], watchAllow: [] });
+  const { server } = createMemoryServer({ root: runtimeRoot });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  t.after(() => server.close());
+  fs.writeFileSync(path.join(runtimeRoot, CONFIG_FILE), JSON.stringify({ allowedPaths: null }) + "\n");
+  const response = await fetch(`http://127.0.0.1:${server.address().port}/api/file`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ path: "src/api-blocked.md", content: "blocked\n" }),
+  });
+  assert.equal(response.status, 500);
+  assert.match((await response.json()).error, /allowedPaths must be an array/);
+  assert.equal(fs.existsSync(path.join(runtimeRoot, "src", "api-blocked.md")), false);
+
+  const gateRoot = makeRoot();
+  initializeContextRoomProject(gateRoot, { allowedPaths: [], watchAllow: [] });
+  fs.writeFileSync(path.join(gateRoot, REVIEW_GATE_FILE), "{broken\n");
+  assert.throws(() => readReviewGateSettings(gateRoot), /Invalid Context Room review gate JSON/);
+  assert.throws(() => writeReviewGateSettings(gateRoot, { operations: "push" }), /operations must be an array/);
+  const gateDoctor = buildContextRoomDoctorReport(gateRoot);
+  assert.ok(gateDoctor.issues.some((issue) => issue.type === "invalid_review_gate" && issue.severity === "critical"));
+});
+
+test("existing config skips project discovery and preserves its configured scope", () => {
+  const root = makeRoot();
+  fs.mkdirSync(path.join(root, "docs"), { recursive: true });
+  fs.writeFileSync(path.join(root, "docs", "index.md"), "# Documentation\n");
+  initializeContextRoomProject(root);
+  const configPath = path.join(root, CONFIG_FILE);
+  const before = fs.readFileSync(configPath);
+
+  fs.mkdirSync(path.join(root, "src", "research"), { recursive: true });
+  fs.writeFileSync(path.join(root, "src", "research", "late.md"), "# Added after setup\n");
+  const repeated = initializeContextRoomProject(root);
+
+  assert.equal(repeated.discoverySkipped, true);
+  assert.deepEqual(repeated.documentationPaths, []);
+  assert.deepEqual(fs.readFileSync(configPath), before);
+  assert.equal(repeated.config.allowedPaths.includes("src/research/late.md"), false);
+});
+
+test("explicit setup scope filters inferred hub cards and rejects uncovered watch paths", () => {
+  const root = makeRoot();
+  fs.mkdirSync(path.join(root, "docs"), { recursive: true });
+  fs.writeFileSync(path.join(root, "README.md"), "# Project\n");
+  fs.writeFileSync(path.join(root, "README_old.md"), "# Old readme\n");
+  fs.writeFileSync(path.join(root, "plans.md"), "# Plans\n");
+  fs.writeFileSync(path.join(root, "proposals.md"), "# Proposals\n");
+  fs.writeFileSync(path.join(root, "roadmap.md"), "# Roadmap\n");
+  fs.writeFileSync(path.join(root, "targets.md"), "# Targets\n");
+  fs.writeFileSync(path.join(root, "target-audience.md"), "# Target audience\n");
+  fs.writeFileSync(path.join(root, "AGENTS.md"), "# Agents\n");
+  fs.writeFileSync(path.join(root, "docs", "index.md"), "# Documentation\n");
+
+  const initialized = initializeContextRoomProject(root, { allowedPaths: ["docs/"] });
+  const hubPaths = initialized.config.hubSections.flatMap((section) =>
+    section.cards.flatMap((card) => [card.path, ...(card.paths || [])].filter(Boolean)),
+  );
+
+  assert.deepEqual(initialized.config.allowedPaths, ["docs/"]);
+  assert.deepEqual(initialized.config.watchAllow, ["docs/"]);
+  assert.ok(hubPaths.length > 0);
+  assert.ok(hubPaths.every((relPath) => relPath.startsWith("docs/")));
+  assert.equal(buildContextRoomDoctorReport(root).issues.some((issue) => issue.type === "hub_path_not_allowed"), false);
+
+  const before = fs.readFileSync(path.join(root, CONFIG_FILE));
+  assert.throws(
+    () => initializeContextRoomProject(root, { allowedPaths: ["docs/"], watchAllow: ["README.md"] }),
+    /watchAllow path is not covered by allowedPaths: README\.md/,
+  );
+  assert.deepEqual(fs.readFileSync(path.join(root, CONFIG_FILE)), before);
+
+  const freshRoot = makeRoot();
+  fs.mkdirSync(path.join(freshRoot, "docs"), { recursive: true });
+  fs.writeFileSync(path.join(freshRoot, "README.md"), "# Fresh\n");
+  fs.writeFileSync(path.join(freshRoot, "docs", "index.md"), "# Documentation\n");
+  assert.throws(
+    () => initializeContextRoomProject(freshRoot, { allowedPaths: ["docs/"], watchAllow: ["README.md"] }),
+    /watchAllow path is not covered by allowedPaths: README\.md/,
+  );
+  assert.equal(fs.existsSync(path.join(freshRoot, CONFIG_FILE)), false);
+  assert.equal(fs.existsSync(path.join(freshRoot, AGENT_CONTEXT_FILE)), false);
+});
+
+test("documentation inference separates target and record truth without widening executable boundaries", () => {
+  const root = makeRoot();
+  for (const relPath of [
+    "docs/target",
+    "docs/research",
+    "research",
+    "incidents",
+    "history",
+    "spec",
+    "spec/fixtures",
+    "vendor/docs",
+    "skills/doc-audit/references",
+    "skills/doc-audit/scripts",
+    "skills/doc-audit/target/doc",
+    "src/research",
+  ]) fs.mkdirSync(path.join(root, relPath), { recursive: true });
+
+  fs.writeFileSync(path.join(root, "README.md"), "# Project\n");
+  fs.writeFileSync(path.join(root, "README_old.md"), "# Old readme\n");
+  fs.writeFileSync(path.join(root, "plans.md"), "# Plans\n");
+  fs.writeFileSync(path.join(root, "proposals.md"), "# Proposals\n");
+  fs.writeFileSync(path.join(root, "roadmap.md"), "# Roadmap\n");
+  fs.writeFileSync(path.join(root, "targets.md"), "# Targets\n");
+  fs.writeFileSync(path.join(root, "target-audience.md"), "# Target audience\n");
+  fs.writeFileSync(path.join(root, "docs", "index.md"), "# Documentation\n");
+  fs.writeFileSync(path.join(root, "docs", "target", "index.md"), "# Target documentation\n");
+  fs.writeFileSync(path.join(root, "docs", "research", "index.md"), "# Research\n");
+  fs.writeFileSync(path.join(root, "research", "notes.md"), "# Notes\n");
+  fs.writeFileSync(path.join(root, "incidents", "outage.md"), "# Outage\n");
+  fs.writeFileSync(path.join(root, "history", "legacy.md"), "# Legacy\n");
+  fs.writeFileSync(path.join(root, "docs", "decision-note.md"), `---
+context_room:
+  kind: decision
+  status: historical
+---
+
+# Decision note
+`);
+  fs.writeFileSync(path.join(root, "docs", "invalid-status.md"), `---
+context_room:
+  kind: canonical
+  status: implemented
+---
+
+# Invalid status
+`);
+  fs.writeFileSync(path.join(root, "docs", "missing-status.md"), `---
+context_room:
+  kind: canonical
+---
+
+# Missing status
+`);
+  fs.writeFileSync(path.join(root, "docs", "draft-guide.md"), `---
+context_room:
+  kind: procedure
+  status: draft
+---
+
+# Draft guide
+`);
+  fs.writeFileSync(path.join(root, "docs", "implemented_target.md"), `---
+context_room:
+  kind: canonical
+  status: current
+  canonical_for: implemented-target
+  last_verified: 2026-07-19
+  sources: []
+---
+
+# Implemented target conflict
+`);
+  fs.writeFileSync(path.join(root, "docs", "research", "current-record.md"), `---
+context_room:
+  kind: canonical
+  status: current
+  canonical_for: current-record
+  last_verified: 2026-07-19
+  sources: []
+---
+
+# Current record conflict
+`);
+  fs.writeFileSync(path.join(root, "docs", "token-budget.md"), "# Sensitive token notes\n");
+  fs.writeFileSync(path.join(root, "spec", "model_spec.rb"), "describe 'model' do\nend\n");
+  fs.writeFileSync(path.join(root, "spec", "fixtures", "README.md"), "# Fixture documentation\n");
+  fs.writeFileSync(path.join(root, "vendor", "docs", "index.md"), "# Vendored docs\n");
+  fs.writeFileSync(path.join(root, "vendor", "AGENTS.md"), "# Vendored instructions\n");
+  fs.writeFileSync(path.join(root, "skills", "doc-audit", "SKILL.md"), "# Documentation audit\n");
+  fs.writeFileSync(path.join(root, "skills", "doc-audit", "references", "guide.md"), "# Skill guide\n");
+  fs.writeFileSync(path.join(root, "skills", "doc-audit", "scripts", "run.js"), "export const run = true;\n");
+  fs.writeFileSync(path.join(root, "skills", "doc-audit", "target", "doc", "generated.html"), "<h1>Generated</h1>\n");
+  fs.writeFileSync(path.join(root, "src", "research", "notes.md"), "# Source research\n");
+  fs.writeFileSync(path.join(root, "src", "research", "runner.js"), "export const run = true;\n");
+
+  const inferred = inferProjectDocumentationSetup(root);
+  initializeContextRoomProject(root);
+  const doctor = buildContextRoomDoctorReport(root);
+  const graph = buildDocumentationGraph(root);
+  const section = (id) => inferred.hubSections.find((item) => item.id === id);
+  const cardPaths = (id) => (section(id)?.cards || []).flatMap((card) => [card.path, ...(card.paths || [])].filter(Boolean));
+
+  assert.deepEqual(inferred.documentationRoots, ["docs/", "history/", "incidents/", "research/"]);
+  assert.ok(inferred.documentationFiles.includes("docs/target/index.md"));
+  assert.ok(inferred.documentationFiles.includes("skills/doc-audit/SKILL.md"));
+  assert.equal(inferred.documentationFiles.includes("vendor/docs/index.md"), false);
+  assert.equal(inferred.agentInstructionPaths.includes("vendor/AGENTS.md"), false);
+  assert.equal(inferred.documentationRoots.includes("spec/"), false);
+  assert.equal(inferred.allowedPaths.includes("skills/"), false);
+  assert.equal(inferred.watchAllow.includes("skills/"), false);
+  assert.ok(inferred.allowedPaths.includes("skills/doc-audit/SKILL.md"));
+  assert.ok(inferred.allowedPaths.includes("skills/doc-audit/references/guide.md"));
+  assert.equal(inferred.allowedPaths.includes("skills/doc-audit/scripts/run.js"), false);
+  assert.equal(inferred.documentationFiles.includes("skills/doc-audit/target/doc/generated.html"), false);
+  assert.equal(inferred.allowedPaths.includes("skills/doc-audit/target/doc/generated.html"), false);
+  assert.equal(inferred.documentationRoots.includes("src/research/"), false);
+  assert.ok(inferred.exactDocumentationFiles.includes("src/research/notes.md"));
+  assert.ok(inferred.allowedPaths.includes("src/research/notes.md"));
+  assert.equal(inferred.allowedPaths.includes("src/research/"), false);
+  assert.equal(inferred.allowedPaths.includes("src/research/runner.js"), false);
+  assert.equal(inferred.documentationFiles.includes("docs/token-budget.md"), false);
+  assert.ok(cardPaths("agent-guidance").includes("skills/doc-audit/SKILL.md"));
+  assert.ok(cardPaths("agent-guidance").includes("skills/doc-audit/references/guide.md"));
+  assert.equal(cardPaths("agent-guidance").includes("skills/"), false);
+  assert.equal(doctor.issues.some((issue) => issue.type === "hub_path_not_allowed"), false);
+  assert.ok(cardPaths("target-documentation").includes("docs/target/index.md"));
+  for (const targetPath of ["plans.md", "proposals.md", "roadmap.md", "targets.md"]) {
+    assert.ok(cardPaths("target-documentation").includes(targetPath), `expected target card for ${targetPath}`);
+  }
+  assert.ok(cardPaths("target-documentation").includes("docs/implemented_target.md"));
+  assert.equal(cardPaths("target-documentation").includes("target-audience.md"), false);
+  assert.equal(cardPaths("start-here").includes("docs/target/index.md"), false);
+  assert.equal(cardPaths("start-here").includes("docs/research/index.md"), false);
+  assert.equal(cardPaths("start-here").includes("README_old.md"), false);
+  assert.ok(cardPaths("records").includes("docs/research/"));
+  assert.ok(cardPaths("records").includes("research/"));
+  assert.ok(cardPaths("records").includes("incidents/"));
+  assert.ok(cardPaths("records").includes("history/"));
+  assert.ok(section("records").cards.some((card) => card.path === "docs/decision-note.md" && !card.autoChildren));
+  assert.ok(section("records").cards.some((card) => card.path === "src/research/notes.md" && !card.autoChildren));
+  assert.equal(section("records").cards.some((card) => card.path === "src/research/"), false);
+  assert.equal(section("records").cards.some((card) => card.path === "docs/"), false);
+  assert.ok(cardPaths("documentation-to-classify").includes("docs/invalid-status.md"));
+  assert.ok(cardPaths("documentation-to-classify").includes("docs/missing-status.md"));
+  assert.ok(cardPaths("documentation-to-classify").includes("docs/draft-guide.md"));
+  assert.ok(cardPaths("documentation-to-classify").includes("README_old.md"));
+  assert.ok(cardPaths("documentation-to-classify").includes("target-audience.md"));
+  assert.equal(cardPaths("target-documentation").includes("docs/draft-guide.md"), false);
+  assert.equal(cardPaths("current-documentation").includes("docs/invalid-status.md"), false);
+  const inferredCards = inferred.hubSections.flatMap((hubSection) => hubSection.cards);
+  assert.ok(inferredCards.every((card) => card.path || card.paths?.length || card.cards?.length));
+  assert.equal(inferredCards.some((card) => card.path === "docs/token-budget.md" || card.paths?.includes("docs/token-budget.md")), false);
+  const targetNode = graph.nodes.find((node) => node.path === "docs/implemented_target.md");
+  const recordNode = graph.nodes.find((node) => node.path === "docs/research/current-record.md");
+  assert.equal(targetNode.metadata.status, "");
+  assert.equal(targetNode.metadata.truthState, "target");
+  assert.equal(recordNode.metadata.status, "");
+  assert.equal(recordNode.metadata.truthState, "record");
+  assert.ok(graph.healthIssues.some((issue) => issue.type === "target_status_conflict" && issue.path === targetNode.path));
+  assert.ok(graph.healthIssues.some((issue) => issue.type === "record_status_conflict" && issue.path === recordNode.path));
+  const truthBrief = buildAgentBrief(root, { task: "implemented target current record", limit: 20 });
+  assert.match(truthBrief, /docs\/implemented_target\.md \(canonical, target,/);
+  assert.match(truthBrief, /docs\/research\/current-record\.md \(canonical, record,/);
+  assert.doesNotMatch(truthBrief, /(?:implemented_target|current-record)\.md \(canonical, current,/);
+});
+
+test("fresh project-only startup context includes discovered nested and Hermes instructions", () => {
+  const root = makeRoot();
+  fs.mkdirSync(path.join(root, "docs", "team"), { recursive: true });
+  fs.writeFileSync(path.join(root, ".hermes.md"), "# Hermes instructions\n");
+  fs.writeFileSync(path.join(root, "docs", "index.md"), "# Documentation\n");
+  fs.writeFileSync(path.join(root, "docs", "team", "AGENTS.md"), "# Team instructions\n");
+  fs.writeFileSync(path.join(root, "docs", "team", "CLAUDE.md"), "# Claude instructions\n");
+
+  const initialized = initializeContextRoomProject(root);
+  const startupFiles = listStartupContextFiles(root, initialized.config);
+  const startupPaths = startupFiles.map((file) => file.startupContext.explorerPath);
+
+  assert.equal(initialized.config.startupContext.projectOnly, true);
+  assert.ok(initialized.config.startupContext.fileNames.includes(".hermes.md"));
+  assert.ok(startupPaths.includes(".hermes.md"));
+  assert.ok(startupPaths.includes("docs/team/AGENTS.md"));
+  assert.ok(startupPaths.includes("docs/team/CLAUDE.md"));
+  assert.ok(startupFiles.every((file) => file.startupContext.source === "project"));
+});
+
+test("project-only startup scanners reject symlink escapes while compatibility mode remains explicit", () => {
+  const root = makeRoot();
+  const external = makeRoot();
+  fs.mkdirSync(path.join(external, "linked-skills", "external-skill"), { recursive: true });
+  fs.writeFileSync(path.join(external, "AGENTS.md"), "# External agents\n");
+  fs.writeFileSync(path.join(external, "linked-skills", "external-skill", "SKILL.md"), "# External skill\n");
+  fs.writeFileSync(path.join(external, "external-skill.md"), "# Escaped skill\n");
+  fs.writeFileSync(path.join(external, "hooks.json"), "{\"hooks\":{}}\n");
+  fs.writeFileSync(path.join(external, "escape.sh"), "#!/bin/sh\nexit 0\n");
+  fs.writeFileSync(path.join(external, "pre-commit"), "#!/bin/sh\nexit 0\n");
+
+  fs.mkdirSync(path.join(root, "skills", "escaped"), { recursive: true });
+  fs.mkdirSync(path.join(root, ".codex"), { recursive: true });
+  fs.mkdirSync(path.join(root, ".husky"), { recursive: true });
+  fs.symlinkSync(path.join(external, "AGENTS.md"), path.join(root, "AGENTS.md"));
+  fs.symlinkSync(path.join(external, "linked-skills"), path.join(root, "linked-skills"), "dir");
+  fs.symlinkSync(path.join(external, "external-skill.md"), path.join(root, "skills", "escaped", "SKILL.md"));
+  fs.symlinkSync(path.join(external, "hooks.json"), path.join(root, ".codex", "external.json"));
+  fs.symlinkSync(path.join(external, "escape.sh"), path.join(root, ".codex", "escape.sh"));
+  fs.symlinkSync(path.join(external, "pre-commit"), path.join(root, ".husky", "pre-commit"));
+  fs.writeFileSync(path.join(root, ".codex", "hooks.json"), JSON.stringify({
+    hooks: { Before: [{ hooks: [{ type: "command", command: ".codex/escape.sh" }] }] },
+  }));
+
+  const projectOnly = createDefaultProjectConfig();
+  projectOnly.startupContext = { enabled: true, projectOnly: true, fileNames: ["AGENTS.md"], globalPaths: [] };
+  projectOnly.startupSkills = { enabled: true, projectOnly: true, folderNames: ["skills", "linked-skills"] };
+  projectOnly.startupHooks = {
+    ...projectOnly.startupHooks,
+    enabled: true,
+    editable: true,
+    projectOnly: true,
+    agentHooks: true,
+    gitHooks: false,
+    hookManagers: true,
+    fileNames: ["pre-commit"],
+    agentHookSources: [{ id: "codex", label: "Codex", paths: [".codex/hooks.json", ".codex/external.json"] }],
+    managerPaths: [".husky/"],
+  };
+
+  assert.deepEqual(listStartupContextFiles(root, projectOnly), []);
+  const projectSkills = listStartupSkillFolders(root, projectOnly);
+  assert.equal(projectSkills.some((folder) => folder.displayPath.includes("linked-skills")), false);
+  assert.equal(projectSkills.flatMap((folder) => folder.skills).includes("escaped"), false);
+  const projectHooks = listStartupHookFiles(root, projectOnly);
+  assert.deepEqual(projectHooks.map((file) => file.startupHook.fileName), ["hooks.json"]);
+  assert.ok(projectHooks.every((file) => fs.realpathSync(file.startupHook.absolutePath).startsWith(fs.realpathSync(root) + path.sep)));
+  const inferred = inferProjectDocumentationSetup(root);
+  assert.equal(inferred.allowedPaths.some((relPath) => relPath.startsWith("skills/escaped") || relPath.startsWith("linked-skills")), false);
+
+  const compatibility = structuredClone(projectOnly);
+  compatibility.startupContext.projectOnly = false;
+  compatibility.startupSkills.projectOnly = false;
+  assert.ok(listStartupContextFiles(root, compatibility).some((file) => file.startupContext.absolutePath === path.join(root, "AGENTS.md")));
+  assert.ok(listStartupSkillFolders(root, compatibility).some((folder) => folder.displayPath.includes("linked-skills")));
+});
+
+test("explicitly empty startup scanner lists stay empty after save and reload", () => {
+  const root = makeRoot();
+  fs.mkdirSync(path.join(root, "skills", "demo"), { recursive: true });
+  fs.mkdirSync(path.join(root, ".codex"), { recursive: true });
+  fs.mkdirSync(path.join(root, ".husky"), { recursive: true });
+  fs.writeFileSync(path.join(root, "AGENTS.md"), "# Agents\n");
+  fs.writeFileSync(path.join(root, "skills", "demo", "SKILL.md"), "# Demo\n");
+  fs.writeFileSync(path.join(root, ".codex", "hooks.json"), '{"hooks":{}}\n');
+  fs.writeFileSync(path.join(root, ".husky", "pre-commit"), "#!/bin/sh\nexit 0\n");
+  initializeContextRoomProject(root);
+
+  const next = readMemoryWebappSettings(root);
+  next.startupContext = { enabled: true, projectOnly: true, fileNames: [], globalPaths: [] };
+  next.startupSkills = { enabled: true, projectOnly: true, folderNames: [] };
+  next.startupHooks = {
+    enabled: true,
+    editable: false,
+    projectOnly: true,
+    agentHooks: true,
+    codexHooks: true,
+    gitHooks: false,
+    hookManagers: true,
+    fileNames: [],
+    agentHookSources: [],
+    agentHookPaths: [],
+    codexPaths: [],
+    managerPaths: [],
+  };
+  writeMemoryWebappSettings(root, next);
+
+  const saved = readMemoryWebappSettings(root);
+  assert.deepEqual(saved.startupContext.fileNames, []);
+  assert.deepEqual(saved.startupContext.globalPaths, []);
+  assert.deepEqual(saved.startupSkills.folderNames, []);
+  assert.deepEqual(saved.startupHooks.fileNames, []);
+  assert.deepEqual(saved.startupHooks.agentHookSources, []);
+  assert.deepEqual(saved.startupHooks.agentHookPaths, []);
+  assert.deepEqual(saved.startupHooks.codexPaths, []);
+  assert.deepEqual(saved.startupHooks.managerPaths, []);
+  assert.deepEqual(listStartupContextFiles(root), []);
+  assert.deepEqual(listStartupSkillFolders(root), []);
+  assert.deepEqual(listStartupHookFiles(root), []);
+});
+
+test("project-only startup skill resolution ignores an external symlink collision", () => {
+  const root = makeRoot();
+  const external = makeRoot();
+  fs.mkdirSync(path.join(root, "skills"), { recursive: true });
+  fs.mkdirSync(path.join(external, "foo"), { recursive: true });
+  fs.writeFileSync(path.join(root, "skills", "foo.md"), "# Local loose skill\n");
+  fs.writeFileSync(path.join(external, "foo", "SKILL.md"), "# External collision\n");
+  fs.symlinkSync(path.join(external, "foo"), path.join(root, "skills", "foo"), "dir");
+  const settings = createDefaultProjectConfig();
+  settings.startupSkills = { enabled: true, projectOnly: true, folderNames: ["skills"] };
+
+  const folders = listStartupSkillFolders(root, settings);
+  assert.deepEqual(folders.flatMap((folder) => folder.skills), ["foo"]);
+  const skill = readStartupSkillFile(root, folders[0].order, "foo", settings);
+  assert.equal(skill.content, "# Local loose skill\n");
+  writeStartupSkillFile(root, folders[0].order, "foo", "# Updated local skill\n", settings);
+  assert.equal(fs.readFileSync(path.join(root, "skills", "foo.md"), "utf8"), "# Updated local skill\n");
+  assert.equal(fs.readFileSync(path.join(external, "foo", "SKILL.md"), "utf8"), "# External collision\n");
+});
+
+test("generated agent guide includes repository setup instructions and the canonical configuration guide", () => {
+  const root = makeRoot();
+  fs.mkdirSync(path.join(root, "docs"), { recursive: true });
+  fs.writeFileSync(path.join(root, "docs", "index.md"), "# Docs\n");
+
+  const initialized = initializeContextRoomProject(root);
+  const guide = fs.readFileSync(initialized.agentContextPath, "utf8");
+  const copiedConfiguration = path.join(root, AGENT_CONTEXT_DIR, "agent-configuration.md");
+  const canonicalConfiguration = fs.readFileSync(new URL("../docs/agent-configuration.md", import.meta.url));
+
+  assert.match(guide, /## Set Up This Repository/);
+  assert.match(guide, /`context-room setup`, `context-room init`, and `context-room start`/);
+  assert.match(guide, /Read the root README, every applicable `AGENTS\.md`/);
+  assert.match(guide, /Do not copy paths or state from another Context Room/);
+  assert.equal(fs.existsSync(copiedConfiguration), true);
+  assert.deepEqual(fs.readFileSync(copiedConfiguration), canonicalConfiguration);
+
+  for (const generatedPath of initialized.agentContextPath
+    ? [initialized.agentContextPath, ...fs.readdirSync(path.join(root, AGENT_CONTEXT_DIR))
+      .filter((fileName) => /[.]md$/i.test(fileName))
+      .map((fileName) => path.join(root, AGENT_CONTEXT_DIR, fileName))]
+    : []) {
+    const content = fs.readFileSync(generatedPath, "utf8");
+    for (const match of content.matchAll(/\[[^\]]*\]\(([^)]+)\)/g)) {
+      const href = match[1].trim().replace(/^<|>$/g, "").split("#")[0];
+      if (!href || /^(?:[a-z]+:|\/)/i.test(href)) continue;
+      assert.equal(fs.existsSync(path.resolve(path.dirname(generatedPath), href)), true, `${generatedPath} has broken link ${href}`);
+    }
+  }
+});
+
+test("available port selection skips an occupied room while strict selection rejects it", async (t) => {
+  const occupied = net.createServer();
+  await new Promise((resolve, reject) => {
+    occupied.once("error", reject);
+    occupied.listen(0, "127.0.0.1", resolve);
+  });
+  t.after(() => new Promise((resolve) => occupied.close(resolve)));
+  const occupiedPort = occupied.address().port;
+
+  const selected = await selectAvailableContextRoomPort(occupiedPort, { maxAttempts: 20 });
+
+  assert.ok(selected > occupiedPort);
+  await assert.rejects(
+    selectAvailableContextRoomPort(occupiedPort, { allowFallback: false }),
+    new RegExp(`port ${occupiedPort} is already in use`, "i"),
+  );
+});
+
 test("agent HTML context uses a stable project path and refreshes generated copies", () => {
   const root = makeRoot();
   initializeContextRoomProject(root, { allowedPaths: ["docs/"] });
@@ -281,6 +1248,7 @@ test("agent HTML context uses a stable project path and refreshes generated copi
   const legacyEntryPath = path.join(root, AGENT_CONTEXT_DIR, "README.md");
   const patternsPath = path.join(root, AGENT_CONTEXT_DIR, "html-visual-patterns.md");
   const canonicalPatterns = fs.readFileSync(new URL("../docs/features/html-visual-patterns.md", import.meta.url), "utf8");
+  const relocatedPatterns = canonicalPatterns.replaceAll("../context-room-", "context-room-");
 
   const entry = fs.readFileSync(entryPath, "utf8");
   assert.match(entry, /generated by Context Room/i);
@@ -298,14 +1266,14 @@ test("agent HTML context uses a stable project path and refreshes generated copi
   assert.match(entry, /## Quality Gate/);
   assert.match(entry, /\[HTML visual patterns\]\(agent-context\/html-visual-patterns\.md\)/);
   assert.match(fs.readFileSync(legacyEntryPath, "utf8"), /\.context-room\/README\.md/);
-  assert.equal(fs.readFileSync(patternsPath, "utf8"), canonicalPatterns);
+  assert.equal(fs.readFileSync(patternsPath, "utf8"), relocatedPatterns);
 
   fs.writeFileSync(patternsPath, "stale generated copy\n", "utf8");
   const refreshed = syncContextRoomAgentContext(root);
 
   assert.equal(refreshed.entryPath, entryPath);
   assert.equal(refreshed.updated, 1);
-  assert.equal(fs.readFileSync(patternsPath, "utf8"), canonicalPatterns);
+  assert.equal(fs.readFileSync(patternsPath, "utf8"), relocatedPatterns);
 });
 
 test("allowed paths are driven by project config", () => {
@@ -720,11 +1688,13 @@ test("startup skills scanner lists configured skill folders from ancestors to ro
   assert.match(folders[0].displayPath, /\.codex\/skills$/);
   assert.equal(systemFolder.readOnly, true);
   assert.equal(openedSystem.content, "# Installer\n");
+  assert.equal(openedSystem.startupContext.readOnly, true);
   assert.match(openedSystem.startupContext.displayPath, /\.codex\/skills\/\.system\/skill-installer\/SKILL\.md$/);
   assert.throws(() => writeStartupSkillFile(root, systemFolder.order, "skill-installer", "# Mutate\n"), /read-only/);
   assert.throws(() => createStartupSkillFile(root, systemFolder.order, "new-system-skill"), /read-only/);
   assert.throws(() => deleteStartupSkill(root, systemFolder.order, "skill-installer"), /read-only/);
   assert.equal(opened.content, "# Parent\n");
+  assert.equal(opened.startupContext.readOnly, false);
   assert.equal(opened.startupContext.kind, "startup-skill");
   assert.equal(opened.startupContext.skillName, "parent-skill");
   assert.match(opened.startupContext.displayPath, /parent-skill\/SKILL\.md$/);
@@ -1047,6 +2017,10 @@ test("startup hooks scanner lists agent hooks from Codex, Claude Code, and OpenC
   fs.writeFileSync(path.join(repo, ".opencode", "plugins", "policy.ts"), "/** Checks OpenCode tool activity. */\nexport default {}\n");
   execFileSync("git", ["add", ".codex/hooks.json", ".codex/hooks/protect.py", ".claude/settings.json", ".claude/hooks/audit.sh", ".opencode/plugins/policy.ts"], { cwd: repo, stdio: "ignore" });
   initializeContextRoomProject(root, { allowedPaths: ["docs/"], watchAllow: [] });
+  const configPath = path.join(root, CONFIG_FILE);
+  const config = JSON.parse(fs.readFileSync(configPath, "utf8"));
+  config.startupHooks.projectOnly = false;
+  fs.writeFileSync(configPath, JSON.stringify(config, null, 2) + "\n");
 
   const hooks = listStartupHookFiles(root);
   const codexConfig = hooks.find((file) => file.startupHook.source === "codex-agent-hooks");
@@ -1506,6 +2480,19 @@ test("collaboration state, commands, annotations, and queue are agent-safe", () 
   assert.equal(session.openFile, "docs/guide.md");
   assert.equal(readCollaborationSessionState(root).visibleHeading, "## Purpose");
 
+  const foreignRoot = makeRoot();
+  fs.writeFileSync(path.join(root, CONFIG_DIR, "session-state.json"), JSON.stringify({
+    version: 1,
+    root: foreignRoot,
+    page: "file",
+    selectedPath: "other-project/private.md",
+    pathFilters: ["other-project/"],
+  }, null, 2) + "\n");
+  const rejectedForeignSession = readCollaborationSessionState(root);
+  assert.equal(rejectedForeignSession.root, path.resolve(root));
+  assert.equal(rejectedForeignSession.selectedPath, null);
+  assert.deepEqual(rejectedForeignSession.pathFilters, []);
+
   const command = writeAgentCommand(root, { view: "file", path: "docs/guide.md", targetType: "heading", targetValue: "Purpose" });
   assert.equal(command.path, "docs/guide.md");
   assert.deepEqual(readAgentCommand(root).command.target, { type: "heading", value: "Purpose" });
@@ -1544,6 +2531,583 @@ test("CLI agent commands expose state, navigation, annotations, and queue withou
   const help = execFileSync(process.execPath, [cli, "--help"], { encoding: "utf8" });
   assert.match(help, /context-room agent state/);
   assert.doesNotMatch(help, /agent verify/);
+});
+
+test("folder watch defaults and legacy watchAllow folders both stay recursive and live", () => {
+  const defaultRoot = makeFolderWatchRoot();
+  const defaultResult = writeFolderWatchRule(defaultRoot, { path: "docs" });
+
+  assert.equal(defaultResult.rule.mode, "recursive-live");
+  assert.equal(defaultResult.rule.path, "docs/");
+  assert.equal(Object.hasOwn(defaultResult.rule, "files"), false);
+  assert.deepEqual(defaultResult.settings.watchAllow, []);
+
+  mutateFolderWatchFixture(defaultRoot);
+  const defaultDeep = buildDocQaReport(defaultRoot).queue.find((item) => item.path === "docs/later-folder/deeper/later-deep.md");
+  assert.equal(defaultDeep?.gitStatus, "??");
+
+  const legacyRoot = makeFolderWatchRoot({ watchAllow: ["docs/"] });
+  mutateFolderWatchFixture(legacyRoot);
+  const legacySettings = readMemoryWebappSettings(legacyRoot);
+  const legacyDeep = buildDocQaReport(legacyRoot).queue.find((item) => item.path === "docs/later-folder/deeper/later-deep.md");
+
+  assert.deepEqual(legacySettings.watchAllow, ["docs/"]);
+  assert.deepEqual(legacySettings.watchRules, []);
+  assert.equal(watchStateForPath("docs/later-folder/deeper/later-deep.md", legacySettings), "watched-inherited");
+  assert.equal(legacyDeep?.gitStatus, "??");
+});
+
+test("folder watch modes enforce recursive, direct, current, and future queue boundaries", () => {
+  const cases = [
+    {
+      mode: "recursive-live",
+      expected: [
+        "docs/direct.md",
+        "docs/later-direct.md",
+        "docs/later-folder/deeper/later-deep.md",
+        "docs/nested/existing.md",
+      ],
+      snapshot: null,
+    },
+    {
+      mode: "recursive-current",
+      expected: ["docs/direct.md", "docs/nested/existing.md"],
+      snapshot: ["docs/delete.md", "docs/direct.md", "docs/nested/existing.md"],
+    },
+    {
+      mode: "direct-current",
+      expected: ["docs/direct.md"],
+      snapshot: ["docs/delete.md", "docs/direct.md"],
+    },
+    {
+      mode: "direct-live",
+      expected: ["docs/direct.md", "docs/later-direct.md"],
+      snapshot: null,
+    },
+  ];
+
+  assert.deepEqual(WATCH_RULE_MODES, cases.map((item) => item.mode));
+  for (const fixture of cases) {
+    const root = makeFolderWatchRoot();
+    const result = writeFolderWatchRule(root, { path: "docs/", mode: fixture.mode });
+    if (fixture.snapshot) assert.deepEqual(result.rule.files, fixture.snapshot, `${fixture.mode} should freeze the intended current files`);
+    else assert.equal(Object.hasOwn(result.rule, "files"), false, `${fixture.mode} should remain live instead of storing a snapshot`);
+
+    mutateFolderWatchFixture(root);
+    const queue = buildDocQaReport(root).queue;
+    const paths = queue.map((item) => item.path).sort((left, right) => left.localeCompare(right, "en"));
+    assert.deepEqual(paths, fixture.expected, `${fixture.mode} should expose only its selected folder scope`);
+
+    const laterDirect = queue.find((item) => item.path === "docs/later-direct.md");
+    const laterDeep = queue.find((item) => item.path === "docs/later-folder/deeper/later-deep.md");
+    assert.equal(Boolean(laterDirect), fixture.mode === "recursive-live" || fixture.mode === "direct-live", `${fixture.mode} future-file behavior`);
+    assert.equal(Boolean(laterDeep), fixture.mode === "recursive-live", `${fixture.mode} recursive future-file behavior`);
+    if (laterDirect) assert.equal(laterDirect.gitStatus, "??");
+    if (laterDeep) assert.equal(laterDeep.gitStatus, "??");
+  }
+});
+
+test("external allowed folders use all four watch modes and baseline-backed review", () => {
+  const originalHome = process.env.HOME;
+  const home = makeRoot();
+  process.env.HOME = home;
+  try {
+    const cases = [
+      {
+        mode: "recursive-live",
+        initial: ["direct.md", "nested/existing.md"],
+        changed: ["direct.md", "later-direct.md", "later-folder/deeper/later-deep.md", "nested/existing.md"],
+        snapshot: ["direct.md", "nested/existing.md"],
+      },
+      {
+        mode: "recursive-current",
+        initial: ["direct.md", "nested/existing.md"],
+        changed: ["direct.md", "nested/existing.md"],
+        snapshot: ["direct.md", "nested/existing.md"],
+      },
+      {
+        mode: "direct-current",
+        initial: ["direct.md"],
+        changed: ["direct.md"],
+        snapshot: ["direct.md"],
+      },
+      {
+        mode: "direct-live",
+        initial: ["direct.md"],
+        changed: ["direct.md", "later-direct.md"],
+        snapshot: ["direct.md"],
+      },
+    ];
+
+    for (const fixture of cases) {
+      const suffix = fixture.mode.replaceAll("-", "_");
+      const root = path.join(home, `project_${suffix}`);
+      const externalRoot = path.join(home, `shared_${suffix}`);
+      const virtualRoot = `~/shared_${suffix}/`;
+      fs.mkdirSync(path.join(externalRoot, "nested"), { recursive: true });
+      fs.mkdirSync(root, { recursive: true });
+      fs.writeFileSync(path.join(externalRoot, "direct.md"), "# Direct\n");
+      fs.writeFileSync(path.join(externalRoot, "nested", "existing.md"), "# Existing nested\n");
+      initializeContextRoomProject(root, { allowedPaths: [virtualRoot], watchAllow: [] });
+
+      assert.equal(isAllowedMemoryPath(`${virtualRoot}direct.md`, readMemoryWebappSettings(root)), true);
+      const watched = writeFolderWatchRule(root, { path: virtualRoot, mode: fixture.mode });
+      const expectedSnapshot = fixture.snapshot.map((relPath) => virtualRoot + relPath);
+      if (fixture.mode.endsWith("-current")) assert.deepEqual(watched.rule.files, expectedSnapshot);
+      else assert.equal("files" in watched.rule, false);
+
+      const initial = buildDocQaReport(root).queue.filter((item) => item.externalWatch);
+      assert.deepEqual(
+        initial.map((item) => item.path).sort((left, right) => left.localeCompare(right, "en")),
+        fixture.initial.map((relPath) => virtualRoot + relPath),
+      );
+      assert.ok(initial.every((item) => item.gitStatus === "??" && item.initialReview), `${fixture.mode} should label first-seen external files as new first reviews`);
+      for (const item of initial) writeDocReviewDecision(root, item.path, { status: "verified", note: "external fixture reviewed" });
+      assert.equal(buildDocQaReport(root).queue.some((item) => item.externalWatch), false);
+
+      fs.writeFileSync(path.join(externalRoot, "direct.md"), "# Direct\n\nChanged.\n");
+      fs.writeFileSync(path.join(externalRoot, "nested", "existing.md"), "# Existing nested\n\nChanged.\n");
+      fs.writeFileSync(path.join(externalRoot, "later-direct.md"), "# Later direct\n");
+      fs.mkdirSync(path.join(externalRoot, "later-folder", "deeper"), { recursive: true });
+      fs.writeFileSync(path.join(externalRoot, "later-folder", "deeper", "later-deep.md"), "# Later deep\n");
+
+      const changed = buildDocQaReport(root).queue.filter((item) => item.externalWatch);
+      assert.deepEqual(
+        changed.map((item) => item.path).sort((left, right) => left.localeCompare(right, "en")),
+        fixture.changed.map((relPath) => virtualRoot + relPath),
+      );
+      assert.equal(changed.find((item) => item.path === virtualRoot + "direct.md")?.gitStatus, "M");
+      const newDirect = changed.find((item) => item.path === virtualRoot + "later-direct.md");
+      if (fixture.mode === "recursive-live" || fixture.mode === "direct-live") {
+        assert.equal(newDirect?.gitStatus, "??");
+        assert.equal(newDirect?.initialReview, true);
+      } else {
+        assert.equal(newDirect, undefined);
+      }
+      assert.equal(changed.some((item) => item.path === virtualRoot + "later-folder/deeper/later-deep.md"), fixture.mode === "recursive-live");
+
+      const reviewBase = readReviewBaseFile(root, virtualRoot + "direct.md");
+      assert.equal(reviewBase.available, true);
+      assert.equal(reviewBase.baseline, "review");
+      assert.equal(reviewBase.baseContent, "# Direct\n");
+      assert.equal(reviewBase.currentContent, "# Direct\n\nChanged.\n");
+      assert.equal(reviewBase.changeKind, "modified");
+    }
+  } finally {
+    if (originalHome === undefined) delete process.env.HOME;
+    else process.env.HOME = originalHome;
+  }
+});
+
+test("external allowed roots reject symlink escapes while an explicit symlink root remains authorized", () => {
+  const originalHome = process.env.HOME;
+  const home = makeRoot();
+  process.env.HOME = home;
+  try {
+    const root = path.join(home, "project");
+    const explicitRoot = path.join(home, "explicit-project");
+    const shared = path.join(home, "shared");
+    const outside = path.join(home, "outside");
+    fs.mkdirSync(root, { recursive: true });
+    fs.mkdirSync(explicitRoot, { recursive: true });
+    fs.mkdirSync(shared, { recursive: true });
+    fs.mkdirSync(outside, { recursive: true });
+    fs.writeFileSync(path.join(shared, "guide.md"), "# Guide\n");
+    fs.writeFileSync(path.join(outside, "outside.md"), "outside content\n");
+    fs.symlinkSync(outside, path.join(shared, "escape"), "dir");
+    fs.symlinkSync(path.join(outside, "outside.md"), path.join(shared, "linked.md"), "file");
+    initializeContextRoomProject(root, { allowedPaths: ["~/shared/"], watchAllow: [] });
+
+    const settings = readMemoryWebappSettings(root);
+    assert.equal(isAllowedMemoryPath("~/shared/guide.md", settings), true);
+    assert.equal(isAllowedMemoryPath("~/shared/escape/outside.md", settings), false);
+    assert.equal(isAllowedMemoryPath("~/shared/linked.md", settings), false);
+    assert.equal(readMemoryFile(root, "~/shared/guide.md").content, "# Guide\n");
+    assert.throws(() => readMemoryFile(root, "~/shared/escape/outside.md"), /Path not allowed/);
+    assert.throws(() => readMemoryFile(root, "~/shared/linked.md"), /Path not allowed/);
+    assert.throws(() => writeMemoryFile(root, "~/shared/escape/outside.md", "overwritten\n"), /Path not allowed/);
+    assert.throws(() => writeMemoryFile(root, "~/shared/linked.md", "overwritten\n"), /Path not allowed/);
+    assert.equal(fs.readFileSync(path.join(outside, "outside.md"), "utf8"), "outside content\n");
+
+    const legitimateWrite = writeMemoryFile(root, "~/shared/guide.md", "# Updated guide\n");
+    assert.equal(legitimateWrite.path, "~/shared/guide.md");
+    assert.equal(fs.readFileSync(path.join(shared, "guide.md"), "utf8"), "# Updated guide\n");
+
+    initializeContextRoomProject(explicitRoot, { allowedPaths: ["~/shared/escape/"], watchAllow: [] });
+    const explicitSettings = readMemoryWebappSettings(explicitRoot);
+    assert.equal(isAllowedMemoryPath("~/shared/escape/outside.md", explicitSettings), true);
+    assert.equal(readMemoryFile(explicitRoot, "~/shared/escape/outside.md").content, "outside content\n");
+    writeMemoryFile(explicitRoot, "~/shared/escape/authorized.md", "explicitly authorized\n");
+    assert.equal(fs.readFileSync(path.join(outside, "authorized.md"), "utf8"), "explicitly authorized\n");
+  } finally {
+    if (originalHome === undefined) delete process.env.HOME;
+    else process.env.HOME = originalHome;
+  }
+});
+
+test("external folder traversal, deletion, and watch snapshots stay inside the configured real root", () => {
+  const originalHome = process.env.HOME;
+  const home = makeRoot();
+  process.env.HOME = home;
+  try {
+    const root = path.join(home, "project");
+    const shared = path.join(home, "shared");
+    const outside = path.join(home, "outside");
+    fs.mkdirSync(path.join(shared, "nested"), { recursive: true });
+    fs.mkdirSync(outside, { recursive: true });
+    fs.mkdirSync(root, { recursive: true });
+    fs.writeFileSync(path.join(shared, "direct.md"), "# Direct\n");
+    fs.writeFileSync(path.join(shared, "delete-me.md"), "# Delete me\n");
+    fs.writeFileSync(path.join(shared, "nested", "inside.md"), "# Inside\n");
+    fs.writeFileSync(path.join(outside, "outside.md"), "# Outside\n");
+    fs.symlinkSync(outside, path.join(shared, "escape"), "dir");
+    fs.symlinkSync(path.join(outside, "outside.md"), path.join(shared, "linked.md"), "file");
+    initializeContextRoomProject(root, { allowedPaths: ["~/shared/"], watchAllow: [] });
+
+    const listedPaths = listMemoryFiles(root).map((file) => file.path);
+    assert.deepEqual(
+      listedPaths.filter((filePath) => filePath.startsWith("~/shared/")).sort((left, right) => left.localeCompare(right, "en")),
+      ["~/shared/delete-me.md", "~/shared/direct.md", "~/shared/nested/inside.md"],
+    );
+    const directories = listExplorerDirectories(root).map((directory) => directory.path);
+    assert.equal(directories.includes("~/shared/nested/"), true);
+    assert.equal(directories.some((directory) => directory.startsWith("~/shared/escape")), false);
+
+    const watched = writeFolderWatchRule(root, { path: "~/shared/", mode: "recursive-current" });
+    assert.deepEqual(watched.rule.files, ["~/shared/delete-me.md", "~/shared/direct.md", "~/shared/nested/inside.md"]);
+    assert.throws(
+      () => writeFolderWatchRule(root, { path: "~/shared/escape/", mode: "recursive-current" }),
+      /not covered by allowedPaths/,
+    );
+
+    assert.throws(() => deleteMemoryPaths(root, ["~/shared/escape/outside.md"]), /Path not allowed/);
+    assert.throws(() => deleteMemoryPaths(root, ["~/shared/escape/"]), /Path not allowed/);
+    assert.throws(() => deleteMemoryPaths(root, ["~/shared/linked.md"]), /Path not allowed/);
+    assert.equal(fs.readFileSync(path.join(outside, "outside.md"), "utf8"), "# Outside\n");
+    assert.equal(fs.existsSync(path.join(shared, "escape")), true);
+    assert.equal(fs.existsSync(path.join(shared, "linked.md")), true);
+
+    const deleted = deleteMemoryPaths(root, ["~/shared/delete-me.md"]);
+    assert.deepEqual(deleted.deleted, ["~/shared/delete-me.md"]);
+    assert.equal(fs.existsSync(path.join(shared, "delete-me.md")), false);
+  } finally {
+    if (originalHome === undefined) delete process.env.HOME;
+    else process.env.HOME = originalHome;
+  }
+});
+
+test("external watched deletions retain their reviewed baseline and unauthorized home paths stay closed", () => {
+  const originalHome = process.env.HOME;
+  const home = makeRoot();
+  process.env.HOME = home;
+  try {
+    const root = path.join(home, "project");
+    const externalRoot = path.join(home, "shared");
+    fs.mkdirSync(root, { recursive: true });
+    fs.mkdirSync(externalRoot, { recursive: true });
+    fs.writeFileSync(path.join(externalRoot, "delete.md"), "# Delete me\n");
+    initializeContextRoomProject(root, { allowedPaths: ["~/shared/"], watchAllow: [] });
+    writeFolderWatchRule(root, { path: "~/shared/", mode: "recursive-live" });
+    writeDocReviewDecision(root, "~/shared/delete.md", { status: "verified", note: "external fixture reviewed" });
+
+    fs.unlinkSync(path.join(externalRoot, "delete.md"));
+    const deletionReport = buildDocQaReport(root);
+    const deletion = deletionReport.queue.find((item) => item.path === "~/shared/delete.md");
+    const reviewBase = readReviewBaseFile(root, "~/shared/delete.md");
+    assert.equal(deletion?.gitStatus, "D");
+    assert.equal(deletion?.resourceState, "absent");
+    assert.equal(deletionReport.summary.deletedDocs, 1);
+    assert.equal(deletionReport.summary.protectedDeletedDocs, 0);
+    assert.equal(reviewBase.available, true);
+    assert.equal(reviewBase.changeKind, "deleted");
+    assert.equal(reviewBase.baseContent, "# Delete me\n");
+    assert.equal(reviewBase.currentContent, "");
+
+    writeDocReviewDecision(root, deletion.path, {
+      status: "verified",
+      note: "external deletion reviewed",
+      expectedResourceState: deletion.resourceState,
+      expectedResourceVersion: deletion.resourceVersion,
+    });
+    const afterDeletionReview = buildDocQaReport(root);
+    assert.equal(afterDeletionReview.queue.some((item) => item.path === "~/shared/delete.md"), false);
+    assert.equal(afterDeletionReview.summary.deletedDocs, 0);
+
+    const doctor = buildContextRoomDoctorReport(root);
+    assert.equal(doctor.issues.some((issue) => issue.severity === "high" && issue.type.startsWith("watch_rule")), false);
+
+    const closedRoot = path.join(home, "closed-project");
+    fs.mkdirSync(path.join(closedRoot, "docs"), { recursive: true });
+    initializeContextRoomProject(closedRoot, { allowedPaths: ["docs/"], watchAllow: [] });
+    assert.equal(isAllowedMemoryPath("~/shared/delete.md", readMemoryWebappSettings(closedRoot)), false);
+    assert.equal(listMemoryFiles(closedRoot).some((file) => file.path.startsWith("~/shared/")), false);
+    assert.throws(
+      () => writeFolderWatchRule(closedRoot, { path: "~/shared/", mode: "recursive-live" }),
+      /not covered by allowedPaths/,
+    );
+  } finally {
+    if (originalHome === undefined) delete process.env.HOME;
+    else process.env.HOME = originalHome;
+  }
+});
+
+test("external watched files deleted before their first decision remain queued in live and current modes", () => {
+  const originalHome = process.env.HOME;
+  const home = makeRoot();
+  process.env.HOME = home;
+  try {
+    for (const mode of WATCH_RULE_MODES) {
+      const suffix = mode.replaceAll("-", "_");
+      const root = path.join(home, `project_${suffix}`);
+      const externalRoot = path.join(home, `shared_${suffix}`);
+      const virtualRoot = `~/shared_${suffix}/`;
+      const watchedPath = virtualRoot + "pending.md";
+      const snapshotOnlyPath = virtualRoot + "deleted-before-observation.md";
+      fs.mkdirSync(root, { recursive: true });
+      fs.mkdirSync(externalRoot, { recursive: true });
+      fs.writeFileSync(path.join(externalRoot, "pending.md"), "# Pending review\n");
+      if (mode.endsWith("-current")) {
+        fs.writeFileSync(path.join(externalRoot, "deleted-before-observation.md"), "# Snapshot only\n");
+      }
+      initializeContextRoomProject(root, { allowedPaths: [virtualRoot], watchAllow: [] });
+      writeFolderWatchRule(root, { path: virtualRoot, mode });
+      if (mode.endsWith("-current")) {
+        fs.unlinkSync(path.join(externalRoot, "deleted-before-observation.md"));
+      }
+
+      const initialQueue = buildDocQaReport(root).queue;
+      const initial = initialQueue.find((item) => item.path === watchedPath);
+      assert.equal(initial?.gitStatus, "??", `${mode} should queue the first-seen file`);
+      assert.equal(initial?.initialReview, true, `${mode} should require a first human decision`);
+      if (mode.endsWith("-current")) {
+        assert.equal(initialQueue.find((item) => item.path === snapshotOnlyPath)?.gitStatus, "D", `${mode} should retain a snapshotted file deleted before observation`);
+      }
+
+      fs.unlinkSync(path.join(externalRoot, "pending.md"));
+      const deleted = buildDocQaReport(root).queue.find((item) => item.path === watchedPath);
+      const reviewBase = readReviewBaseFile(root, watchedPath);
+      assert.equal(deleted?.gitStatus, "D", `${mode} should retain the observed deletion`);
+      assert.equal(deleted?.resourceState, "absent");
+      assert.equal(typeof deleted?.resourceVersion, "string");
+      assert.equal(reviewBase.baseContent, "# Pending review\n");
+      assert.equal(reviewBase.currentContent, "");
+      assert.equal(reviewBase.changeKind, "deleted");
+    }
+  } finally {
+    if (originalHome === undefined) delete process.env.HOME;
+    else process.env.HOME = originalHome;
+  }
+});
+
+test("external watched file changes invalidate cached reports", async () => {
+  const originalHome = process.env.HOME;
+  const home = makeRoot();
+  process.env.HOME = home;
+  let server = null;
+  try {
+    const root = path.join(home, "project");
+    const externalRoot = path.join(home, "shared");
+    fs.mkdirSync(root, { recursive: true });
+    fs.mkdirSync(externalRoot, { recursive: true });
+    fs.writeFileSync(path.join(externalRoot, "guide.md"), "# Guide\n");
+    initializeContextRoomProject(root, { allowedPaths: ["~/shared/"], watchAllow: [] });
+    writeFolderWatchRule(root, { path: "~/shared/", mode: "recursive-live" });
+    writeDocReviewDecision(root, "~/shared/guide.md", { status: "verified", note: "external fixture reviewed" });
+
+    ({ server } = createMemoryServer({ root }));
+    await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const baseUrl = `http://127.0.0.1:${server.address().port}`;
+    const initial = await (await fetch(baseUrl + "/api/reports")).json();
+    assert.equal(initial.docqa.queue.some((item) => item.path === "~/shared/guide.md"), false);
+
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    fs.writeFileSync(path.join(externalRoot, "guide.md"), "# Guide\n\nChanged outside the repo.\n");
+    let refreshed = initial;
+    const deadline = Date.now() + 3_000;
+    while (Date.now() < deadline && refreshed.generatedAt === initial.generatedAt) {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      refreshed = await (await fetch(baseUrl + "/api/reports")).json();
+    }
+    assert.notEqual(refreshed.generatedAt, initial.generatedAt);
+    assert.equal(refreshed.docqa.queue.find((item) => item.path === "~/shared/guide.md")?.gitStatus, "M");
+  } finally {
+    if (server) await new Promise((resolve) => server.close(resolve));
+    if (originalHome === undefined) delete process.env.HOME;
+    else process.env.HOME = originalHome;
+  }
+});
+
+test("current-only folder watch snapshots keep later files out but retain tracked deletions", () => {
+  const root = makeFolderWatchRoot();
+  const result = writeFolderWatchRule(root, { path: "docs/", mode: "recursive-current" });
+  assert.ok(result.rule.files.includes("docs/delete.md"));
+
+  fs.unlinkSync(path.join(root, "docs", "delete.md"));
+  fs.writeFileSync(path.join(root, "docs", "later.md"), "# Later\n");
+  const report = buildDocQaReport(root);
+  const deletion = report.queue.find((item) => item.path === "docs/delete.md");
+
+  assert.equal(deletion?.gitStatus.trim(), "D");
+  assert.equal(report.queue.some((item) => item.path === "docs/later.md"), false);
+  assert.equal(watchStateForPath("docs/delete.md", readMemoryWebappSettings(root)), "watched-inherited");
+});
+
+test("the most-specific structured child rule narrows a broad legacy parent", () => {
+  const root = makeRoot();
+  fs.mkdirSync(path.join(root, "docs", "narrow", "deeper"), { recursive: true });
+  fs.writeFileSync(path.join(root, "docs", "outside.md"), "# Outside\n");
+  fs.writeFileSync(path.join(root, "docs", "narrow", "direct.md"), "# Direct\n");
+  fs.writeFileSync(path.join(root, "docs", "narrow", "deeper", "deep.md"), "# Deep\n");
+  execFileSync("git", ["init"], { cwd: root, stdio: "ignore" });
+  execFileSync("git", ["config", "user.email", "context-room@example.test"], { cwd: root, stdio: "ignore" });
+  execFileSync("git", ["config", "user.name", "Context Room Test"], { cwd: root, stdio: "ignore" });
+  initializeContextRoomProject(root, { allowedPaths: ["docs/"], watchAllow: ["docs/"] });
+  execFileSync("git", ["add", "."], { cwd: root, stdio: "ignore" });
+  execFileSync("git", ["commit", "-m", "initial"], { cwd: root, stdio: "ignore" });
+
+  writeFolderWatchRule(root, { path: "docs/narrow/", mode: "direct-live" });
+  fs.writeFileSync(path.join(root, "docs", "outside.md"), "# Outside\n\nChanged.\n");
+  fs.writeFileSync(path.join(root, "docs", "narrow", "direct.md"), "# Direct\n\nChanged.\n");
+  fs.writeFileSync(path.join(root, "docs", "narrow", "deeper", "deep.md"), "# Deep\n\nChanged.\n");
+
+  const settings = readMemoryWebappSettings(root);
+  const queuePaths = buildDocQaReport(root).queue.map((item) => item.path).sort((left, right) => left.localeCompare(right, "en"));
+  assert.deepEqual(settings.watchAllow, ["docs/"]);
+  assert.deepEqual(queuePaths, ["docs/narrow/direct.md", "docs/outside.md"]);
+  assert.equal(watchStateForPath("docs/outside.md", settings), "watched-inherited");
+  assert.equal(watchStateForPath("docs/narrow/direct.md", settings), "watched-inherited");
+  assert.equal(watchStateForPath("docs/narrow/deeper/deep.md", settings), "");
+  assert.equal(explorerWatchFilterMatches("docs/narrow/deeper/deep.md", "watched", settings), false);
+  assert.equal(explorerWatchFilterMatches("docs/narrow/deeper/deep.md", "unwatched", settings), true);
+});
+
+test("watch state and Explorer filters honor current-file snapshots", () => {
+  const settings = {
+    watchAllow: [],
+    watchRules: [{ path: "docs/", mode: "recursive-current", files: ["docs/direct.md"] }],
+  };
+
+  assert.equal(watchStateForPath("docs", settings), "watched");
+  assert.equal(watchStateForPath("docs/direct.md", settings), "watched-inherited");
+  assert.equal(watchStateForPath("docs/later.md", settings), "");
+  assert.equal(explorerWatchFilterMatches("docs/direct.md", "watched", settings), true);
+  assert.equal(explorerWatchFilterMatches("docs/direct.md", "unwatched", settings), false);
+  assert.equal(explorerWatchFilterMatches("docs/later.md", "watched", settings), false);
+  assert.equal(explorerWatchFilterMatches("docs/later.md", "unwatched", settings), true);
+  assert.equal(explorerWatchFilterMatches("docs/later.md", "all", settings), true);
+});
+
+test("folder watch helpers and API add, replace, expose, and remove structured rules", async (t) => {
+  const root = makeFolderWatchRoot({ watchAllow: ["docs/"] });
+  const direct = writeFolderWatchRule(root, { path: "docs/", mode: "recursive-current" });
+  assert.deepEqual(direct.settings.watchAllow, []);
+  assert.deepEqual(direct.rule.files, ["docs/delete.md", "docs/direct.md", "docs/nested/existing.md"]);
+  assert.equal(removeFolderWatchRule(root, { path: "docs" }).removed, true);
+  assert.deepEqual(readMemoryWebappSettings(root).watchRules, []);
+
+  const { server } = createMemoryServer({ root });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  t.after(() => new Promise((resolve, reject) => server.close((error) => error ? reject(error) : resolve())));
+  const baseUrl = `http://127.0.0.1:${server.address().port}`;
+
+  const addResponse = await fetch(baseUrl + "/api/watch-rule", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ path: "docs/", mode: "direct-current" }),
+  });
+  const added = await addResponse.json();
+  assert.equal(addResponse.status, 200);
+  assert.equal(added.rule.mode, "direct-current");
+  assert.equal(added.matchedFiles, 2);
+  assert.deepEqual(added.rule.files, ["docs/delete.md", "docs/direct.md"]);
+
+  const settingsResponse = await fetch(baseUrl + "/api/settings");
+  const settingsPayload = await settingsResponse.json();
+  assert.equal(settingsResponse.status, 200);
+  assert.deepEqual(settingsPayload.settings.watchRules, [added.rule]);
+
+  const removeResponse = await fetch(baseUrl + "/api/watch-rule", {
+    method: "DELETE",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ path: "docs" }),
+  });
+  const removed = await removeResponse.json();
+  assert.equal(removeResponse.status, 200);
+  assert.equal(removed.removed, true);
+  assert.deepEqual(removed.settings.watchRules, []);
+  assert.deepEqual(readMemoryWebappSettings(root).watchRules, []);
+});
+
+test("doctor accepts legacy settings objects that predate structured watch rules", () => {
+  const root = makeRoot();
+  const legacySettings = createDefaultProjectConfig();
+  delete legacySettings.watchRules;
+
+  const report = buildContextRoomDoctorReport(root, {
+    settings: legacySettings,
+    graph: { healthIssues: [], summary: {} },
+    docqa: { summary: {} },
+  });
+
+  assert.equal(report.settings.watchRules, 0);
+});
+
+test("doctor distinguishes missing and non-directory project folder watch rules without invalidating deleted snapshots", () => {
+  const root = makeFolderWatchRoot();
+  const currentOnly = writeFolderWatchRule(root, { path: "docs/", mode: "recursive-current" });
+  fs.writeFileSync(path.join(root, "docs", "not-a-folder"), "This is a file.\n");
+  fs.unlinkSync(path.join(root, "docs", "delete.md"));
+  writeMemoryWebappSettings(root, {
+    ...currentOnly.settings,
+    watchRules: [
+      ...currentOnly.settings.watchRules,
+      { path: "docs/missing/", mode: "recursive-live" },
+      { path: "docs/not-a-folder/", mode: "direct-live" },
+    ],
+  });
+
+  const report = buildContextRoomDoctorReport(root);
+  const missing = report.issues.find((issue) => issue.type === "watch_rule_path_missing" && issue.path === "docs/missing/");
+  const notDirectory = report.issues.find((issue) => issue.type === "watch_rule_path_not_directory" && issue.path === "docs/not-a-folder/");
+  const deletion = buildDocQaReport(root).queue.find((item) => item.path === "docs/delete.md");
+
+  assert.equal(missing?.severity, "medium");
+  assert.match(missing?.message || "", /does not exist/);
+  assert.equal(notDirectory?.severity, "high");
+  assert.match(notDirectory?.message || "", /not a directory/);
+  assert.equal(report.issues.some((issue) => issue.path === "docs/delete.md" && issue.type.startsWith("watch_rule_path_")), false);
+  assert.equal(deletion?.gitStatus.trim(), "D");
+});
+
+test("invalid folder watch modes, paths, and snapshot members never mutate config", () => {
+  const root = makeFolderWatchRoot();
+  const configPath = path.join(root, CONFIG_FILE);
+  const initialSettings = readMemoryWebappSettings(root);
+  const initialConfig = fs.readFileSync(configPath, "utf8");
+  const expectUnchanged = (operation, pattern) => {
+    assert.throws(operation, pattern);
+    assert.equal(fs.readFileSync(configPath, "utf8"), initialConfig);
+  };
+
+  expectUnchanged(() => writeFolderWatchRule(root, { path: "docs/", mode: "sometimes" }), /must be one of/);
+  expectUnchanged(() => writeFolderWatchRule(root, { path: "..\/docs", mode: "recursive-live" }), /safe relative/);
+  expectUnchanged(() => writeFolderWatchRule(root, { path: "src/", mode: "recursive-live" }), /not covered by allowedPaths/);
+  expectUnchanged(() => writeMemoryWebappSettings(root, {
+    ...initialSettings,
+    watchRules: [{ path: "docs/", mode: "recursive-current" }],
+  }), /files is required/);
+  expectUnchanged(() => writeMemoryWebappSettings(root, {
+    ...initialSettings,
+    watchRules: [{ path: "docs/", mode: "recursive-current", files: ["outside.md"] }],
+  }), /is outside docs\//);
+  expectUnchanged(() => writeMemoryWebappSettings(root, {
+    ...initialSettings,
+    watchRules: [{ path: "docs/", mode: "direct-current", files: ["docs/nested/existing.md"] }],
+  }), /not a direct child/);
+  expectUnchanged(() => writeMemoryWebappSettings(root, {
+    ...initialSettings,
+    watchRules: [{ path: "docs/", mode: "recursive-current", files: ["..\/private.md"] }],
+  }), /not a safe relative path/);
 });
 
 test("doc QA detects watched changes when context root is a git subdirectory", () => {
@@ -2432,6 +3996,125 @@ context_room:
   assert.equal(graph.healthIssues.some((issue) => issue.type === "missing_metadata" && issue.path === "docs/plain.md"), false);
 });
 
+test("invalid or missing metadata status is never treated as current truth", () => {
+  const root = makeRoot();
+  fs.mkdirSync(path.join(root, "docs"), { recursive: true });
+  const doc = (statusLine) => `---
+context_room:
+  kind: canonical
+  scope: project
+${statusLine}
+  canonical_for: topic
+  sources: []
+---
+
+# Topic
+`;
+  fs.writeFileSync(path.join(root, "docs", "topic-current.md"), doc("  status: current\n  last_verified: 2026-07-19"));
+  fs.writeFileSync(path.join(root, "docs", "topic-invalid.md"), doc("  status: implemented"));
+  fs.writeFileSync(path.join(root, "docs", "topic-missing.md"), doc(""));
+  initializeContextRoomProject(root);
+
+  const graph = buildDocumentationGraph(root);
+  const invalid = graph.nodes.find((node) => node.path === "docs/topic-invalid.md");
+  const missing = graph.nodes.find((node) => node.path === "docs/topic-missing.md");
+  const invalidIssues = computeDocIssues({
+    path: invalid.path,
+    content: fs.readFileSync(path.join(root, invalid.path), "utf8"),
+    gitStatus: "M",
+    metadata: invalid.metadata,
+  });
+  const briefReadFirst = buildAgentBrief(root, { task: "topic", limit: 1 })
+    .split("## Read First\n")[1]
+    .split("\n## Review Warnings")[0];
+  const allTopicBrief = buildAgentBrief(root, { task: "topic", limit: 3 })
+    .split("## Read First\n")[1]
+    .split("\n## Review Warnings")[0];
+
+  assert.equal(invalid.metadata.statusValid, false);
+  assert.equal(missing.metadata.statusValid, false);
+  assert.equal(invalid.metadata.status, "");
+  assert.equal(missing.metadata.status, "");
+  assert.ok(graph.healthIssues.some((issue) => issue.type === "invalid_metadata_status" && issue.path === invalid.path));
+  assert.ok(graph.healthIssues.some((issue) => issue.type === "invalid_metadata_status" && issue.path === missing.path));
+  assert.equal(graph.healthIssues.some((issue) => issue.type === "duplicate_canonical"), false);
+  assert.ok(invalidIssues.some((issue) => issue.type === "invalid_metadata_status" && issue.severity === "high"));
+  assert.equal(invalidIssues.some((issue) => issue.type === "missing_last_verified"), false);
+  assert.match(briefReadFirst, /docs\/topic-current\.md/);
+  assert.doesNotMatch(briefReadFirst, /docs\/topic-(?:invalid|missing)\.md/);
+  assert.match(allTopicBrief, /docs\/topic-invalid\.md \(canonical, unclassified,/);
+  assert.match(allTopicBrief, /docs\/topic-missing\.md \(canonical, unclassified,/);
+  assert.doesNotMatch(allTopicBrief, /topic-(?:invalid|missing)\.md \(canonical, current,/);
+});
+
+test("path truth classifies invalid target and record docs while current routing indexes stay current", () => {
+  const root = makeRoot();
+  for (const relPath of ["docs/target", "docs/decisions", "docs/research", "docs/incidents"]) {
+    fs.mkdirSync(path.join(root, relPath), { recursive: true });
+  }
+  const metadataDoc = ({ kind = "canonical", status = null, canonicalFor = "topic" } = {}) => `---
+context_room:
+  kind: ${kind}
+  scope: echodesk
+${status === null ? "" : `  status: ${status}\n`}  canonical_for: ${canonicalFor}
+  last_verified: 2026-07-19
+  sources: []
+---
+
+# Topic
+`;
+  fs.writeFileSync(path.join(root, "docs", "roadmap.md"), metadataDoc({ status: "implemented", canonicalFor: "roadmap" }));
+  fs.writeFileSync(path.join(root, "docs", "target", "missing.md"), metadataDoc({ canonicalFor: "target-missing" }));
+  fs.writeFileSync(path.join(root, "docs", "research", "invalid.md"), metadataDoc({ status: "implemented", canonicalFor: "research-invalid" }));
+  fs.writeFileSync(path.join(root, "docs", "incidents", "missing.md"), metadataDoc({ canonicalFor: "incident-missing" }));
+  for (const directory of ["target", "decisions", "research", "incidents"]) {
+    fs.writeFileSync(path.join(root, "docs", directory, "index.md"), metadataDoc({ kind: "index", status: "current", canonicalFor: `${directory}-index` }));
+  }
+  fs.writeFileSync(path.join(root, "docs", "research", "current-record.md"), metadataDoc({ status: "current", canonicalFor: "record-current" }));
+  fs.writeFileSync(path.join(root, "research.md"), "# Research notes\n");
+  fs.writeFileSync(path.join(root, "incident-report.md"), "# Incident report\n");
+
+  const initialized = initializeContextRoomProject(root);
+  const graph = buildDocumentationGraph(root);
+  const node = (relPath) => graph.nodes.find((item) => item.path === relPath);
+  const hubPaths = (id) => (initialized.config.hubSections.find((section) => section.id === id)?.cards || [])
+    .flatMap((card) => [card.path, ...(card.paths || [])].filter(Boolean));
+
+  for (const relPath of ["docs/roadmap.md", "docs/target/missing.md"]) {
+    assert.equal(node(relPath).metadata.truthState, "target");
+    assert.notEqual(node(relPath).metadata.status, "current");
+  }
+  for (const relPath of ["docs/research/invalid.md", "docs/incidents/missing.md", "research.md", "incident-report.md"]) {
+    assert.equal(node(relPath).metadata.truthState, "record");
+    assert.notEqual(node(relPath).metadata.status, "current");
+  }
+  for (const relPath of ["docs/target/index.md", "docs/decisions/index.md", "docs/research/index.md", "docs/incidents/index.md"]) {
+    assert.equal(node(relPath).metadata.kind, "index");
+    assert.equal(node(relPath).metadata.status, "current");
+    assert.equal(node(relPath).metadata.truthState, "current");
+    assert.equal(graph.healthIssues.some((issue) => issue.path === relPath && ["target_status_conflict", "record_status_conflict"].includes(issue.type)), false);
+  }
+  const currentRecord = node("docs/research/current-record.md");
+  assert.equal(currentRecord.metadata.status, "");
+  assert.equal(currentRecord.metadata.truthState, "record");
+  assert.ok(graph.healthIssues.some((issue) => issue.path === currentRecord.path && issue.type === "record_status_conflict"));
+  for (const relPath of ["docs/roadmap.md", "docs/research/invalid.md", "docs/incidents/missing.md"]) {
+    assert.ok(graph.healthIssues.some((issue) => issue.path === relPath && issue.type === "invalid_metadata_status"));
+  }
+  assert.ok(hubPaths("target-documentation").includes("docs/roadmap.md"));
+  assert.ok(hubPaths("target-documentation").includes("docs/target/index.md"));
+  assert.ok(hubPaths("records").includes("docs/decisions/"));
+  assert.ok(hubPaths("records").includes("docs/research/"));
+  assert.ok(hubPaths("records").includes("docs/incidents/"));
+  assert.ok(hubPaths("records").includes("research.md"));
+  assert.ok(hubPaths("records").includes("incident-report.md"));
+  const brief = buildAgentBrief(root, { task: "roadmap research incidents index", limit: 30 });
+  assert.match(brief, /docs\/roadmap\.md \(canonical, target,/);
+  assert.match(brief, /docs\/research\/invalid\.md \(canonical, record,/);
+  assert.match(brief, /docs\/research\/index\.md \(index, current,/);
+  assert.doesNotMatch(brief, /docs\/research\/current-record\.md \(canonical, current,/);
+});
+
 test("documentation graph resolves inline references from project sub-roots", () => {
   const root = makeRoot();
   fs.mkdirSync(path.join(root, "projects", "hicharlie", "website", "docs"), { recursive: true });
@@ -2548,6 +4231,7 @@ context_room:
   const issue = before.issues.find((item) => item.type === "broken_source" && item.path === "docs/plain.md");
   assert.ok(issue?.key);
   assert.equal(issue.acknowledged, false);
+  assert.equal(issue.category, "references");
 
   const result = acknowledgeContextHealthIssue(root, { key: issue.key, note: "Known docs gap" });
   const saved = readContextHealthAcknowledgements(root);
@@ -2559,6 +4243,25 @@ context_room:
   assert.equal(acknowledged?.acknowledged, true);
   assert.equal(after.acknowledgedIssues, 1);
   assert.ok(after.issues.some((item) => item.type === "broken_source" && item.path === "docs/plain.md"));
+});
+
+test("context health categories cover every filter area and configuration issues can be marked OK", () => {
+  assert.equal(healthIssueCategory({ type: "invalid_config" }), "configuration");
+  assert.equal(healthIssueCategory({ type: "missing_sources" }), "documentation");
+  assert.equal(healthIssueCategory({ type: "broken_reference" }), "references");
+  assert.equal(healthIssueCategory({ type: "git_conflict" }), "review");
+  assert.equal(healthIssueCategory({ type: "startup_skill_review_required" }), "startup");
+  assert.equal(healthIssueCategory({ type: "external_startup_hook" }), "hooks");
+
+  const root = makeRoot();
+  initializeContextRoomProject(root, { allowedPaths: ["docs/"], watchAllow: ["docs/"] });
+  fs.writeFileSync(path.join(root, CONFIG_FILE), "{ invalid json\n");
+  const before = buildContextRoomDoctorReport(root);
+  const issue = before.issues.find((item) => item.type === "invalid_config");
+  assert.equal(issue?.category, "configuration");
+  const result = acknowledgeContextHealthIssue(root, { key: issue.key, note: "Owner reviewed the invalid config." });
+  assert.equal(result.issue.acknowledged, true);
+  assert.equal(buildContextRoomDoctorReport(root).issues.find((item) => item.key === issue.key)?.acknowledged, true);
 });
 
 test("explorer context menu renders action choices and keeps creation forms hidden", () => {
@@ -2596,6 +4299,81 @@ test("explorer context menu renders action choices and keeps creation forms hidd
   assert.match(html, /explorer-context-actions form-actions/);
   assert.match(html, /<label class="explorer-context-label" for="contextMarkdownTitle">Name<\/label>/);
   assert.match(html, /<label class="explorer-context-label" for="contextFolderPath">Path<\/label>/);
+});
+
+test("explorer folder watch menu renders all four modes with recursive live as the default", () => {
+  const menu = renderExplorerContextMenuMarkup({
+    targetPath: "docs",
+    targetKind: "folder",
+    directory: "docs",
+  });
+
+  assert.match(menu, /data-context-watch>Watch options…<\/button>/);
+  assert.match(menu, /data-context-watch-mode-form hidden/);
+  assert.match(menu, /role="radiogroup" aria-label="Folder watch mode"/);
+  assert.deepEqual(WATCH_RULE_MODE_OPTIONS.map((option) => option.id), WATCH_RULE_MODES);
+  for (const option of WATCH_RULE_MODE_OPTIONS) {
+    assert.match(menu, new RegExp(`value="${option.id}"`));
+    assert.ok(menu.includes(option.label));
+    assert.ok(menu.includes(option.description));
+  }
+  assert.equal((menu.match(/\schecked/g) || []).length, 1);
+  assert.match(menu, /value="recursive-live" checked/);
+  assert.match(menu, /id="contextCancelWatchMode"/);
+  assert.match(menu, /id="contextApplyWatchMode" class="primary"/);
+
+  const existingStructuredRule = renderExplorerContextMenuMarkup({
+    targetPath: "docs",
+    targetKind: "folder",
+    directory: "docs",
+    settings: {
+      watchAllow: [],
+      watchRules: [{ path: "docs/", mode: "direct-current", files: [] }],
+    },
+  });
+  assert.equal((existingStructuredRule.match(/\schecked/g) || []).length, 1);
+  assert.match(existingStructuredRule, /value="direct-current" checked/);
+
+  const existingLegacyRule = renderExplorerContextMenuMarkup({
+    targetPath: "docs",
+    targetKind: "folder",
+    directory: "docs",
+    settings: { watchAllow: ["docs/"], watchRules: [] },
+  });
+  assert.match(existingLegacyRule, /value="recursive-live" checked/);
+});
+
+test("folder watch dialogs restore failed actions and keep keyboard focus contained", () => {
+  const script = extractInlineAppScript(renderAppHtml());
+  const contextApplySource = script.slice(script.indexOf("async function applyExplorerFolderWatchMode"), script.indexOf("async function deleteExplorerContextTarget"));
+  const bulkDialogSource = script.slice(script.indexOf("function showFolderWatchModeDialog"), script.indexOf("function linesFromTextarea"));
+
+  assert.match(script, /renderWatchModeOptions\("contextWatchMode", exactUiFolderWatchMode/);
+  assert.match(contextApplySource, /catch \(error\)/);
+  assert.match(contextApplySource, /button\.disabled = false;/);
+  assert.match(contextApplySource, /button\.textContent = "Watch";/);
+  assert.match(bulkDialogSource, /event\.key === "Escape"/);
+  assert.match(bulkDialogSource, /event\.key !== "Tab"/);
+  assert.match(bulkDialogSource, /document\.addEventListener\("keydown", onKeydown\)/);
+  assert.match(bulkDialogSource, /document\.removeEventListener\("keydown", onKeydown\)/);
+  assert.match(bulkDialogSource, /returnFocus\?\.isConnected/);
+});
+
+test("empty allowed folders remain explorable and expose all four watch modes", () => {
+  const root = makeRoot();
+  fs.mkdirSync(path.join(root, "docs", "empty"), { recursive: true });
+  initializeContextRoomProject(root, { allowedPaths: ["docs/empty/"], watchAllow: [] });
+
+  assert.deepEqual(listExplorerDirectories(root), [{ path: "docs/empty/" }]);
+  assert.equal(listExplorerFiles(root).some((file) => file.path.startsWith("docs/empty/")), false);
+
+  const menu = renderExplorerContextMenuMarkup({
+    targetPath: "docs/empty",
+    targetKind: "folder",
+    directory: "docs/empty",
+  });
+  for (const mode of WATCH_RULE_MODES) assert.match(menu, new RegExp(`value="${mode}"`));
+  assert.match(menu, /value="recursive-live" checked/);
 });
 
 test("explorer rendering uses a cache and delegated tree events", () => {
@@ -3034,9 +4812,18 @@ test("browser refresh restores the last Context Room page", () => {
   assert.match(html, /NAVIGATION_STATE_STORAGE_PREFIX = "context-room:navigation:"/);
   assert.match(html, /function navigationStorageKey\(root = state\.root\)/);
   assert.match(html, /window\.localStorage\?\.setItem\(key, JSON\.stringify/);
+  assert.match(html, /if \(state\.projectId\) headers\.set\("x-context-room-project", state\.projectId\);/);
+  assert.match(html, /if \(!state\.projectId && responseProjectId\) state\.projectId = responseProjectId;/);
+  assert.match(html, /function handleContextRoomProjectChange\(\)[\s\S]*state\.projectReloading = true;[\s\S]*window\.location\.reload\(\);/);
   assert.match(html, /searchText: el\("search"\)\?\.value \|\| ""/);
+  assert.match(html, /root: state\.root,\s*projectId: state\.projectId,/);
+  assert.match(html, /if \(!raw\.root \|\| !raw\.projectId\) return null;/);
+  assert.match(html, /if \(raw\.root !== root\) return null;/);
+  assert.match(html, /if \(!state\.projectId \|\| raw\.projectId !== state\.projectId\) return null;/);
+  assert.match(html, /const pathFilters = rawPathFilters\.filter\(\(filter\) => state\.files\.some\(\(file\) => pathMatchesFilter\(file\.path, filter\)\)\);/);
   assert.match(html, /el\("search"\)\.value = persisted\.searchText \|\| folderFilterSearchQuery\(state\.pathFilters\);/);
-  assert.match(html, /state\.root = data\.root \|\| state\.root;/);
+  assert.match(html, /function acceptContextRoomRoot\(nextRoot\)[\s\S]*if \(!state\.root\) \{[\s\S]*state\.root = nextRoot;[\s\S]*if \(state\.root === nextRoot\) return;[\s\S]*handleContextRoomProjectChange\(\);/);
+  assert.match(html, /acceptContextRoomRoot\(data\.root\);/);
   assert.match(html, /const restoreRequest = restoreNavigationAfterInitialLoad\(\);/);
   assert.match(html, /const restored = await restoreRequest;/);
   assert.match(html, /if \(restored\) \{[\s\S]*scheduleSessionStatePush\(\);[\s\S]*return;/);
@@ -3112,7 +4899,7 @@ test("HTML files open as sandboxed visual previews without source editing", () =
   assert.match(html, /externalChange[\s\S]*isHtmlDocument[\s\S]*renderHtmlDocumentPreview\(externalChange\.diskContent \|\| "", file\.path\)/);
   assert.match(html, /const visualHtmlReview = isHtmlDocumentPath\(change\.path\);/);
   assert.match(html, /const jumpAction = summary\.pending && !visualHtmlReview/);
-  assert.match(html, /const bulkActions = summary\.pending && \(visualHtmlReview \|\| summary\.pending > 1 \|\| summary\.pendingLines > 1\)/);
+  assert.match(html, /const bulkActions = summary\.pending\s*\?/);
   assert.match(html, /savable: !isHtmlDocument/);
   assert.match(html, /savable \? '<button class="file-action primary"/);
 });
@@ -3288,7 +5075,7 @@ test("verification actions are limited to files opened from the review queue", (
   assert.match(html, /checkboxLabel: "Do not ask again"/);
   assert.match(html, /confirmVariant: "primary"/);
   assert.match(html, /This marks the current content as trusted\. Use Next review when ready\./);
-  assert.match(html, /No previous baseline exists for this first review\./);
+  assert.match(html, /<strong>First review<\/strong> <span>No previous baseline exists for this first review\./);
   assert.match(html, /label: "Accept document"/);
   assert.match(html, /label: "Request changes"/);
   assert.match(html, /if \(!reviewActionForSelectedFile\(\)\) return;/);
@@ -3359,16 +5146,29 @@ test("opening a file never reopens a collapsed explorer", () => {
   assert.match(html, /if \(options\.revealInExplorer && !explorerWasCollapsed\) scrollExplorerToPath\(path\);/);
 });
 
-test("context health is a compact triggered-alert panel", () => {
+test("context health supports full refresh, acknowledged results, and simple filters", () => {
   const html = renderAppHtml();
 
-  assert.match(html, /id="contextHealthPanel" class="docqa-panel" hidden/);
+  assert.match(html, /id="contextHealthPanel" class="docqa-panel">/);
+  assert.match(html, /id="refreshContextHealth"[^>]*>Refresh all<\/button>/);
   assert.doesNotMatch(html, /shown only when checks need attention/);
-  assert.match(html, /\["critical", "high", "medium"\]\.includes\(issue\.severity\) && !issue\.acknowledged/);
-  assert.match(html, /if \(!issues\.length\) \{[\s\S]*panel\.hidden = true;[\s\S]*return;/);
+  assert.match(html, /contextHealthStatusFilter: "open"/);
+  assert.match(html, /contextHealthSeverityFilter: "triggered"/);
+  assert.match(html, /contextHealthCategoryFilter: "all"/);
+  assert.match(html, /data-health-filter=/);
+  assert.match(html, /Open \+ OK/);
+  assert.match(html, /All severities/);
+  assert.match(html, /All areas/);
+  assert.match(html, /function contextHealthIssueMatchesFilters\(issue\)/);
+  assert.match(html, /function refreshContextHealthAnalysis\(\)/);
+  assert.match(html, /api\("\/api\/reports\?fresh=1"\)/);
+  assert.match(html, /state\.contextHealthStatusFilter = "all";/);
+  assert.match(html, /state\.contextHealthSeverityFilter = "all";/);
+  assert.match(html, /state\.contextHealthCategoryFilter = "all";/);
   assert.match(html, /panel\.hidden = false;/);
-  assert.match(html, /issue' \+ \(issues\.length > 1 \? 's' : ''\) \+ ' triggered/);
-  assert.match(html, /issues\.slice\(0, 5\)/);
+  assert.match(html, /issues\.map\(renderContextHealthIssue\)/);
+  assert.doesNotMatch(html, /issues\.slice\(0, 5\)/);
+  assert.match(html, /context-health-ok-badge/);
   assert.match(html, /data-health-ack/);
   assert.match(html, /api\("\/api\/doctor\/ack"/);
   assert.match(html, /function acknowledgeContextHealthIssueFromPanel\(key\)/);
@@ -3528,7 +5328,8 @@ test("rendered app exposes agent collaboration hooks without human review bypass
   assert.match(html, /function buildSessionStatePayload\(\)/);
   assert.match(html, /function activeEditorCaretLineIndex\(editor\)/);
   assert.match(html, /api\("\/api\/session-state"/);
-  assert.match(html, /AGENT_COMMAND_ACK_STORAGE_KEY = "context-room:last-agent-command-id"/);
+  assert.match(html, /AGENT_COMMAND_ACK_STORAGE_PREFIX = "context-room:last-agent-command-id:"/);
+  assert.match(html, /function agentCommandAckStorageKey\(\)[\s\S]*AGENT_COMMAND_ACK_STORAGE_PREFIX \+ state\.root/);
   assert.match(html, /AGENT_COMMAND_MAX_AGE_MS = 60_000/);
   assert.match(html, /function startAgentCommandPolling\(\)/);
   assert.match(html, /api\("\/api\/agent\/command"\)/);
@@ -3569,6 +5370,8 @@ test("disk changes stay pending for review instead of silently reloading the ope
   assert.match(html, />First change<\/button>/);
   assert.match(html, />Accept all<\/button>/);
   assert.match(html, />Reject all<\/button>/);
+  assert.match(html, /const bulkActions = summary\.pending\s*\?/);
+  assert.doesNotMatch(html, /const bulkActions = summary\.pending &&/);
   assert.match(html, /buildExternalReviewBlocks/);
   assert.match(html, /chooseExternalReviewBlock/);
   assert.match(html, /function chooseAllExternalReviewBlocks\(decision\)/);
@@ -3583,6 +5386,10 @@ test("disk changes stay pending for review instead of silently reloading the ope
   assert.match(html, /refreshExternalReviewFinalLineIndexes\(blocks\);/);
   assert.match(html, /const settlePromise = updatedInPlace[\s\S]*settleExternalReviewBlocks\(\[blockId\], viewState, \{ restoreScroll: false \}\)/);
   assert.match(html, /if \(pending\.length\)[\s\S]*await finalizeExternalReview\(settlePromise, blocks, viewState\);/);
+  assert.match(html, /const previousDecisions = \{ \.\.\.\(change\.reviewDecisions \|\| \{\}\) \};/);
+  assert.match(html, /function restoreExternalReviewAfterSaveFailure\(change, previousDecisions, error\)/);
+  assert.match(html, /change\.reviewDecisions = \{ \.\.\.\(previousDecisions \|\| \{\}\) \};/);
+  assert.match(html, /review not saved · /);
   assert.match(html, /const updatedInPlace = updateExternalReviewBlockInPlace\(blocks, blockId, viewState\);[\s\S]*if \(!updatedInPlace\) renderViewer\(\);\s*else updateExternalReviewActionsInPlace\(change\);\s*updateHeader\(\);/);
   assert.match(html, /actions\.outerHTML = renderExternalReviewActions\(change, \{ fileActionOptions: externalReviewFileActionOptions\(\) \}\);/);
   assert.match(html, /wireExternalReviewJumpButtons\(document\.querySelector\("\.file-panel > header"\) \|\| document\);/);
@@ -3616,13 +5423,13 @@ test("disk changes stay pending for review instead of silently reloading the ope
   assert.match(html, /renderExternalReviewActions/);
   assert.match(html, /const pendingLabel = summary\.pending \? summary\.pending \+ " left" : "saving\.\.\.";/);
   assert.doesNotMatch(html, /const pendingLabel = summary\.pending \? summary\.pending \+ " left" : "reviewed";/);
-  assert.match(html, /const bulkActions = summary\.pending && \(visualHtmlReview \|\| summary\.pending > 1 \|\| summary\.pendingLines > 1\)/);
+  assert.match(html, /const bulkActions = summary\.pending\s*\?/);
   assert.match(html, /function updateExternalReviewActionsInPlace\(change = activeExternalChange\(\)\)/);
   assert.match(html, /function renderFileActionItems\(/);
   assert.match(html, /function externalReviewFileActionOptions\(\)/);
   assert.match(html, /renderExternalReviewActions\(externalChange, \{ fileActionOptions: externalReviewFileActionOptions\(\) \}\)/);
   assert.match(html, /blockedByConflict:\s*true/);
-  assert.match(html, /summary\.pending && \(visualHtmlReview \|\| summary\.pending > 1 \|\| summary\.pendingLines > 1\)/);
+  assert.doesNotMatch(html, /summary\.pending && \(visualHtmlReview \|\| summary\.pending > 1 \|\| summary\.pendingLines > 1\)/);
   assert.match(html, /pendingBlock && \(row\.type === "add" \|\| row\.type === "del"\)/);
   assert.match(html, /state\.externalChange = \{[\s\S]*reviewDecisions: \{\},[\s\S]*\};\s*state\.selectedDiff = diff;\s*state\.diffCollapsed = true;/);
   assert.match(html, /state\.openingFilePath = path;[\s\S]*state\.savedHash = data\.contentHash;[\s\S]*state\.openingFilePath = null;/);
@@ -3664,7 +5471,7 @@ test("disk changes stay pending for review instead of silently reloading the ope
   assert.match(html, /block\.classList\.add\("settled"\)/);
   assert.match(html, /settleFinishedExternalReview\(viewState\)\.then/);
   assert.match(html, /if \(!activeExternalChange\(\) && document\.querySelector\("\.external-review-doc"\)\) \{[\s\S]*finalizeExternalReviewPanelInPlace\(viewState\);/);
-  assert.match(html, /\.external-review-block\.resolved\.settling\s*\{[^}]*height 2s ease[^}]*min-height 2s ease/);
+  assert.match(html, /\.external-review-block\.resolved\.settling\s*\{[^}]*height 180ms ease[^}]*min-height 180ms ease/);
   assert.match(html, /block\.classList\.add\("settling"\)/);
   assert.match(html, /const targetHeight = naturalExternalReviewBlockHeight\(block\);/);
   assert.match(html, /function naturalExternalReviewBlockHeight\(block\)/);
@@ -3698,13 +5505,18 @@ test("disk changes stay pending for review instead of silently reloading the ope
   assert.match(html, /clone\.classList\.remove\("settling"\);[\s\S]*clone\.classList\.add\("settled"\);/);
   assert.match(html, /function waitForExternalReviewBlockSettle\(block\)/);
   assert.match(html, /event\.target === block && event\.propertyName === "height"/);
-  assert.match(html, /window\.setTimeout\(finish, 2400\)/);
+  assert.match(html, /window\.setTimeout\(finish, 350\)/);
+  assert.doesNotMatch(html, /height 2s ease|window\.setTimeout\(finish, 2400\)/);
   assert.match(html, /function restoreEditorViewState\(snapshot, options = \{\}\)/);
   assert.match(html, /const deferred = options\.deferred !== false;/);
   assert.match(html, /if \(!deferred\) return;[\s\S]*window\.requestAnimationFrame/);
   assert.doesNotMatch(html, /\.external-review-doc\.settled \.external-review-block\.resolved/);
   assert.match(html, /\.external-review-block\.resolved\.settled\.empty\s*\{[^}]*min-height:\s*0/);
   assert.match(html, /resetExternalChangeState\(change\.source === "review" \? \{ discardReview: true \} : \{\}\);\s*\/\/ Returning from inline review should keep[\s\S]*state\.diffCollapsed = true;/);
+  assert.match(html, /const diskContentAlreadyCurrent = merged === \(change\.diskContent \|\| ""\);/);
+  assert.match(html, /!diskContentAlreadyCurrent && \(state\.selectedReadOnly \|\| state\.selectedStartupContext\?\.readOnly\)/);
+  assert.match(html, /read-only file · rejecting reviewed changes requires write access/);
+  assert.match(html, /diskContentAlreadyCurrent\s*\? \{ contentHash: change\.diskHash \|\| state\.savedHash, backupPath: "" \}\s*:\s*await writeSelectedDiskFile\(merged, change\.path\)/);
   assert.match(html, /applyReviewDecision\(change\.path, "verified", \{ previousQueue, viewState \}\)/);
   assert.match(html, /const finalizedInPlace = options\.viewState \? finalizeExternalReviewPanelInPlace\(options\.viewState\) : false;/);
   assert.match(html, /if \(!restoreInlineReviewViewport\(viewState\) && anchor && typeof anchorTop === "number"\)/);
@@ -4042,4 +5854,107 @@ test("hub cards open direct file paths without filtering folders", () => {
   assert.match(html, /selectFile\(button\.dataset\.hubFile\)/);
   assert.match(html, /data-hub-file="[^"]*directFilePath/);
   assert.match(html, /data-hub-folders="[^"]*paths\.join/);
+});
+
+test("stale project identities cannot write session state after a port is reused", async (t) => {
+  const firstRoot = makeRoot();
+  const secondRoot = makeRoot();
+  for (const root of [firstRoot, secondRoot]) {
+    fs.mkdirSync(path.join(root, "docs"));
+    fs.writeFileSync(path.join(root, "docs", "guide.md"), "# Guide\n");
+    initializeContextRoomProject(root, { allowedPaths: ["docs/"], watchAllow: ["docs/"] });
+  }
+
+  let activeServer = null;
+  const closeActiveServer = async () => {
+    const server = activeServer;
+    activeServer = null;
+    if (!server?.listening) return;
+    await new Promise((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+  };
+  t.after(closeActiveServer);
+
+  const firstRoom = createMemoryServer({ root: firstRoot });
+  activeServer = firstRoom.server;
+  await new Promise((resolve) => activeServer.listen(0, "127.0.0.1", resolve));
+  const port = activeServer.address().port;
+  const firstHealth = await fetch(`http://127.0.0.1:${port}/api/health`);
+  const firstProjectId = firstHealth.headers.get("x-context-room-project");
+  assert.equal(firstHealth.status, 200);
+  assert.equal(firstProjectId, firstRoom.projectId);
+  await closeActiveServer();
+
+  const secondRoom = createMemoryServer({ root: secondRoot });
+  activeServer = secondRoom.server;
+  await new Promise((resolve) => activeServer.listen(port, "127.0.0.1", resolve));
+  const secondHealth = await fetch(`http://127.0.0.1:${port}/api/health`);
+  const secondProjectId = secondHealth.headers.get("x-context-room-project");
+  assert.equal(secondHealth.status, 200);
+  assert.equal(secondProjectId, secondRoom.projectId);
+  assert.notEqual(secondProjectId, firstProjectId);
+
+  const secondSessionPath = path.join(secondRoot, CONFIG_DIR, "session-state.json");
+  const legacyBrowserResponse = await fetch(`http://127.0.0.1:${port}/api/session-state`, {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      "sec-fetch-site": "same-origin",
+    },
+    body: JSON.stringify({ page: "hub", pathFilters: ["old-browser/docs/"] }),
+  });
+  const legacyBrowserPayload = await legacyBrowserResponse.json();
+  assert.equal(legacyBrowserResponse.status, 409);
+  assert.equal(legacyBrowserPayload.code, "context_room_project_identity_required");
+  assert.equal(fs.existsSync(secondSessionPath), false);
+
+  const staleResponse = await fetch(`http://127.0.0.1:${port}/api/session-state`, {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      "x-context-room-project": firstProjectId,
+    },
+    body: JSON.stringify({ page: "hub", pathFilters: ["other-project/docs/"] }),
+  });
+  const stalePayload = await staleResponse.json();
+  assert.equal(staleResponse.status, 409);
+  assert.equal(stalePayload.code, "context_room_project_changed");
+  assert.equal(stalePayload.projectId, secondProjectId);
+  assert.equal(fs.existsSync(secondSessionPath), false);
+  assert.deepEqual(readCollaborationSessionState(secondRoot).pathFilters, []);
+
+  const acceptedResponse = await fetch(`http://127.0.0.1:${port}/api/session-state`, {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      "x-context-room-project": secondProjectId,
+    },
+    body: JSON.stringify({ page: "hub", pathFilters: ["docs/"] }),
+  });
+  assert.equal(acceptedResponse.status, 200);
+  assert.deepEqual(readCollaborationSessionState(secondRoot).pathFilters, ["docs/"]);
+  await closeActiveServer();
+
+  const restartedRoom = createMemoryServer({ root: secondRoot });
+  assert.equal(restartedRoom.projectId, secondProjectId);
+  activeServer = restartedRoom.server;
+  await new Promise((resolve) => activeServer.listen(port, "127.0.0.1", resolve));
+  let restartedResponse;
+  for (let attempt = 1; attempt <= 3; attempt += 1) {
+    try {
+      restartedResponse = await fetch(`http://127.0.0.1:${port}/api/session-state`, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "x-context-room-project": secondProjectId,
+        },
+        body: JSON.stringify({ page: "file", selectedPath: "docs/guide.md", pathFilters: ["docs/"] }),
+      });
+      break;
+    } catch (error) {
+      if (attempt === 3) throw error;
+      await new Promise((resolve) => setTimeout(resolve, 25 * attempt));
+    }
+  }
+  assert.equal(restartedResponse.status, 200);
+  assert.equal(readCollaborationSessionState(secondRoot).selectedPath, "docs/guide.md");
 });
