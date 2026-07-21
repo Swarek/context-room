@@ -17,7 +17,7 @@ Shared Context adds an optional Git repository for documentation and skills that
 | Mode | Trusted content | How changes are made |
 | --- | --- | --- |
 | Project-local | Files in the current project | Edit an allowed file, then use the normal review queue |
-| Shared | The accepted commit on the shared repository's default branch | Create and publish a `proposal/*` branch, review its exact commit in a dedicated Context Room, then accept all or part of it |
+| Shared | The merged commit on the shared repository's default branch | Create and publish a `proposal/*` branch, review its exact commit in a dedicated Context Room, publish the selected result as `accepted/*`, then merge its pull request |
 
 The accepted shared snapshot is exposed to the connected project as read-only. An agent therefore cannot change accepted shared documentation or skills through the normal editor. Its writable surface is a proposal worktree created by the CLI.
 
@@ -53,6 +53,7 @@ The generated repository manifest contains the paths and branch conventions used
   "name": "Company Shared Context",
   "defaultBranch": "main",
   "proposalPrefix": "proposal/",
+  "acceptancePrefix": "accepted/",
   "globalSkillsPath": "skills/global",
   "projectsPath": "projects",
   "projectsFile": "projects.json"
@@ -78,7 +79,7 @@ The generated repository manifest contains the paths and branch conventions used
 }
 ```
 
-Commit and push both schemas' data plus every registered `projects/<project-id>/` directory. The paths and proposal prefix come from the manifest; the implementation is not tied to one organization or project name. Context Room normalizes SSH and HTTPS forms of the same Git remote and chooses the longest matching source subpath.
+Commit and push both schemas' data plus every registered `projects/<project-id>/` directory. The paths and proposal and acceptance prefixes come from the manifest; the implementation is not tied to one organization or project name. Context Room normalizes SSH and HTTPS forms of the same Git remote and chooses the longest matching source subpath. Older version 1 manifests without `acceptancePrefix` use `accepted/`.
 
 ## Connect And Refresh A Project
 
@@ -116,7 +117,7 @@ context-room shared status --root .
 context-room shared sync --root .
 ```
 
-Normal `setup`, `start`, `doctor`, `guard`, `brief`, and `agent` CLI invocations also attempt a shared refresh before doing their work. If the remote is unavailable and a previous snapshot exists, Context Room continues with that snapshot, reports `online: false`, and includes the fetch error and cached revision. Creating, publishing, reviewing, and accepting proposals still require the remote.
+Normal `setup`, `start`, `doctor`, `guard`, `brief`, and `agent` CLI invocations also attempt a shared refresh before doing their work. If the remote is unavailable and a previous snapshot exists, Context Room continues with that snapshot, reports `online: false`, and includes the fetch error and cached revision. Creating, publishing, reviewing, and preparing accepted branches still require the remote.
 
 ## Propose A Change
 
@@ -164,13 +165,15 @@ The normal project room also shows a proposal selector in its top toolbar. Selec
 
 Use the existing inline controls to accept or reject each change. Rejecting a change block rewrites the review worktree to remove that block; accepting it keeps the proposed result. This means the final worktree diff contains only the parts the human chose to accept.
 
-After the review queue is empty, the human owner presses **Accept into main** in the review room. The agent-facing CLI deliberately has no acceptance command.
+After the review queue is empty, the human owner presses **Prepare pull request** in the review room. The agent-facing CLI deliberately has no acceptance or merge command.
 
 Acceptance is bound to the recorded proposal hash. If the proposal branch moved after the room was created, acceptance expires and the new commit must be reviewed in a new room.
 
 An exact review authority is single-use after a successful acceptance. Reopen the proposal if another reviewed result is needed.
 
-Before writing, Context Room fetches the latest accepted default branch and applies only the reviewed result onto that newer commit. Unrelated accepted changes already on the default branch are preserved. If the selected result conflicts with the latest default branch, nothing is pushed and the resolved result must be reviewed again. If no accepted change remains, no commit is created.
+Before publishing, Context Room fetches the latest default branch and applies only the reviewed result onto that newer commit. Unrelated merged changes already on the default branch are preserved. If the selected result conflicts with the latest default branch, nothing is pushed and the resolved result must be reviewed again. If no selected change remains, no commit is created.
+
+The result is committed and pushed to a unique `accepted/<scope>/...` branch. `main` remains unchanged. For GitHub remotes, Context Room opens the compare page so the human can create and merge the pull request. The pull request diff is the final visibility layer for changes that arrived on `main` while the proposal was under review.
 
 ## Shared Skills
 
@@ -184,19 +187,24 @@ A skill is shared when its directory contains `<skill-directory>/SKILL.md`.
 - Context Room refuses to replace an existing ordinary directory or a symbolic link that it does not manage.
 - Refresh removes a managed link when its accepted skill is deleted or renamed, without touching unmanaged paths.
 
-Skills therefore follow the same trust path as documentation: proposal, exact-commit human review, acceptance into the default branch, then refresh of the read-only snapshot.
+Skills therefore follow the same trust path as documentation: proposal, exact-commit human review, accepted branch, human pull-request merge, then refresh of the read-only snapshot.
 
 ## Permission Boundary
 
-The CLI enforces proposal path scopes and keeps accepted snapshots read-only, but these are workflow protections, not a sandbox for a process with unrestricted filesystem access. It also cannot distinguish a human from an agent when both processes use the same Git credential. Local rules alone do not prevent that credential from pushing directly to the default branch.
+Context Room never pushes a shared review result to the default branch. Proposal publication writes `proposal/*`; partial acceptance writes `accepted/*`; only the Git host merges a pull request into `main`.
 
-For an actual owner-only default branch:
+For a GitHub shared repository, an owner runs this once from the shared repository or a connected project:
 
-- protect the shared repository's default branch on the Git host;
-- give the agent a distinct credential that can push proposal branches but cannot push the default branch; and
-- let only a human owner credential, or an owner-controlled acceptance service, run the final default-branch push.
+```bash
+context-room shared secure-github --root .
+context-room shared security-check --root .
+```
 
-The owner button asks the local Context Room server to push directly to the configured default branch. The identity running that server must be allowed to do so. A host rule that requires every default-branch update to arrive through a pull request will reject this operation unless an owner-controlled acceptance service adapts the final step. `shared status` reports that provider-side protection is not locally verifiable.
+`secure-github` uses the authenticated GitHub CLI owner session to create or update an active repository ruleset for the configured default branch. The managed rule has no bypass actors, requires a pull request, blocks deletion and force-pushes, and requires review conversations to be resolved. It requires zero additional GitHub approvals because the owner already made the line-level decision in Context Room; merging the pull request remains a separate explicit human action.
+
+`security-check` reads the live GitHub rule, exits non-zero unless every required protection is present, and records the last successful remote check for `shared status`. Re-run it after repository or permission changes. If the GitHub plan does not support rulesets for that private repository, setup fails instead of claiming protection.
+
+The Git credential used by agents may push ordinary proposal and accepted branches, but GitHub rejects its direct push to `main`. Keep the GitHub owner browser/API credential outside the agent runtime: an agent that can edit repository rules or operate the owner's authenticated GitHub session has crossed the owner boundary and cannot be constrained by Git branch policy alone.
 
 ## Source Map
 

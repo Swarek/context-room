@@ -9278,7 +9278,7 @@ export function renderAppHtml() {
           <select id="sharedProposalSelect" class="shared-context-select" aria-label="Shared context proposal"></select>
           <button id="sharedContextRefresh" class="dock-button" type="button" title="Refresh shared main and proposals">Refresh</button>
           <button id="sharedProposalReview" class="dock-button" type="button">Review</button>
-          <button id="sharedProposalAccept" class="dock-button primary" type="button" hidden>Accept into main</button>
+          <button id="sharedProposalAccept" class="dock-button primary" type="button" hidden>Prepare pull request</button>
         </div>
         <div id="workspaceTitle" class="workspace-title">Context Room</div>
         <div id="status" class="dock-status" aria-live="polite">Ready</div>
@@ -9456,15 +9456,20 @@ function renderSharedContextControls() {
     refresh.hidden = true;
     reviewButton.hidden = true;
     acceptButton.hidden = false;
-    acceptButton.textContent = shared.accepted?.accepted ? "Accepted" : state.sharedContextBusy ? "Accepting..." : "Accept into main";
-    acceptButton.disabled = Boolean(state.sharedContextBusy || shared.accepted || state.dirty || queueCount);
+    const delivered = shared.accepted?.accepted ? shared.accepted : null;
+    acceptButton.textContent = delivered
+      ? delivered.pullRequestUrl ? "Open pull request" : "Accepted branch ready"
+      : state.sharedContextBusy ? "Preparing..." : "Prepare pull request";
+    acceptButton.disabled = Boolean(state.sharedContextBusy || (delivered ? !delivered.pullRequestUrl : state.dirty || queueCount));
     acceptButton.title = shared.accepted
-      ? "Accepted as " + shortSharedHash(shared.accepted.commit)
+      ? shared.accepted.pullRequestUrl
+        ? "Open the GitHub pull request for " + shared.accepted.acceptanceBranch
+        : "Accepted branch " + shared.accepted.acceptanceBranch + " is ready for a pull request"
       : state.dirty
         ? "Save or discard the current editor changes first"
         : queueCount
           ? queueCount + " file(s) still need human review"
-          : "Apply only the accepted review result onto the latest main commit";
+          : "Publish only the accepted review result on a dedicated branch; main stays unchanged until the human merges the pull request";
     return;
   }
   const proposals = Array.isArray(shared.proposals) ? shared.proposals : [];
@@ -9527,15 +9532,20 @@ async function openSelectedSharedProposal() {
 
 async function acceptCurrentSharedProposal() {
   const review = state.sharedContext?.review;
+  const delivered = state.sharedContext?.accepted;
   const queueCount = state.docqa?.queue?.length || 0;
+  if (delivered?.pullRequestUrl) {
+    window.location.assign(delivered.pullRequestUrl);
+    return;
+  }
   if (!review || state.sharedContextBusy) return;
   if (state.dirty) throw new Error("Save or discard the current editor changes before acceptance");
   if (queueCount) throw new Error(queueCount + " file(s) still need human review");
-  const confirmed = confirm("Accept the reviewed result into " + review.defaultBranch + "?\n\nProposal: " + review.proposal + "\nExact commit: " + review.proposalHead + "\n\nOnly the changes still present in this review workspace will be applied onto the latest main.");
+  const confirmed = confirm("Prepare a pull request for the reviewed result?\n\nProposal: " + review.proposal + "\nExact commit: " + review.proposalHead + "\n\nOnly the changes still present in this review workspace will be published on an accepted/* branch. " + review.defaultBranch + " will not be changed.");
   if (!confirmed) return;
   state.sharedContextBusy = true;
   renderSharedContextControls();
-  setStatus("applying accepted result to latest main...");
+  setStatus("preparing accepted branch from latest main...");
   try {
     const result = await api("/api/shared-context/accept", {
       method: "POST",
@@ -9543,7 +9553,10 @@ async function acceptCurrentSharedProposal() {
       body: JSON.stringify({ expectedProposalHead: review.proposalHead }),
     });
     state.sharedContext = { ...state.sharedContext, accepted: result };
-    setStatus(result.accepted ? "accepted into main @" + shortSharedHash(result.commit) : result.reason || "nothing to accept");
+    setStatus(result.accepted
+      ? "accepted branch ready · main unchanged · @" + shortSharedHash(result.commit)
+      : result.reason || "nothing to accept");
+    if (result.accepted && result.pullRequestUrl) window.location.assign(result.pullRequestUrl);
   } finally {
     state.sharedContextBusy = false;
     renderSharedContextControls();

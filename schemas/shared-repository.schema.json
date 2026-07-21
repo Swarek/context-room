@@ -11,6 +11,7 @@
     "name": { "type": "string", "minLength": 1 },
     "defaultBranch": { "type": "string", "minLength": 1 },
     "proposalPrefix": { "type": "string", "pattern": "/$" },
+    "acceptancePrefix": { "type": "string", "pattern": "/$" },
     "globalSkillsPath": { "$ref": "#/$defs/relativePath" },
     "projectsPath": { "$ref": "#/$defs/relativePath" },
     "projectsFile": { "$ref": "#/$defs/relativePath" }

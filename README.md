@@ -75,6 +75,7 @@ context-room shared init-repository --root /path/to/shared-context --name "Compa
 context-room shared bind --root . --repository <git-url> [--project <project-id>]
 context-room shared setup --root . --repository <git-url> [--project <project-id>]
 context-room shared sync|status|proposals --root .
+context-room shared secure-github|security-check --root .
 context-room shared propose --root . --title "Change" [--scope project|global]
 context-room shared publish --root . --proposal proposal/... [--message "..."]
 context-room shared review --root . --proposal proposal/... [--port 4317]

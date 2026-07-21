@@ -7,6 +7,7 @@ import test from "node:test";
 
 import {
   acceptSharedReview,
+  checkSharedGitHubSecurity,
   connectSharedContext,
   createSharedProposal,
   detectSharedProject,
@@ -15,6 +16,7 @@ import {
   materializeSharedReview,
   publishSharedProposal,
   readSharedProjectConnection,
+  secureSharedGitHubRepository,
   sharedContextStatus,
   syncSharedContext,
 } from "../src/shared_context.mjs";
@@ -29,12 +31,14 @@ import {
   writeMemoryFile,
 } from "../src/context_room.mjs";
 
-test("shared proposal selector and exact-hash owner acceptance are present in the UI", () => {
+test("shared proposal selector and exact-hash pull-request delivery are present in the UI", () => {
   const html = renderAppHtml();
   assert.match(html, /id="sharedProposalSelect"/);
   assert.match(html, /id="sharedProposalReview"/);
   assert.match(html, /id="sharedProposalAccept"/);
   assert.match(html, /expectedProposalHead: review\.proposalHead/);
+  assert.match(html, /Prepare pull request/);
+  assert.doesNotMatch(html, /Accept into main/);
 });
 
 function git(cwd, args, options = {}) {
@@ -51,6 +55,57 @@ function writeFile(root, relPath, content) {
   fs.mkdirSync(path.dirname(target), { recursive: true });
   fs.writeFileSync(target, content, "utf8");
 }
+
+test("GitHub security setup installs and verifies a no-bypass pull-request ruleset", (t) => {
+  const base = fs.mkdtempSync(path.join(os.tmpdir(), "context-room-github-security-"));
+  const repository = path.join(base, "shared");
+  const fakeBin = path.join(base, "bin");
+  const statePath = path.join(base, "ruleset.json");
+  fs.mkdirSync(repository, { recursive: true });
+  fs.mkdirSync(fakeBin, { recursive: true });
+  initializeSharedRepository(repository, { name: "Secure shared context" });
+  git(repository, ["init", "--initial-branch=main"]);
+  git(repository, ["remote", "add", "origin", "git@github.com:Acme/shared-context.git"]);
+  const fakeGh = path.join(fakeBin, "gh");
+  fs.writeFileSync(fakeGh, `#!/usr/bin/env node
+const fs = require("node:fs");
+const args = process.argv.slice(2);
+const endpoint = args[1] || "";
+const methodIndex = args.indexOf("--method");
+const method = methodIndex >= 0 ? args[methodIndex + 1] : "GET";
+const statePath = process.env.FAKE_GH_STATE;
+const current = fs.existsSync(statePath) ? JSON.parse(fs.readFileSync(statePath, "utf8")) : null;
+if (method === "POST" || method === "PUT") {
+  const body = JSON.parse(fs.readFileSync(0, "utf8"));
+  const saved = { ...body, id: 42, _links: { html: { href: "https://github.com/Acme/shared-context/rules/42" } } };
+  fs.writeFileSync(statePath, JSON.stringify(saved));
+  process.stdout.write(JSON.stringify(saved));
+} else if (/\\/rulesets\\/42/.test(endpoint)) {
+  process.stdout.write(JSON.stringify(current));
+} else {
+  process.stdout.write(JSON.stringify(current ? [{ id: 42, name: current.name }] : []));
+}
+`, "utf8");
+  fs.chmodSync(fakeGh, 0o755);
+  const previousPath = process.env.PATH;
+  const previousState = process.env.FAKE_GH_STATE;
+  process.env.PATH = `${fakeBin}:${previousPath}`;
+  process.env.FAKE_GH_STATE = statePath;
+  t.after(() => {
+    process.env.PATH = previousPath;
+    if (previousState === undefined) delete process.env.FAKE_GH_STATE;
+    else process.env.FAKE_GH_STATE = previousState;
+  });
+
+  const secured = secureSharedGitHubRepository(repository);
+  assert.equal(secured.verified, true);
+  assert.equal(secured.created, true);
+  assert.equal(Object.values(secured.checks).every(Boolean), true);
+  const ruleset = JSON.parse(fs.readFileSync(statePath, "utf8"));
+  assert.deepEqual(ruleset.bypass_actors, []);
+  assert.equal(ruleset.rules.find((rule) => rule.type === "pull_request").parameters.required_approving_review_count, 0);
+  assert.equal(checkSharedGitHubSecurity(repository).verified, true);
+});
 
 function makeFixture() {
   const base = fs.mkdtempSync(path.join(os.tmpdir(), "context-room-shared-"));
@@ -177,7 +232,7 @@ test("shared sync advances current atomically and keeps an explicit offline snap
   assert.match(offline.fetchError, /remote|repository|read/i);
 });
 
-test("proposal branches stay scoped and a partially accepted review lands on a newer non-conflicting main", (t) => {
+test("proposal branches stay scoped and partial acceptance becomes a PR branch on newer non-conflicting main", (t) => {
   const fixture = makeFixture();
   withSharedHome(t, fixture);
   connectSharedContext(fixture.project, { repository: fixture.remote, projectId: "demo" });
@@ -203,9 +258,20 @@ test("proposal branches stay scoped and a partially accepted review lands on a n
   configureGit(review.reviewRoot);
   const accepted = acceptSharedReview(review.reviewRoot, { message: "Accept selected demo changes" });
   assert.equal(accepted.accepted, true);
+  assert.equal(accepted.delivery, "pull-request");
+  assert.match(accepted.acceptanceBranch, /^accepted\/demo\//);
   git(fixture.seed, ["pull", "--ff-only", "origin", "main"]);
-  assert.equal(fs.readFileSync(path.join(fixture.seed, "projects/demo/docs/README.md"), "utf8"), "# Demo\n\nAccepted sentence.\n");
+  assert.equal(fs.readFileSync(path.join(fixture.seed, "projects/demo/docs/README.md"), "utf8"), "# Demo\n\nInitial.\n");
   assert.equal(fs.existsSync(path.join(fixture.seed, "projects/demo/docs/OTHER.md")), true);
+  git(fixture.seed, ["fetch", "origin", accepted.acceptanceBranch]);
+  assert.equal(
+    git(fixture.seed, ["show", `origin/${accepted.acceptanceBranch}:projects/demo/docs/README.md`]),
+    "# Demo\n\nAccepted sentence.",
+  );
+  assert.equal(
+    git(fixture.seed, ["show", `origin/${accepted.acceptanceBranch}:projects/demo/docs/OTHER.md`]),
+    "# Other\n\nAlready accepted on main.",
+  );
   assert.throws(() => acceptSharedReview(review.reviewRoot), /already accepted/);
 });
 
@@ -250,8 +316,11 @@ test("partial acceptance includes new files and omits rejected new files", (t) =
   assert.equal(accepted.accepted, true);
 
   git(fixture.seed, ["pull", "--ff-only", "origin", "main"]);
-  assert.equal(fs.readFileSync(path.join(fixture.seed, "projects/demo/docs/ACCEPTED.md"), "utf8"), "# Accepted\n");
+  assert.equal(fs.existsSync(path.join(fixture.seed, "projects/demo/docs/ACCEPTED.md")), false);
   assert.equal(fs.existsSync(path.join(fixture.seed, "projects/demo/docs/REJECTED.md")), false);
+  git(fixture.seed, ["fetch", "origin", accepted.acceptanceBranch]);
+  assert.equal(git(fixture.seed, ["show", `origin/${accepted.acceptanceBranch}:projects/demo/docs/ACCEPTED.md`]), "# Accepted");
+  assert.throws(() => git(fixture.seed, ["cat-file", "-e", `origin/${accepted.acceptanceBranch}:projects/demo/docs/REJECTED.md`]));
 });
 
 test("remote proposal branches are revalidated before review", (t) => {

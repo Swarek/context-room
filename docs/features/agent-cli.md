@@ -47,13 +47,14 @@ Use the shared CLI when the project is connected to a generic shared-context Git
 context-room shared bind --root . --repository <git-url> [--project <project-id>]
 context-room shared status --root .
 context-room shared sync --root .
+context-room shared security-check --root .
 context-room shared proposals --root .
 context-room shared propose --root . --title "Clarify onboarding" [--scope project|global]
 context-room shared publish --root . --proposal proposal/... [--message "..."]
 context-room shared review --root . --proposal proposal/... [--port 4317]
 ```
 
-`propose` returns a writable worktree. `publish` rejects files outside the proposal's project or global scope. `review` is the owner handoff: the room reuses the normal human inline decisions. Only the review UI exposes **Accept into main**, bound to the exact proposal hash that room examined; the agent-facing CLI has no acceptance command.
+`propose` returns a writable worktree. `publish` rejects files outside the proposal's project or global scope. `review` is the owner handoff: the room reuses the normal human inline decisions. Only the review UI exposes **Prepare pull request**, bound to the exact proposal hash that room examined. It publishes an `accepted/*` branch containing only the selected result; the agent-facing CLI has no acceptance or merge command. `security-check` verifies the live GitHub rule that blocks direct changes to `main`.
 
 See [Shared context](shared-context.md) for repository initialization, read-only snapshots, refresh behavior, partial acceptance, and Git permission requirements.
 

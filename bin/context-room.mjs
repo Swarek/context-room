@@ -4,6 +4,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { updateAllContextRooms } from "../scripts/update-context-rooms.mjs";
 import {
+  checkSharedGitHubSecurity,
   connectSharedContext,
   createSharedProposal,
   detectSharedProject,
@@ -12,6 +13,7 @@ import {
   materializeSharedReview,
   publishSharedProposal,
   readSharedProjectConnection,
+  secureSharedGitHubRepository,
   sharedContextStatus,
   syncSharedContext,
 } from "../src/shared_context.mjs";
@@ -86,6 +88,7 @@ Usage:
   context-room shared bind --root . --repository <git-url> [--project <projectId>]
   context-room shared setup --root . --repository <git-url> [--project <projectId>]
   context-room shared sync|status|proposals --root .
+  context-room shared secure-github|security-check --root .
   context-room shared propose --root . --title "Change" [--scope project|global]
   context-room shared publish --root . --proposal proposal/... [--message "..."]
   context-room shared review --root . --proposal proposal/... [--port 4317]
@@ -218,6 +221,15 @@ if (command === "shared") {
     if (action === "status") {
       console.log(JSON.stringify(sharedContextStatus(root), null, 2));
       process.exit(0);
+    }
+    if (action === "secure-github") {
+      console.log(JSON.stringify(secureSharedGitHubRepository(root), null, 2));
+      process.exit(0);
+    }
+    if (action === "security-check") {
+      const result = checkSharedGitHubSecurity(root);
+      console.log(JSON.stringify(result, null, 2));
+      process.exit(result.verified ? 0 : 1);
     }
     if (action === "proposals" || action === "list") {
       console.log(JSON.stringify(listSharedProposals(root), null, 2));

@@ -28,10 +28,12 @@ const DEFAULT_REPOSITORY_CONFIG = {
   name: "Shared Context",
   defaultBranch: "main",
   proposalPrefix: "proposal/",
+  acceptancePrefix: "accepted/",
   globalSkillsPath: "skills/global",
   projectsPath: "projects",
   projectsFile: "projects.json",
 };
+const GITHUB_RULESET_PREFIX = "Context Room: protect ";
 
 function sharedHome() {
   return process.env.CONTEXT_ROOM_SHARED_HOME
@@ -184,11 +186,16 @@ function normalizedRepositoryConfig(raw = {}) {
   const proposalPrefix = String(raw.proposalPrefix || "proposal/").trim();
   if (!proposalPrefix.endsWith("/")) throw new Error("Proposal prefix must end with /");
   safeBranchName(proposalPrefix + "example", "proposal prefix");
+  const acceptancePrefix = String(raw.acceptancePrefix || "accepted/").trim();
+  if (!acceptancePrefix.endsWith("/")) throw new Error("Acceptance prefix must end with /");
+  safeBranchName(acceptancePrefix + "example", "acceptance prefix");
+  if (proposalPrefix === acceptancePrefix) throw new Error("proposalPrefix and acceptancePrefix must be different");
   const config = {
     version,
     name: String(raw.name || "Shared Context").trim() || "Shared Context",
     defaultBranch,
     proposalPrefix,
+    acceptancePrefix,
     globalSkillsPath: safeRelativePath(raw.globalSkillsPath || "skills/global", "globalSkillsPath"),
     projectsPath: safeRelativePath(raw.projectsPath || "projects", "projectsPath"),
     projectsFile: safeRelativePath(raw.projectsFile || "projects.json", "projectsFile"),
@@ -201,6 +208,27 @@ function normalizedRepositoryConfig(raw = {}) {
     throw new Error("projectsFile must stay outside the shared content roots");
   }
   return config;
+}
+
+function githubRepositoryCoordinates(repository) {
+  const value = safeRepository(repository).replace(/\.git$/i, "");
+  let match = value.match(/^git@github\.com:([^/]+)\/(.+)$/i);
+  if (!match) match = value.match(/^ssh:\/\/(?:git@)?github\.com\/([^/]+)\/(.+)$/i);
+  if (!match) match = value.match(/^https?:\/\/github\.com\/([^/]+)\/(.+)$/i);
+  if (!match) throw new Error("GitHub security setup requires a github.com repository remote");
+  const owner = match[1];
+  const repo = match[2];
+  if (!owner || !repo || repo.includes("/")) throw new Error("Unable to resolve GitHub owner/repository from the shared remote");
+  return { owner, repo, fullName: `${owner}/${repo}` };
+}
+
+function githubPullRequestUrl(repository, baseBranch, headBranch) {
+  try {
+    const { owner, repo } = githubRepositoryCoordinates(repository);
+    return `https://github.com/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/compare/${encodeURIComponent(baseBranch)}...${encodeURIComponent(headBranch)}?expand=1`;
+  } catch {
+    return "";
+  }
 }
 
 function safeSourceSubpath(value) {
@@ -766,17 +794,149 @@ export function sharedContextStatus(root) {
   const connection = readSharedProjectConnection(root);
   if (!connection) return { connected: false };
   const state = readJson(sharedStatePath(connection.repository), {});
+  const security = readJson(path.join(repositoryCacheRoot(connection.repository), "github-security.json"), null);
   return {
     connected: true,
     connection,
     ...state,
     cacheRoot: repositoryCacheRoot(connection.repository),
     permissionBoundary: {
-      verified: false,
-      enforcement: "remote Git branch protection and separate agent credentials",
-      note: "Local Context Room cannot prove provider-side branch permissions.",
+      verified: Boolean(security?.verified),
+      checkedAt: security?.checkedAt || null,
+      enforcement: "GitHub ruleset requires a pull request and Context Room never pushes accepted changes to main",
+      note: security?.verified
+        ? `Last remote check passed for ${security.repository}:${security.defaultBranch}. Run shared security-check to verify again.`
+        : "Run context-room shared secure-github once, then shared security-check to verify the remote rule.",
     },
   };
+}
+
+function sharedSecurityTarget(root) {
+  const resolvedRoot = path.resolve(root);
+  const connection = readSharedProjectConnection(resolvedRoot);
+  if (connection) {
+    const state = readJson(sharedStatePath(connection.repository), {});
+    let repositoryConfig = state.repositoryConfig ? normalizedRepositoryConfig(state.repositoryConfig) : null;
+    if (!repositoryConfig) {
+      const checkout = ensureRepositoryClone(connection.repository);
+      runGit(checkout, ["fetch", "--prune", "origin"], { stdio: ["ignore", "ignore", "pipe"] });
+      repositoryConfig = readRemoteSharedDescriptor(checkout).config;
+    }
+    return { repository: connection.repository, repositoryConfig };
+  }
+  if (fs.existsSync(path.join(resolvedRoot, SHARED_REPOSITORY_CONFIG))) {
+    const repository = tryGit(resolvedRoot, ["remote", "get-url", "origin"]);
+    if (!repository) throw new Error("The shared repository has no origin remote");
+    return { repository, repositoryConfig: readSharedRepositoryConfig(resolvedRoot) };
+  }
+  throw new Error("Run this command from a shared repository or a project connected to shared context");
+}
+
+function runGitHubApi(endpoint, { method = "GET", body = null } = {}) {
+  const args = [
+    "api",
+    endpoint,
+    "-H", "Accept: application/vnd.github+json",
+    "-H", "X-GitHub-Api-Version: 2022-11-28",
+  ];
+  if (method !== "GET") args.push("--method", method);
+  if (body !== null) args.push("--input", "-");
+  const result = spawnSync("gh", args, {
+    encoding: "utf8",
+    input: body === null ? undefined : JSON.stringify(body),
+    maxBuffer: 8 * 1024 * 1024,
+  });
+  if (result.error?.code === "ENOENT") throw new Error("GitHub CLI is required; install gh and authenticate an owner account");
+  if (result.status !== 0) {
+    const detail = String(result.stderr || result.stdout || "GitHub API request failed").trim().split("\n")[0];
+    throw new Error(`GitHub API request failed: ${detail}`);
+  }
+  try {
+    return result.stdout ? JSON.parse(result.stdout) : null;
+  } catch {
+    throw new Error("GitHub API returned an invalid JSON response");
+  }
+}
+
+function githubRulesetName(defaultBranch) {
+  return `${GITHUB_RULESET_PREFIX}${defaultBranch}`;
+}
+
+function githubRulesetPayload(defaultBranch) {
+  return {
+    name: githubRulesetName(defaultBranch),
+    target: "branch",
+    enforcement: "active",
+    bypass_actors: [],
+    conditions: { ref_name: { include: [`refs/heads/${defaultBranch}`], exclude: [] } },
+    rules: [
+      { type: "deletion" },
+      { type: "non_fast_forward" },
+      {
+        type: "pull_request",
+        parameters: {
+          allowed_merge_methods: ["merge", "squash", "rebase"],
+          dismiss_stale_reviews_on_push: false,
+          require_code_owner_review: false,
+          require_last_push_approval: false,
+          required_approving_review_count: 0,
+          required_review_thread_resolution: true,
+        },
+      },
+    ],
+  };
+}
+
+function inspectGitHubRuleset(ruleset, defaultBranch) {
+  const types = new Map((ruleset?.rules || []).map((rule) => [rule.type, rule]));
+  const pullRequest = types.get("pull_request");
+  const checks = {
+    active: ruleset?.enforcement === "active",
+    branchTarget: ruleset?.target === "branch",
+    exactDefaultBranch: ruleset?.conditions?.ref_name?.include?.includes(`refs/heads/${defaultBranch}`) === true,
+    noBypassActors: Array.isArray(ruleset?.bypass_actors) && ruleset.bypass_actors.length === 0,
+    requiresPullRequest: Boolean(pullRequest),
+    resolvesReviewThreads: pullRequest?.parameters?.required_review_thread_resolution === true,
+    blocksDeletion: types.has("deletion"),
+    blocksForcePush: types.has("non_fast_forward"),
+  };
+  return { verified: Object.values(checks).every(Boolean), checks };
+}
+
+function writeGitHubSecurityState(repository, result) {
+  return writeJson(path.join(repositoryCacheRoot(repository), "github-security.json"), result);
+}
+
+export function checkSharedGitHubSecurity(root) {
+  const { repository, repositoryConfig } = sharedSecurityTarget(root);
+  const github = githubRepositoryCoordinates(repository);
+  const rulesets = runGitHubApi(`repos/${github.fullName}/rulesets?includes_parents=false&targets=branch`);
+  const summary = (rulesets || []).find((item) => item.name === githubRulesetName(repositoryConfig.defaultBranch));
+  let ruleset = null;
+  if (summary?.id) ruleset = runGitHubApi(`repos/${github.fullName}/rulesets/${summary.id}?includes_parents=false`);
+  const inspected = inspectGitHubRuleset(ruleset, repositoryConfig.defaultBranch);
+  return writeGitHubSecurityState(repository, {
+    verified: inspected.verified,
+    checkedAt: new Date().toISOString(),
+    repository: github.fullName,
+    defaultBranch: repositoryConfig.defaultBranch,
+    rulesetId: ruleset?.id || null,
+    rulesetUrl: ruleset?._links?.html?.href || `https://github.com/${github.fullName}/settings/rules`,
+    checks: inspected.checks,
+  });
+}
+
+export function secureSharedGitHubRepository(root) {
+  const { repository, repositoryConfig } = sharedSecurityTarget(root);
+  const github = githubRepositoryCoordinates(repository);
+  const rulesets = runGitHubApi(`repos/${github.fullName}/rulesets?includes_parents=false&targets=branch`);
+  const existing = (rulesets || []).find((item) => item.name === githubRulesetName(repositoryConfig.defaultBranch));
+  const payload = githubRulesetPayload(repositoryConfig.defaultBranch);
+  if (existing?.id) runGitHubApi(`repos/${github.fullName}/rulesets/${existing.id}`, { method: "PUT", body: payload });
+  else runGitHubApi(`repos/${github.fullName}/rulesets`, { method: "POST", body: payload });
+  const result = checkSharedGitHubSecurity(root);
+  if (!result.verified) throw new Error("GitHub created the ruleset but its effective security checks did not pass");
+  return { ...result, created: !existing, updated: Boolean(existing) };
 }
 
 function proposalScopePrefixes(config, projectId, scope) {
@@ -1067,8 +1227,23 @@ export function acceptSharedReview(reviewRoot, { message = "Accept shared contex
     const acceptedCommit = safeRevision(tryGit(acceptanceRoot, ["rev-parse", "HEAD"]), "accepted commit");
     assertSafeTreeEntries(acceptanceRoot, acceptedCommit, policy.allowedPrefixes);
     assertReviewableChangedPaths(acceptanceRoot, currentMain, acceptedCommit, workspace.files);
-    runGit(acceptanceRoot, ["push", "origin", `HEAD:${review.defaultBranch}`], { stdio: ["ignore", "ignore", "pipe"] });
-    const result = { accepted: true, proposal: review.proposal, proposalHead: review.proposalHead, previousMain: currentMain, commit: acceptedCommit };
+    const stamp = new Date().toISOString().replace(/[-:TZ.]/g, "").slice(0, 14);
+    const acceptanceBranch = safeBranchName(
+      `${repositoryConfig.acceptancePrefix}${policy.projectId}/${stamp}-${acceptedCommit.slice(0, 12)}`,
+      "acceptance branch",
+    );
+    if (acceptanceBranch === review.defaultBranch) throw new Error("Acceptance branch must not be the default branch");
+    runGit(acceptanceRoot, ["push", "origin", `HEAD:refs/heads/${acceptanceBranch}`], { stdio: ["ignore", "ignore", "pipe"] });
+    const result = {
+      accepted: true,
+      delivery: "pull-request",
+      proposal: review.proposal,
+      proposalHead: review.proposalHead,
+      previousMain: currentMain,
+      commit: acceptedCommit,
+      acceptanceBranch,
+      pullRequestUrl: githubPullRequestUrl(review.repository, review.defaultBranch, acceptanceBranch),
+    };
     writeJson(path.join(sharedHome(), "review-authority", `${review.authorityId}.json`), { ...review, accepted: result, acceptedAt: new Date().toISOString() });
     return result;
   } finally {
