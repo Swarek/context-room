@@ -4,8 +4,8 @@ context_room:
   scope: context-room
   status: current
   canonical_for: features
-  last_verified: 2026-07-11
-  sources: [README.md, docs/product-overview.md, bin/context-room.mjs, src/context_room.mjs, schemas/config.schema.json]
+  last_verified: 2026-07-21
+  sources: [README.md, docs/product-overview.md, bin/context-room.mjs, src/context_room.mjs, src/shared_context.mjs, schemas/config.schema.json]
 ---
 
 # Features
@@ -24,6 +24,7 @@ This folder explains Context Room by user-facing feature. Read this when changin
 - [Settings](settings.md)
 - [Health, guard, and brief](health-guard-and-brief.md)
 - [Agent CLI](agent-cli.md)
+- [Shared context](shared-context.md)
 
 ## Boundaries
 

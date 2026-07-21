@@ -4,6 +4,18 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { updateAllContextRooms } from "../scripts/update-context-rooms.mjs";
 import {
+  connectSharedContext,
+  createSharedProposal,
+  detectSharedProject,
+  initializeSharedRepository,
+  listSharedProposals,
+  materializeSharedReview,
+  publishSharedProposal,
+  readSharedProjectConnection,
+  sharedContextStatus,
+  syncSharedContext,
+} from "../src/shared_context.mjs";
+import {
   appendAgentAnnotation,
   buildAgentBrief,
   buildAgentReviewQueue,
@@ -55,13 +67,49 @@ function splitList(value) {
 }
 
 function usage() {
-  return `Context Room\n\nUsage:\n  context-room setup [--root .] [--title "My Project"] [--allow docs/] [--watch docs/] [--port 4317]\n  context-room init [--root .] [--title "My Project"] [--allow docs/] [--watch docs/]\n  context-room start [--root .] [--port 4317]\n  context-room doctor [--root .] [--strict]\n  context-room guard [--root .] [--profile advisory|review-only|strict] [--operation commit|push|pull-request|merge]\n  context-room brief [--root .] [--task "what the agent will do"] [--limit 12]\n  context-room agent state [--root .]\n  context-room agent open [--root .] [--path docs/INDEX.md] [--view hub|settings|file|diff] [--heading "Purpose"] [--text "needle"] [--percent 50]\n  context-room agent annotate --root . --path docs/INDEX.md --note "Human-facing note" [--target "text"]\n  context-room agent queue [--root .]\n  context-room agent watch --root . --path docs/ [--mode recursive-live|recursive-current|direct-current|direct-live]\n  context-room agent unwatch --root . --path docs/\n  context-room install-hook [--root .]\n  context-room install-hooks [--root .]\n  context-room update-all [--dry-run] [--no-restart] [--exclude /path]\n  context-room --version\n\nFolder watch modes:\n  recursive-live     Current and future files at any depth (default)\n  recursive-current  Current files at any depth; future files are excluded\n  direct-current     Current direct child files; future files and subfolders are excluded\n  direct-live        Current and future direct child files; subfolder files are excluded\n\nFresh setup discovers and watches project documentation, builds project-specific hub sections, and uses the first free port when --port is omitted.\n\nConfig: ${CONFIG_FILE}\n`;
+  return `Context Room
+
+Usage:
+  context-room setup [--root .] [--title "My Project"] [--allow docs/] [--watch docs/] [--port 4317]
+  context-room init [--root .] [--title "My Project"] [--allow docs/] [--watch docs/]
+  context-room start [--root .] [--port 4317]
+  context-room doctor [--root .] [--strict]
+  context-room guard [--root .] [--profile advisory|review-only|strict] [--operation commit|push|pull-request|merge]
+  context-room brief [--root .] [--task "what the agent will do"] [--limit 12]
+  context-room agent state [--root .]
+  context-room agent open [--root .] [--path docs/INDEX.md] [--view hub|settings|file|diff] [--heading "Purpose"] [--text "needle"] [--percent 50]
+  context-room agent annotate --root . --path docs/INDEX.md --note "Human-facing note" [--target "text"]
+  context-room agent queue [--root .]
+  context-room agent watch --root . --path docs/ [--mode recursive-live|recursive-current|direct-current|direct-live]
+  context-room agent unwatch --root . --path docs/
+  context-room shared init-repository --root . --name "My Shared Context"
+  context-room shared bind --root . --repository <git-url> [--project <projectId>]
+  context-room shared setup --root . --repository <git-url> [--project <projectId>]
+  context-room shared sync|status|proposals --root .
+  context-room shared propose --root . --title "Change" [--scope project|global]
+  context-room shared publish --root . --proposal proposal/... [--message "..."]
+  context-room shared review --root . --proposal proposal/... [--port 4317]
+  context-room install-hook [--root .]
+  context-room install-hooks [--root .]
+  context-room update-all [--dry-run] [--no-restart] [--exclude /path]
+  context-room --version
+
+Folder watch modes:
+  recursive-live     Current and future files at any depth (default)
+  recursive-current  Current files at any depth; future files are excluded
+  direct-current     Current direct child files; future files and subfolders are excluded
+  direct-live        Current and future direct child files; subfolder files are excluded
+
+Fresh setup discovers and watches project documentation, builds project-specific hub sections, and uses the first free port when --port is omitted.
+
+Config: ${CONFIG_FILE}
+`;
 }
 
 const KNOWN_OPTIONS = new Set([
-  "advisory", "allow", "dry-run", "exclude", "h", "heading", "help", "highlight", "hook",
-  "limit", "message", "mode", "no-restart", "note", "operation", "path", "percent", "port", "profile",
-  "root", "strict", "target", "task", "text", "title", "version", "view", "watch",
+  "advisory", "allow", "branch", "dry-run", "exclude", "h", "heading", "help", "highlight", "hook",
+  "limit", "message", "mode", "name", "no-restart", "note", "operation", "path", "percent", "port", "profile",
+  "project", "proposal", "repository", "root", "scope", "strict", "target", "task", "text", "title", "version", "view", "watch",
 ]);
 
 function packageVersion() {
@@ -121,6 +169,109 @@ try {
 if (!rootStats?.isDirectory()) {
   console.error(`Context Room root must be an existing directory: ${root}`);
   process.exit(2);
+}
+
+if (command !== "shared" && ["setup", "start", "doctor", "guard", "brief", "agent"].includes(command) && readSharedProjectConnection(root)) {
+  try {
+    const shared = syncSharedContext(root, { allowOffline: true });
+    if (!shared.online) console.error(`Shared context offline: using ${shared.revision.slice(0, 12)} (${shared.fetchError})`);
+  } catch (error) {
+    console.error(`Shared context refresh failed: ${error.message}`);
+    process.exit(1);
+  }
+}
+
+if (command === "shared") {
+  const action = args._[1] || "status";
+  try {
+    if (action === "init-repository") {
+      console.log(JSON.stringify(initializeSharedRepository(root, { name: args.name || args.title || path.basename(root) }), null, 2));
+      process.exit(0);
+    }
+    if (action === "bind") {
+      if (!args.repository || args.repository === true || args.project === true) {
+        throw new Error("Usage: context-room shared bind --root . --repository <git-url> [--project <projectId>]");
+      }
+      const detected = detectSharedProject(root, { repository: args.repository, projectId: args.project || "" });
+      const bindingRoot = detected.projectRoot;
+      console.log(JSON.stringify(connectSharedContext(bindingRoot, {
+        repository: args.repository,
+        projectId: detected.projectId,
+        sync: false,
+      }), null, 2));
+      process.exit(0);
+    }
+    if (action === "setup" || action === "connect") {
+      if (!args.repository || args.repository === true || args.project === true) {
+        throw new Error("Usage: context-room shared setup --root . --repository <git-url> [--project <projectId>]");
+      }
+      const detected = detectSharedProject(root, { repository: args.repository, projectId: args.project || "" });
+      const setupRoot = detected.projectRoot;
+      initializeContextRoomProject(setupRoot);
+      console.log(JSON.stringify(connectSharedContext(setupRoot, { repository: args.repository, projectId: detected.projectId }), null, 2));
+      process.exit(0);
+    }
+    if (action === "sync") {
+      console.log(JSON.stringify(syncSharedContext(root, { allowOffline: true }), null, 2));
+      process.exit(0);
+    }
+    if (action === "status") {
+      console.log(JSON.stringify(sharedContextStatus(root), null, 2));
+      process.exit(0);
+    }
+    if (action === "proposals" || action === "list") {
+      console.log(JSON.stringify(listSharedProposals(root), null, 2));
+      process.exit(0);
+    }
+    if (action === "propose" || action === "proposal-create") {
+      console.log(JSON.stringify(createSharedProposal(root, {
+        title: args.title || args.task || "Shared context change",
+        scope: args.scope || "project",
+        branch: args.branch || "",
+      }), null, 2));
+      process.exit(0);
+    }
+    if (action === "publish" || action === "proposal-push") {
+      if (!args.proposal || args.proposal === true) throw new Error("--proposal requires a proposal/* branch");
+      console.log(JSON.stringify(publishSharedProposal(root, { proposal: args.proposal, message: args.message }), null, 2));
+      process.exit(0);
+    }
+    if (action === "review") {
+      if (!args.proposal || args.proposal === true) throw new Error("--proposal requires a proposal/* branch");
+      const result = materializeSharedReview(root, { proposal: args.proposal });
+      const config = result.repositoryConfig;
+      const projectId = result.metadata.projectId;
+      const projectPrefix = `${config.projectsPath}/${projectId}`;
+      const allowedPaths = projectId === "global"
+        ? [`${config.globalSkillsPath}/`]
+        : [`${projectPrefix}/docs/`, `${projectPrefix}/skills/`];
+      initializeContextRoomProject(result.reviewRoot, {
+        title: `Review · ${args.proposal}`,
+        allowedPaths,
+        watchAllow: allowedPaths,
+        reviewAgentInstructions: false,
+      });
+      const preferredPort = args.port === undefined ? 4317 : Number(args.port);
+      const port = await selectAvailableContextRoomPort(preferredPort, { allowFallback: args.port === undefined });
+      const { server } = createMemoryServer({ root: result.reviewRoot, port });
+      await new Promise((resolve, reject) => {
+        const onError = (error) => reject(error);
+        server.once("error", onError);
+        server.listen(port, "127.0.0.1", () => { server.off("error", onError); resolve(); });
+      });
+      console.log(`Context Room: http://127.0.0.1:${port}`);
+      console.log(`Proposal: ${args.proposal}`);
+      console.log(`Proposal head: ${result.metadata.proposalHead}`);
+      console.log(`Review root: ${result.reviewRoot}`);
+      process.on("SIGINT", () => server.close(() => process.exit(0)));
+      process.on("SIGTERM", () => server.close(() => process.exit(0)));
+      await new Promise(() => {});
+    }
+    throw new Error(`Unknown shared command: ${action}`);
+  } catch (error) {
+    console.error(`Shared context failed: ${error.message}`);
+    process.exit(1);
+  }
 }
 
 if (command === "init") {

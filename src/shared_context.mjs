@@ -1,0 +1,1077 @@
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { isUtf8 } from "node:buffer";
+import { execFileSync, spawnSync } from "node:child_process";
+import { createHash, randomUUID } from "node:crypto";
+
+export const SHARED_REPOSITORY_CONFIG = ".context-room/shared-repository.json";
+export const SHARED_REVIEW_CONFIG = ".context-room/shared-review.json";
+export const SHARED_REPOSITORY_SCHEMA_VERSION = 1;
+const MAX_SHARED_TEXT_BYTES = 750_000;
+const SHARED_REPOSITORY_SCHEMA_URL = "https://raw.githubusercontent.com/Swarek/context-room/main/schemas/shared-repository.schema.json";
+const SHARED_PROJECTS_SCHEMA_URL = "https://raw.githubusercontent.com/Swarek/context-room/main/schemas/shared-projects.schema.json";
+const SHARED_REVIEW_TEXT_EXTENSIONS = new Set([
+  ".md", ".mdx", ".csv", ".tsv", ".txt", ".json", ".jsonc", ".jsonl", ".yaml", ".yml", ".toml", ".ini",
+  ".mjs", ".cjs", ".js", ".jsx", ".ts", ".tsx", ".py", ".sh", ".bash", ".zsh", ".css", ".scss", ".sass",
+  ".html", ".htm", ".xml", ".sql", ".graphql", ".gql", ".rs", ".go", ".java", ".kt", ".swift", ".rb", ".php",
+  ".c", ".cc", ".cpp", ".h", ".hpp",
+]);
+const SHARED_REVIEW_TEXT_FILENAMES = new Set([
+  "Dockerfile", "Containerfile", "Makefile", "Rakefile", "Gemfile", "Procfile", "README", "LICENSE", "CHANGELOG",
+  ".dockerignore", ".editorconfig", ".eslintignore", ".gitattributes", ".gitignore", ".markdownlintignore", ".node-version",
+  ".npmignore", ".nvmrc", ".prettierignore", ".python-version", ".ruby-version", ".tool-versions",
+]);
+
+const DEFAULT_REPOSITORY_CONFIG = {
+  version: SHARED_REPOSITORY_SCHEMA_VERSION,
+  name: "Shared Context",
+  defaultBranch: "main",
+  proposalPrefix: "proposal/",
+  globalSkillsPath: "skills/global",
+  projectsPath: "projects",
+  projectsFile: "projects.json",
+};
+
+function sharedHome() {
+  return process.env.CONTEXT_ROOM_SHARED_HOME
+    ? path.resolve(process.env.CONTEXT_ROOM_SHARED_HOME)
+    : path.join(process.env.HOME || os.homedir(), ".context-room", "shared");
+}
+
+function readJson(filePath, fallback = null) {
+  if (!fs.existsSync(filePath)) return fallback;
+  return JSON.parse(fs.readFileSync(filePath, "utf8"));
+}
+
+function writeJson(filePath, value) {
+  fs.mkdirSync(path.dirname(filePath), { recursive: true });
+  fs.writeFileSync(filePath, JSON.stringify(value, null, 2) + "\n", "utf8");
+  return value;
+}
+
+function runGit(cwd, args, options = {}) {
+  return execFileSync("git", args, {
+    cwd,
+    encoding: options.encoding === null ? null : "utf8",
+    stdio: options.stdio || ["ignore", "pipe", "pipe"],
+    maxBuffer: options.maxBuffer || 64 * 1024 * 1024,
+    env: { ...process.env, ...options.env },
+  });
+}
+
+function tryGit(cwd, args) {
+  try {
+    return String(runGit(cwd, args)).trim();
+  } catch {
+    return "";
+  }
+}
+
+function splitNull(value) {
+  const buffer = Buffer.isBuffer(value) ? value : Buffer.from(String(value || ""));
+  return buffer.toString("utf8").split("\0").filter(Boolean);
+}
+
+function gitChangedPaths(cwd, range) {
+  return splitNull(runGit(cwd, ["diff", "--name-only", "-z", range, "--"], { encoding: null }));
+}
+
+function gitTreeEntries(cwd, revision, prefixes = []) {
+  const args = ["ls-tree", "-r", "-z", revision, "--", ...prefixes];
+  return splitNull(runGit(cwd, args, { encoding: null })).map((record) => {
+    const separator = record.indexOf("\t");
+    if (separator < 0) throw new Error(`Unable to parse Git tree entry at ${revision}`);
+    const [mode, type, object] = record.slice(0, separator).split(" ");
+    return { mode, type, object, path: record.slice(separator + 1) };
+  });
+}
+
+function assertSafeTreeEntries(cwd, revision, prefixes) {
+  for (const entry of gitTreeEntries(cwd, revision, prefixes)) {
+    if (!["100644", "100755"].includes(entry.mode) || entry.type !== "blob") {
+      throw new Error(`Shared context rejects symlinks, gitlinks, and special files: ${entry.path}`);
+    }
+  }
+}
+
+function assertReviewableChangedPaths(cwd, baseRevision, headRevision, changedPaths) {
+  for (const filePath of changedPaths) {
+    const base = path.posix.basename(filePath);
+    if (!SHARED_REVIEW_TEXT_EXTENSIONS.has(path.posix.extname(base)) && !SHARED_REVIEW_TEXT_FILENAMES.has(base)) {
+      throw new Error(`Shared proposal file type is not reviewable in Context Room: ${filePath}`);
+    }
+  }
+  for (const revision of [baseRevision, headRevision]) {
+    const entries = new Map(gitTreeEntries(cwd, revision, changedPaths).map((entry) => [entry.path, entry]));
+    for (const filePath of changedPaths) {
+      const entry = entries.get(filePath);
+      if (!entry) continue;
+      if (!["100644", "100755"].includes(entry.mode) || entry.type !== "blob") {
+        throw new Error(`Shared proposals reject symlinks, gitlinks, and special files: ${filePath}`);
+      }
+      const content = runGit(cwd, ["cat-file", "blob", entry.object], { encoding: null, maxBuffer: MAX_SHARED_TEXT_BYTES + 1 });
+      if (content.length > MAX_SHARED_TEXT_BYTES) throw new Error(`Shared proposal file is too large to review: ${filePath}`);
+      if (!isUtf8(content) || content.includes(0)) throw new Error(`Shared proposals only support reviewable UTF-8 text files: ${filePath}`);
+    }
+  }
+}
+
+function hashKey(value, length = 16) {
+  return createHash("sha256").update(String(value)).digest("hex").slice(0, length);
+}
+
+function safeId(value, label = "id") {
+  const result = String(value || "").trim().toLowerCase();
+  if (!/^[a-z0-9][a-z0-9-]{0,62}$/.test(result)) {
+    throw new Error(`${label} must use lowercase letters, numbers, and single hyphens`);
+  }
+  return result;
+}
+
+function safeRelativePath(value, label) {
+  const clean = String(value || "").trim().replaceAll("\\", "/").replace(/^\.\//, "").replace(/\/$/, "");
+  const segments = clean.split("/");
+  if (!clean || path.posix.isAbsolute(clean) || clean.includes("\0") || segments.some((segment) => !segment || segment === "." || segment === "..")) {
+    throw new Error(`${label} must be a safe repository-relative path`);
+  }
+  if (segments.includes(".git")) throw new Error(`${label} must not enter .git`);
+  if (path.posix.normalize(clean) !== clean) throw new Error(`${label} must be normalized`);
+  return clean;
+}
+
+function safeBranchName(value, label = "branch") {
+  const branch = String(value || "").trim();
+  const invalid = !branch
+    || branch.startsWith("-")
+    || branch.startsWith("/")
+    || branch.endsWith("/")
+    || branch.endsWith(".")
+    || branch.includes("..")
+    || branch.includes("//")
+    || branch.includes("@{")
+    || /[\x00-\x20\x7f~^:?*\[\\]/.test(branch)
+    || branch.split("/").some((segment) => !segment || segment.startsWith(".") || segment.endsWith(".lock"));
+  if (invalid) throw new Error(`Invalid ${label}: ${branch || "(empty)"}`);
+  return branch;
+}
+
+function safeRepository(value) {
+  const repository = String(value || "").trim();
+  if (!repository || repository.startsWith("-") || /[\x00-\x1f\x7f]/.test(repository)) throw new Error("repository is required");
+  if (/^[a-z][a-z0-9+.-]*:\/\//i.test(repository)) {
+    let parsed;
+    try { parsed = new URL(repository); } catch { throw new Error("repository must be a valid Git URL or local path"); }
+    if (parsed.username || parsed.password) throw new Error("repository URLs must not contain embedded credentials");
+  }
+  return repository;
+}
+
+function safeRevision(value, label = "revision") {
+  const revision = String(value || "").trim().toLowerCase();
+  if (!/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/.test(revision)) throw new Error(`Invalid ${label}`);
+  return revision;
+}
+
+function pathsOverlap(left, right) {
+  return left === right || left.startsWith(right + "/") || right.startsWith(left + "/");
+}
+
+function normalizedRepositoryConfig(raw = {}) {
+  const version = Number(raw.version || SHARED_REPOSITORY_SCHEMA_VERSION);
+  if (version !== SHARED_REPOSITORY_SCHEMA_VERSION) throw new Error(`Unsupported shared repository version: ${version}`);
+  const defaultBranch = safeBranchName(raw.defaultBranch || "main", "shared default branch");
+  const proposalPrefix = String(raw.proposalPrefix || "proposal/").trim();
+  if (!proposalPrefix.endsWith("/")) throw new Error("Proposal prefix must end with /");
+  safeBranchName(proposalPrefix + "example", "proposal prefix");
+  const config = {
+    version,
+    name: String(raw.name || "Shared Context").trim() || "Shared Context",
+    defaultBranch,
+    proposalPrefix,
+    globalSkillsPath: safeRelativePath(raw.globalSkillsPath || "skills/global", "globalSkillsPath"),
+    projectsPath: safeRelativePath(raw.projectsPath || "projects", "projectsPath"),
+    projectsFile: safeRelativePath(raw.projectsFile || "projects.json", "projectsFile"),
+  };
+  if (pathsOverlap(config.globalSkillsPath, config.projectsPath)) throw new Error("globalSkillsPath and projectsPath must not overlap");
+  if ([config.globalSkillsPath, config.projectsPath, config.projectsFile].some((value) => value === ".context-room" || value.startsWith(".context-room/"))) {
+    throw new Error("Shared content paths must stay outside .context-room runtime state");
+  }
+  if (pathsOverlap(config.projectsFile, config.globalSkillsPath) || pathsOverlap(config.projectsFile, config.projectsPath)) {
+    throw new Error("projectsFile must stay outside the shared content roots");
+  }
+  return config;
+}
+
+function safeSourceSubpath(value) {
+  const clean = String(value || ".").trim().replaceAll("\\", "/").replace(/^\.\//, "").replace(/\/$/, "") || ".";
+  return clean === "." ? "." : safeRelativePath(clean, "project source subpath");
+}
+
+function normalizedProjectsCatalog(raw = {}) {
+  if (Number(raw.version || 1) !== 1) throw new Error(`Unsupported shared projects version: ${raw.version}`);
+  if (!Array.isArray(raw.projects)) throw new Error("Shared projects catalog must contain a projects array");
+  const seen = new Set();
+  const projects = raw.projects.map((item) => {
+    const id = safeId(item?.id, "project id");
+    if (seen.has(id)) throw new Error(`Duplicate shared project id: ${id}`);
+    seen.add(id);
+    const source = item?.source && typeof item.source === "object" ? {
+      remotes: [...new Set((item.source.remotes || []).map((remote) => normalizeRemote(safeRepository(remote))).filter(Boolean))],
+      subpath: safeSourceSubpath(item.source.subpath || "."),
+    } : null;
+    if (source && !source.remotes.length) throw new Error(`Shared project ${id} source.remotes must not be empty`);
+    return { id, title: String(item?.title || id).trim() || id, source };
+  });
+  return { version: 1, projects };
+}
+
+function registryPath() {
+  return path.join(sharedHome(), "registry.json");
+}
+
+function normalizeRemote(value) {
+  let remote = String(value || "").trim().replace(/\.git$/, "");
+  const scp = remote.match(/^[^@]+@([^:]+):(.+)$/);
+  if (scp) remote = `${scp[1]}/${scp[2]}`;
+  else remote = remote.replace(/^[a-z]+:\/\//i, "").replace(/^([^/]+@)?/, "");
+  return remote.replace(/^github\.com\//i, "github.com/").toLowerCase();
+}
+
+function sourceIdentity(root) {
+  const resolved = stableRoot(root);
+  const topLevel = tryGit(resolved, ["rev-parse", "--show-toplevel"]);
+  if (!topLevel) return null;
+  const remotes = tryGit(topLevel, ["remote"]).split("\n").filter(Boolean)
+    .flatMap((name) => tryGit(topLevel, ["remote", "get-url", "--all", name]).split("\n"))
+    .map(normalizeRemote).filter(Boolean);
+  if (!remotes.length) return null;
+  const stableTopLevel = stableRoot(topLevel);
+  const sourceSubpath = path.relative(stableTopLevel, resolved).replaceAll(path.sep, "/") || ".";
+  return { topLevel: stableTopLevel, remotes: [...new Set(remotes)], sourceSubpath };
+}
+
+function stableRoot(root) {
+  const resolved = path.resolve(root);
+  try { return fs.realpathSync(resolved); } catch { return resolved; }
+}
+
+function bindingMatchesSource(binding, source) {
+  const bindingRemotes = [...new Set([...(binding.sourceRemotes || []), binding.sourceRemote].filter(Boolean).map(normalizeRemote))];
+  if (!source || !source.remotes.some((remote) => bindingRemotes.includes(remote))) return false;
+  const bindingPath = String(binding.sourceSubpath || ".").replace(/^\.\//, "").replace(/\/$/, "") || ".";
+  const sourcePath = String(source.sourceSubpath || ".").replace(/^\.\//, "").replace(/\/$/, "") || ".";
+  return bindingPath === "." || sourcePath === bindingPath || sourcePath.startsWith(bindingPath + "/");
+}
+
+function registerSourceBinding(root, connection) {
+  const source = sourceIdentity(root);
+  const registry = readJson(registryPath(), { version: 1, bindings: [] });
+  const binding = source ? {
+    repository: connection.repository,
+    projectId: connection.projectId,
+    sourceRemotes: source.remotes,
+    sourceSubpath: source.sourceSubpath,
+  } : {
+    repository: connection.repository,
+    projectId: connection.projectId,
+    sourceRoot: stableRoot(root),
+  };
+  registry.bindings = [...(registry.bindings || []).filter((item) => !(
+    source
+      ? String(item.sourceSubpath || ".") === binding.sourceSubpath
+        && [...new Set([...(item.sourceRemotes || []), item.sourceRemote].filter(Boolean).map(normalizeRemote))].some((remote) => source.remotes.includes(remote))
+      : item.sourceRoot && stableRoot(item.sourceRoot) === binding.sourceRoot
+  )), binding];
+  writeJson(registryPath(), registry);
+  return binding;
+}
+
+function resolveRegisteredConnection(root) {
+  const source = sourceIdentity(root);
+  const registry = readJson(registryPath(), { bindings: [] });
+  if (!source) {
+    const resolved = stableRoot(root);
+    const matches = (registry.bindings || []).filter((binding) => {
+      if (!binding.sourceRoot) return false;
+      const bindingRoot = stableRoot(binding.sourceRoot);
+      return resolved === bindingRoot || resolved.startsWith(bindingRoot + path.sep);
+    }).sort((left, right) => String(right.sourceRoot || "").length - String(left.sourceRoot || "").length);
+    const binding = matches[0];
+    return binding ? {
+      version: 1,
+      repository: safeRepository(binding.repository),
+      projectId: safeId(binding.projectId, "projectId"),
+      projectRoot: stableRoot(binding.sourceRoot),
+    } : null;
+  }
+  const matches = (registry.bindings || []).filter((binding) => bindingMatchesSource(binding, source));
+  matches.sort((left, right) => String(right.sourceSubpath || ".").length - String(left.sourceSubpath || ".").length);
+  const binding = matches[0];
+  if (!binding) return null;
+  const sourceSubpath = String(binding.sourceSubpath || ".").replace(/^\.\//, "").replace(/\/$/, "") || ".";
+  const projectRoot = sourceSubpath === "." ? source.topLevel : path.join(source.topLevel, ...sourceSubpath.split("/"));
+  return {
+    version: 1,
+    repository: safeRepository(binding.repository),
+    projectId: safeId(binding.projectId, "projectId"),
+    projectRoot: stableRoot(projectRoot),
+  };
+}
+
+function repositoryCacheRoot(repository) {
+  return path.join(sharedHome(), hashKey(repository));
+}
+
+function repositoryCheckout(repository) {
+  return path.join(repositoryCacheRoot(repository), "repository");
+}
+
+function sharedStatePath(repository) {
+  return path.join(repositoryCacheRoot(repository), "state.json");
+}
+
+function ensureRepositoryClone(repository) {
+  const checkout = repositoryCheckout(repository);
+  if (fs.existsSync(path.join(checkout, ".git"))) return checkout;
+  if (fs.existsSync(checkout)) throw new Error(`Shared cache path already exists and is not a Git clone: ${checkout}`);
+  fs.mkdirSync(path.dirname(checkout), { recursive: true });
+  runGit(path.dirname(checkout), ["clone", "--origin", "origin", "--no-checkout", repository, checkout], { stdio: ["ignore", "ignore", "pipe"] });
+  return checkout;
+}
+
+function remoteRevision(checkout, branch) {
+  const safeBranch = safeBranchName(branch, "remote branch");
+  const revision = tryGit(checkout, ["rev-parse", `refs/remotes/origin/${safeBranch}^{commit}`]);
+  if (!revision) throw new Error(`The shared repository has no origin/${branch} commit`);
+  return safeRevision(revision);
+}
+
+function remoteHeadBranch(checkout) {
+  const value = tryGit(checkout, ["symbolic-ref", "--short", "refs/remotes/origin/HEAD"]);
+  if (!value.startsWith("origin/")) return "";
+  try { return safeBranchName(value.slice("origin/".length), "remote default branch"); } catch { return ""; }
+}
+
+function readRemoteSharedDescriptor(checkout, fallbackBranch = "") {
+  const bootstrapBranch = fallbackBranch || remoteHeadBranch(checkout) || "main";
+  let revision = remoteRevision(checkout, bootstrapBranch);
+  let config = normalizedRepositoryConfig(JSON.parse(runGit(checkout, ["show", `${revision}:${SHARED_REPOSITORY_CONFIG}`])));
+  if (config.defaultBranch !== bootstrapBranch) {
+    const selectedBranch = config.defaultBranch;
+    revision = remoteRevision(checkout, selectedBranch);
+    config = normalizedRepositoryConfig(JSON.parse(runGit(checkout, ["show", `${revision}:${SHARED_REPOSITORY_CONFIG}`])));
+    if (config.defaultBranch !== selectedBranch) throw new Error("Shared defaultBranch must be stable across the selected branch");
+  }
+  const catalog = normalizedProjectsCatalog(JSON.parse(runGit(checkout, ["show", `${revision}:${config.projectsFile}`])));
+  return { revision, config, catalog };
+}
+
+export function detectSharedProject(root, { repository, projectId = "" } = {}) {
+  const resolvedRoot = stableRoot(root);
+  const safeRemote = safeRepository(repository);
+  const checkout = ensureRepositoryClone(safeRemote);
+  runGit(checkout, ["fetch", "--prune", "origin"], { stdio: ["ignore", "ignore", "pipe"] });
+  const descriptor = readRemoteSharedDescriptor(checkout);
+  const source = sourceIdentity(resolvedRoot);
+  const explicitProjectId = projectId ? safeId(projectId, "projectId") : "";
+  if (explicitProjectId) {
+    const project = descriptor.catalog.projects.find((item) => item.id === explicitProjectId);
+    if (!project) throw new Error(`Shared project is not registered in ${descriptor.config.projectsFile}: ${explicitProjectId}`);
+    const sourceMatches = source && project.source?.remotes.some((remote) => source.remotes.includes(remote));
+    const projectRoot = sourceMatches
+      ? project.source.subpath === "."
+        ? source.topLevel
+        : path.join(source.topLevel, ...project.source.subpath.split("/"))
+      : resolvedRoot;
+    return { projectId: project.id, projectRoot: stableRoot(projectRoot), repository: safeRemote, revision: descriptor.revision };
+  }
+  if (!source) throw new Error("--project is required because this directory has no Git remote identity");
+  const matches = descriptor.catalog.projects.filter((project) => {
+    if (!project.source || !project.source.remotes.some((remote) => source.remotes.includes(remote))) return false;
+    return project.source.subpath === "."
+      || source.sourceSubpath === project.source.subpath
+      || source.sourceSubpath.startsWith(project.source.subpath + "/");
+  }).sort((left, right) => right.source.subpath.length - left.source.subpath.length);
+  const project = matches[0];
+  if (!project) throw new Error("No shared project matches this Git remote and repository subpath; pass --project explicitly");
+  const projectRoot = project.source.subpath === "."
+    ? source.topLevel
+    : path.join(source.topLevel, ...project.source.subpath.split("/"));
+  return { projectId: project.id, projectRoot: stableRoot(projectRoot), repository: safeRemote, revision: descriptor.revision };
+}
+
+function materializeSnapshot(checkout, revision, destination) {
+  if (fs.existsSync(path.join(destination, SHARED_REPOSITORY_CONFIG))) return destination;
+  const cacheRoot = path.dirname(path.dirname(destination));
+  const temporary = path.join(cacheRoot, `snapshot-${revision.slice(0, 12)}-${process.pid}.tmp`);
+  fs.mkdirSync(temporary, { recursive: true });
+  try {
+    const archive = runGit(checkout, ["archive", "--format=tar", revision], { encoding: null });
+    const extracted = spawnSync("tar", ["-xf", "-", "-C", temporary], { input: archive, encoding: "utf8" });
+    if (extracted.status !== 0) throw new Error(extracted.stderr || "Unable to extract shared context snapshot");
+    fs.renameSync(temporary, destination);
+    makeTreeReadOnly(destination);
+  } finally {
+    if (fs.existsSync(temporary)) {
+      makeTreeWritable(temporary);
+      fs.rmSync(temporary, { recursive: true, force: true });
+    }
+  }
+  return destination;
+}
+
+function makeTreeReadOnly(root) {
+  for (const entry of fs.readdirSync(root, { withFileTypes: true })) {
+    const target = path.join(root, entry.name);
+    if (entry.isDirectory()) {
+      makeTreeReadOnly(target);
+      fs.chmodSync(target, 0o555);
+    } else if (entry.isFile()) {
+      const executable = Boolean(fs.statSync(target).mode & 0o111);
+      fs.chmodSync(target, executable ? 0o555 : 0o444);
+    }
+  }
+  fs.chmodSync(root, 0o555);
+}
+
+function makeTreeWritable(root) {
+  try { fs.chmodSync(root, 0o755); } catch {}
+  let entries = [];
+  try { entries = fs.readdirSync(root, { withFileTypes: true }); } catch { return; }
+  for (const entry of entries) {
+    const target = path.join(root, entry.name);
+    if (entry.isDirectory()) makeTreeWritable(target);
+    else if (entry.isFile()) try { fs.chmodSync(target, 0o644); } catch {}
+  }
+}
+
+function replaceSymlink(linkPath, targetPath, { managedRoot = "" } = {}) {
+  fs.mkdirSync(path.dirname(linkPath), { recursive: true });
+  let existing = null;
+  try {
+    existing = fs.lstatSync(linkPath);
+  } catch {}
+  if (existing && !existing.isSymbolicLink()) throw new Error(`Refusing to replace existing non-link path: ${linkPath}`);
+  const existingTarget = existing?.isSymbolicLink() ? path.resolve(path.dirname(linkPath), fs.readlinkSync(linkPath)) : "";
+  if (existingTarget === path.resolve(targetPath)) return false;
+  if (existingTarget && managedRoot && existingTarget !== path.resolve(managedRoot) && !existingTarget.startsWith(path.resolve(managedRoot) + path.sep)) {
+    throw new Error(`Refusing to replace unmanaged skill link: ${linkPath}`);
+  }
+  const temporary = `${linkPath}.context-room-${process.pid}.tmp`;
+  try { fs.unlinkSync(temporary); } catch (error) { if (error.code !== "ENOENT") throw error; }
+  fs.symlinkSync(targetPath, temporary, "dir");
+  fs.renameSync(temporary, linkPath);
+  return true;
+}
+
+function skillDirectories(root) {
+  if (!fs.existsSync(root) || !fs.statSync(root).isDirectory()) return [];
+  return fs.readdirSync(root, { withFileTypes: true })
+    .filter((entry) => entry.isDirectory() && fs.existsSync(path.join(root, entry.name, "SKILL.md")))
+    .map((entry) => entry.name)
+    .sort((left, right) => left.localeCompare(right, "en"));
+}
+
+function homeVirtualPath(absolutePath, trailingSlash = false) {
+  const home = path.resolve(process.env.HOME || os.homedir());
+  const absolute = path.resolve(absolutePath);
+  if (absolute !== home && !absolute.startsWith(home + path.sep)) throw new Error(`Shared cache must stay inside the user home: ${absolute}`);
+  const value = "~/" + path.relative(home, absolute).replaceAll(path.sep, "/");
+  return trailingSlash ? value.replace(/\/$/, "") + "/" : value;
+}
+
+function appendUnique(values, next) {
+  return [...new Set([...(values || []), ...next].filter(Boolean))];
+}
+
+function managedSymlinkTarget(linkPath, managedRoot) {
+  let stats;
+  try { stats = fs.lstatSync(linkPath); } catch { return { exists: false, symbolic: false, target: "" }; }
+  if (!stats.isSymbolicLink()) return { exists: true, symbolic: false, target: "" };
+  const target = path.resolve(path.dirname(linkPath), fs.readlinkSync(linkPath));
+  const root = path.resolve(managedRoot);
+  return { exists: true, symbolic: true, target, managed: target === root || target.startsWith(root + path.sep) };
+}
+
+function skillLinkRegistryPath(repository, projectRoot) {
+  return path.join(repositoryCacheRoot(repository), "skill-links", `${hashKey(stableRoot(projectRoot))}.json`);
+}
+
+function configureProjectRoom(root, connection, repositoryConfig, currentRoot) {
+  const configPath = path.join(root, ".context-room", "config.json");
+  if (!fs.existsSync(configPath)) return { updated: false, reason: "Context Room is not initialized yet" };
+  const config = readJson(configPath, {});
+  const previousRepository = config.sharedContext?.repository
+    ? safeRepository(config.sharedContext.repository)
+    : "";
+  if (previousRepository) {
+    const previousPrefix = homeVirtualPath(path.join(repositoryCacheRoot(previousRepository), "current"), true);
+    const keepNonManaged = (value) => !String(value || "").startsWith(previousPrefix);
+    config.allowedPaths = (config.allowedPaths || []).filter(keepNonManaged);
+    config.readOnlyPaths = (config.readOnlyPaths || []).filter(keepNonManaged);
+  }
+  const projectRoot = path.join(currentRoot, repositoryConfig.projectsPath, connection.projectId);
+  const docs = homeVirtualPath(path.join(projectRoot, "docs"), true);
+  const projectSkills = homeVirtualPath(path.join(projectRoot, "skills"), true);
+  const globalSkills = homeVirtualPath(path.join(currentRoot, repositoryConfig.globalSkillsPath), true);
+  config.allowedPaths = appendUnique(config.allowedPaths, [docs, projectSkills, globalSkills]);
+  config.readOnlyPaths = appendUnique(config.readOnlyPaths, [docs, projectSkills, globalSkills]);
+  const section = {
+    id: "shared-context",
+    title: "Shared context",
+    description: `${repositoryConfig.name} accepted main snapshot. Changes must go through proposal branches.`,
+    cards: [
+      { id: "shared-docs", title: "Shared project docs", path: docs, description: `Accepted documentation for ${connection.projectId}.` },
+      { id: "shared-project-skills", title: "Shared project skills", path: projectSkills, description: `Accepted skills for ${connection.projectId}.` },
+      { id: "shared-global-skills", title: "Shared global skills", path: globalSkills, description: "Accepted skills shared across projects." },
+    ],
+  };
+  config.hubSections = [...(config.hubSections || []).filter((item) => item?.id !== section.id), section];
+  config.sharedContext = { enabled: true, projectId: connection.projectId, repository: connection.repository };
+  writeJson(configPath, config);
+  return { updated: true, configPath, paths: { docs, projectSkills, globalSkills } };
+}
+
+function syncSkillLinks(root, connection, repositoryConfig, currentRoot) {
+  const projectSkillSource = path.join(currentRoot, repositoryConfig.projectsPath, connection.projectId, "skills");
+  const globalSkillSource = path.join(currentRoot, repositoryConfig.globalSkillsPath);
+  const projectSkills = skillDirectories(projectSkillSource);
+  const globalSkills = skillDirectories(globalSkillSource);
+  const collisions = projectSkills.filter((name) => globalSkills.includes(name));
+  if (collisions.length) throw new Error(`Project skills must not shadow global skills: ${collisions.join(", ")}`);
+  const links = [];
+  const globalDestination = path.join(process.env.HOME || os.homedir(), ".codex", "skills");
+  const projectDestination = path.join(root, ".codex", "skills");
+  for (const name of globalSkills) {
+    const link = path.join(globalDestination, name);
+    links.push({ scope: "global", name, link, target: path.join(globalSkillSource, name) });
+  }
+  for (const name of projectSkills) {
+    const link = path.join(projectDestination, name);
+    links.push({ scope: "project", name, link, target: path.join(projectSkillSource, name) });
+  }
+  const managedRoot = repositoryCacheRoot(connection.repository);
+  const registryFile = skillLinkRegistryPath(connection.repository, root);
+  const previous = readJson(registryFile, { version: 1, links: [] });
+  const desiredPaths = new Set(links.map((item) => path.resolve(item.link)));
+  const safeDestinations = new Set([path.resolve(globalDestination), path.resolve(projectDestination)]);
+  const stale = (previous.links || []).filter((item) => {
+    const link = path.resolve(String(item.link || ""));
+    return safeDestinations.has(path.dirname(link)) && !desiredPaths.has(link);
+  });
+  const before = new Map();
+  for (const item of [...links, ...stale]) {
+    const link = path.resolve(item.link);
+    if (!safeDestinations.has(path.dirname(link))) throw new Error(`Unsafe managed skill link path: ${link}`);
+    const state = managedSymlinkTarget(link, managedRoot);
+    before.set(link, state);
+    if (links.includes(item) && state.exists && (!state.symbolic || !state.managed)) {
+      throw new Error(`Refusing to replace unmanaged skill path: ${link}`);
+    }
+  }
+  try {
+    for (const item of links) replaceSymlink(item.link, item.target, { managedRoot });
+    for (const item of stale) {
+      const state = managedSymlinkTarget(item.link, managedRoot);
+      if (state.symbolic && state.managed) fs.unlinkSync(item.link);
+    }
+    writeJson(registryFile, { version: 1, repository: connection.repository, projectRoot: stableRoot(root), links });
+  } catch (error) {
+    for (const [link, state] of [...before.entries()].reverse()) {
+      try {
+        const current = managedSymlinkTarget(link, managedRoot);
+        if (!state.exists && current.symbolic && current.managed) fs.unlinkSync(link);
+        else if (state.symbolic && state.managed) replaceSymlink(link, state.target, { managedRoot });
+      } catch {}
+    }
+    throw error;
+  }
+  return links;
+}
+
+function detachInstalledSkillLinks(root, installed) {
+  if (!installed?.repository) return [];
+  const repository = safeRepository(installed.repository);
+  const managedRoot = repositoryCacheRoot(repository);
+  const registry = readJson(skillLinkRegistryPath(repository, root), { links: [] });
+  const safeDestinations = new Set([
+    path.resolve(process.env.HOME || os.homedir(), ".codex", "skills"),
+    path.resolve(root, ".codex", "skills"),
+  ]);
+  const removed = [];
+  try {
+    for (const item of registry.links || []) {
+      const link = path.resolve(String(item.link || ""));
+      if (!safeDestinations.has(path.dirname(link))) continue;
+      const state = managedSymlinkTarget(link, managedRoot);
+      if (!state.symbolic || !state.managed) continue;
+      fs.unlinkSync(link);
+      removed.push({ link, target: state.target, managedRoot });
+    }
+  } catch (error) {
+    restoreDetachedSkillLinks(removed);
+    throw error;
+  }
+  return removed;
+}
+
+function restoreDetachedSkillLinks(links) {
+  for (const item of links) {
+    try { replaceSymlink(item.link, item.target, { managedRoot: item.managedRoot }); } catch {}
+  }
+}
+
+export function initializeSharedRepository(root, options = {}) {
+  const resolvedRoot = path.resolve(root);
+  fs.mkdirSync(resolvedRoot, { recursive: true });
+  const configPath = path.join(resolvedRoot, SHARED_REPOSITORY_CONFIG);
+  if (fs.existsSync(configPath)) return { configPath, config: readSharedRepositoryConfig(resolvedRoot), created: false };
+  const config = normalizedRepositoryConfig({ ...DEFAULT_REPOSITORY_CONFIG, ...options });
+  writeJson(configPath, { $schema: SHARED_REPOSITORY_SCHEMA_URL, ...config });
+  fs.mkdirSync(path.join(resolvedRoot, config.globalSkillsPath), { recursive: true });
+  const globalKeep = path.join(resolvedRoot, config.globalSkillsPath, ".gitkeep");
+  if (!fs.existsSync(globalKeep)) fs.writeFileSync(globalKeep, "", "utf8");
+  fs.mkdirSync(path.join(resolvedRoot, config.projectsPath), { recursive: true });
+  if (!fs.existsSync(path.join(resolvedRoot, config.projectsFile))) {
+    writeJson(path.join(resolvedRoot, config.projectsFile), { $schema: SHARED_PROJECTS_SCHEMA_URL, version: 1, projects: [] });
+  }
+  return { configPath, config, created: true };
+}
+
+export function readSharedRepositoryConfig(root) {
+  const configPath = path.join(path.resolve(root), SHARED_REPOSITORY_CONFIG);
+  const raw = readJson(configPath);
+  if (!raw) throw new Error(`Missing ${SHARED_REPOSITORY_CONFIG}`);
+  return normalizedRepositoryConfig(raw);
+}
+
+export function readSharedProjectConnection(root) {
+  return resolveRegisteredConnection(root);
+}
+
+export function connectSharedContext(root, { repository, projectId, sync = true } = {}) {
+  const resolvedRoot = path.resolve(root);
+  if (!fs.existsSync(resolvedRoot) || !fs.statSync(resolvedRoot).isDirectory()) throw new Error(`Project root does not exist: ${resolvedRoot}`);
+  const safeRemote = safeRepository(repository);
+  const detected = detectSharedProject(resolvedRoot, { repository: safeRemote, projectId });
+  const bindingRoot = detected.projectRoot;
+  const connection = { version: 1, repository: safeRemote, projectId: detected.projectId, projectRoot: bindingRoot };
+  const previousRegistry = readJson(registryPath(), { version: 1, bindings: [] });
+  registerSourceBinding(bindingRoot, connection);
+  if (!sync) return { connection, connected: true };
+  try {
+    return syncSharedContext(bindingRoot);
+  } catch (error) {
+    writeJson(registryPath(), previousRegistry);
+    throw error;
+  }
+}
+
+export function syncSharedContext(root, { allowOffline = true } = {}) {
+  const resolvedRoot = path.resolve(root);
+  const connection = readSharedProjectConnection(resolvedRoot);
+  if (!connection) throw new Error("This project has no approved shared-context binding; run context-room shared setup first");
+  const localProjectRoot = connection.projectRoot || resolvedRoot;
+  const checkout = ensureRepositoryClone(connection.repository);
+  let fetchError = "";
+  try {
+    runGit(checkout, ["fetch", "--prune", "origin"], { stdio: ["ignore", "ignore", "pipe"] });
+  } catch (error) {
+    fetchError = String(error.stderr || error.message || error).trim();
+    if (!allowOffline) throw new Error(`Unable to refresh shared context: ${fetchError}`);
+  }
+  const state = readJson(sharedStatePath(connection.repository), {});
+  let repositoryConfig;
+  let revision;
+  let catalog;
+  try {
+    const descriptor = readRemoteSharedDescriptor(checkout, state.defaultBranch || "");
+    ({ revision, config: repositoryConfig, catalog } = descriptor);
+  } catch (error) {
+    if (!fetchError || !state.revision || !state.repositoryConfig) throw error;
+    revision = state.revision;
+    repositoryConfig = normalizedRepositoryConfig(state.repositoryConfig);
+    catalog = state.catalog
+      ? normalizedProjectsCatalog(state.catalog)
+      : normalizedProjectsCatalog(JSON.parse(runGit(checkout, ["show", `${revision}:${repositoryConfig.projectsFile}`])));
+  }
+  assertSafeTreeEntries(checkout, revision, []);
+  const cacheRoot = repositoryCacheRoot(connection.repository);
+  const snapshot = path.join(cacheRoot, "snapshots", revision);
+  fs.mkdirSync(path.dirname(snapshot), { recursive: true });
+  materializeSnapshot(checkout, revision, snapshot);
+  repositoryConfig = readSharedRepositoryConfig(snapshot);
+  catalog = normalizedProjectsCatalog(readJson(path.join(snapshot, repositoryConfig.projectsFile)));
+  if (!catalog.projects.some((project) => project.id === connection.projectId)) {
+    throw new Error(`Shared project is not registered in ${repositoryConfig.projectsFile}: ${connection.projectId}`);
+  }
+  const sharedProjectRoot = path.join(snapshot, repositoryConfig.projectsPath, connection.projectId);
+  if (!fs.existsSync(sharedProjectRoot) || !fs.statSync(sharedProjectRoot).isDirectory()) {
+    throw new Error(`Shared project does not exist in origin/${repositoryConfig.defaultBranch}: ${connection.projectId}`);
+  }
+  const current = path.join(cacheRoot, "current");
+  const previousCurrent = (() => {
+    try { return fs.lstatSync(current).isSymbolicLink() ? path.resolve(path.dirname(current), fs.readlinkSync(current)) : ""; } catch { return ""; }
+  })();
+  const configPath = path.join(localProjectRoot, ".context-room", "config.json");
+  const previousConfig = fs.existsSync(configPath) ? fs.readFileSync(configPath, "utf8") : null;
+  let installedSharedContext = null;
+  if (previousConfig !== null) {
+    try { installedSharedContext = JSON.parse(previousConfig).sharedContext || null; } catch {}
+  }
+  const switchingSharedContext = installedSharedContext?.repository && (
+    safeRepository(installedSharedContext.repository) !== connection.repository
+    || installedSharedContext.projectId !== connection.projectId
+  );
+  let detachedSkillLinks = [];
+  let links;
+  let room;
+  try {
+    if (switchingSharedContext) detachedSkillLinks = detachInstalledSkillLinks(localProjectRoot, installedSharedContext);
+    replaceSymlink(current, snapshot, { managedRoot: cacheRoot });
+    room = configureProjectRoom(localProjectRoot, connection, repositoryConfig, current);
+    links = syncSkillLinks(localProjectRoot, connection, repositoryConfig, snapshot);
+  } catch (error) {
+    restoreDetachedSkillLinks(detachedSkillLinks);
+    if (previousCurrent) {
+      try { replaceSymlink(current, previousCurrent, { managedRoot: cacheRoot }); } catch {}
+    } else {
+      const currentState = managedSymlinkTarget(current, cacheRoot);
+      if (currentState.symbolic && currentState.managed) {
+        try { fs.unlinkSync(current); } catch {}
+      }
+    }
+    if (previousConfig !== null) {
+      try { fs.writeFileSync(configPath, previousConfig, "utf8"); } catch {}
+    }
+    throw error;
+  }
+  const nextState = {
+    version: 1,
+    repository: connection.repository,
+    defaultBranch: repositoryConfig.defaultBranch,
+    revision,
+    syncedAt: new Date().toISOString(),
+    online: !fetchError,
+    fetchError,
+    repositoryConfig,
+    catalog,
+  };
+  writeJson(sharedStatePath(connection.repository), nextState);
+  return { connection: { ...connection, projectRoot: localProjectRoot }, repositoryConfig, catalog, revision, online: !fetchError, fetchError, cacheRoot, current, links, room };
+}
+
+export function sharedContextStatus(root) {
+  const connection = readSharedProjectConnection(root);
+  if (!connection) return { connected: false };
+  const state = readJson(sharedStatePath(connection.repository), {});
+  return {
+    connected: true,
+    connection,
+    ...state,
+    cacheRoot: repositoryCacheRoot(connection.repository),
+    permissionBoundary: {
+      verified: false,
+      enforcement: "remote Git branch protection and separate agent credentials",
+      note: "Local Context Room cannot prove provider-side branch permissions.",
+    },
+  };
+}
+
+function proposalScopePrefixes(config, projectId, scope) {
+  if (scope === "global") return [config.globalSkillsPath.replace(/\/$/, "") + "/"];
+  if (scope !== "project") throw new Error("Proposal scope must be project or global");
+  const projectRoot = `${config.projectsPath.replace(/\/$/, "")}/${safeId(projectId, "projectId")}`;
+  return [`${projectRoot}/docs/`, `${projectRoot}/skills/`];
+}
+
+function proposalIdentity(config, branch) {
+  const safeBranch = safeBranchName(branch, "proposal branch");
+  if (!safeBranch.startsWith(config.proposalPrefix)) throw new Error(`Proposal branch must start with ${config.proposalPrefix}`);
+  const suffix = safeBranch.slice(config.proposalPrefix.length);
+  const segments = suffix.split("/");
+  if (segments.length < 2 || !segments.slice(1).join("/")) throw new Error("Proposal branch must include a scope and proposal name");
+  const scopeId = safeId(segments[0], "proposal scope");
+  return {
+    branch: safeBranch,
+    projectId: scopeId,
+    scope: scopeId === "global" ? "global" : "project",
+    allowedPrefixes: proposalScopePrefixes(config, scopeId, scopeId === "global" ? "global" : "project"),
+  };
+}
+
+function assertPathsInProposalScope(files, policy) {
+  const outside = files.filter((file) => !policy.allowedPrefixes.some((prefix) => file.startsWith(prefix)));
+  if (outside.length) throw new Error(`Proposal changes files outside ${policy.allowedPrefixes.join(" or ")}: ${outside.join(", ")}`);
+}
+
+function proposalBranch(config, projectId, title, scope, explicit = "") {
+  const scopeId = scope === "global" ? "global" : safeId(projectId, "projectId");
+  if (!['project', 'global'].includes(scope)) throw new Error("Proposal scope must be project or global");
+  if (explicit) {
+    const identity = proposalIdentity(config, explicit);
+    if (identity.projectId !== scopeId) throw new Error(`Proposal branch scope must be ${config.proposalPrefix}${scopeId}/`);
+    return identity.branch;
+  }
+  const slug = String(title || "change").toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "").replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 48) || "change";
+  const stamp = new Date().toISOString().replace(/[-:TZ.]/g, "").slice(0, 14);
+  return `${config.proposalPrefix}${scopeId}/${stamp}-${slug}`;
+}
+
+function proposalRegistryPath(repository) {
+  return path.join(repositoryCacheRoot(repository), "proposals.json");
+}
+
+export function createSharedProposal(root, { title, scope = "project", branch = "" } = {}) {
+  const synced = syncSharedContext(root, { allowOffline: false });
+  const { connection, repositoryConfig, revision } = synced;
+  const proposal = proposalBranch(repositoryConfig, connection.projectId, title, scope, branch);
+  const checkout = repositoryCheckout(connection.repository);
+  const proposalRoot = path.join(repositoryCacheRoot(connection.repository), "proposals", hashKey(proposal));
+  if (fs.existsSync(proposalRoot)) throw new Error(`Proposal workspace already exists: ${proposalRoot}`);
+  runGit(checkout, ["worktree", "add", "-b", proposal, proposalRoot, revision], { stdio: ["ignore", "ignore", "pipe"] });
+  const sourceRoot = connection.projectRoot || path.resolve(root);
+  const source = sourceIdentity(sourceRoot);
+  const sourceCommit = tryGit(sourceRoot, ["rev-parse", "HEAD"]);
+  const sourceBranch = tryGit(sourceRoot, ["branch", "--show-current"]);
+  const registry = readJson(proposalRegistryPath(connection.repository), { version: 1, proposals: {} });
+  registry.proposals[proposal] = {
+    branch: proposal,
+    root: proposalRoot,
+    baseRevision: revision,
+    projectId: connection.projectId,
+    scope,
+    title: String(title || "Shared context proposal"),
+    sourceRemote: source?.remotes?.[0] || "",
+    sourceBranch,
+    sourceCommit: /^(?:[a-f0-9]{40}|[a-f0-9]{64})$/i.test(sourceCommit) ? sourceCommit : "",
+    createdAt: new Date().toISOString(),
+  };
+  writeJson(proposalRegistryPath(connection.repository), registry);
+  return registry.proposals[proposal];
+}
+
+function proposalCommitMessage(entry, message) {
+  const trailers = [
+    `Context-Room-Project: ${entry.scope === "global" ? "global" : entry.projectId}`,
+    `Context-Room-Base: ${entry.baseRevision}`,
+    entry.sourceRemote ? `Context-Room-Source-Remote: ${entry.sourceRemote}` : "",
+    entry.sourceBranch ? `Context-Room-Source-Branch: ${entry.sourceBranch}` : "",
+    entry.sourceCommit ? `Context-Room-Source-Commit: ${entry.sourceCommit}` : "",
+  ].filter(Boolean);
+  return `${String(message || entry.title || "Propose shared context changes").trim()}\n\n${trailers.join("\n")}`;
+}
+
+function proposalEntry(root, branch) {
+  const connection = readSharedProjectConnection(root);
+  if (!connection) throw new Error("This project has no approved shared-context binding");
+  const registry = readJson(proposalRegistryPath(connection.repository), { proposals: {} });
+  const entry = registry.proposals?.[branch];
+  if (!entry || !fs.existsSync(entry.root)) throw new Error(`Unknown local proposal workspace: ${branch}`);
+  return { connection, entry };
+}
+
+function changedFiles(cwd, base) {
+  const committed = gitChangedPaths(cwd, `${base}...HEAD`);
+  const working = splitNull(runGit(cwd, ["diff", "--name-only", "-z", "HEAD", "--"], { encoding: null }));
+  const untracked = splitNull(runGit(cwd, ["ls-files", "--others", "--exclude-standard", "-z", "--"], { encoding: null }));
+  return [...new Set([...committed, ...working, ...untracked])];
+}
+
+export function publishSharedProposal(root, { proposal, message = "" } = {}) {
+  const { connection, entry } = proposalEntry(root, proposal);
+  const config = readSharedRepositoryConfig(entry.root);
+  const identity = proposalIdentity(config, entry.branch);
+  const expectedScopeId = entry.scope === "global" ? "global" : entry.projectId;
+  if (identity.projectId !== expectedScopeId) throw new Error(`Proposal branch scope must be ${config.proposalPrefix}${expectedScopeId}/`);
+  const pendingFiles = changedFiles(entry.root, entry.baseRevision);
+  assertPathsInProposalScope(pendingFiles, identity);
+  if (!pendingFiles.length) throw new Error("Proposal has no changes");
+  runGit(entry.root, ["add", "-A"]);
+  try {
+    runGit(entry.root, ["diff", "--cached", "--quiet"]);
+  } catch {
+    runGit(entry.root, ["commit", "-m", proposalCommitMessage(entry, message)], { stdio: ["ignore", "ignore", "pipe"] });
+  }
+  const head = safeRevision(tryGit(entry.root, ["rev-parse", "HEAD"]), "proposal head");
+  const files = gitChangedPaths(entry.root, `${entry.baseRevision}...${head}`);
+  assertPathsInProposalScope(files, identity);
+  assertReviewableChangedPaths(entry.root, entry.baseRevision, head, files);
+  runGit(entry.root, ["push", "--set-upstream", "origin", `${entry.branch}:${entry.branch}`], { stdio: ["ignore", "ignore", "pipe"] });
+  return { ...entry, head, files };
+}
+
+export function listSharedProposals(root, { allProjects = true } = {}) {
+  const synced = syncSharedContext(root, { allowOffline: true });
+  return listRemoteSharedProposals(synced, { allProjects });
+}
+
+function listRemoteSharedProposals(synced, { allProjects = true } = {}) {
+  const checkout = repositoryCheckout(synced.connection.repository);
+  const prefix = `refs/remotes/origin/${synced.repositoryConfig.proposalPrefix}`;
+  const output = tryGit(checkout, ["for-each-ref", "--format=%(refname:strip=3)%09%(objectname)%09%(committerdate:iso8601)%09%(authorname)%09%(authoremail)%09%(subject)", prefix]);
+  return output.split("\n").filter(Boolean).flatMap((line) => {
+    const [branch, head, updatedAt, authorName, authorEmail, title] = line.split("\t");
+    try {
+      const identity = proposalIdentity(synced.repositoryConfig, branch);
+      return [{ ...identity, head: safeRevision(head, "proposal head"), updatedAt, author: { name: authorName, email: authorEmail }, title }];
+    } catch {
+      return [];
+    }
+  }).filter((item) => allProjects || item.projectId === synced.connection.projectId || item.projectId === "global");
+}
+
+export function materializeSharedReview(root, { proposal } = {}) {
+  const synced = syncSharedContext(root, { allowOffline: false });
+  const match = listRemoteSharedProposals(synced).find((item) => item.branch === proposal);
+  if (!match) throw new Error(`Remote proposal not found: ${proposal}`);
+  const checkout = repositoryCheckout(synced.connection.repository);
+  const changedFiles = gitChangedPaths(checkout, `${synced.revision}...${match.head}`);
+  if (!changedFiles.length) throw new Error("Proposal has no changes relative to shared main");
+  assertPathsInProposalScope(changedFiles, match);
+  assertSafeTreeEntries(checkout, synced.revision, match.allowedPrefixes);
+  assertSafeTreeEntries(checkout, match.head, match.allowedPrefixes);
+  assertReviewableChangedPaths(checkout, synced.revision, match.head, changedFiles);
+  const reviewRoot = path.join(repositoryCacheRoot(synced.connection.repository), "reviews", `${hashKey(proposal)}-${Date.now()}`);
+  let worktreeCreated = false;
+  try {
+    runGit(checkout, ["worktree", "add", "--detach", reviewRoot, synced.revision], { stdio: ["ignore", "ignore", "pipe"] });
+    worktreeCreated = true;
+    const patch = runGit(checkout, ["diff", "--binary", "--full-index", `${synced.revision}...${match.head}`, "--"], { encoding: null });
+    const applied = spawnSync("git", ["apply", "--whitespace=nowarn", "-"], { cwd: reviewRoot, input: patch, encoding: "utf8" });
+    if (applied.status !== 0) throw new Error(applied.stderr || "Unable to materialize proposal diff");
+    const authorityId = randomUUID();
+    const metadata = {
+      version: 1,
+      authorityId,
+      reviewRoot: stableRoot(reviewRoot),
+      repository: synced.connection.repository,
+      projectId: match.projectId,
+      scope: match.scope,
+      allowedPrefixes: match.allowedPrefixes,
+      proposalFiles: changedFiles,
+      proposal: match.branch,
+      proposalHead: match.head,
+      baseRevision: synced.revision,
+      defaultBranch: synced.repositoryConfig.defaultBranch,
+      createdAt: new Date().toISOString(),
+    };
+    writeJson(path.join(sharedHome(), "review-authority", `${authorityId}.json`), metadata);
+    writeJson(path.join(reviewRoot, SHARED_REVIEW_CONFIG), {
+      version: 1,
+      authorityId,
+      proposal: match.branch,
+      proposalHead: match.head,
+    });
+    return { reviewRoot, metadata, repositoryConfig: synced.repositoryConfig };
+  } catch (error) {
+    if (worktreeCreated) {
+      try { runGit(checkout, ["worktree", "remove", "--force", reviewRoot], { stdio: ["ignore", "ignore", "ignore"] }); } catch {}
+    }
+    throw error;
+  }
+}
+
+export function readSharedReview(root) {
+  const pointer = readJson(path.join(path.resolve(root), SHARED_REVIEW_CONFIG));
+  if (!pointer) throw new Error(`Missing ${SHARED_REVIEW_CONFIG}`);
+  const authorityId = String(pointer.authorityId || "");
+  if (!/^[a-f0-9-]{36}$/i.test(authorityId)) throw new Error("Invalid shared review authority");
+  const metadata = readJson(path.join(sharedHome(), "review-authority", `${authorityId}.json`));
+  if (!metadata || stableRoot(metadata.reviewRoot) !== stableRoot(root)) throw new Error("Shared review authority does not match this worktree");
+  safeRepository(metadata.repository);
+  safeId(metadata.projectId, "projectId");
+  safeBranchName(metadata.proposal, "proposal branch");
+  safeBranchName(metadata.defaultBranch, "default branch");
+  safeRevision(metadata.proposalHead, "proposal head");
+  safeRevision(metadata.baseRevision, "review base");
+  return metadata;
+}
+
+function isContextRoomControlPath(filePath) {
+  return filePath === ".context-room" || filePath.startsWith(".context-room/");
+}
+
+function reviewWorkspaceChanges(reviewRoot, baseRevision) {
+  const tracked = gitChangedPaths(reviewRoot, baseRevision);
+  const untracked = splitNull(runGit(reviewRoot, ["ls-files", "--others", "--exclude-standard", "-z", "--"], { encoding: null }));
+  return {
+    files: [...new Set([...tracked, ...untracked])].filter((filePath) => !isContextRoomControlPath(filePath)),
+    untracked: untracked.filter((filePath) => !isContextRoomControlPath(filePath)),
+  };
+}
+
+function assertReviewWorkspaceFiles(reviewRoot, files) {
+  const stableReviewRoot = stableRoot(reviewRoot);
+  for (const filePath of files) {
+    const base = path.posix.basename(filePath);
+    if (!SHARED_REVIEW_TEXT_EXTENSIONS.has(path.posix.extname(base)) && !SHARED_REVIEW_TEXT_FILENAMES.has(base)) {
+      throw new Error(`Shared review file type is not reviewable in Context Room: ${filePath}`);
+    }
+    const absolute = path.join(reviewRoot, ...filePath.split("/"));
+    if (!fs.existsSync(absolute)) continue;
+    const stats = fs.lstatSync(absolute);
+    if (stats.isSymbolicLink() || !stats.isFile()) throw new Error(`Shared reviews reject symlinks and special files: ${filePath}`);
+    const real = fs.realpathSync(absolute);
+    if (real !== stableReviewRoot && !real.startsWith(stableReviewRoot + path.sep)) throw new Error(`Shared review path escapes its worktree: ${filePath}`);
+    const content = fs.readFileSync(absolute);
+    if (content.length > MAX_SHARED_TEXT_BYTES) throw new Error(`Shared review file is too large: ${filePath}`);
+    if (!isUtf8(content) || content.includes(0)) throw new Error(`Shared reviews only support UTF-8 text files: ${filePath}`);
+  }
+}
+
+function addIntentToAdd(root, files) {
+  for (let index = 0; index < files.length; index += 200) {
+    runGit(root, ["add", "-N", "--", ...files.slice(index, index + 200)]);
+  }
+}
+
+export function acceptSharedReview(reviewRoot, { message = "Accept shared context proposal" } = {}) {
+  const resolvedReviewRoot = path.resolve(reviewRoot);
+  const review = readSharedReview(resolvedReviewRoot);
+  if (review.accepted) throw new Error("This exact shared review was already accepted and cannot be reused");
+  const checkout = ensureRepositoryClone(review.repository);
+  runGit(checkout, ["fetch", "--prune", "origin"], { stdio: ["ignore", "ignore", "pipe"] });
+  const reviewHead = safeRevision(tryGit(resolvedReviewRoot, ["rev-parse", "HEAD"]), "review worktree head");
+  if (reviewHead !== review.baseRevision) throw new Error("Review worktree history changed; materialize the proposal again");
+  const configText = runGit(checkout, ["show", `${review.baseRevision}:${SHARED_REPOSITORY_CONFIG}`]);
+  const repositoryConfig = normalizedRepositoryConfig(JSON.parse(configText));
+  const policy = proposalIdentity(repositoryConfig, review.proposal);
+  if (policy.projectId !== review.projectId || policy.scope !== review.scope) throw new Error("Shared review scope metadata is invalid");
+  const currentProposalHead = remoteRevision(checkout, review.proposal);
+  if (currentProposalHead !== review.proposalHead) throw new Error("Proposal changed after review; materialize and review the new exact commit");
+  const proposalFiles = gitChangedPaths(checkout, `${review.baseRevision}...${review.proposalHead}`);
+  assertPathsInProposalScope(proposalFiles, policy);
+  assertReviewableChangedPaths(checkout, review.baseRevision, review.proposalHead, proposalFiles);
+  const currentMain = remoteRevision(checkout, review.defaultBranch);
+  const workspace = reviewWorkspaceChanges(resolvedReviewRoot, review.baseRevision);
+  assertPathsInProposalScope(workspace.files, policy);
+  assertReviewWorkspaceFiles(resolvedReviewRoot, workspace.files);
+  addIntentToAdd(resolvedReviewRoot, workspace.untracked);
+  const acceptedPatch = runGit(resolvedReviewRoot, ["diff", "--binary", "--full-index", review.baseRevision, "--", ...policy.allowedPrefixes], { encoding: null });
+  if (!acceptedPatch.length) return { accepted: false, reason: "No accepted changes remain", proposal: review.proposal };
+  const acceptanceRoot = path.join(repositoryCacheRoot(review.repository), "accept", `${hashKey(review.proposal)}-${Date.now()}`);
+  runGit(checkout, ["worktree", "add", "--detach", acceptanceRoot, currentMain], { stdio: ["ignore", "ignore", "pipe"] });
+  try {
+    const applied = spawnSync("git", ["apply", "--3way", "--whitespace=nowarn", "-"], { cwd: acceptanceRoot, input: acceptedPatch, encoding: "utf8" });
+    if (applied.status !== 0 || tryGit(acceptanceRoot, ["diff", "--name-only", "--diff-filter=U"])) {
+      throw new Error("Accepted result conflicts with the current main branch; review the resolved result again");
+    }
+    runGit(acceptanceRoot, ["add", "-A", "--", ...policy.allowedPrefixes]);
+    try {
+      runGit(acceptanceRoot, ["diff", "--cached", "--quiet"]);
+      return { accepted: false, reason: "Accepted result is already present on main", proposal: review.proposal };
+    } catch {}
+    runGit(acceptanceRoot, ["commit", "-m", String(message || "Accept shared context proposal")], { stdio: ["ignore", "ignore", "pipe"] });
+    const acceptedCommit = safeRevision(tryGit(acceptanceRoot, ["rev-parse", "HEAD"]), "accepted commit");
+    assertSafeTreeEntries(acceptanceRoot, acceptedCommit, policy.allowedPrefixes);
+    assertReviewableChangedPaths(acceptanceRoot, currentMain, acceptedCommit, workspace.files);
+    runGit(acceptanceRoot, ["push", "origin", `HEAD:${review.defaultBranch}`], { stdio: ["ignore", "ignore", "pipe"] });
+    const result = { accepted: true, proposal: review.proposal, proposalHead: review.proposalHead, previousMain: currentMain, commit: acceptedCommit };
+    writeJson(path.join(sharedHome(), "review-authority", `${review.authorityId}.json`), { ...review, accepted: result, acceptedAt: new Date().toISOString() });
+    return result;
+  } finally {
+    try { runGit(checkout, ["worktree", "remove", "--force", acceptanceRoot], { stdio: ["ignore", "ignore", "ignore"] }); } catch {}
+  }
+}

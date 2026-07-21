@@ -12,6 +12,7 @@ Context Room gives a repository a browser UI to map important docs, edit safe te
 - Inspect startup context, startup skills, and hooks that can affect agents.
 - Run local checks with no LLM call.
 - Report watched doc changes before commits without blocking by default.
+- Share accepted documentation and global or project skills across repositories without giving agents a direct edit path to the accepted snapshot.
 
 ## Core Loop
 
@@ -46,10 +47,13 @@ Open the printed `/api/health` URL and confirm that `root` is the intended proje
 ## Main Files
 
 - `.context-room/config.json`: project map, safe edit paths, watched paths, hub cards, startup scanners, templates.
+- `~/.context-room/shared/registry.json`: user-approved bindings from source repositories and subpaths to generic shared-context projects.
 - `~/.context-room/preferences.json`: computer-wide appearance preferences shared by every Context Room.
 - Runtime review state and external baselines live under `.context-room/`.
 - `docs/agent-configuration.md`: full config guide for agents and humans.
 - `schemas/config.schema.json`: JSON Schema for config validation and editor autocomplete.
+- `schemas/shared-repository.schema.json`: JSON Schema for the optional shared repository manifest.
+- `schemas/shared-projects.schema.json`: JSON Schema for its project catalog and cwd mappings.
 
 Runtime files under `.context-room/` are excluded from Git where possible. Commit the config only when the project should share the same Context Room map.
 
@@ -67,6 +71,13 @@ context-room agent open [--root .] [--path docs/INDEX.md] [--view hub|settings|f
 context-room agent annotate --root . --path docs/INDEX.md --note "Human-facing note"
 context-room agent watch --root . --path docs/ [--mode recursive-live|recursive-current|direct-current|direct-live]
 context-room agent unwatch --root . --path docs/
+context-room shared init-repository --root /path/to/shared-context --name "Company Shared Context"
+context-room shared bind --root . --repository <git-url> [--project <project-id>]
+context-room shared setup --root . --repository <git-url> [--project <project-id>]
+context-room shared sync|status|proposals --root .
+context-room shared propose --root . --title "Change" [--scope project|global]
+context-room shared publish --root . --proposal proposal/... [--message "..."]
+context-room shared review --root . --proposal proposal/... [--port 4317]
 context-room install-hooks [--root .]
 context-room update-all [--dry-run] [--no-restart] [--exclude /path]
 ```
@@ -78,6 +89,7 @@ context-room update-all [--dry-run] [--no-restart] [--exclude /path]
 - The Review settings tab stores owner-selected gates outside project config. Local hooks cover commit, push, and local merge; pull requests and hosted merges need a required provider check.
 - `brief` ranks relevant docs locally and deterministically. It does not call an LLM.
 - `agent` commands let an agent open files, inspect the queue, leave annotations for the human, and manage explicit folder watch rules without making review decisions.
+- `shared` commands connect any compatible shared-context Git repository, refresh its accepted default-branch snapshot, manage scoped proposal worktrees, and open the normal review UI against an exact proposal commit. See [Shared context](docs/features/shared-context.md).
 - `update-all` installs the latest npm release globally and restarts every verified active room it discovers except a Context Room development checkout. Before acting, it verifies each room's canonical project root through `/api/health`, so paths containing spaces are not inferred from process command text.
 
 Preview an update without changing installations or processes:
@@ -119,6 +131,7 @@ The reusable HTML examples are available directly at:
   "title": "My Project",
   "projectOnly": true,
   "allowedPaths": ["docs/", "README.md", "AGENTS.md"],
+  "readOnlyPaths": [],
   "watchAllow": ["docs/", "README.md"],
   "watchRules": [],
   "reviewPaths": [],
@@ -156,6 +169,7 @@ The reusable HTML examples are available directly at:
 Rules that matter:
 
 - `allowedPaths` is the edit boundary. Project-relative entries stay in the project; an explicit `~/...` entry authorizes that external home file or folder without making other home paths accessible.
+- `readOnlyPaths` narrows allowed files to display-only access. Shared accepted snapshots are added to both arrays and must be changed through proposal branches.
 - Top-level `projectOnly: true` also requires ordinary allowed, watched, and hub paths to remain physically inside the project after symbolic links are resolved. Fresh setup enables it. Setting it to `false`, or omitting it in a legacy config, can make explicitly configured symlink targets outside the project both readable and editable; retain that compatibility only for trusted, established hubs.
 - `watchAllow` keeps the simple watch list. A folder entry uses the default recursive live behavior: current and future files at any depth can enter review.
 - `watchRules` stores explicit folder modes for recursive versus direct-child scope and live versus current-file snapshots. External rules must already be covered by a narrow `~/...` entry in `allowedPaths` and use Context Room review baselines because project Git does not own them. See [Agent configuration](docs/agent-configuration.md#watchrules).
@@ -169,6 +183,7 @@ Rules that matter:
 - [Product overview](docs/product-overview.md): product map and development source map.
 - [Feature documentation](docs/features/index.md): clear docs for each user-facing feature.
 - [Agent configuration](docs/agent-configuration.md): config fields, metadata, and agent setup.
+- [Shared context](docs/features/shared-context.md): generic shared repositories, proposals, partial acceptance, skills, freshness, and permissions.
 
 ## Development
 

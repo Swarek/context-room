@@ -1,0 +1,25 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/Swarek/context-room/main/schemas/shared-repository.schema.json",
+  "title": "Context Room shared repository",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["version", "name", "defaultBranch", "proposalPrefix", "globalSkillsPath", "projectsPath", "projectsFile"],
+  "properties": {
+    "$schema": { "type": "string" },
+    "version": { "const": 1 },
+    "name": { "type": "string", "minLength": 1 },
+    "defaultBranch": { "type": "string", "minLength": 1 },
+    "proposalPrefix": { "type": "string", "pattern": "/$" },
+    "globalSkillsPath": { "$ref": "#/$defs/relativePath" },
+    "projectsPath": { "$ref": "#/$defs/relativePath" },
+    "projectsFile": { "$ref": "#/$defs/relativePath" }
+  },
+  "$defs": {
+    "relativePath": {
+      "type": "string",
+      "minLength": 1,
+      "not": { "pattern": "(^/|(^|/)\\.\\.?(/|$)|(^|/)\\.git(/|$)|^\\.context-room(/|$)|\\u0000)" }
+    }
+  }
+}

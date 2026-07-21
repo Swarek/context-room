@@ -15,6 +15,16 @@ import {
   insertFileReferenceIntoActiveCodexComposer,
   insertIntoActiveCodexComposer,
 } from "./codex_composer_bridge.mjs";
+import {
+  SHARED_REVIEW_CONFIG,
+  acceptSharedReview,
+  listSharedProposals,
+  materializeSharedReview,
+  readSharedProjectConnection,
+  readSharedReview,
+  sharedContextStatus,
+  syncSharedContext,
+} from "./shared_context.mjs";
 
 export { DOC_METADATA_KINDS, DOC_METADATA_STATUSES, parseDocMetadata } from "./doc_metadata.mjs";
 
@@ -41,6 +51,7 @@ const AGENT_CONTEXT_ASSET_FILENAMES = [
   "html-visual-patterns.md",
   "context-room-visual-components.html",
   "context-room-data-visual-components.html",
+  "features/shared-context.md",
 ];
 export const GLOBAL_PREFERENCES_FILE = "~/.context-room/preferences.json";
 const CONFIG_SCHEMA_URL = "https://raw.githubusercontent.com/Swarek/context-room/main/schemas/config.schema.json";
@@ -209,6 +220,8 @@ const BACKGROUND_REPORT_INVALIDATING_PATHS = new Set([
   "/api/folder/create",
   "/api/markdown/apply-template",
   "/api/files/delete",
+  "/api/shared-context/accept",
+  "/api/shared-context/refresh",
 ]);
 const BACKGROUND_WATCH_IGNORED_PATHS = new Set([
   COLLAB_SESSION_STATE,
@@ -577,6 +590,21 @@ export function isAllowedMemoryPath(relPath, settings = defaultMemoryWebappSetti
   return allowed.some((pattern) => pathMatchesSetting(normalized, pattern) || normalized.startsWith(pattern.replace(/\/$/, "") + "/")) && isEditableTextFile(normalized);
 }
 
+export function isReadOnlyMemoryPath(relPath, settings = defaultMemoryWebappSettings()) {
+  const normalized = normalizeRelPath(String(relPath || ""));
+  if (!normalized) return false;
+  return sanitizePathList(settings.readOnlyPaths || []).some((pattern) => pathMatchesSetting(normalized, pattern));
+}
+
+function pathContainsReadOnlyMemoryPath(relPath, settings = defaultMemoryWebappSettings()) {
+  const normalized = normalizeRelPath(String(relPath || "")).replace(/\/$/, "");
+  if (!normalized) return false;
+  return sanitizePathList(settings.readOnlyPaths || []).some((pattern) => {
+    const readOnly = normalizeRelPath(pattern).replace(/\/$/, "");
+    return readOnly === normalized || readOnly.startsWith(normalized + "/") || normalized.startsWith(readOnly + "/");
+  });
+}
+
 export function resolveMemoryPath(root, relPath) {
   const normalized = normalizeRelPath(relPath);
   const settings = effectiveMemoryWebappSettings(root);
@@ -706,6 +734,7 @@ export function listMemoryFiles(root = process.cwd(), { externalRoots = [] } = {
         updatedAt: stats ? stats.mtime.toISOString() : null,
         kind: fileKindForPath(file.path),
         summary: summarizeContent(content),
+        readOnly: isReadOnlyMemoryPath(file.path, settings),
       };
     })
     .sort((a, b) => categoryRank(a.category) - categoryRank(b.category) || a.path.localeCompare(b.path, "fr"));
@@ -715,7 +744,7 @@ export function listExplorerFiles(root = process.cwd(), { externalRoots = [], sh
   const settings = effectiveMemoryWebappSettings(root);
   const byPath = new Map();
   for (const file of listMemoryFiles(root, { externalRoots })) {
-    byPath.set(file.path, { ...file, readOnly: false, explorerScope: "allowed" });
+    byPath.set(file.path, { ...file, readOnly: isReadOnlyMemoryPath(file.path, settings), explorerScope: "allowed" });
   }
   for (const rel of walkProjectExplorerTextFiles(root, { showHiddenFiles })) {
     if (byPath.has(rel)) continue;
@@ -800,10 +829,12 @@ export function readMemoryFile(root, relPath) {
   if (isCronJobMarkdownPath(relPath)) return readCronJobMarkdownFile(relPath);
   const normalized = normalizeRelPath(relPath);
   if (isSensitiveProjectFile(normalized)) return readSensitiveProjectFile(root, normalized);
-  const allowed = isAllowedMemoryPath(normalized, effectiveMemoryWebappSettings(root));
+  const settings = effectiveMemoryWebappSettings(root);
+  const allowed = isAllowedMemoryPath(normalized, settings);
+  const configuredReadOnly = allowed && isReadOnlyMemoryPath(normalized, settings);
   const abs = allowed ? resolveMemoryPath(root, normalized) : resolveProjectReadableMemoryPath(root, normalized);
   if (!fs.existsSync(abs)) {
-    return { path: normalized, content: "", exists: false, updatedAt: null, chars: 0, contentHash: hashContent(""), readOnly: !allowed };
+    return { path: normalized, content: "", exists: false, updatedAt: null, chars: 0, contentHash: hashContent(""), readOnly: !allowed || configuredReadOnly };
   }
   const stats = fs.statSync(abs);
   if (!stats.isFile()) throw new Error(`Not a file: ${relPath}`);
@@ -816,7 +847,7 @@ export function readMemoryFile(root, relPath) {
     updatedAt: stats.mtime.toISOString(),
     chars: content.length,
     contentHash: hashContent(content),
-    readOnly: !allowed,
+    readOnly: !allowed || configuredReadOnly,
   };
 }
 
@@ -1804,7 +1835,9 @@ export function writeMemoryFile(root, relPath, content) {
     throw new Error("Content is too large for the local context room");
   }
   const normalized = normalizeRelPath(relPath);
-  const projectOnly = !resolveExternalPath(normalized) && effectiveMemoryWebappSettings(root).projectOnly === true;
+  const settings = effectiveMemoryWebappSettings(root);
+  if (isReadOnlyMemoryPath(normalized, settings)) throw new Error(`Path is read-only in context room: ${normalized}`);
+  const projectOnly = !resolveExternalPath(normalized) && settings.projectOnly === true;
   validateEditableContent(normalized, content);
   if (isCronJobVirtualPath(normalized)) return writeCronJobVirtualFile(root, normalized, content);
   if (isCronJobMarkdownPath(normalized)) return writeCronJobMarkdownFile(root, normalized, content);
@@ -1847,6 +1880,7 @@ export function createFolder(root, { path: relPath } = {}) {
   const settings = effectiveMemoryWebappSettings(root);
   const normalized = normalizeRelPath(String(relPath || "")).replace(/\/$/, "");
   if (!normalized) throw new Error("Folder path is required");
+  if (isReadOnlyMemoryPath(normalized, settings)) throw new Error(`Path is read-only in context room: ${normalized}`);
   const alreadyAllowed = isAllowedFolderPath(normalized, settings);
   const abs = alreadyAllowed ? resolveMemoryFolderPath(root, normalized, settings) : resolveCreatableRepoPath(root, normalized);
   const external = resolveExternalPath(normalized);
@@ -2053,6 +2087,7 @@ export function deleteMemoryPaths(root, relPaths = []) {
   const uniquePaths = [...new Set(relPaths.map((item) => normalizeRelPath(String(item || ""))).filter(Boolean))];
   for (const relPath of uniquePaths) {
     const normalized = relPath.replace(/\/$/, "");
+    if (pathContainsReadOnlyMemoryPath(normalized, settings)) throw new Error(`Path is read-only in context room: ${normalized}`);
     if (isCronJobMarkdownPath(normalized)) {
       const result = deleteCronJobMarkdownFile(root, normalized);
       if (result.deleted) deleted.push(normalized);
@@ -2394,8 +2429,10 @@ function buildNewFileDiff(root, normalized, abs) {
 export function revertMemoryFile(root, relPath) {
   const normalized = normalizeRelPath(relPath);
   if (!normalized) throw new Error("Path is required");
+  const settings = effectiveMemoryWebappSettings(root);
+  if (isReadOnlyMemoryPath(normalized, settings)) throw new Error(`Path is read-only in context room: ${normalized}`);
   if (resolveExternalPath(normalized)) {
-    if (!isAllowedMemoryPath(normalized, readMemoryWebappSettings(root))) throw new Error(`Path not allowed in context room: ${relPath}`);
+    if (!isAllowedMemoryPath(normalized, settings)) throw new Error(`Path not allowed in context room: ${relPath}`);
     const review = readReviewBaseFile(root, normalized);
     const abs = resolveMemoryPath(root, normalized);
     if (!review.available || review.changeKind === "unchanged") return { path: normalized, reverted: false, deleted: false, reason: "No Context Room baseline change for this file." };
@@ -2411,7 +2448,7 @@ export function revertMemoryFile(root, relPath) {
     const restored = writeMemoryFile(root, normalized, review.baseContent);
     return { path: normalized, reverted: true, deleted: false, backupPath: restored.backupPath };
   }
-  if (!isAllowedMemoryPath(normalized, readMemoryWebappSettings(root))) throw new Error(`Path not allowed in context room: ${relPath}`);
+  if (!isAllowedMemoryPath(normalized, settings)) throw new Error(`Path not allowed in context room: ${relPath}`);
   const abs = resolveMemoryPath(root, normalized);
   try {
     const statusLine = execFileSync("git", ["status", "--porcelain=v1", "--untracked-files=all", "--", normalized], { cwd: root, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).split("\n").find(Boolean) || "";
@@ -3664,6 +3701,11 @@ export function buildConfigDiagnostics(root = process.cwd(), settings = readMemo
     }
     if (projectPathEscapes(relPath)) issues.push({ path: relPath, type: "allowed_path_symlink_escape", severity: "high", message: `Allowed path escapes the project through a symbolic link while projectOnly is enabled: ${relPath}.` });
     else if (!fs.existsSync(path.join(root, relPath.replace(/\/$/, "")))) issues.push({ type: "allowed_path_missing", severity: "low", message: `Allowed path does not exist: ${relPath}.` });
+  }
+  for (const relPath of settings.readOnlyPaths || []) {
+    const covered = (settings.allowedPaths || []).some((allowed) => pathMatchesSetting(relPath, allowed));
+    if (!covered) issues.push({ type: "read_only_not_allowed", severity: "high", message: `Read-only path is not covered by allowedPaths: ${relPath}.` });
+    if (projectPathEscapes(relPath)) issues.push({ path: relPath, type: "read_only_path_symlink_escape", severity: "high", message: `Read-only path escapes the project through a symbolic link while projectOnly is enabled: ${relPath}.` });
   }
   for (const relPath of settings.watchAllow || []) {
     const covered = (settings.allowedPaths || []).some((allowed) => pathMatchesSetting(relPath, allowed) || pathMatchesSetting(allowed, relPath));
@@ -4938,6 +4980,7 @@ export function createDefaultProjectConfig({ title = "Context Room", allowedPath
     title,
     projectOnly: true,
     allowedPaths: sanitizePathList(allowedPaths),
+    readOnlyPaths: [],
     watchAllow: sanitizePathList(watchAllow),
     watchRules: [],
     reviewPaths: [],
@@ -5073,12 +5116,18 @@ export function initializeContextRoomProject(root = process.cwd(), options = {})
     if (options.title) amended.title = String(title).trim() || existing.title;
     if (options.allowedPaths?.length) amended.allowedPaths = sanitizePathList(allowedPaths);
     if (options.watchAllow?.length) amended.watchAllow = sanitizePathList(watchAllow);
+    if (options.reviewAgentInstructions !== undefined) {
+      amended.reviewAgentInstructions = Boolean(options.reviewAgentInstructions);
+    }
     if (JSON.stringify(amended) !== JSON.stringify(existingRaw)) {
       fs.writeFileSync(configPath, JSON.stringify(amended, null, 2) + "\n", "utf8");
     }
     saved = normalizeMemoryWebappSettings(amended, { ...defaultMemoryWebappSettings(), projectOnly: false });
   } else {
     const defaults = createDefaultProjectConfig({ title, allowedPaths, watchAllow });
+    if (options.reviewAgentInstructions !== undefined) {
+      defaults.reviewAgentInstructions = Boolean(options.reviewAgentInstructions);
+    }
     const inferredHubSections = filterInferredHubSectionsForAllowedPaths(inferred.hubSections, allowedPaths);
     const inferredCards = flattenHubCards(inferredHubSections);
     defaults.hubSections = inferredHubSections;
@@ -5522,6 +5571,7 @@ export function syncContextRoomAgentContext(root = process.cwd()) {
     [path.join(sourceRoot, "features", "html-visual-patterns.md"), AGENT_CONTEXT_ASSET_FILENAMES[2]],
     [path.join(sourceRoot, "context-room-visual-components.html"), AGENT_CONTEXT_ASSET_FILENAMES[3]],
     [path.join(sourceRoot, "context-room-data-visual-components.html"), AGENT_CONTEXT_ASSET_FILENAMES[4]],
+    [path.join(sourceRoot, "features", "shared-context.md"), AGENT_CONTEXT_ASSET_FILENAMES[5]],
   ];
   const missing = assets.filter(([source]) => !fs.existsSync(source)).map(([source]) => source);
   if (missing.length) throw new Error(`Context Room agent context is incomplete: ${missing.join(", ")}`);
@@ -5653,6 +5703,7 @@ This compatibility file is generated by Context Room.
   for (const [target, content] of files) {
     assertManagedProjectPath(projectRoot, target, path.relative(projectRoot, target));
     if (fs.existsSync(target) && fs.readFileSync(target, "utf8") === content) continue;
+    fs.mkdirSync(path.dirname(target), { recursive: true });
     fs.writeFileSync(target, content, "utf8");
     updated += 1;
   }
@@ -6170,10 +6221,12 @@ function normalizeMemoryWebappSettings(raw = {}, base = defaultMemoryWebappSetti
     title: String(raw.title || base.title || "Context Room").trim() || "Context Room",
     projectOnly: Boolean(raw.projectOnly ?? base.projectOnly ?? false),
     allowedPaths: sanitizePathList(raw.allowedPaths ?? base.allowedPaths ?? ALLOWED_PREFIXES),
+    readOnlyPaths: sanitizePathList(raw.readOnlyPaths ?? base.readOnlyPaths ?? []),
     watchAllow: sanitizePathList(raw.watchAllow ?? base.watchAllow),
     watchRules: sanitizeWatchRules(raw.watchRules ?? base.watchRules ?? []),
     reviewPaths: sanitizePathList(raw.reviewPaths ?? base.reviewPaths ?? []),
     reviewAgentInstructions: Boolean(raw.reviewAgentInstructions ?? base.reviewAgentInstructions ?? true),
+    sharedContext: raw.sharedContext && typeof raw.sharedContext === "object" ? { ...raw.sharedContext } : base.sharedContext || null,
     integrations: { hermes: Boolean(raw.integrations?.hermes ?? base.integrations?.hermes ?? false) },
     startupContext: normalizeStartupContextSettings(raw.startupContext ?? base.startupContext),
     startupSkills: normalizeStartupSkillSettings(raw.startupSkills ?? base.startupSkills),
@@ -6918,6 +6971,62 @@ async function readBackgroundReports(root, { force = false } = {}) {
   }
 }
 
+function sharedReviewAllowedPaths(repositoryConfig, projectId) {
+  if (projectId === "global") return [`${repositoryConfig.globalSkillsPath}/`];
+  const projectPrefix = `${repositoryConfig.projectsPath}/${projectId}`;
+  return [`${projectPrefix}/docs/`, `${projectPrefix}/skills/`];
+}
+
+function sharedContextUiState(root) {
+  const reviewPath = path.join(path.resolve(root), SHARED_REVIEW_CONFIG);
+  if (fs.existsSync(reviewPath)) {
+    const review = readSharedReview(root);
+    return {
+      enabled: true,
+      mode: "review",
+      review,
+      accepted: review.accepted || null,
+    };
+  }
+  const connection = readSharedProjectConnection(root);
+  if (!connection) return { enabled: false, mode: "local" };
+  const status = sharedContextStatus(root);
+  try {
+    return {
+      enabled: true,
+      mode: "project",
+      status,
+      proposals: listSharedProposals(root),
+    };
+  } catch (error) {
+    return {
+      enabled: true,
+      mode: "project",
+      status: sharedContextStatus(root),
+      proposals: [],
+      proposalError: error.message,
+    };
+  }
+}
+
+function sharedRequestError(message, statusCode = 400, code = "shared_context_request_failed") {
+  const error = new Error(message);
+  error.statusCode = statusCode;
+  error.code = code;
+  return error;
+}
+
+async function listenContextRoomServer(server, port) {
+  await new Promise((resolve, reject) => {
+    const onError = (error) => reject(error);
+    server.once("error", onError);
+    server.listen(port, "127.0.0.1", () => {
+      server.off("error", onError);
+      resolve();
+    });
+  });
+}
+
 export function createMemoryServer({
   root = process.cwd(),
   port = DEFAULT_PORT,
@@ -6926,6 +7035,7 @@ export function createMemoryServer({
   codexReferenceInsert = insertFileReferenceIntoActiveCodexComposer,
 } = {}) {
   const projectId = contextRoomProjectId(root);
+  const sharedReviewServers = new Set();
   ensureBackgroundWorker(root, "files");
   void readBackgroundReports(root).catch(() => {});
   const lastSelectedPath = normalizeRelPath(readCollaborationSessionState(root).selectedPath || "");
@@ -6955,14 +7065,45 @@ export function createMemoryServer({
       return;
     }
     try {
-      await routeRequest(req, res, root, globalPreferencesPath, { codexComposerInsert, codexReferenceInsert });
+      await routeRequest(req, res, root, globalPreferencesPath, {
+        codexComposerInsert,
+        codexReferenceInsert,
+        startSharedReview: async (proposal) => {
+          if (fs.existsSync(path.join(path.resolve(root), SHARED_REVIEW_CONFIG))) {
+            throw sharedRequestError("This Context Room already represents an exact proposal review", 409, "shared_context_review_already_open");
+          }
+          const result = materializeSharedReview(root, { proposal });
+          const allowedPaths = sharedReviewAllowedPaths(result.repositoryConfig, result.metadata.projectId);
+          initializeContextRoomProject(result.reviewRoot, {
+            title: `Review · ${proposal}`,
+            allowedPaths,
+            watchAllow: allowedPaths,
+            reviewAgentInstructions: false,
+          });
+          const reviewPort = await selectAvailableContextRoomPort(DEFAULT_PORT, { allowFallback: true });
+          const reviewRoom = createMemoryServer({ root: result.reviewRoot, port: reviewPort, globalPreferencesPath });
+          await listenContextRoomServer(reviewRoom.server, reviewPort);
+          sharedReviewServers.add(reviewRoom.server);
+          reviewRoom.server.once("close", () => sharedReviewServers.delete(reviewRoom.server));
+          return {
+            ...result,
+            port: reviewPort,
+            url: `http://127.0.0.1:${reviewPort}`,
+          };
+        },
+      });
     } catch (error) {
-      sendJson(res, Number(error.statusCode) || 500, { error: error.message });
+      sendJson(res, Number(error.statusCode) || 500, {
+        error: error.message,
+        ...(error.code ? { code: error.code } : {}),
+      });
     } finally {
       if (requestInvalidatesBackgroundCaches(req)) invalidateBackgroundCaches(root, { explicit: true });
     }
   });
   server.once("close", () => {
+    for (const reviewServer of sharedReviewServers) reviewServer.close();
+    sharedReviewServers.clear();
     stopBackgroundWatch();
     closeBackgroundWorkers(root);
     clearBackgroundCacheState(root);
@@ -6973,11 +7114,59 @@ export function createMemoryServer({
 async function routeRequest(req, res, root, globalPreferencesPath = null, {
   codexComposerInsert = insertIntoActiveCodexComposer,
   codexReferenceInsert = insertFileReferenceIntoActiveCodexComposer,
+  startSharedReview = null,
 } = {}) {
   const url = new URL(req.url, `http://${req.headers.host || "localhost"}`);
 
   if (req.method === "GET" && url.pathname === "/") {
     sendHtml(res, renderAppHtml());
+    return;
+  }
+  if (req.method === "GET" && url.pathname === "/api/shared-context") {
+    sendJson(res, 200, sharedContextUiState(root));
+    return;
+  }
+  if (req.method === "POST" && url.pathname === "/api/shared-context/refresh") {
+    if (!readSharedProjectConnection(root)) throw sharedRequestError("This project is not connected to shared context", 404, "shared_context_not_connected");
+    syncSharedContext(root, { allowOffline: true });
+    sendJson(res, 200, sharedContextUiState(root));
+    return;
+  }
+  if (req.method === "POST" && url.pathname === "/api/shared-context/review") {
+    const body = await readJsonBody(req);
+    const proposal = String(body.proposal || "").trim();
+    if (!proposal) throw sharedRequestError("proposal is required", 400, "shared_context_proposal_required");
+    if (!startSharedReview) throw sharedRequestError("Shared proposal review is unavailable", 503, "shared_context_review_unavailable");
+    const result = await startSharedReview(proposal);
+    sendJson(res, 201, {
+      url: result.url,
+      port: result.port,
+      reviewRoot: result.reviewRoot,
+      review: result.metadata,
+    });
+    return;
+  }
+  if (req.method === "POST" && url.pathname === "/api/shared-context/accept") {
+    const body = await readJsonBody(req);
+    const review = readSharedReview(root);
+    const expectedProposalHead = String(body.expectedProposalHead || "").trim();
+    if (!expectedProposalHead) {
+      throw sharedRequestError("expectedProposalHead is required", 400, "shared_context_proposal_head_required");
+    }
+    if (expectedProposalHead !== review.proposalHead) {
+      throw sharedRequestError("The reviewed proposal commit does not match this acceptance request", 409, "shared_context_proposal_head_mismatch");
+    }
+    const report = buildDocQaReport(root);
+    if (report.queue.length) {
+      throw sharedRequestError(`Human review is incomplete: ${report.queue.length} file(s) remain in the review queue`, 409, "shared_context_review_incomplete");
+    }
+    let result;
+    try {
+      result = acceptSharedReview(root, { message: body.message });
+    } catch (error) {
+      throw sharedRequestError(error.message, 409, "shared_context_acceptance_stale");
+    }
+    sendJson(res, 200, result);
     return;
   }
   if (req.method === "GET" && url.pathname === "/api/files") {
@@ -8801,6 +8990,8 @@ export function renderAppHtml() {
       .workspace-dock #back.dock-button, .workspace-dock #forward.dock-button { padding: 0; }
       .workspace-dock .dock-button.diff-dock-button { padding: 0 11px; }
       .workspace-dock .dock-status { display: none; }
+      .shared-context-label, .workspace-title { display: none; }
+      .shared-context-select { width: 220px; }
       aside { position: fixed; left: 0; right: 0; bottom: 0; top: auto; width: 100%; height: auto; max-height: 0; min-height: 0; margin: 0; padding: 0; border: 0; border-radius: 22px 22px 0 0; background: rgba(6,10,22,0.985); backdrop-filter: none; box-shadow: 0 -20px 70px rgba(0,0,0,0.55); overflow: auto; overscroll-behavior: contain; transition: transform 280ms cubic-bezier(.2,.9,.2,1), max-height 280ms ease, padding 280ms ease; transform: translateY(100%); pointer-events: none; }
       .app.explorer-expanded aside { height: min(66dvh, 560px) !important; max-height: min(66dvh, 560px) !important; padding: 0 var(--space-3) var(--space-4) !important; border-top: 1px solid var(--line) !important; transform: translateY(0) !important; pointer-events: auto !important; }
       .app.sidebar-collapsed aside { height: auto; max-height: 0; padding: 0; border: 0; transform: translateY(100%); pointer-events: none; }
@@ -8913,6 +9104,12 @@ export function renderAppHtml() {
       background: var(--accent); color: var(--on-accent); box-shadow: none;
     }
     .dock-button.diff-dock-button.active, .mode-toggle button.active { background: var(--accent); color: var(--on-accent); }
+    .shared-context-controls { display: inline-flex; align-items: center; gap: 6px; min-width: 0; margin-left: auto; }
+    .shared-context-controls[hidden] { display: none !important; }
+    .shared-context-label { max-width: 220px; color: var(--muted); font: 10px/1.2 ui-monospace, SFMono-Regular, Menlo, monospace; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .shared-context-select { width: min(320px, 30vw); min-height: 32px; padding: 5px 28px 5px 8px; border: 1px solid var(--line); border-radius: 8px; background: var(--panel-strong); color: var(--text); font: 11px/1.2 ui-monospace, SFMono-Regular, Menlo, monospace; }
+    .shared-context-controls .dock-button { min-height: 32px; padding: 0 9px; }
+    .shared-context-controls:not([hidden]) + .workspace-title { margin-left: 0; }
     .workspace-title { min-width: 0; margin-left: auto; padding: 0 8px; color: var(--muted); font: 11px/1.2 ui-monospace, SFMono-Regular, Menlo, monospace; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
     .topbar { border-radius: 8px; box-shadow: none; backdrop-filter: none; }
     .editor-shell { border: 0; border-radius: 0; background: transparent; box-shadow: none; backdrop-filter: none; }
@@ -9076,6 +9273,13 @@ export function renderAppHtml() {
         <button id="verifyCurrent" class="dock-button" type="button" hidden>Verified</button>
         <button id="deleteCurrent" class="dock-button danger-action" type="button" hidden>Delete</button>
         <button id="save" class="dock-button primary" hidden disabled>Save</button>
+        <div id="sharedContextControls" class="shared-context-controls" hidden>
+          <span id="sharedContextLabel" class="shared-context-label"></span>
+          <select id="sharedProposalSelect" class="shared-context-select" aria-label="Shared context proposal"></select>
+          <button id="sharedContextRefresh" class="dock-button" type="button" title="Refresh shared main and proposals">Refresh</button>
+          <button id="sharedProposalReview" class="dock-button" type="button">Review</button>
+          <button id="sharedProposalAccept" class="dock-button primary" type="button" hidden>Accept into main</button>
+        </div>
         <div id="workspaceTitle" class="workspace-title">Context Room</div>
         <div id="status" class="dock-status" aria-live="polite">Ready</div>
       </div>
@@ -9149,6 +9353,8 @@ export function renderAppHtml() {
   </button>
 	<script>
 		const state = { root: null, projectId: null, projectReloading: false, files: [], directories: [], startupContextFiles: [], startupSkillFolders: [], startupHookFiles: [], startupHooksHelpOpen: false, startupHookFilter: "all", hubDisclosuresOpen: new Set(), activeStartupSkillExplorer: null, activeStartupContextExplorer: null, startupSkillCreateFolder: null, startupContextContextTarget: null, selectedStartupContext: null, docqa: null, doctor: null, backgroundReportRenderKey: "", contextHealthStatusFilter: "open", contextHealthSeverityFilter: "triggered", contextHealthCategoryFilter: "all", contextHealthRefreshing: false, contextHealthCodexSending: false, settings: null, settingsOpen: false, settingsSection: "review", page: "hub", pendingMarkdown: null, availableHubCards: [], hubFolders: [], hubSections: [], rootHubSections: [], activeHubCardId: null, selectedReview: null, deletionBatchExpanded: false, deletionBatchLoading: false, deletionBatchItems: [], deletionBatchKey: "", deletionBatchReportedCount: 0, deletionBatchError: "", selectedDeletionReviews: new Set(), reviewModePath: null, reviewModeStatus: null, reviewSessions: {}, reviewFinalizationPromise: null, selected: null, selectedReadOnly: false, selectedDiff: null, fileLoadError: null, fileConflict: null, externalChange: null, conflictCompare: false, conflictMergeText: null, conflictMergeKey: "", conflictMergeMode: "auto", diffCollapsed: false, saved: "", savedHash: null, dirty: false, mode: "view", homeView: "root", planetStack: ["root"], filePanel: false, history: [], historyIndex: -1, pathFilters: [], explorerWatchFilter: "all", explorerRenderKey: "", explorerSearchFrame: 0, selectedForDelete: new Set(), selectionRequest: 0, openingFilePath: null, fileContentReadyPath: null, mobileSidebarTouched: false, sessionStateTimer: null, agentCommandTimer: null, lastAgentCommandId: "", pendingAgentCommand: null, agentAnnotations: {}, userActiveAt: 0, userScrollIntentAt: 0, refreshInFlight: false, reportsRefreshInFlight: false, backgroundRefreshTimer: null, filePrefetches: new Map(), prefetchTimer: null, prefetchPath: "", lastDiffRefreshAt: 0, lastReportRefreshAt: 0, lastFullRefreshAt: 0, navigationRestoreAttempted: false, bootStartedAt: Date.now(), bootMilestones: {}, markdownHighlightFrame: 0, markdownHighlightText: "", markdownHighlightLastText: "", docLinkModifierActive: false, expanded: new Set(["data", "automations", "integrations", "skills", "tools", "~", "~/.hermes", "~/.hermes/memories", "~/.hermes/skills"]) };
+		state.sharedContext = null;
+		state.sharedContextBusy = false;
 	const VERIFY_CONFIRM_STORAGE_KEY = "context-room:skip-mark-verified-confirm";
 const NAVIGATION_STATE_STORAGE_PREFIX = "context-room:navigation:";
 const AGENT_COMMAND_ACK_STORAGE_PREFIX = "context-room:last-agent-command-id:";
@@ -9224,6 +9430,124 @@ async function api(path, options) {
     }
   }
   throw lastError || new Error("request failed");
+}
+
+function shortSharedHash(value) {
+  return String(value || "").slice(0, 12);
+}
+
+function renderSharedContextControls() {
+  const controls = el("sharedContextControls");
+  const label = el("sharedContextLabel");
+  const select = el("sharedProposalSelect");
+  const refresh = el("sharedContextRefresh");
+  const reviewButton = el("sharedProposalReview");
+  const acceptButton = el("sharedProposalAccept");
+  if (!controls || !label || !select || !refresh || !reviewButton || !acceptButton) return;
+  const shared = state.sharedContext;
+  controls.hidden = !shared?.enabled;
+  if (!shared?.enabled) return;
+  if (shared.mode === "review") {
+    const review = shared.review || {};
+    const queueCount = state.docqa?.queue?.length || 0;
+    label.textContent = "Review " + (review.proposal || "proposal") + " @" + shortSharedHash(review.proposalHead);
+    label.title = (review.proposal || "") + "\nExact reviewed commit: " + (review.proposalHead || "");
+    select.hidden = true;
+    refresh.hidden = true;
+    reviewButton.hidden = true;
+    acceptButton.hidden = false;
+    acceptButton.textContent = shared.accepted?.accepted ? "Accepted" : state.sharedContextBusy ? "Accepting..." : "Accept into main";
+    acceptButton.disabled = Boolean(state.sharedContextBusy || shared.accepted || state.dirty || queueCount);
+    acceptButton.title = shared.accepted
+      ? "Accepted as " + shortSharedHash(shared.accepted.commit)
+      : state.dirty
+        ? "Save or discard the current editor changes first"
+        : queueCount
+          ? queueCount + " file(s) still need human review"
+          : "Apply only the accepted review result onto the latest main commit";
+    return;
+  }
+  const proposals = Array.isArray(shared.proposals) ? shared.proposals : [];
+  const previous = select.value;
+  select.hidden = false;
+  refresh.hidden = false;
+  reviewButton.hidden = false;
+  acceptButton.hidden = true;
+  const online = shared.status?.online !== false;
+  label.textContent = "Shared " + (online ? "@" + shortSharedHash(shared.status?.revision) : "offline @" + shortSharedHash(shared.status?.revision));
+  label.title = shared.proposalError || shared.status?.fetchError || "Accepted shared main snapshot";
+  select.innerHTML = proposals.length
+    ? proposals.map((item) => '<option value="' + escapeHtml(item.branch) + '">' + escapeHtml(item.branch + " @" + shortSharedHash(item.head)) + '</option>').join("")
+    : '<option value="">No proposals</option>';
+  if (proposals.some((item) => item.branch === previous)) select.value = previous;
+  reviewButton.disabled = Boolean(state.sharedContextBusy || !select.value);
+  refresh.disabled = Boolean(state.sharedContextBusy);
+  reviewButton.textContent = state.sharedContextBusy ? "Opening..." : "Review";
+}
+
+async function refreshSharedContextUi() {
+  if (state.sharedContextBusy) return;
+  state.sharedContextBusy = true;
+  renderSharedContextControls();
+  setStatus("refreshing shared context...");
+  try {
+    state.sharedContext = await api("/api/shared-context/refresh", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: "{}",
+    });
+    renderSharedContextControls();
+    await loadFiles();
+    setStatus(state.sharedContext?.status?.online === false ? "shared context offline · cached snapshot" : "shared context refreshed");
+  } finally {
+    state.sharedContextBusy = false;
+    renderSharedContextControls();
+  }
+}
+
+async function openSelectedSharedProposal() {
+  const proposal = el("sharedProposalSelect")?.value || "";
+  if (!proposal || state.sharedContextBusy) return;
+  if (state.dirty) throw new Error("Save or discard the current editor changes before opening a proposal review");
+  state.sharedContextBusy = true;
+  renderSharedContextControls();
+  setStatus("materializing exact proposal review...");
+  try {
+    const result = await api("/api/shared-context/review", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ proposal }),
+    });
+    window.location.assign(result.url);
+  } finally {
+    state.sharedContextBusy = false;
+    renderSharedContextControls();
+  }
+}
+
+async function acceptCurrentSharedProposal() {
+  const review = state.sharedContext?.review;
+  const queueCount = state.docqa?.queue?.length || 0;
+  if (!review || state.sharedContextBusy) return;
+  if (state.dirty) throw new Error("Save or discard the current editor changes before acceptance");
+  if (queueCount) throw new Error(queueCount + " file(s) still need human review");
+  const confirmed = confirm("Accept the reviewed result into " + review.defaultBranch + "?\n\nProposal: " + review.proposal + "\nExact commit: " + review.proposalHead + "\n\nOnly the changes still present in this review workspace will be applied onto the latest main.");
+  if (!confirmed) return;
+  state.sharedContextBusy = true;
+  renderSharedContextControls();
+  setStatus("applying accepted result to latest main...");
+  try {
+    const result = await api("/api/shared-context/accept", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ expectedProposalHead: review.proposalHead }),
+    });
+    state.sharedContext = { ...state.sharedContext, accepted: result };
+    setStatus(result.accepted ? "accepted into main @" + shortSharedHash(result.commit) : result.reason || "nothing to accept");
+  } finally {
+    state.sharedContextBusy = false;
+    renderSharedContextControls();
+  }
 }
 
 function handleContextRoomProjectChange() {
@@ -10711,6 +11035,7 @@ function applyBackgroundReportPayload(reports = {}) {
 
 function renderAfterBackgroundReportPayload() {
   renderFiles();
+  renderSharedContextControls();
   if (state.page === "file" && state.selected && !state.openingFilePath) {
     const viewState = captureEditorViewState();
     renderViewer();
@@ -10752,12 +11077,16 @@ async function loadFiles(options = {}) {
   setStatus("chargement...");
   if (options.initial) state.bootMilestones.requestsStarted = Date.now() - state.bootStartedAt;
   const reportsRequest = options.initial ? api("/api/reports") : null;
+  const sharedRequest = options.initial ? api("/api/shared-context") : null;
   const [data, settingsData] = await Promise.all([api(filesApiPath()), api("/api/settings")]);
+  const sharedData = sharedRequest ? await sharedRequest : null;
   if (options.initial) state.bootMilestones.coreDataReady = Date.now() - state.bootStartedAt;
   acceptContextRoomRoot(data.root);
   state.files = data.files;
   state.directories = data.directories || [];
+  if (sharedData) state.sharedContext = sharedData;
   applySettingsPayload(settingsData);
+  renderSharedContextControls();
   state.lastFullRefreshAt = Date.now();
   const clearedMissingSelection = reconcileMissingSelectedFile();
   renderFiles();
@@ -11411,6 +11740,7 @@ function showHome() {
 function renderDocQaDashboard() {
   const report = state.docqa;
   if (!report) return;
+  renderSharedContextControls();
   const s = report.summary;
   el("reviewSummary").innerHTML = renderReviewSummary(s);
   const queue = report.queue.length ? report.queue : [];
@@ -17399,6 +17729,10 @@ el("explorerOpen")?.addEventListener("click", () => {
 el("refreshDocQa")?.addEventListener("click", () => loadFiles({ waitForBackground: true }).catch((error) => setStatus(error.message)));
 el("refreshContextHealth")?.addEventListener("click", () => refreshContextHealthAnalysis().catch((error) => setStatus(error.message)));
 el("sendContextHealthToCodex")?.addEventListener("click", () => sendContextHealthIssuesToCodex().catch((error) => setStatus(error.message)));
+el("sharedContextRefresh")?.addEventListener("click", () => refreshSharedContextUi().catch((error) => setStatus(error.message)));
+el("sharedProposalReview")?.addEventListener("click", () => openSelectedSharedProposal().catch((error) => setStatus(error.message)));
+el("sharedProposalAccept")?.addEventListener("click", () => acceptCurrentSharedProposal().catch((error) => setStatus(error.message)));
+el("sharedProposalSelect")?.addEventListener("change", renderSharedContextControls);
 document.querySelectorAll("[data-home-action]").forEach((button) => button.addEventListener("click", () => homeAction(button.dataset.homeAction)));
 document.querySelectorAll("[data-home-file]").forEach((button) => button.addEventListener("click", () => selectFile(button.dataset.homeFile).catch((error) => setStatus(error.message))));
 el("back").addEventListener("click", () => goHistory(-1).catch((error) => setStatus(error.message)));

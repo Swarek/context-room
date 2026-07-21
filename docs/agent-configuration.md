@@ -4,8 +4,8 @@ context_room:
   scope: context-room
   status: current
   canonical_for: agent configuration
-  last_verified: 2026-07-20
-  sources: [bin/context-room.mjs, src/context_room.mjs, schemas/config.schema.json]
+  last_verified: 2026-07-21
+  sources: [bin/context-room.mjs, src/context_room.mjs, src/shared_context.mjs, schemas/config.schema.json]
 ---
 
 # Agent configuration guide
@@ -70,7 +70,8 @@ Use this checklist to make the intended setup clear before checking field detail
 
 Check intent:
 
-- `allowedPaths` exposes only safe editable text. A `~/...` entry is an explicit external authorization, so keep it as narrow as a project-relative entry.
+- `allowedPaths` exposes only safe text. A `~/...` entry is an explicit external authorization, so keep it as narrow as a project-relative entry.
+- `readOnlyPaths` contains the allowed paths that Context Room may display but must not create, edit, or delete. It does not widen `allowedPaths`.
 - Top-level `projectOnly` controls physical containment for ordinary project paths. Fresh setup writes `true`. Setting it to `false`, or omitting it in a legacy config, can make configured symlink targets outside the project readable and editable; retain that compatibility only for trusted, established hubs.
 - `watchAllow` contains simple file watches and legacy/default recursive live folder watches.
 - `watchRules` contains folder watches that need an explicit recursive/direct and live/current-files mode.
@@ -91,7 +92,7 @@ If those boundaries are right, the exact JSON shape is a mechanical concern.
 
 Safety boundary.
 
-Context Room only reads and writes editable text files inside these files or folders. Project-relative entries stay inside the room's normal project boundary. An entry beginning with `~/` explicitly authorizes that home file or folder even though Git in the project does not own it. Keep both forms narrow and documentation-focused.
+Context Room only exposes supported text files inside these files or folders. It may write them unless they also match `readOnlyPaths`. Project-relative entries stay inside the room's normal project boundary. An entry beginning with `~/` explicitly authorizes that home file or folder even though Git in the project does not own it. Keep both forms narrow and documentation-focused.
 
 Set top-level `projectOnly: true` to require every ordinary allowed, watched, and hub path to remain physically inside the project root after symbolic links are resolved. Fresh setup writes this flag. Setting it to `false`, or omitting it in an existing configuration, preserves established symlink documentation hubs but can make their configured targets outside the project both readable and editable. Use that mode only for trusted, established hubs. This flag does not govern explicit `~/...` integrations.
 
@@ -104,6 +105,21 @@ Good examples:
 ```
 
 Do not use `~/` as a broad filesystem browser. Avoid secrets, dependency folders, build outputs, generated files, private exports, and binary assets. External entries remain subject to the same supported-text and blocked-path checks as project entries.
+
+### `readOnlyPaths`
+
+Display-only boundary.
+
+Every entry uses the same project-relative or explicit `~/...` path syntax as `allowedPaths`. A matching file can appear in the hub, explorer, and reader, but the server rejects create, edit, and delete operations. Add the path to `allowedPaths` as well; `readOnlyPaths` never grants access by itself.
+
+Shared-context sync adds the accepted project docs, project skills, and global skills to both arrays. Those entries point through `~/.context-room/shared/` to an accepted immutable Git snapshot. Change them through the shared proposal workflow, not by removing their read-only protection.
+
+```json
+{
+  "allowedPaths": ["docs/", "imported-reference/"],
+  "readOnlyPaths": ["imported-reference/"]
+}
+```
 
 ### `watchAllow`
 
@@ -241,6 +257,22 @@ Hook cards include a readable name, provider/source, a short description extract
 
 Hooks are read-only by default because they execute code. Enable `startupHooks.editable` only when the project owner intentionally wants Context Room to edit hook files.
 
+### `sharedContext`
+
+Generated connection summary.
+
+`context-room shared setup` writes the active repository URL and project ID here after it adds the accepted shared paths and hub section. This field is only a display summary; it does not authorize fetching a remote. The approved connection, source-repository mapping, accepted snapshots, and skill-link registry live under `~/.context-room/shared/`. Use the shared CLI instead of editing this summary directly.
+
+```json
+"sharedContext": {
+  "enabled": true,
+  "repository": "git@github.com:example/company-shared-context.git",
+  "projectId": "my-project"
+}
+```
+
+See [Shared context](features/shared-context.md) for repository setup, refresh, proposals, exact-hash review, partial acceptance, skills, and the required Git-host permission boundary.
+
 ## Documentation metadata
 
 Structured Markdown docs should include frontmatter:
@@ -279,16 +311,17 @@ Keep metadata small. The goal is not bureaucracy; it lets Context Room find stal
 1. Treat `.context-room/config.json` as the source of truth for Context Room setup.
 2. Start with `context-room setup`; edit the JSON directly only when the inferred project map needs deliberate curation.
 3. Keep `allowedPaths` conservative: documentation, skills, runbooks, agent instructions, and safe text files.
-4. Put the truly important docs in `watchAllow` or an explicit `watchRules` mode, not every file in the repo. Use `context-room agent watch` to create folder snapshots.
-5. Use stable lowercase IDs with dashes, for example `agent-context`, `architecture`, `release-runbooks`.
-6. Preserve the `$schema` field so editors and agents can validate the file shape.
-7. After editing config, run:
+4. Treat `readOnlyPaths` as context, not an edit surface. For shared accepted paths, create a shared proposal instead of removing the boundary.
+5. Put the truly important docs in `watchAllow` or an explicit `watchRules` mode, not every file in the repo. Use `context-room agent watch` to create folder snapshots.
+6. Use stable lowercase IDs with dashes, for example `agent-context`, `architecture`, `release-runbooks`.
+7. Preserve the `$schema` field so editors and agents can validate the file shape.
+8. After editing config, run:
 
 ```bash
 context-room doctor
 ```
 
-8. For stronger validation, run:
+9. For stronger validation, run:
 
 ```bash
 context-room doctor --strict
@@ -297,13 +330,13 @@ context-room guard --profile strict
 
 Use strict mode only when the project is ready to enforce metadata and graph health.
 
-9. To generate a local no-LLM context brief for a task, run:
+10. To generate a local no-LLM context brief for a task, run:
 
 ```bash
 context-room brief --task "change billing onboarding"
 ```
 
-10. If available, start the UI and smoke-test the hub and review queue:
+11. If available, start the UI and smoke-test the hub and review queue:
 
 ```bash
 context-room start --root .
@@ -311,7 +344,7 @@ context-room start --root .
 
 Without `--port`, Context Room selects a free port and prints the URL. Do not stop or reuse an unrelated room to obtain a preferred port.
 
-11. To install or refresh the local Git hooks selected by the owner review gate, run:
+12. To install or refresh the local Git hooks selected by the owner review gate, run:
 
 ```bash
 context-room install-hooks

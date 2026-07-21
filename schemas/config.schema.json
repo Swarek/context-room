@@ -26,6 +26,13 @@
       "uniqueItems": true,
       "default": ["docs/", "context/", "skills/", "README.md", "AGENTS.md"]
     },
+    "readOnlyPaths": {
+      "type": "array",
+      "description": "Allowed project-relative or explicit ~/... paths that Context Room may display but must never create, edit, or delete. Shared accepted snapshots should be exposed here.",
+      "items": { "$ref": "#/$defs/allowedPath" },
+      "uniqueItems": true,
+      "default": []
+    },
     "watchAllow": {
       "type": "array",
       "description": "Simple files or folders to monitor for the review queue. Folder entries use recursive-live behavior: current and future files at any depth can appear for verification.",
@@ -50,6 +57,16 @@
       "type": "boolean",
       "description": "Whether project AGENTS.md files are implicit required-review paths. Disable this only for a room whose human review scope is intentionally narrower.",
       "default": true
+    },
+    "sharedContext": {
+      "type": ["object", "null"],
+      "description": "Generated shared-context connection summary. Use `context-room shared setup` instead of editing this object directly.",
+      "additionalProperties": true,
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "repository": { "type": "string" },
+        "projectId": { "type": "string", "pattern": "^[a-z0-9][a-z0-9-]{0,62}$" }
+      }
     },
     "markdownTemplates": {
       "type": "array",
