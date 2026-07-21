@@ -175,6 +175,15 @@ function safeRevision(value, label = "revision") {
   return revision;
 }
 
+function safeSessionId(value, { optional = true } = {}) {
+  const sessionId = String(value || "").trim();
+  if (!sessionId && optional) return "";
+  if (!/^[a-zA-Z0-9][a-zA-Z0-9._-]{0,127}$/.test(sessionId)) {
+    throw new Error("session must use letters, numbers, dots, underscores, or hyphens");
+  }
+  return sessionId;
+}
+
 function pathsOverlap(left, right) {
   return left === right || left.startsWith(right + "/") || right.startsWith(left + "/");
 }
@@ -1089,7 +1098,7 @@ function proposalRegistryPath(repository) {
   return path.join(repositoryCacheRoot(repository), "proposals.json");
 }
 
-export function createSharedProposal(root, { title, scope = "project", branch = "" } = {}) {
+export function createSharedProposal(root, { title, scope = "project", branch = "", sessionId = process.env.CODEX_THREAD_ID || "" } = {}) {
   const synced = syncSharedContext(root, { allowOffline: false });
   const { connection, repositoryConfig, revision } = synced;
   const proposal = proposalBranch(repositoryConfig, connection.projectId, title, scope, branch);
@@ -1112,6 +1121,7 @@ export function createSharedProposal(root, { title, scope = "project", branch = 
     sourceRemote: source?.remotes?.[0] || "",
     sourceBranch,
     sourceCommit: /^(?:[a-f0-9]{40}|[a-f0-9]{64})$/i.test(sourceCommit) ? sourceCommit : "",
+    sessionId: safeSessionId(sessionId),
     createdAt: new Date().toISOString(),
   };
   writeJson(proposalRegistryPath(connection.repository), registry);
@@ -1125,6 +1135,7 @@ function proposalCommitMessage(entry, message) {
     entry.sourceRemote ? `Context-Room-Source-Remote: ${entry.sourceRemote}` : "",
     entry.sourceBranch ? `Context-Room-Source-Branch: ${entry.sourceBranch}` : "",
     entry.sourceCommit ? `Context-Room-Source-Commit: ${entry.sourceCommit}` : "",
+    entry.sessionId ? `Context-Room-Session: ${entry.sessionId}` : "",
   ].filter(Boolean);
   return `${String(message || entry.title || "Propose shared context changes").trim()}\n\n${trailers.join("\n")}`;
 }
@@ -1181,7 +1192,17 @@ function listRemoteSharedProposals(synced, { allProjects = true } = {}) {
     const [branch, head, updatedAt, authorName, authorEmail, title] = line.split("\t");
     try {
       const identity = proposalIdentity(synced.repositoryConfig, branch);
-      return [{ ...identity, head: safeRevision(head, "proposal head"), updatedAt, author: { name: authorName, email: authorEmail }, title }];
+      const proposalHead = safeRevision(head, "proposal head");
+      let sessionId = "";
+      try {
+        sessionId = safeSessionId(tryGit(checkout, [
+          "log",
+          "-1",
+          "--format=%(trailers:key=Context-Room-Session,valueonly)",
+          proposalHead,
+        ]));
+      } catch {}
+      return [{ ...identity, head: proposalHead, updatedAt, author: { name: authorName, email: authorEmail }, title, sessionId }];
     } catch {
       return [];
     }
@@ -1219,6 +1240,7 @@ export function materializeSharedReview(root, { proposal } = {}) {
       proposalFiles: changedFiles,
       proposal: match.branch,
       proposalHead: match.head,
+      sessionId: match.sessionId,
       baseRevision: synced.revision,
       defaultBranch: synced.repositoryConfig.defaultBranch,
       createdAt: new Date().toISOString(),

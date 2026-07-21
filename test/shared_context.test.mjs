@@ -34,6 +34,10 @@ import {
 test("shared proposal selector and exact-hash pull-request delivery are present in the UI", () => {
   const html = renderAppHtml();
   assert.match(html, /id="sharedProposalSelect"/);
+  assert.match(html, /id="sharedProposalBrowser"/);
+  assert.match(html, /id="sharedProposalWorkspace"/);
+  assert.match(html, /id="sharedProposalSearch"/);
+  assert.match(html, /\/?embedded=1/);
   assert.match(html, /id="sharedProposalReview"/);
   assert.match(html, /id="sharedProposalAccept"/);
   assert.match(html, /expectedProposalHead: review\.proposalHead/);
@@ -262,14 +266,20 @@ test("proposal branches stay scoped and partial acceptance becomes a PR branch o
   const proposal = createSharedProposal(fixture.project, {
     title: "Clarify demo",
     branch: "proposal/demo/clarify-demo",
+    sessionId: "task-clarify-123",
   });
   configureGit(proposal.root);
   writeFile(proposal.root, "projects/demo/docs/README.md", "# Demo\n\nAccepted sentence.\n\nRejected sentence.\n");
   const published = publishSharedProposal(fixture.project, { proposal: proposal.branch, message: "Clarify demo docs" });
   assert.equal(published.files.includes("projects/demo/docs/README.md"), true);
-  assert.equal(listSharedProposals(fixture.project).some((item) => item.branch === proposal.branch && item.head === published.head), true);
+  assert.equal(listSharedProposals(fixture.project).some((item) => (
+    item.branch === proposal.branch
+    && item.head === published.head
+    && item.sessionId === "task-clarify-123"
+  )), true);
 
   const review = materializeSharedReview(fixture.project, { proposal: proposal.branch });
+  assert.equal(review.metadata.sessionId, "task-clarify-123");
   writeFile(review.reviewRoot, "projects/demo/docs/README.md", "# Demo\n\nAccepted sentence.\n");
 
   writeFile(fixture.seed, "projects/demo/docs/OTHER.md", "# Other\n\nAlready accepted on main.\n");
@@ -514,6 +524,16 @@ test("shared Context Room API lists proposals and opens an exact review room", a
   const exact = await exactResponse.json();
   assert.equal(exact.mode, "review");
   assert.equal(exact.review.proposalHead, published.head);
+
+  const reopenedResponse = await fetch(origin + "/api/shared-context/review", {
+    method: "POST",
+    headers: { "content-type": "application/json", "x-context-room-project": room.projectId },
+    body: JSON.stringify({ proposal: proposal.branch }),
+  });
+  assert.equal(reopenedResponse.status, 201);
+  const reopened = await reopenedResponse.json();
+  assert.equal(reopened.url, opened.url);
+  assert.equal(reopened.reviewRoot, opened.reviewRoot);
 
   const staleResponse = await fetch(opened.url + "/api/shared-context/accept", {
     method: "POST",

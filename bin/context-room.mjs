@@ -89,7 +89,7 @@ Usage:
   context-room shared setup --root . --repository <git-url> [--project <projectId>]
   context-room shared sync|status|proposals --root .
   context-room shared secure-github|security-check --root .
-  context-room shared propose --root . --title "Change" [--scope project|global]
+  context-room shared propose --root . --title "Change" [--scope project|global] [--session <task-id>]
   context-room shared publish --root . --proposal proposal/... [--message "..."]
   context-room shared review --root . --proposal proposal/... [--port 4317]
   context-room install-hook [--root .]
@@ -112,7 +112,7 @@ Config: ${CONFIG_FILE}
 const KNOWN_OPTIONS = new Set([
   "advisory", "allow", "branch", "dry-run", "exclude", "h", "heading", "help", "highlight", "hook",
   "limit", "message", "mode", "name", "no-restart", "note", "operation", "path", "percent", "port", "profile",
-  "project", "proposal", "repository", "root", "scope", "strict", "target", "task", "text", "title", "version", "view", "watch",
+  "project", "proposal", "repository", "root", "scope", "session", "strict", "target", "task", "text", "title", "version", "view", "watch",
 ]);
 
 function packageVersion() {
@@ -240,6 +240,7 @@ if (command === "shared") {
         title: args.title || args.task || "Shared context change",
         scope: args.scope || "project",
         branch: args.branch || "",
+        sessionId: args.session || process.env.CODEX_THREAD_ID || "",
       }), null, 2));
       process.exit(0);
     }

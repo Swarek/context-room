@@ -138,7 +138,7 @@ context-room shared publish \
 
 Project proposals may change only `projects/<project-id>/docs/` and `projects/<project-id>/skills/`. A global proposal uses `--scope global`, receives a `proposal/global/...` branch by default, and may change only the configured global skills directory. The explicit branch scope must match the requested scope.
 
-Context Room repeats that validation after fetching the remote branch, so bypassing the local publish command does not widen the review. Proposal files must be reviewable UTF-8 text supported by Context Room and no larger than 750 KB. Symlinks, gitlinks, binaries, and special files are rejected. The proposal commit records its accepted-doc base plus the source repository, branch, and commit when those are available.
+Context Room repeats that validation after fetching the remote branch, so bypassing the local publish command does not widen the review. Proposal files must be reviewable UTF-8 text supported by Context Room and no larger than 750 KB. Symlinks, gitlinks, binaries, and special files are rejected. The proposal commit records its accepted-doc base plus the source repository, branch, commit, and Codex task ID when those are available. `shared propose` reads `CODEX_THREAD_ID` automatically in Codex; `--session <task-id>` can attach an explicit identity in another agent runtime. This identity is metadata for finding a proposal, not an authorization token.
 
 `--branch proposal/...` can provide an explicit unique branch name. Otherwise Context Room derives one from the project or global scope, timestamp, and title.
 
@@ -161,13 +161,15 @@ The review command:
 4. applies the proposal as uncommitted changes; and
 5. starts the normal Context Room review UI for those changes.
 
-The normal project room also shows a proposal selector in its top toolbar. Selecting a proposal and pressing **Review** performs the same exact-hash materialization and opens the dedicated room. Local-only projects simply keep the existing UI without these controls.
+Every connected project room can act as the shared proposal cockpit. It lists proposals for every project in the shared repository, not only the project used to launch Context Room. **All proposals** opens a central workspace with project and text filters; the search covers title, branch, author, commit hash, and linked Codex task ID.
+
+Selecting a proposal still creates a dedicated exact-hash review server and worktree, but the review is embedded inside that central workspace instead of replacing the cockpit URL. Several opened reviews remain mounted while the owner switches between them, so unsaved browser state is not discarded. Returning to the normal project context only hides the workspace. Reopening the same unchanged proposal reuses its exact review room; if the branch moves, Context Room presents the new hash as a separate review and the old review remains bound to the hash already examined. Local-only projects keep the existing UI without these controls.
 
 Use the existing inline controls to accept or reject each change. Rejecting a change block rewrites the review worktree to remove that block; accepting it keeps the proposed result. This means the final worktree diff contains only the parts the human chose to accept.
 
 After the review queue is empty, the human owner presses **Prepare pull request** in the review room. The agent-facing CLI deliberately has no acceptance or merge command.
 
-Acceptance is bound to the recorded proposal hash. If the proposal branch moved after the room was created, acceptance expires and the new commit must be reviewed in a new room.
+Acceptance is bound to the recorded proposal hash. If the proposal branch moved after the room was created, acceptance expires and the new commit must be reviewed in a new room. The cockpit makes this visible by showing the old exact hash and offering the branch's new hash as a separate review.
 
 An exact review authority is single-use after a successful acceptance. Reopen the proposal if another reviewed result is needed.
 

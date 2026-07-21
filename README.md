@@ -76,7 +76,7 @@ context-room shared bind --root . --repository <git-url> [--project <project-id>
 context-room shared setup --root . --repository <git-url> [--project <project-id>]
 context-room shared sync|status|proposals --root .
 context-room shared secure-github|security-check --root .
-context-room shared propose --root . --title "Change" [--scope project|global]
+context-room shared propose --root . --title "Change" [--scope project|global] [--session <task-id>]
 context-room shared publish --root . --proposal proposal/... [--message "..."]
 context-room shared review --root . --proposal proposal/... [--port 4317]
 context-room install-hooks [--root .]
