@@ -200,11 +200,11 @@ context-room shared secure-github --root .
 context-room shared security-check --root .
 ```
 
-`secure-github` uses the authenticated GitHub CLI owner session to create or update an active repository ruleset for the configured default branch. The managed rule has no bypass actors, requires a pull request, blocks deletion and force-pushes, and requires review conversations to be resolved. It requires zero additional GitHub approvals because the owner already made the line-level decision in Context Room; merging the pull request remains a separate explicit human action.
+`secure-github` uses the authenticated GitHub CLI owner session to create or update an active repository ruleset for the configured default branch. It also creates a repository-specific writable deploy key under the user-local shared cache and configures the managed Git checkout to use only that key. The managed rule has no bypass actors, requires a pull request, blocks deletion and force-pushes, and requires review conversations to be resolved. It requires zero additional GitHub approvals because the owner already made the line-level decision in Context Room; merging the pull request remains a separate explicit human action.
 
 `security-check` reads the live GitHub rule, exits non-zero unless every required protection is present, and records the last successful remote check for `shared status`. Re-run it after repository or permission changes. If the GitHub plan does not support rulesets for that private repository, setup fails instead of claiming protection.
 
-The Git credential used by agents may push ordinary proposal and accepted branches, but GitHub rejects its direct push to `main`. Keep the GitHub owner browser/API credential outside the agent runtime: an agent that can edit repository rules or operate the owner's authenticated GitHub session has crossed the owner boundary and cannot be constrained by Git branch policy alone.
+The generated deploy key may push ordinary proposal and accepted branches, but GitHub rejects its direct push to `main`; it cannot administer repository rules or merge pull requests. Keep the GitHub owner browser/API credential and any GitHub connector with merge or administration permission outside the agent runtime: an agent that can operate either has crossed the owner boundary and cannot be constrained by Git branch policy alone.
 
 ## Source Map
 

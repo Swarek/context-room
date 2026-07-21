@@ -822,14 +822,79 @@ function sharedSecurityTarget(root) {
       runGit(checkout, ["fetch", "--prune", "origin"], { stdio: ["ignore", "ignore", "pipe"] });
       repositoryConfig = readRemoteSharedDescriptor(checkout).config;
     }
-    return { repository: connection.repository, repositoryConfig };
+    return { repository: connection.repository, repositoryConfig, gitRoots: [repositoryCheckout(connection.repository)] };
   }
   if (fs.existsSync(path.join(resolvedRoot, SHARED_REPOSITORY_CONFIG))) {
     const repository = tryGit(resolvedRoot, ["remote", "get-url", "origin"]);
     if (!repository) throw new Error("The shared repository has no origin remote");
-    return { repository, repositoryConfig: readSharedRepositoryConfig(resolvedRoot) };
+    return { repository, repositoryConfig: readSharedRepositoryConfig(resolvedRoot), gitRoots: [resolvedRoot] };
   }
   throw new Error("Run this command from a shared repository or a project connected to shared context");
+}
+
+function sharedAgentCredential(repository) {
+  const directory = path.join(repositoryCacheRoot(repository), "credentials");
+  return {
+    directory,
+    privateKey: path.join(directory, "agent_ed25519"),
+    publicKey: path.join(directory, "agent_ed25519.pub"),
+    title: `Context Room agent ${hashKey(repository, 8)}`,
+  };
+}
+
+function ensureSharedAgentCredential(repository) {
+  const credential = sharedAgentCredential(repository);
+  fs.mkdirSync(credential.directory, { recursive: true, mode: 0o700 });
+  fs.chmodSync(credential.directory, 0o700);
+  if (!fs.existsSync(credential.privateKey) || !fs.existsSync(credential.publicKey)) {
+    if (fs.existsSync(credential.privateKey) || fs.existsSync(credential.publicKey)) {
+      throw new Error(`Incomplete shared agent SSH credential at ${credential.directory}`);
+    }
+    const result = spawnSync("ssh-keygen", [
+      "-q", "-t", "ed25519", "-N", "", "-C", credential.title, "-f", credential.privateKey,
+    ], { encoding: "utf8" });
+    if (result.error?.code === "ENOENT") throw new Error("ssh-keygen is required to create the restricted agent credential");
+    if (result.status !== 0) throw new Error(`Unable to create the restricted agent credential: ${String(result.stderr || result.stdout).trim()}`);
+  }
+  fs.chmodSync(credential.privateKey, 0o600);
+  fs.chmodSync(credential.publicKey, 0o644);
+  return { ...credential, key: fs.readFileSync(credential.publicKey, "utf8").trim() };
+}
+
+function shellSingleQuote(value) {
+  return `'${String(value).replaceAll("'", `'"'"'`)}'`;
+}
+
+function configureSharedAgentGit(repository, github, gitRoots) {
+  const credential = sharedAgentCredential(repository);
+  if (!fs.existsSync(credential.privateKey)) throw new Error("Restricted shared agent credential is missing");
+  const sshCommand = `ssh -i ${shellSingleQuote(credential.privateKey)} -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new`;
+  const remote = `git@github.com:${github.fullName}.git`;
+  for (const gitRoot of gitRoots) {
+    if (!fs.existsSync(path.join(gitRoot, ".git"))) throw new Error(`Shared Git checkout is missing: ${gitRoot}`);
+    runGit(gitRoot, ["remote", "set-url", "origin", remote]);
+    runGit(gitRoot, ["config", "core.sshCommand", sshCommand]);
+  }
+  return { privateKey: credential.privateKey, remote, gitRoots };
+}
+
+function inspectSharedAgentGit(repository, github, gitRoots, deployKeys) {
+  const credential = sharedAgentCredential(repository);
+  const publicKey = fs.existsSync(credential.publicKey) ? fs.readFileSync(credential.publicKey, "utf8").trim() : "";
+  const deployKey = (deployKeys || []).find((item) => item.title === credential.title && (!publicKey || item.key === publicKey));
+  const expectedRemote = `git@github.com:${github.fullName}.git`;
+  const localConfigured = Boolean(publicKey && fs.existsSync(credential.privateKey) && gitRoots.every((gitRoot) => (
+    tryGit(gitRoot, ["remote", "get-url", "origin"]) === expectedRemote
+    && tryGit(gitRoot, ["config", "--get", "core.sshCommand"]).includes(credential.privateKey)
+  )));
+  return {
+    deployKey,
+    checks: {
+      writableAgentDeployKey: Boolean(deployKey && deployKey.read_only === false),
+      localAgentCredential: localConfigured,
+    },
+    credential: { title: credential.title, publicKey: credential.publicKey, privateKey: credential.privateKey },
+  };
 }
 
 function runGitHubApi(endpoint, { method = "GET", body = null } = {}) {
@@ -908,35 +973,51 @@ function writeGitHubSecurityState(repository, result) {
 }
 
 export function checkSharedGitHubSecurity(root) {
-  const { repository, repositoryConfig } = sharedSecurityTarget(root);
+  const { repository, repositoryConfig, gitRoots } = sharedSecurityTarget(root);
   const github = githubRepositoryCoordinates(repository);
   const rulesets = runGitHubApi(`repos/${github.fullName}/rulesets?includes_parents=false&targets=branch`);
   const summary = (rulesets || []).find((item) => item.name === githubRulesetName(repositoryConfig.defaultBranch));
   let ruleset = null;
   if (summary?.id) ruleset = runGitHubApi(`repos/${github.fullName}/rulesets/${summary.id}?includes_parents=false`);
   const inspected = inspectGitHubRuleset(ruleset, repositoryConfig.defaultBranch);
+  const deployKeys = runGitHubApi(`repos/${github.fullName}/keys?per_page=100`);
+  const agentGit = inspectSharedAgentGit(repository, github, gitRoots, deployKeys);
+  const checks = { ...inspected.checks, ...agentGit.checks };
   return writeGitHubSecurityState(repository, {
-    verified: inspected.verified,
+    verified: Object.values(checks).every(Boolean),
     checkedAt: new Date().toISOString(),
     repository: github.fullName,
     defaultBranch: repositoryConfig.defaultBranch,
     rulesetId: ruleset?.id || null,
     rulesetUrl: ruleset?._links?.html?.href || `https://github.com/${github.fullName}/settings/rules`,
-    checks: inspected.checks,
+    deployKeyId: agentGit.deployKey?.id || null,
+    agentCredential: agentGit.credential,
+    checks,
   });
 }
 
 export function secureSharedGitHubRepository(root) {
-  const { repository, repositoryConfig } = sharedSecurityTarget(root);
+  const { repository, repositoryConfig, gitRoots } = sharedSecurityTarget(root);
   const github = githubRepositoryCoordinates(repository);
   const rulesets = runGitHubApi(`repos/${github.fullName}/rulesets?includes_parents=false&targets=branch`);
   const existing = (rulesets || []).find((item) => item.name === githubRulesetName(repositoryConfig.defaultBranch));
   const payload = githubRulesetPayload(repositoryConfig.defaultBranch);
   if (existing?.id) runGitHubApi(`repos/${github.fullName}/rulesets/${existing.id}`, { method: "PUT", body: payload });
   else runGitHubApi(`repos/${github.fullName}/rulesets`, { method: "POST", body: payload });
+  const credential = ensureSharedAgentCredential(repository);
+  const deployKeys = runGitHubApi(`repos/${github.fullName}/keys?per_page=100`);
+  let deployKey = (deployKeys || []).find((item) => item.title === credential.title && item.key === credential.key);
+  if (deployKey?.read_only) throw new Error(`GitHub deploy key ${credential.title} exists but is read-only`);
+  if (!deployKey) {
+    deployKey = runGitHubApi(`repos/${github.fullName}/keys`, {
+      method: "POST",
+      body: { title: credential.title, key: credential.key, read_only: false },
+    });
+  }
+  configureSharedAgentGit(repository, github, gitRoots);
   const result = checkSharedGitHubSecurity(root);
   if (!result.verified) throw new Error("GitHub created the ruleset but its effective security checks did not pass");
-  return { ...result, created: !existing, updated: Boolean(existing) };
+  return { ...result, rulesetCreated: !existing, rulesetUpdated: Boolean(existing), deployKeyId: deployKey.id || result.deployKeyId };
 }
 
 function proposalScopePrefixes(config, projectId, scope) {

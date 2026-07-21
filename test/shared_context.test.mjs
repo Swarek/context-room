@@ -61,6 +61,8 @@ test("GitHub security setup installs and verifies a no-bypass pull-request rules
   const repository = path.join(base, "shared");
   const fakeBin = path.join(base, "bin");
   const statePath = path.join(base, "ruleset.json");
+  const keyStatePath = path.join(base, "deploy-key.json");
+  const sharedHome = path.join(base, "shared-home");
   fs.mkdirSync(repository, { recursive: true });
   fs.mkdirSync(fakeBin, { recursive: true });
   initializeSharedRepository(repository, { name: "Secure shared context" });
@@ -74,8 +76,17 @@ const endpoint = args[1] || "";
 const methodIndex = args.indexOf("--method");
 const method = methodIndex >= 0 ? args[methodIndex + 1] : "GET";
 const statePath = process.env.FAKE_GH_STATE;
+const keyStatePath = process.env.FAKE_GH_KEY_STATE;
 const current = fs.existsSync(statePath) ? JSON.parse(fs.readFileSync(statePath, "utf8")) : null;
-if (method === "POST" || method === "PUT") {
+const currentKey = fs.existsSync(keyStatePath) ? JSON.parse(fs.readFileSync(keyStatePath, "utf8")) : null;
+if (/\\/keys/.test(endpoint) && method === "POST") {
+  const body = JSON.parse(fs.readFileSync(0, "utf8"));
+  const saved = { ...body, id: 84 };
+  fs.writeFileSync(keyStatePath, JSON.stringify(saved));
+  process.stdout.write(JSON.stringify(saved));
+} else if (/\\/keys/.test(endpoint)) {
+  process.stdout.write(JSON.stringify(currentKey ? [currentKey] : []));
+} else if (method === "POST" || method === "PUT") {
   const body = JSON.parse(fs.readFileSync(0, "utf8"));
   const saved = { ...body, id: 42, _links: { html: { href: "https://github.com/Acme/shared-context/rules/42" } } };
   fs.writeFileSync(statePath, JSON.stringify(saved));
@@ -89,21 +100,33 @@ if (method === "POST" || method === "PUT") {
   fs.chmodSync(fakeGh, 0o755);
   const previousPath = process.env.PATH;
   const previousState = process.env.FAKE_GH_STATE;
+  const previousKeyState = process.env.FAKE_GH_KEY_STATE;
+  const previousSharedHome = process.env.CONTEXT_ROOM_SHARED_HOME;
   process.env.PATH = `${fakeBin}:${previousPath}`;
   process.env.FAKE_GH_STATE = statePath;
+  process.env.FAKE_GH_KEY_STATE = keyStatePath;
+  process.env.CONTEXT_ROOM_SHARED_HOME = sharedHome;
   t.after(() => {
     process.env.PATH = previousPath;
     if (previousState === undefined) delete process.env.FAKE_GH_STATE;
     else process.env.FAKE_GH_STATE = previousState;
+    if (previousKeyState === undefined) delete process.env.FAKE_GH_KEY_STATE;
+    else process.env.FAKE_GH_KEY_STATE = previousKeyState;
+    if (previousSharedHome === undefined) delete process.env.CONTEXT_ROOM_SHARED_HOME;
+    else process.env.CONTEXT_ROOM_SHARED_HOME = previousSharedHome;
   });
 
   const secured = secureSharedGitHubRepository(repository);
   assert.equal(secured.verified, true);
-  assert.equal(secured.created, true);
+  assert.equal(secured.rulesetCreated, true);
   assert.equal(Object.values(secured.checks).every(Boolean), true);
   const ruleset = JSON.parse(fs.readFileSync(statePath, "utf8"));
   assert.deepEqual(ruleset.bypass_actors, []);
   assert.equal(ruleset.rules.find((rule) => rule.type === "pull_request").parameters.required_approving_review_count, 0);
+  const deployKey = JSON.parse(fs.readFileSync(keyStatePath, "utf8"));
+  assert.equal(deployKey.read_only, false);
+  assert.equal(git(repository, ["remote", "get-url", "origin"]), "git@github.com:Acme/shared-context.git");
+  assert.match(git(repository, ["config", "--get", "core.sshCommand"]), /agent_ed25519/);
   assert.equal(checkSharedGitHubSecurity(repository).verified, true);
 });
 
