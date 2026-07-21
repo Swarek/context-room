@@ -361,10 +361,14 @@ function sharedStatePath(repository) {
 
 function ensureRepositoryClone(repository) {
   const checkout = repositoryCheckout(repository);
-  if (fs.existsSync(path.join(checkout, ".git"))) return checkout;
+  if (fs.existsSync(path.join(checkout, ".git"))) {
+    configureExistingSharedAgentGit(repository, checkout);
+    return checkout;
+  }
   if (fs.existsSync(checkout)) throw new Error(`Shared cache path already exists and is not a Git clone: ${checkout}`);
   fs.mkdirSync(path.dirname(checkout), { recursive: true });
   runGit(path.dirname(checkout), ["clone", "--origin", "origin", "--no-checkout", repository, checkout], { stdio: ["ignore", "ignore", "pipe"] });
+  configureExistingSharedAgentGit(repository, checkout);
   return checkout;
 }
 
@@ -827,7 +831,10 @@ function sharedSecurityTarget(root) {
   if (fs.existsSync(path.join(resolvedRoot, SHARED_REPOSITORY_CONFIG))) {
     const repository = tryGit(resolvedRoot, ["remote", "get-url", "origin"]);
     if (!repository) throw new Error("The shared repository has no origin remote");
-    return { repository, repositoryConfig: readSharedRepositoryConfig(resolvedRoot), gitRoots: [resolvedRoot] };
+    const cachedCheckout = repositoryCheckout(repository);
+    const gitRoots = [resolvedRoot];
+    if (fs.existsSync(path.join(cachedCheckout, ".git"))) gitRoots.push(cachedCheckout);
+    return { repository, repositoryConfig: readSharedRepositoryConfig(resolvedRoot), gitRoots };
   }
   throw new Error("Run this command from a shared repository or a project connected to shared context");
 }
@@ -876,6 +883,14 @@ function configureSharedAgentGit(repository, github, gitRoots) {
     runGit(gitRoot, ["config", "core.sshCommand", sshCommand]);
   }
   return { privateKey: credential.privateKey, remote, gitRoots };
+}
+
+function configureExistingSharedAgentGit(repository, gitRoot) {
+  const credential = sharedAgentCredential(repository);
+  if (!fs.existsSync(credential.privateKey)) return;
+  let github;
+  try { github = githubRepositoryCoordinates(repository); } catch { return; }
+  configureSharedAgentGit(repository, github, [gitRoot]);
 }
 
 function normalizedSshPublicKey(value) {
