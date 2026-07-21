@@ -9114,12 +9114,62 @@ export function renderAppHtml() {
       background: var(--accent); color: var(--on-accent); box-shadow: none;
     }
     .dock-button.diff-dock-button.active, .mode-toggle button.active { background: var(--accent); color: var(--on-accent); }
-    .shared-context-controls { display: inline-flex; align-items: center; gap: 6px; min-width: 0; margin-left: auto; }
+    .workspace-chrome { min-width: 0; display: grid; gap: 8px; }
+    .shared-context-controls {
+      position: relative; isolation: isolate; min-width: 0; overflow: hidden;
+      display: grid; grid-template-columns: minmax(136px, 0.55fr) minmax(240px, 1.55fr) auto;
+      align-items: end; gap: 12px; padding: 10px 12px 11px;
+      border: 1px solid color-mix(in srgb, var(--line) 92%, transparent); border-radius: 8px;
+      background: color-mix(in srgb, var(--surface-floating) 94%, var(--accent) 6%);
+      box-shadow: inset 0 1px 0 rgba(255,255,255,0.025);
+    }
     .shared-context-controls[hidden] { display: none !important; }
-    .shared-context-label { max-width: 220px; color: var(--muted); font: 10px/1.2 ui-monospace, SFMono-Regular, Menlo, monospace; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-    .shared-context-select { width: min(320px, 30vw); min-height: 32px; padding: 5px 28px 5px 8px; border: 1px solid var(--line); border-radius: 8px; background: var(--panel-strong); color: var(--text); font: 11px/1.2 ui-monospace, SFMono-Regular, Menlo, monospace; }
-    .shared-context-controls .dock-button { min-height: 32px; padding: 0 9px; }
-    .shared-context-controls:not([hidden]) + .workspace-title { margin-left: 0; }
+    .shared-context-controls::before {
+      content: ""; position: absolute; z-index: -1; left: 0; right: 0; top: 0; height: 2px;
+      background: linear-gradient(90deg, var(--accent), color-mix(in srgb, var(--accent) 36%, var(--accent-2)), var(--accent-2));
+    }
+    .shared-context-heading { min-width: 0; min-height: 36px; display: flex; align-items: center; gap: 9px; }
+    .shared-context-indicator {
+      width: 8px; height: 8px; flex: 0 0 8px; border-radius: 50%; background: var(--good);
+      box-shadow: 0 0 0 4px color-mix(in srgb, var(--good) 13%, transparent);
+    }
+    .shared-context-controls[data-online="false"] .shared-context-indicator { background: var(--danger); box-shadow: 0 0 0 4px color-mix(in srgb, var(--danger) 13%, transparent); }
+    .shared-context-heading-copy { min-width: 0; display: grid; gap: 3px; }
+    .shared-context-heading-copy strong { color: var(--label-strong); font-size: 12px; line-height: 1.15; font-weight: 760; letter-spacing: -0.01em; }
+    .shared-context-heading .shared-context-label { display: block; min-width: 0; color: var(--muted); font: 9px/1.2 ui-monospace, SFMono-Regular, Menlo, monospace; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .shared-context-picker { min-width: 0; display: grid; gap: 4px; }
+    .shared-context-picker > span { color: var(--muted); font-size: 8px; line-height: 1; font-weight: 850; letter-spacing: 0.09em; text-transform: uppercase; }
+    .shared-context-picker:has(.shared-context-select[hidden]) { display: none; }
+    .shared-context-select {
+      width: 100%; min-width: 0; min-height: 36px; padding: 6px 32px 6px 10px;
+      border: 1px solid color-mix(in srgb, var(--line) 96%, transparent); border-radius: 6px;
+      background: color-mix(in srgb, var(--panel-strong) 92%, var(--accent) 8%); color: var(--text);
+      font: 10px/1.25 ui-monospace, SFMono-Regular, Menlo, monospace;
+      transition: border-color 180ms cubic-bezier(0.22, 1, 0.36, 1), background-color 180ms cubic-bezier(0.22, 1, 0.36, 1);
+    }
+    .shared-context-select:hover { border-color: color-mix(in srgb, var(--accent) 38%, var(--line)); }
+    .shared-context-select:focus-visible { outline: 2px solid color-mix(in srgb, var(--accent) 58%, transparent); outline-offset: 2px; }
+    .shared-context-actions { min-width: 0; display: inline-flex; align-items: center; justify-content: flex-end; gap: 6px; }
+    .shared-context-actions .dock-button { min-height: 36px; padding: 0 10px; white-space: nowrap; }
+    .shared-context-actions .dock-button[hidden] { display: none !important; }
+    .shared-context-actions .dock-button.primary { padding-inline: 13px; }
+    .shared-context-actions .shared-context-refresh { width: 36px; min-width: 36px; padding: 0; color: var(--muted); font-size: 17px; }
+    .shared-context-actions .dock-button:focus-visible { outline: 2px solid color-mix(in srgb, var(--accent) 58%, transparent); outline-offset: 2px; }
+    .shared-context-controls[data-mode="review"] { grid-template-columns: minmax(0, 1fr) auto; align-items: center; }
+    .shared-context-controls[data-mode="review"] .shared-context-actions { grid-column: 2; }
+    @media (max-width: 760px) {
+      .shared-context-controls { grid-template-columns: minmax(0, 1fr) auto; align-items: center; }
+      .shared-context-picker { grid-column: 1 / -1; grid-row: 2; }
+      .shared-context-actions { grid-column: 2; grid-row: 1; }
+    }
+    @media (max-width: 500px) {
+      .shared-context-controls { grid-template-columns: 1fr; gap: 9px; padding: 10px; }
+      .shared-context-controls[data-mode="review"] { grid-template-columns: 1fr; }
+      .shared-context-heading, .shared-context-picker, .shared-context-actions { grid-column: 1; grid-row: auto; }
+      .shared-context-controls[data-mode="review"] .shared-context-actions { grid-column: 1; }
+      .shared-context-actions { display: grid; grid-template-columns: minmax(0, 1fr) 36px minmax(0, 1fr); width: 100%; }
+      .shared-context-actions .dock-button { min-width: 0; }
+    }
     .shared-proposal-workspace { position: fixed; inset: 0; z-index: 80; display: grid; grid-template-rows: auto minmax(0, 1fr); background: var(--bg); color: var(--text); }
     .shared-proposal-workspace[hidden] { display: none !important; }
     .shared-proposal-workspace-head { display: flex; align-items: center; gap: 10px; min-height: 58px; padding: 10px 14px; border-bottom: 1px solid var(--line); background: var(--panel-strong); }
@@ -9250,7 +9300,7 @@ export function renderAppHtml() {
       .hub-section-grid { grid-template-columns: repeat(auto-fit, minmax(min(100%, 170px), 1fr)); }
     }
     @media (max-width: 640px) {
-      main { grid-template-rows: minmax(0, 1fr); }
+      main { grid-template-rows: auto minmax(0, 1fr); }
       .workspace-title { display: none; }
       .docqa-home, .settings-page { padding: 8px; }
       .settings-shell { min-height: calc(100dvh - 126px); }
@@ -9303,25 +9353,38 @@ export function renderAppHtml() {
       <div id="files" class="tree"></div>
     </aside>
     <main>
-      <div class="workspace-dock" role="toolbar" aria-label="Workspace navigation">
-        <button id="hub" class="dock-button" type="button" title="Open settings">Settings</button>
-        <button id="back" class="dock-button" type="button" title="Previous file" aria-label="Previous file">←</button>
-        <button id="forward" class="dock-button" type="button" title="Next file" aria-label="Next file">→</button>
-        <button id="gitDiffToggle" class="dock-button diff-dock-button" type="button" title="Show Git diff" hidden>Show Git diff</button>
-        <button id="reload" class="dock-button" type="button" hidden>Reload</button>
-        <button id="verifyCurrent" class="dock-button" type="button" hidden>Verified</button>
-        <button id="deleteCurrent" class="dock-button danger-action" type="button" hidden>Delete</button>
-        <button id="save" class="dock-button primary" hidden disabled>Save</button>
-        <div id="sharedContextControls" class="shared-context-controls" hidden>
-          <span id="sharedContextLabel" class="shared-context-label"></span>
-          <select id="sharedProposalSelect" class="shared-context-select" aria-label="Shared context proposal"></select>
-          <button id="sharedProposalBrowser" class="dock-button" type="button">All proposals</button>
-          <button id="sharedContextRefresh" class="dock-button" type="button" title="Refresh shared main and proposals">Refresh</button>
-          <button id="sharedProposalReview" class="dock-button" type="button">Review</button>
-          <button id="sharedProposalAccept" class="dock-button primary" type="button" hidden>Prepare pull request</button>
+      <div class="workspace-chrome">
+        <div class="workspace-dock" role="toolbar" aria-label="Workspace navigation">
+          <button id="hub" class="dock-button" type="button" title="Open settings">Settings</button>
+          <button id="back" class="dock-button" type="button" title="Previous file" aria-label="Previous file">←</button>
+          <button id="forward" class="dock-button" type="button" title="Next file" aria-label="Next file">→</button>
+          <button id="gitDiffToggle" class="dock-button diff-dock-button" type="button" title="Show Git diff" hidden>Show Git diff</button>
+          <button id="reload" class="dock-button" type="button" hidden>Reload</button>
+          <button id="verifyCurrent" class="dock-button" type="button" hidden>Verified</button>
+          <button id="deleteCurrent" class="dock-button danger-action" type="button" hidden>Delete</button>
+          <button id="save" class="dock-button primary" hidden disabled>Save</button>
+          <div id="workspaceTitle" class="workspace-title">Context Room</div>
+          <div id="status" class="dock-status" aria-live="polite">Ready</div>
         </div>
-        <div id="workspaceTitle" class="workspace-title">Context Room</div>
-        <div id="status" class="dock-status" aria-live="polite">Ready</div>
+        <div id="sharedContextControls" class="shared-context-controls" hidden>
+          <div class="shared-context-heading">
+            <span class="shared-context-indicator" aria-hidden="true"></span>
+            <span class="shared-context-heading-copy">
+              <strong>Shared context</strong>
+              <span id="sharedContextLabel" class="shared-context-label"></span>
+            </span>
+          </div>
+          <label class="shared-context-picker">
+            <span>Selected proposal</span>
+            <select id="sharedProposalSelect" class="shared-context-select" aria-label="Shared context proposal"></select>
+          </label>
+          <div class="shared-context-actions">
+            <button id="sharedProposalBrowser" class="dock-button" type="button">All proposals</button>
+            <button id="sharedContextRefresh" class="dock-button shared-context-refresh" type="button" title="Refresh shared main and proposals" aria-label="Refresh shared main and proposals">↻</button>
+            <button id="sharedProposalReview" class="dock-button primary" type="button">Review selected</button>
+            <button id="sharedProposalAccept" class="dock-button primary" type="button" hidden>Prepare pull request</button>
+          </div>
+        </div>
       </div>
       <section class="topbar" aria-hidden="true">
         <div id="title" class="selected-title">Loading...</div>
@@ -9638,6 +9701,8 @@ function renderSharedContextControls() {
   controls.hidden = !shared?.enabled;
   if (!shared?.enabled) return;
   if (shared.mode === "review") {
+    controls.dataset.mode = "review";
+    controls.dataset.online = "true";
     const review = shared.review || {};
     const queueCount = state.docqa?.queue?.length || 0;
     label.textContent = "Review " + (review.proposal || "proposal") + " @" + shortSharedHash(review.proposalHead);
@@ -9671,7 +9736,9 @@ function renderSharedContextControls() {
   reviewButton.hidden = false;
   acceptButton.hidden = true;
   const online = shared.status?.online !== false;
-  label.textContent = "Shared hub " + (online ? "@" + shortSharedHash(shared.status?.revision) : "offline @" + shortSharedHash(shared.status?.revision));
+  controls.dataset.mode = "project";
+  controls.dataset.online = String(online);
+  label.textContent = online ? "Synced @" + shortSharedHash(shared.status?.revision) : "Offline @" + shortSharedHash(shared.status?.revision);
   label.title = shared.proposalError || shared.status?.fetchError || "Accepted shared main snapshot";
   select.innerHTML = proposals.length
     ? proposals.map((item) => '<option value="' + escapeHtml(item.branch) + '">' + escapeHtml(sharedProposalLabel(item)) + '</option>').join("")
@@ -9681,7 +9748,7 @@ function renderSharedContextControls() {
   browserButton.disabled = Boolean(state.sharedContextBusy);
   browserButton.textContent = "All proposals (" + proposals.length + ")";
   refresh.disabled = Boolean(state.sharedContextBusy);
-  reviewButton.textContent = state.sharedContextBusy ? "Opening..." : "Review";
+  reviewButton.textContent = state.sharedContextBusy ? "Opening review…" : "Review selected";
 }
 
 async function refreshSharedContextUi() {
