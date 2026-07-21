@@ -878,10 +878,17 @@ function configureSharedAgentGit(repository, github, gitRoots) {
   return { privateKey: credential.privateKey, remote, gitRoots };
 }
 
+function normalizedSshPublicKey(value) {
+  return String(value || "").trim().split(/\s+/).slice(0, 2).join(" ");
+}
+
 function inspectSharedAgentGit(repository, github, gitRoots, deployKeys) {
   const credential = sharedAgentCredential(repository);
   const publicKey = fs.existsSync(credential.publicKey) ? fs.readFileSync(credential.publicKey, "utf8").trim() : "";
-  const deployKey = (deployKeys || []).find((item) => item.title === credential.title && (!publicKey || item.key === publicKey));
+  const deployKey = (deployKeys || []).find((item) => (
+    item.title === credential.title
+    && (!publicKey || normalizedSshPublicKey(item.key) === normalizedSshPublicKey(publicKey))
+  ));
   const expectedRemote = `git@github.com:${github.fullName}.git`;
   const localConfigured = Boolean(publicKey && fs.existsSync(credential.privateKey) && gitRoots.every((gitRoot) => (
     tryGit(gitRoot, ["remote", "get-url", "origin"]) === expectedRemote
@@ -1006,7 +1013,10 @@ export function secureSharedGitHubRepository(root) {
   else runGitHubApi(`repos/${github.fullName}/rulesets`, { method: "POST", body: payload });
   const credential = ensureSharedAgentCredential(repository);
   const deployKeys = runGitHubApi(`repos/${github.fullName}/keys?per_page=100`);
-  let deployKey = (deployKeys || []).find((item) => item.title === credential.title && item.key === credential.key);
+  let deployKey = (deployKeys || []).find((item) => (
+    item.title === credential.title
+    && normalizedSshPublicKey(item.key) === normalizedSshPublicKey(credential.key)
+  ));
   if (deployKey?.read_only) throw new Error(`GitHub deploy key ${credential.title} exists but is read-only`);
   if (!deployKey) {
     deployKey = runGitHubApi(`repos/${github.fullName}/keys`, {
