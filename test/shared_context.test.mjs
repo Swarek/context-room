@@ -35,7 +35,7 @@ test("shared proposal selector and exact-hash pull-request delivery are present 
   const html = renderAppHtml();
   assert.match(html, /class="workspace-chrome"/);
   assert.match(html, /class="shared-context-heading"/);
-  assert.match(html, />Selected proposal</);
+  assert.match(html, />Choose proposal</);
   assert.match(html, /id="sharedProposalSelect"/);
   assert.match(html, /id="sharedProposalBrowser"/);
   assert.match(html, /id="sharedProposalWorkspace"/);
@@ -43,7 +43,7 @@ test("shared proposal selector and exact-hash pull-request delivery are present 
   assert.match(html, /\/?embedded=1/);
   assert.match(html, /id="sharedProposalReview"/);
   assert.match(html, /id="sharedProposalAccept"/);
-  assert.match(html, /Review selected/);
+  assert.match(html, /Open review/);
   assert.match(html, /expectedProposalHead: review\.proposalHead/);
   assert.match(html, /Prepare pull request/);
   assert.doesNotMatch(html, /Accept into main/);
