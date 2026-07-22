@@ -9176,24 +9176,43 @@ export function renderAppHtml() {
     }
     .shared-proposal-workspace { position: fixed; inset: 0; z-index: 80; display: grid; grid-template-rows: auto minmax(0, 1fr); background: var(--bg); color: var(--text); }
     .shared-proposal-workspace[hidden] { display: none !important; }
-    .shared-proposal-workspace-head { display: flex; align-items: center; gap: 10px; min-height: 58px; padding: 10px 14px; border-bottom: 1px solid var(--line); background: var(--panel-strong); }
-    .shared-proposal-workspace-title { min-width: 190px; }
-    .shared-proposal-workspace-title strong { display: block; font-size: 14px; }
+    .shared-proposal-workspace-head { display: flex; align-items: center; gap: 10px; min-height: 64px; padding: 10px 14px; border-bottom: 1px solid var(--line); background: var(--panel-strong); }
+    .shared-proposal-workspace-title { min-width: 210px; }
+    .shared-proposal-workspace-title strong { display: block; font-size: 15px; }
     .shared-proposal-workspace-title span { display: block; margin-top: 2px; color: var(--muted); font: 10px/1.25 ui-monospace, SFMono-Regular, Menlo, monospace; }
     .shared-proposal-search { width: min(360px, 32vw); min-height: 34px; padding: 7px 10px; border: 1px solid var(--line); border-radius: 8px; background: var(--panel); color: var(--text); }
     .shared-proposal-filter { width: min(220px, 20vw); min-height: 34px; padding: 6px 28px 6px 9px; border: 1px solid var(--line); border-radius: 8px; background: var(--panel); color: var(--text); }
-    .shared-proposal-workspace-body { min-height: 0; display: grid; grid-template-columns: minmax(280px, 360px) minmax(0, 1fr); }
-    .shared-proposal-list-panel { min-height: 0; overflow: auto; padding: 12px; border-right: 1px solid var(--line); background: var(--surface-sidebar); }
-    .shared-proposal-list { display: grid; gap: 8px; }
-    .shared-proposal-card { width: 100%; padding: 11px; border: 1px solid var(--line); border-radius: 10px; background: var(--surface-card); color: var(--text); text-align: left; cursor: pointer; }
-    .shared-proposal-card:hover, .shared-proposal-card.active { border-color: color-mix(in srgb, var(--accent) 58%, var(--line)); background: var(--surface-card-hover); }
+    .shared-proposal-workspace-body { min-height: 0; display: grid; grid-template-columns: minmax(340px, 420px) minmax(0, 1fr); }
+    .shared-proposal-list-panel { position: relative; inset: auto; z-index: auto; width: auto; height: auto; min-height: 0; max-height: none; overflow: auto; border-right: 1px solid var(--line); background: var(--surface-sidebar); transform: none; }
+    .shared-proposal-list { display: grid; }
+    .shared-proposal-card { width: 100%; padding: 14px 16px; border: 0; border-bottom: 1px solid var(--line); border-radius: 0; background: transparent; color: var(--text); text-align: left; cursor: pointer; }
+    .shared-proposal-card:hover { background: color-mix(in srgb, var(--accent) 6%, transparent); }
+    .shared-proposal-card.active { background: color-mix(in srgb, var(--accent) 11%, var(--surface-sidebar)); }
+    .shared-proposal-card:focus-visible { position: relative; outline: 2px solid color-mix(in srgb, var(--accent) 62%, transparent); outline-offset: -3px; }
     .shared-proposal-card-top { display: flex; align-items: center; gap: 7px; }
     .shared-proposal-project { padding: 2px 6px; border-radius: 999px; background: color-mix(in srgb, var(--accent) 15%, transparent); color: var(--accent); font: 10px/1.25 ui-monospace, SFMono-Regular, Menlo, monospace; }
-    .shared-proposal-card-title { display: block; margin-top: 8px; font-weight: 650; }
+    .shared-proposal-card-title { display: block; margin-top: 9px; font-size: 14px; line-height: 1.3; font-weight: 720; }
+    .shared-proposal-card-description { display: -webkit-box; margin-top: 5px; overflow: hidden; color: var(--text-soft); font-size: 11px; line-height: 1.4; -webkit-box-orient: vertical; -webkit-line-clamp: 2; }
+    .shared-proposal-card-files { display: grid; gap: 3px; margin-top: 9px; }
+    .shared-proposal-card-file { display: block; min-width: 0; overflow: hidden; color: var(--muted); font: 10px/1.3 ui-monospace, SFMono-Regular, Menlo, monospace; text-overflow: ellipsis; white-space: nowrap; }
     .shared-proposal-card-meta, .shared-proposal-card-identity { display: block; margin-top: 5px; color: var(--muted); font: 10px/1.35 ui-monospace, SFMono-Regular, Menlo, monospace; overflow-wrap: anywhere; }
-    .shared-proposal-card-state { margin-left: auto; color: var(--good); font: 10px/1.2 ui-monospace, SFMono-Regular, Menlo, monospace; }
+    .shared-proposal-card-state { margin-left: auto; color: var(--muted); font: 10px/1.2 ui-monospace, SFMono-Regular, Menlo, monospace; }
     .shared-proposal-empty { padding: 18px 10px; color: var(--muted); text-align: center; }
-    .shared-proposal-review-panel { position: relative; min-width: 0; min-height: 0; background: var(--bg); }
+    .shared-proposal-review-panel { min-width: 0; min-height: 0; display: grid; grid-template-rows: auto minmax(220px, 1fr); background: var(--bg); }
+    .shared-proposal-overview { min-width: 0; padding: 18px 22px 16px; border-bottom: 1px solid var(--line); background: var(--panel); }
+    .shared-proposal-overview[hidden] { display: none !important; }
+    .shared-proposal-overview-top { display: flex; align-items: center; gap: 8px; }
+    .shared-proposal-overview-state { color: var(--muted); font: 10px/1.2 ui-monospace, SFMono-Regular, Menlo, monospace; }
+    .shared-proposal-overview h2 { margin: 10px 0 0; color: var(--text); font-size: 20px; line-height: 1.2; letter-spacing: -0.02em !important; }
+    .shared-proposal-description { max-width: 72ch; margin: 7px 0 0; color: var(--text-soft); font-size: 12px; line-height: 1.5; white-space: pre-wrap; }
+    .shared-proposal-overview-meta { display: flex; flex-wrap: wrap; gap: 5px 14px; margin-top: 11px; color: var(--muted); font: 10px/1.35 ui-monospace, SFMono-Regular, Menlo, monospace; }
+    .shared-proposal-overview-actions { display: flex; align-items: center; gap: 10px; margin-top: 13px; }
+    .shared-proposal-overview-actions .primary { min-height: 36px; }
+    .shared-proposal-change-summary { color: var(--muted); font-size: 11px; }
+    .shared-proposal-files { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 4px 14px; max-height: 84px; margin-top: 12px; overflow: auto; }
+    .shared-proposal-file { min-width: 0; overflow: hidden; color: var(--text-soft); font: 10px/1.35 ui-monospace, SFMono-Regular, Menlo, monospace; text-overflow: ellipsis; white-space: nowrap; }
+    .shared-proposal-file::before { content: "↳"; margin-right: 6px; color: var(--accent); }
+    .shared-proposal-review-stage { position: relative; min-width: 0; min-height: 0; }
     .shared-proposal-review-empty { position: absolute; inset: 0; display: grid; place-items: center; padding: 30px; color: var(--muted); text-align: center; }
     .shared-proposal-frames, .shared-proposal-frame { width: 100%; height: 100%; min-height: 0; border: 0; background: var(--bg); }
     .shared-proposal-frame[hidden], .shared-proposal-review-empty[hidden] { display: none !important; }
@@ -9201,7 +9220,22 @@ export function renderAppHtml() {
       .shared-proposal-workspace-head { flex-wrap: wrap; }
       .shared-proposal-workspace-title { min-width: 0; flex: 1 1 auto; }
       .shared-proposal-search, .shared-proposal-filter { width: auto; flex: 1 1 180px; }
-      .shared-proposal-workspace-body { grid-template-columns: minmax(220px, 300px) minmax(0, 1fr); }
+      .shared-proposal-workspace-body { grid-template-columns: minmax(280px, 340px) minmax(0, 1fr); }
+      .shared-proposal-files { grid-template-columns: 1fr; }
+    }
+    @media (max-width: 680px) {
+      .shared-proposal-workspace-head { gap: 7px; padding: 8px; }
+      .shared-proposal-workspace-head > .dock-button:first-child { order: 0; }
+      .shared-proposal-workspace-title { order: 1; }
+      .shared-proposal-search { order: 3; flex-basis: calc(65% - 6px); }
+      .shared-proposal-filter { order: 4; flex-basis: calc(35% - 6px); }
+      .shared-proposal-workspace-head > .dock-button:last-child { order: 2; }
+      .shared-proposal-workspace-body { grid-template-columns: 1fr; grid-template-rows: minmax(230px, 38vh) minmax(0, 1fr); }
+      .shared-proposal-list-panel { border-right: 0; border-bottom: 1px solid var(--line); }
+      .shared-proposal-overview { padding: 14px 16px 13px; }
+      .shared-proposal-overview h2 { font-size: 17px; }
+      .shared-proposal-description { display: -webkit-box; overflow: hidden; -webkit-box-orient: vertical; -webkit-line-clamp: 3; }
+      .shared-proposal-files { max-height: 56px; }
     }
     .workspace-title { min-width: 0; margin-left: auto; padding: 0 8px; color: var(--muted); font: 11px/1.2 ui-monospace, SFMono-Regular, Menlo, monospace; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
     .topbar { border-radius: 8px; box-shadow: none; backdrop-filter: none; }
@@ -9454,10 +9488,10 @@ export function renderAppHtml() {
     <header class="shared-proposal-workspace-head">
       <button id="sharedProposalWorkspaceClose" class="dock-button" type="button">← Context</button>
       <div class="shared-proposal-workspace-title">
-        <strong id="sharedProposalWorkspaceHeading">Proposal reviews</strong>
-        <span id="sharedProposalWorkspaceSummary">Choose an exact proposal to review</span>
+        <strong id="sharedProposalWorkspaceHeading">Proposal inbox</strong>
+        <span id="sharedProposalWorkspaceSummary">Choose a proposal to inspect</span>
       </div>
-      <input id="sharedProposalSearch" class="shared-proposal-search" type="search" placeholder="Search title, branch, author, session…" aria-label="Search proposals" />
+      <input id="sharedProposalSearch" class="shared-proposal-search" type="search" placeholder="Search proposals or changed files…" aria-label="Search proposals" />
       <select id="sharedProposalProjectFilter" class="shared-proposal-filter" aria-label="Filter proposals by project"></select>
       <button id="sharedProposalWorkspaceRefresh" class="dock-button" type="button">Refresh</button>
     </header>
@@ -9466,8 +9500,24 @@ export function renderAppHtml() {
         <div id="sharedProposalList" class="shared-proposal-list"></div>
       </aside>
       <section class="shared-proposal-review-panel" aria-label="Selected proposal review">
-        <div id="sharedProposalReviewEmpty" class="shared-proposal-review-empty">Choose a proposal on the left. Its exact-hash review will open here and stay available while you switch between proposals.</div>
-        <div id="sharedProposalFrames" class="shared-proposal-frames"></div>
+        <article id="sharedProposalOverview" class="shared-proposal-overview" hidden>
+          <div class="shared-proposal-overview-top">
+            <span id="sharedProposalOverviewProject" class="shared-proposal-project"></span>
+            <span id="sharedProposalOverviewState" class="shared-proposal-overview-state"></span>
+          </div>
+          <h2 id="sharedProposalOverviewTitle"></h2>
+          <p id="sharedProposalOverviewDescription" class="shared-proposal-description"></p>
+          <div id="sharedProposalOverviewMeta" class="shared-proposal-overview-meta"></div>
+          <div id="sharedProposalFiles" class="shared-proposal-files"></div>
+          <div class="shared-proposal-overview-actions">
+            <button id="sharedProposalOpenReview" class="dock-button primary" type="button">Open files to review</button>
+            <span id="sharedProposalChangeSummary" class="shared-proposal-change-summary"></span>
+          </div>
+        </article>
+        <div class="shared-proposal-review-stage">
+          <div id="sharedProposalReviewEmpty" class="shared-proposal-review-empty">Select a proposal to inspect its latest description and changed files before opening the exact-hash review.</div>
+          <div id="sharedProposalFrames" class="shared-proposal-frames"></div>
+        </div>
       </section>
     </div>
   </section>
@@ -9488,6 +9538,7 @@ export function renderAppHtml() {
 		state.sharedProposalWorkspaceOpen = false;
 		state.sharedProposalSearch = "";
 		state.sharedProposalProject = "";
+		state.sharedProposalSelection = "";
 	const VERIFY_CONFIRM_STORAGE_KEY = "context-room:skip-mark-verified-confirm";
 const NAVIGATION_STATE_STORAGE_PREFIX = "context-room:navigation:";
 const AGENT_COMMAND_ACK_STORAGE_PREFIX = "context-room:last-agent-command-id:";
@@ -9579,7 +9630,7 @@ function sharedProposalLabel(item) {
 }
 
 function sharedProposalSearchText(item) {
-  return [item.projectId, item.title, item.branch, item.author?.name, item.author?.email, item.sessionId, item.head]
+  return [item.projectId, item.title, item.description, item.branch, item.author?.name, item.author?.email, item.sessionId, item.head, ...(item.files || [])]
     .filter(Boolean)
     .join(" ")
     .toLowerCase();
@@ -9591,6 +9642,11 @@ function setSharedProposalWorkspaceOpen(open) {
   if (!workspace) return;
   workspace.hidden = !state.sharedProposalWorkspaceOpen;
   if (state.sharedProposalWorkspaceOpen) {
+    const proposals = Array.isArray(state.sharedContext?.proposals) ? state.sharedContext.proposals : [];
+    const selectedFromDock = el("sharedProposalSelect")?.value || "";
+    if (!proposals.some((item) => item.branch === state.sharedProposalSelection)) {
+      state.sharedProposalSelection = proposals.some((item) => item.branch === selectedFromDock) ? selectedFromDock : (proposals[0]?.branch || "");
+    }
     renderSharedProposalWorkspace();
     window.requestAnimationFrame(() => el("sharedProposalSearch")?.focus());
   }
@@ -9602,7 +9658,8 @@ function renderSharedProposalWorkspace() {
   const search = el("sharedProposalSearch");
   const summary = el("sharedProposalWorkspaceSummary");
   const empty = el("sharedProposalReviewEmpty");
-  if (!list || !projectFilter || !search || !summary || !empty) return;
+  const overview = el("sharedProposalOverview");
+  if (!list || !projectFilter || !search || !summary || !empty || !overview) return;
   const proposals = Array.isArray(state.sharedContext?.proposals) ? state.sharedContext.proposals : [];
   const projects = [...new Set(proposals.map((item) => item.projectId || "global"))].sort();
   projectFilter.innerHTML = '<option value="">All projects</option>'
@@ -9615,35 +9672,78 @@ function renderSharedProposalWorkspace() {
     (!state.sharedProposalProject || item.projectId === state.sharedProposalProject)
     && (!needle || sharedProposalSearchText(item).includes(needle))
   ));
-  const currentRoom = state.sharedReviewRooms.get(state.sharedReviewKey);
-  const currentProposal = currentRoom?.result?.review;
-  const currentRemote = currentProposal ? proposals.find((item) => item.branch === currentProposal.proposal) : null;
-  summary.textContent = currentProposal
-    ? currentRemote && currentRemote.head !== currentProposal.proposalHead
-      ? currentProposal.proposal + " @" + shortSharedHash(currentProposal.proposalHead) + " · branch updated; open it again to review the new hash"
-      : currentProposal.proposal + " @" + shortSharedHash(currentProposal.proposalHead)
-    : proposals.length + " proposal" + (proposals.length === 1 ? "" : "s") + " across " + projects.length + " project" + (projects.length === 1 ? "" : "s");
+  if (!visible.some((item) => item.branch === state.sharedProposalSelection)) state.sharedProposalSelection = visible[0]?.branch || "";
+  const selected = proposals.find((item) => item.branch === state.sharedProposalSelection) || null;
+  const totalFiles = proposals.reduce((total, item) => total + Number(item.fileCount || item.files?.length || 0), 0);
+  summary.textContent = proposals.length + " proposal" + (proposals.length === 1 ? "" : "s") + " · " + totalFiles + " file" + (totalFiles === 1 ? "" : "s") + " · " + projects.length + " project" + (projects.length === 1 ? "" : "s");
   list.innerHTML = visible.length ? visible.map((item) => {
     const key = sharedProposalKey(item);
     const opened = state.sharedReviewRooms.has(key);
-    const active = state.sharedReviewKey === key;
+    const active = state.sharedProposalSelection === item.branch;
     const author = item.author?.name || item.author?.email || "Unknown author";
     const updated = item.updatedAt ? new Date(item.updatedAt).toLocaleString() : "Unknown date";
-    const session = item.sessionId ? "session " + item.sessionId : "no linked session";
-    return '<button class="shared-proposal-card' + (active ? ' active' : '') + '" type="button" data-shared-proposal="' + escapeHtml(item.branch) + '" title="Review exact commit ' + escapeHtml(item.head) + '">'
-      + '<span class="shared-proposal-card-top"><span class="shared-proposal-project">' + escapeHtml(item.projectId || "global") + '</span><span class="shared-proposal-card-state">' + (opened ? (active ? "Open now" : "Ready") : "Review") + '</span></span>'
+    const files = Array.isArray(item.files) ? item.files : [];
+    const fileCount = Number(item.fileCount || files.length || 0);
+    const previewFiles = files.slice(0, 2).map((file) => '<span class="shared-proposal-card-file" title="' + escapeHtml(file) + '">↳ ' + escapeHtml(file) + '</span>').join("");
+    const moreFiles = fileCount > 2 ? '<span class="shared-proposal-card-file">+' + (fileCount - 2) + ' more</span>' : '';
+    return '<button class="shared-proposal-card' + (active ? ' active' : '') + '" type="button" data-shared-proposal-select="' + escapeHtml(item.branch) + '" title="Inspect ' + escapeHtml(item.title || item.branch) + '">'
+      + '<span class="shared-proposal-card-top"><span class="shared-proposal-project">' + escapeHtml(item.projectId || "global") + '</span><span class="shared-proposal-card-state">' + (opened ? "Review ready" : fileCount + " file" + (fileCount === 1 ? "" : "s")) + '</span></span>'
       + '<span class="shared-proposal-card-title">' + escapeHtml(item.title || item.branch) + '</span>'
+      + '<span class="shared-proposal-card-description">' + escapeHtml(item.description || "No description supplied for this legacy proposal.") + '</span>'
+      + '<span class="shared-proposal-card-files">' + previewFiles + moreFiles + '</span>'
       + '<span class="shared-proposal-card-meta">' + escapeHtml(author + " · " + updated) + '</span>'
-      + '<span class="shared-proposal-card-identity">' + escapeHtml(item.branch + " · @" + shortSharedHash(item.head) + " · " + session) + '</span>'
       + '</button>';
   }).join("") : '<div class="shared-proposal-empty">No proposal matches these filters.</div>';
-  empty.hidden = Boolean(state.sharedReviewKey);
+  renderSharedProposalOverview(selected);
+}
+
+function renderSharedProposalOverview(item) {
+  const overview = el("sharedProposalOverview");
+  const empty = el("sharedProposalReviewEmpty");
+  if (!overview || !empty) return;
+  overview.hidden = !item;
+  if (!item) {
+    for (const room of state.sharedReviewRooms.values()) room.frame.hidden = true;
+    empty.hidden = false;
+    empty.textContent = "No proposal is selected.";
+    return;
+  }
+  const key = sharedProposalKey(item);
+  const room = state.sharedReviewRooms.get(key);
+  const files = Array.isArray(item.files) ? item.files : [];
+  const fileCount = Number(item.fileCount || files.length || 0);
+  const author = item.author?.name || item.author?.email || "Unknown author";
+  const updated = item.updatedAt ? new Date(item.updatedAt).toLocaleString() : "Unknown date";
+  const session = item.sessionId ? "session " + item.sessionId : "no linked session";
+  el("sharedProposalOverviewProject").textContent = item.projectId || "global";
+  el("sharedProposalOverviewState").textContent = room ? "Exact review ready" : "Not opened yet";
+  el("sharedProposalOverviewTitle").textContent = item.title || item.branch;
+  el("sharedProposalOverviewDescription").textContent = item.description || "No description was supplied for this legacy proposal. Republish it through the CLI to attach an up-to-date description.";
+  el("sharedProposalOverviewMeta").innerHTML = '<span>' + escapeHtml(author + " · " + updated) + '</span><span>' + escapeHtml(item.branch + " · @" + shortSharedHash(item.head)) + '</span><span>' + escapeHtml(session) + '</span>';
+  el("sharedProposalFiles").innerHTML = files.length
+    ? files.map((file) => '<span class="shared-proposal-file" title="' + escapeHtml(file) + '">' + escapeHtml(file) + '</span>').join("")
+    : '<span class="shared-proposal-file">Changed-file details unavailable for this legacy proposal.</span>';
+  const openButton = el("sharedProposalOpenReview");
+  openButton.dataset.sharedProposal = item.branch;
+  openButton.textContent = room ? "Resume exact review" : "Open " + fileCount + " file" + (fileCount === 1 ? "" : "s") + " to review";
+  el("sharedProposalChangeSummary").textContent = "Bound to @" + shortSharedHash(item.head);
+  for (const candidate of state.sharedReviewRooms.values()) candidate.frame.hidden = candidate !== room;
+  state.sharedReviewKey = room ? key : "";
+  empty.hidden = Boolean(room);
+  if (!room) empty.textContent = "The review opens only when you are ready. This overview always reflects the proposal's latest published commit.";
+}
+
+function selectSharedProposal(proposal) {
+  if (!(state.sharedContext?.proposals || []).some((item) => item.branch === proposal)) return;
+  state.sharedProposalSelection = proposal;
+  renderSharedProposalWorkspace();
 }
 
 function activateSharedReviewRoom(key) {
   const room = state.sharedReviewRooms.get(key);
   if (!room) return;
   state.sharedReviewKey = key;
+  state.sharedProposalSelection = room.result.review.proposal;
   for (const item of state.sharedReviewRooms.values()) item.frame.hidden = item !== room;
   room.frame.hidden = false;
   el("sharedProposalReviewEmpty").hidden = true;
@@ -9656,6 +9756,7 @@ async function openSharedProposal(proposal) {
   const item = (state.sharedContext?.proposals || []).find((candidate) => candidate.branch === proposal);
   if (!item) throw new Error("Proposal is no longer available: " + proposal);
   setSharedProposalWorkspaceOpen(true);
+  state.sharedProposalSelection = proposal;
   const key = sharedProposalKey(item);
   if (state.sharedReviewRooms.has(key)) {
     activateSharedReviewRoom(key);
@@ -18026,9 +18127,12 @@ el("sharedProposalProjectFilter")?.addEventListener("change", (event) => {
   renderSharedProposalWorkspace();
 });
 el("sharedProposalList")?.addEventListener("click", (event) => {
-  const button = event.target.closest("[data-shared-proposal]");
+  const button = event.target.closest("[data-shared-proposal-select]");
   if (!button) return;
-  openSharedProposal(button.dataset.sharedProposal).catch((error) => setStatus(error.message));
+  selectSharedProposal(button.dataset.sharedProposalSelect);
+});
+el("sharedProposalOpenReview")?.addEventListener("click", (event) => {
+  openSharedProposal(event.currentTarget.dataset.sharedProposal).catch((error) => setStatus(error.message));
 });
 document.querySelectorAll("[data-home-action]").forEach((button) => button.addEventListener("click", () => homeAction(button.dataset.homeAction)));
 document.querySelectorAll("[data-home-file]").forEach((button) => button.addEventListener("click", () => selectFile(button.dataset.homeFile).catch((error) => setStatus(error.message))));

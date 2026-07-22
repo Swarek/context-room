@@ -89,8 +89,8 @@ Usage:
   context-room shared setup --root . --repository <git-url> [--project <projectId>]
   context-room shared sync|status|proposals --root .
   context-room shared secure-github|security-check --root .
-  context-room shared propose --root . --title "Change" [--scope project|global] [--session <task-id>]
-  context-room shared publish --root . --proposal proposal/... [--message "..."]
+  context-room shared propose --root . --title "Change" --description "Current proposal summary" [--scope project|global] [--session <task-id>]
+  context-room shared publish --root . --proposal proposal/... [--title "Updated name"] [--description "Required when updating"] [--message "..."]
   context-room shared review --root . --proposal proposal/... [--port 4317]
   context-room install-hook [--root .]
   context-room install-hooks [--root .]
@@ -110,7 +110,7 @@ Config: ${CONFIG_FILE}
 }
 
 const KNOWN_OPTIONS = new Set([
-  "advisory", "allow", "branch", "dry-run", "exclude", "h", "heading", "help", "highlight", "hook",
+  "advisory", "allow", "branch", "description", "dry-run", "exclude", "h", "heading", "help", "highlight", "hook",
   "limit", "message", "mode", "name", "no-restart", "note", "operation", "path", "percent", "port", "profile",
   "project", "proposal", "repository", "root", "scope", "session", "strict", "target", "task", "text", "title", "version", "view", "watch",
 ]);
@@ -149,6 +149,11 @@ if (args.root === true || args.root === "") {
 
 if (args.title === true || args.title === "") {
   console.error("--title requires a value.");
+  process.exit(2);
+}
+
+if (args.description === true || args.description === "") {
+  console.error("--description requires a value.");
   process.exit(2);
 }
 
@@ -236,8 +241,10 @@ if (command === "shared") {
       process.exit(0);
     }
     if (action === "propose" || action === "proposal-create") {
+      if (!args.description) throw new Error("--description is required when creating a proposal");
       console.log(JSON.stringify(createSharedProposal(root, {
         title: args.title || args.task || "Shared context change",
+        description: args.description,
         scope: args.scope || "project",
         branch: args.branch || "",
         sessionId: args.session || process.env.CODEX_THREAD_ID || "",
@@ -246,7 +253,12 @@ if (command === "shared") {
     }
     if (action === "publish" || action === "proposal-push") {
       if (!args.proposal || args.proposal === true) throw new Error("--proposal requires a proposal/* branch");
-      console.log(JSON.stringify(publishSharedProposal(root, { proposal: args.proposal, message: args.message }), null, 2));
+      console.log(JSON.stringify(publishSharedProposal(root, {
+        proposal: args.proposal,
+        message: args.message,
+        title: args.title,
+        description: args.description,
+      }), null, 2));
       process.exit(0);
     }
     if (action === "review") {

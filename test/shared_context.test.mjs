@@ -3,6 +3,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { execFileSync } from "node:child_process";
+import { fileURLToPath } from "node:url";
 import test from "node:test";
 
 import {
@@ -31,6 +32,8 @@ import {
   writeMemoryFile,
 } from "../src/context_room.mjs";
 
+const cli = fileURLToPath(new URL("../bin/context-room.mjs", import.meta.url));
+
 test("shared proposal selector and exact-hash pull-request delivery are present in the UI", () => {
   const html = renderAppHtml();
   assert.match(html, /class="workspace-chrome"/);
@@ -40,6 +43,9 @@ test("shared proposal selector and exact-hash pull-request delivery are present 
   assert.match(html, /id="sharedProposalBrowser"/);
   assert.match(html, /id="sharedProposalWorkspace"/);
   assert.match(html, /id="sharedProposalSearch"/);
+  assert.match(html, /id="sharedProposalOverviewDescription"/);
+  assert.match(html, /id="sharedProposalFiles"/);
+  assert.match(html, /id="sharedProposalOpenReview"/);
   assert.match(html, /\/?embedded=1/);
   assert.match(html, /id="sharedProposalReview"/);
   assert.match(html, /id="sharedProposalAccept"/);
@@ -269,6 +275,7 @@ test("proposal branches stay scoped and partial acceptance becomes a PR branch o
   connectSharedContext(fixture.project, { repository: fixture.remote, projectId: "demo" });
   const proposal = createSharedProposal(fixture.project, {
     title: "Clarify demo",
+    description: "Clarify the accepted and rejected sentences in the demo documentation.",
     branch: "proposal/demo/clarify-demo",
     sessionId: "task-clarify-123",
   });
@@ -276,11 +283,13 @@ test("proposal branches stay scoped and partial acceptance becomes a PR branch o
   writeFile(proposal.root, "projects/demo/docs/README.md", "# Demo\n\nAccepted sentence.\n\nRejected sentence.\n");
   const published = publishSharedProposal(fixture.project, { proposal: proposal.branch, message: "Clarify demo docs" });
   assert.equal(published.files.includes("projects/demo/docs/README.md"), true);
-  assert.equal(listSharedProposals(fixture.project).some((item) => (
-    item.branch === proposal.branch
-    && item.head === published.head
-    && item.sessionId === "task-clarify-123"
-  )), true);
+  const listed = listSharedProposals(fixture.project).find((item) => item.branch === proposal.branch);
+  assert.equal(listed.head, published.head);
+  assert.equal(listed.title, "Clarify demo");
+  assert.equal(listed.description, "Clarify the accepted and rejected sentences in the demo documentation.");
+  assert.equal(listed.sessionId, "task-clarify-123");
+  assert.deepEqual(listed.files, ["projects/demo/docs/README.md"]);
+  assert.equal(listed.fileCount, 1);
 
   const review = materializeSharedReview(fixture.project, { proposal: proposal.branch });
   assert.equal(review.metadata.sessionId, "task-clarify-123");
@@ -312,18 +321,39 @@ test("proposal branches stay scoped and partial acceptance becomes a PR branch o
   assert.throws(() => acceptSharedReview(review.reviewRoot), /already accepted/);
 });
 
-test("review acceptance expires when the proposal branch changes", (t) => {
+test("proposal updates require and expose fresh descriptive metadata, and expire an earlier review", (t) => {
   const fixture = makeFixture();
   withSharedHome(t, fixture);
   connectSharedContext(fixture.project, { repository: fixture.remote, projectId: "demo" });
-  const proposal = createSharedProposal(fixture.project, { title: "Change", branch: "proposal/demo/change" });
+  assert.throws(
+    () => execFileSync(process.execPath, [cli, "shared", "propose", "--root", fixture.project, "--title", "Missing description"], { encoding: "utf8" }),
+    (error) => /--description is required when creating a proposal/.test(String(error.stderr || "")),
+  );
+  const proposal = createSharedProposal(fixture.project, {
+    title: "Change",
+    description: "Describe the first proposal version.",
+    branch: "proposal/demo/change",
+  });
   configureGit(proposal.root);
   writeFile(proposal.root, "projects/demo/docs/README.md", "# Demo\n\nFirst proposal.\n");
   publishSharedProposal(fixture.project, { proposal: proposal.branch });
   const review = materializeSharedReview(fixture.project, { proposal: proposal.branch });
 
   writeFile(proposal.root, "projects/demo/docs/README.md", "# Demo\n\nChanged proposal.\n");
-  publishSharedProposal(fixture.project, { proposal: proposal.branch, message: "Change proposal after review" });
+  assert.throws(
+    () => publishSharedProposal(fixture.project, { proposal: proposal.branch, message: "Change proposal after review" }),
+    /--description is required whenever a published proposal is updated/,
+  );
+  const republished = publishSharedProposal(fixture.project, {
+    proposal: proposal.branch,
+    title: "Change demo guidance",
+    description: "The updated proposal now replaces the first sentence with the final guidance.",
+    message: "Change proposal after review",
+  });
+  const listed = listSharedProposals(fixture.project).find((item) => item.branch === proposal.branch);
+  assert.equal(listed.head, republished.head);
+  assert.equal(listed.title, "Change demo guidance");
+  assert.equal(listed.description, "The updated proposal now replaces the first sentence with the final guidance.");
   assert.throws(() => acceptSharedReview(review.reviewRoot), /Proposal changed after review/);
 });
 

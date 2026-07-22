@@ -34,6 +34,8 @@ const DEFAULT_REPOSITORY_CONFIG = {
   projectsFile: "projects.json",
 };
 const GITHUB_RULESET_PREFIX = "Context Room: protect ";
+const MAX_PROPOSAL_TITLE_LENGTH = 160;
+const MAX_PROPOSAL_DESCRIPTION_LENGTH = 6_000;
 
 function sharedHome() {
   return process.env.CONTEXT_ROOM_SHARED_HOME
@@ -182,6 +184,41 @@ function safeSessionId(value, { optional = true } = {}) {
     throw new Error("session must use letters, numbers, dots, underscores, or hyphens");
   }
   return sessionId;
+}
+
+function proposalTitle(value, fallback = "Shared context proposal") {
+  const title = String(value || fallback).trim();
+  if (!title) throw new Error("proposal title is required");
+  if (/\r|\n/.test(title)) throw new Error("proposal title must stay on one line");
+  if (title.length > MAX_PROPOSAL_TITLE_LENGTH) throw new Error(`proposal title must be ${MAX_PROPOSAL_TITLE_LENGTH} characters or fewer`);
+  return title;
+}
+
+function proposalDescription(value, { optional = true } = {}) {
+  const description = String(value || "").replaceAll("\r\n", "\n").trim();
+  if (!description && !optional) throw new Error("proposal description is required");
+  if (description.length > MAX_PROPOSAL_DESCRIPTION_LENGTH) {
+    throw new Error(`proposal description must be ${MAX_PROPOSAL_DESCRIPTION_LENGTH} characters or fewer`);
+  }
+  return description;
+}
+
+function encodeProposalDescription(value) {
+  const description = proposalDescription(value);
+  return description ? Buffer.from(description, "utf8").toString("base64url") : "";
+}
+
+function decodeProposalDescription(value) {
+  const encoded = String(value || "").trim();
+  if (!encoded) return "";
+  if (!/^[A-Za-z0-9_-]+$/.test(encoded)) return "";
+  try {
+    const decoded = Buffer.from(encoded, "base64url");
+    if (decoded.toString("base64url") !== encoded) return "";
+    return proposalDescription(decoded.toString("utf8"));
+  } catch {
+    return "";
+  }
 }
 
 function pathsOverlap(left, right) {
@@ -1098,10 +1135,12 @@ function proposalRegistryPath(repository) {
   return path.join(repositoryCacheRoot(repository), "proposals.json");
 }
 
-export function createSharedProposal(root, { title, scope = "project", branch = "", sessionId = process.env.CODEX_THREAD_ID || "" } = {}) {
+export function createSharedProposal(root, { title, description = "", scope = "project", branch = "", sessionId = process.env.CODEX_THREAD_ID || "" } = {}) {
   const synced = syncSharedContext(root, { allowOffline: false });
   const { connection, repositoryConfig, revision } = synced;
-  const proposal = proposalBranch(repositoryConfig, connection.projectId, title, scope, branch);
+  const safeTitle = proposalTitle(title);
+  const safeDescription = proposalDescription(description);
+  const proposal = proposalBranch(repositoryConfig, connection.projectId, safeTitle, scope, branch);
   const checkout = repositoryCheckout(connection.repository);
   const proposalRoot = path.join(repositoryCacheRoot(connection.repository), "proposals", hashKey(proposal));
   if (fs.existsSync(proposalRoot)) throw new Error(`Proposal workspace already exists: ${proposalRoot}`);
@@ -1117,7 +1156,8 @@ export function createSharedProposal(root, { title, scope = "project", branch = 
     baseRevision: revision,
     projectId: connection.projectId,
     scope,
-    title: String(title || "Shared context proposal"),
+    title: safeTitle,
+    description: safeDescription,
     sourceRemote: source?.remotes?.[0] || "",
     sourceBranch,
     sourceCommit: /^(?:[a-f0-9]{40}|[a-f0-9]{64})$/i.test(sourceCommit) ? sourceCommit : "",
@@ -1130,6 +1170,8 @@ export function createSharedProposal(root, { title, scope = "project", branch = 
 
 function proposalCommitMessage(entry, message) {
   const trailers = [
+    `Context-Room-Title: ${proposalTitle(entry.title)}`,
+    entry.description ? `Context-Room-Description-Base64: ${encodeProposalDescription(entry.description)}` : "",
     `Context-Room-Project: ${entry.scope === "global" ? "global" : entry.projectId}`,
     `Context-Room-Base: ${entry.baseRevision}`,
     entry.sourceRemote ? `Context-Room-Source-Remote: ${entry.sourceRemote}` : "",
@@ -1146,7 +1188,7 @@ function proposalEntry(root, branch) {
   const registry = readJson(proposalRegistryPath(connection.repository), { proposals: {} });
   const entry = registry.proposals?.[branch];
   if (!entry || !fs.existsSync(entry.root)) throw new Error(`Unknown local proposal workspace: ${branch}`);
-  return { connection, entry };
+  return { connection, entry, registry };
 }
 
 function changedFiles(cwd, base) {
@@ -1156,26 +1198,45 @@ function changedFiles(cwd, base) {
   return [...new Set([...committed, ...working, ...untracked])];
 }
 
-export function publishSharedProposal(root, { proposal, message = "" } = {}) {
-  const { connection, entry } = proposalEntry(root, proposal);
+export function publishSharedProposal(root, { proposal, message = "", title, description } = {}) {
+  const { connection, entry, registry } = proposalEntry(root, proposal);
   const config = readSharedRepositoryConfig(entry.root);
   const identity = proposalIdentity(config, entry.branch);
   const expectedScopeId = entry.scope === "global" ? "global" : entry.projectId;
   if (identity.projectId !== expectedScopeId) throw new Error(`Proposal branch scope must be ${config.proposalPrefix}${expectedScopeId}/`);
+  const previousRemoteHead = tryGit(entry.root, ["rev-parse", "--verify", `refs/remotes/origin/${entry.branch}`]);
+  if (previousRemoteHead && description === undefined) {
+    throw new Error("--description is required whenever a published proposal is updated");
+  }
+  const nextTitle = proposalTitle(title === undefined ? entry.title : title);
+  const nextDescription = proposalDescription(description === undefined ? entry.description : description, { optional: !previousRemoteHead });
   const pendingFiles = changedFiles(entry.root, entry.baseRevision);
   assertPathsInProposalScope(pendingFiles, identity);
   if (!pendingFiles.length) throw new Error("Proposal has no changes");
   runGit(entry.root, ["add", "-A"]);
+  let hasStagedChanges = false;
   try {
     runGit(entry.root, ["diff", "--cached", "--quiet"]);
   } catch {
-    runGit(entry.root, ["commit", "-m", proposalCommitMessage(entry, message)], { stdio: ["ignore", "ignore", "pipe"] });
+    hasStagedChanges = true;
+  }
+  const metadataChanged = nextTitle !== entry.title || nextDescription !== (entry.description || "");
+  entry.title = nextTitle;
+  entry.description = nextDescription;
+  if (hasStagedChanges || metadataChanged) {
+    const commitArgs = ["commit"];
+    if (!hasStagedChanges) commitArgs.push("--allow-empty");
+    commitArgs.push("-m", proposalCommitMessage(entry, message));
+    runGit(entry.root, commitArgs, { stdio: ["ignore", "ignore", "pipe"] });
   }
   const head = safeRevision(tryGit(entry.root, ["rev-parse", "HEAD"]), "proposal head");
   const files = gitChangedPaths(entry.root, `${entry.baseRevision}...${head}`);
   assertPathsInProposalScope(files, identity);
   assertReviewableChangedPaths(entry.root, entry.baseRevision, head, files);
   runGit(entry.root, ["push", "--set-upstream", "origin", `${entry.branch}:${entry.branch}`], { stdio: ["ignore", "ignore", "pipe"] });
+  entry.updatedAt = new Date().toISOString();
+  entry.lastPublishedHead = head;
+  writeJson(proposalRegistryPath(connection.repository), registry);
   return { ...entry, head, files };
 }
 
@@ -1189,24 +1250,42 @@ function listRemoteSharedProposals(synced, { allProjects = true } = {}) {
   const prefix = `refs/remotes/origin/${synced.repositoryConfig.proposalPrefix}`;
   const output = tryGit(checkout, ["for-each-ref", "--format=%(refname:strip=3)%09%(objectname)%09%(committerdate:iso8601)%09%(authorname)%09%(authoremail)%09%(subject)", prefix]);
   return output.split("\n").filter(Boolean).flatMap((line) => {
-    const [branch, head, updatedAt, authorName, authorEmail, title] = line.split("\t");
+    const [branch, head, updatedAt, authorName, authorEmail, subject] = line.split("\t");
     try {
       const identity = proposalIdentity(synced.repositoryConfig, branch);
       const proposalHead = safeRevision(head, "proposal head");
       let sessionId = "";
+      let title = subject;
+      let description = "";
       try {
-        sessionId = safeSessionId(tryGit(checkout, [
+        const metadata = String(runGit(checkout, [
           "log",
           "-1",
-          "--format=%(trailers:key=Context-Room-Session,valueonly)",
+          "--format=%(trailers:key=Context-Room-Title,valueonly)%x00%(trailers:key=Context-Room-Description-Base64,valueonly)%x00%(trailers:key=Context-Room-Session,valueonly)",
           proposalHead,
-        ]));
+        ])).split("\0").map((value) => value.trim());
+        title = proposalTitle(metadata[0] || subject);
+        description = decodeProposalDescription(metadata[1]);
+        sessionId = safeSessionId(metadata[2]);
       } catch {}
-      return [{ ...identity, head: proposalHead, updatedAt, author: { name: authorName, email: authorEmail }, title, sessionId }];
+      const files = gitChangedPaths(checkout, `${synced.revision}...${proposalHead}`);
+      return [{
+        ...identity,
+        head: proposalHead,
+        updatedAt,
+        author: { name: authorName, email: authorEmail },
+        title,
+        description,
+        sessionId,
+        files,
+        fileCount: files.length,
+      }];
     } catch {
       return [];
     }
-  }).filter((item) => allProjects || item.projectId === synced.connection.projectId || item.projectId === "global");
+  })
+    .filter((item) => allProjects || item.projectId === synced.connection.projectId || item.projectId === "global")
+    .sort((left, right) => String(right.updatedAt || "").localeCompare(String(left.updatedAt || "")));
 }
 
 export function materializeSharedReview(root, { proposal } = {}) {

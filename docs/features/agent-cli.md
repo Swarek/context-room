@@ -49,12 +49,12 @@ context-room shared status --root .
 context-room shared sync --root .
 context-room shared security-check --root .
 context-room shared proposals --root .
-context-room shared propose --root . --title "Clarify onboarding" [--scope project|global]
-context-room shared publish --root . --proposal proposal/... [--message "..."]
+context-room shared propose --root . --title "Clarify onboarding" --description "Explain the latest intended onboarding changes" [--scope project|global]
+context-room shared publish --root . --proposal proposal/... [--title "Updated proposal name"] [--description "Required for every update"] [--message "..."]
 context-room shared review --root . --proposal proposal/... [--port 4317]
 ```
 
-`propose` returns a writable worktree. `publish` rejects files outside the proposal's project or global scope. `review` is the owner handoff: the room reuses the normal human inline decisions. Only the review UI exposes **Prepare pull request**, bound to the exact proposal hash that room examined. It publishes an `accepted/*` branch containing only the selected result; the agent-facing CLI has no acceptance or merge command. `security-check` verifies the live GitHub rule that blocks direct changes to `main`.
+`propose` returns a writable worktree and records the proposal name and agent-written description. `publish` rejects files outside the proposal's project or global scope. The first publish uses the description recorded by `propose`; every later publish requires a fresh `--description`, and may also replace the proposal name with `--title`. The latest commit therefore always owns the current remote description shown to owners. `review` is the owner handoff: the room reuses the normal human inline decisions. Only the review UI exposes **Prepare pull request**, bound to the exact proposal hash that room examined. It publishes an `accepted/*` branch containing only the selected result; the agent-facing CLI has no acceptance or merge command. `security-check` verifies the live GitHub rule that blocks direct changes to `main`.
 
 See [Shared context](shared-context.md) for repository initialization, read-only snapshots, refresh behavior, partial acceptance, and Git permission requirements.
 
