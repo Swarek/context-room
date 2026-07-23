@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://raw.githubusercontent.com/Swarek/context-room/main/schemas/config.schema.json",
+  "$id": "https://unpkg.com/context-room@latest/schemas/config.schema.json",
   "title": "Context Room project configuration",
   "description": "Configuration for the local Context Room documentation control room.",
   "type": "object",

@@ -12,7 +12,7 @@ context_room:
 
 ## Purpose
 
-The hub is the first screen for review-first work. It keeps the review queue visible before navigation and secondary context.
+The project hub is the first screen for review-first work inside one isolated project. It keeps that project's review queue visible before navigation and secondary context. The computer-wide local/shared switcher is documented separately in [Context Hub](context-hub.md).
 
 ## Example Flow
 

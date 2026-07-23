@@ -1,0 +1,174 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://unpkg.com/context-room@latest/schemas/doc-context.schema.json",
+  "title": "Context Room documentation context packet",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "summary": {
+      "type": "string"
+    },
+    "currentFacts": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/evidence"
+      }
+    },
+    "constraints": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/evidence"
+      }
+    },
+    "decisions": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/evidence"
+      }
+    },
+    "targetDifferences": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/evidence"
+      }
+    },
+    "pendingSessionChanges": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/pendingEvidence"
+      }
+    },
+    "unknowns": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "conflicts": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "optionalReads": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/read"
+      }
+    },
+    "coverage": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "project": {
+          "type": "string"
+        },
+        "docsRevision": {
+          "type": "string"
+        },
+        "scope": {
+          "type": "string"
+        },
+        "sourcesExamined": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "pathsExamined": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "required": ["project", "docsRevision", "scope", "sourcesExamined", "pathsExamined"]
+    }
+  },
+  "required": [
+    "summary",
+    "currentFacts",
+    "constraints",
+    "decisions",
+    "targetDifferences",
+    "pendingSessionChanges",
+    "unknowns",
+    "conflicts",
+    "optionalReads",
+    "coverage"
+  ],
+  "$defs": {
+    "evidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "claim": {
+          "type": "string"
+        },
+        "path": {
+          "type": "string"
+        },
+        "section": {
+          "type": "string"
+        },
+        "truthState": {
+          "type": "string"
+        },
+        "revision": {
+          "type": "string"
+        },
+        "contentHash": {
+          "type": "string",
+          "pattern": "^[a-f0-9]{64}$"
+        }
+      },
+      "required": ["claim", "path", "section", "truthState", "revision", "contentHash"]
+    },
+    "read": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "path": {
+          "type": "string"
+        },
+        "section": {
+          "type": "string"
+        },
+        "reason": {
+          "type": "string"
+        }
+      },
+      "required": ["path", "section", "reason"]
+    },
+    "pendingEvidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "claim": { "type": "string" },
+        "path": { "type": "string", "pattern": "^_session-proposals/" },
+        "repositoryPath": { "type": "string", "minLength": 1 },
+        "section": { "type": "string" },
+        "truthState": { "const": "proposal" },
+        "revision": { "type": "string", "pattern": "^[a-f0-9]{40,64}$" },
+        "contentHash": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+        "deleted": { "type": "boolean" },
+        "proposal": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "branch": { "type": "string" },
+            "head": { "type": "string", "pattern": "^[a-f0-9]{40,64}$" },
+            "baseRevision": { "type": "string", "pattern": "^[a-f0-9]{40,64}$" },
+            "sessionId": { "type": "string" },
+            "projectId": { "type": "string" },
+            "scope": { "enum": ["project", "global"] },
+            "title": { "type": "string" },
+            "description": { "type": "string" },
+            "reviewStatus": { "type": "string" },
+            "hasConflict": { "type": "boolean" }
+          },
+          "required": ["branch", "head", "baseRevision", "sessionId", "projectId", "scope", "title", "description", "reviewStatus", "hasConflict"]
+        }
+      },
+      "required": ["claim", "path", "repositoryPath", "section", "truthState", "revision", "contentHash", "deleted", "proposal"]
+    }
+  }
+}

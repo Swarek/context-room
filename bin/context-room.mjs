@@ -6,8 +6,8 @@ import { updateAllContextRooms } from "../scripts/update-context-rooms.mjs";
 import {
   checkSharedGitHubSecurity,
   connectSharedContext,
-  createSharedProposal,
   detectSharedProject,
+  ensureSharedProposal,
   initializeSharedRepository,
   listSharedProposals,
   materializeSharedReview,
@@ -18,11 +18,32 @@ import {
   syncSharedContext,
 } from "../src/shared_context.mjs";
 import {
+  clearContextHubRuntime,
+  contextHubHostRoot,
+  listContextHubProjects,
+  readContextHubRegistry,
+  readContextHubRuntime,
+  registerContextHubProject,
+  registerContextHubSharedRepository,
+  writeContextHubRuntime,
+} from "../src/context_hub.mjs";
+import {
+  documentationCapabilities,
+  readDocumentation,
+  relatedDocumentation,
+  renderDocumentationPacket,
+  resolveDocumentationProjectRoot,
+  runDocumentationAgent,
+  searchDocumentation,
+  traceDocumentation,
+} from "../src/doc_agent.mjs";
+import {
   appendAgentAnnotation,
   buildAgentBrief,
   buildAgentReviewQueue,
   buildContextRoomDoctorReport,
   buildDocQaReport,
+  contextHubUiState,
   createMemoryServer,
   initializeContextRoomProject,
   readAgentAnnotations,
@@ -75,9 +96,20 @@ Usage:
   context-room setup [--root .] [--title "My Project"] [--allow docs/] [--watch docs/] [--port 4317]
   context-room init [--root .] [--title "My Project"] [--allow docs/] [--watch docs/]
   context-room start [--root .] [--port 4317]
+  context-room hub [--root .] [--port 4317] [--no-local]
+  context-room hub list
+  context-room hub proposals [--project <project-id>] [--session <task-id>]
+  context-room hub open [--project <project-id>] [--session <task-id>] [--proposal proposal/...]
+  context-room hub add-shared --repository <git-url>
   context-room doctor [--root .] [--strict]
   context-room guard [--root .] [--profile advisory|review-only|strict] [--operation commit|push|pull-request|merge]
   context-room brief [--root .] [--task "what the agent will do"] [--limit 12]
+  context-room context ask "what the agent needs to do" [--root . | --repository <git-url> --project <project-id>] [--goal "desired outcome"] [--files path,...] [--depth quick|standard|exhaustive] [--budget 1200] [--session <task-id>] [--json]
+  context-room docs capabilities [--root . | --repository <git-url> --project <project-id>] [--session <task-id>]
+  context-room docs search "query" [--root . | --repository <git-url> --project <project-id>] [--status current|proposal] [--kind canonical] [--limit 8] [--budget 1200] [--session <task-id>]
+  context-room docs read path[#section] [--root . | --repository <git-url> --project <project-id>] [--budget 1600] [--session <task-id>]
+  context-room docs related path [--root . | --repository <git-url> --project <project-id>] [--session <task-id>]
+  context-room docs trace path[#section] [--root . | --repository <git-url> --project <project-id>] [--session <task-id>]
   context-room agent state [--root .]
   context-room agent open [--root .] [--path docs/INDEX.md] [--view hub|settings|file|diff] [--heading "Purpose"] [--text "needle"] [--percent 50]
   context-room agent annotate --root . --path docs/INDEX.md --note "Human-facing note" [--target "text"]
@@ -110,9 +142,9 @@ Config: ${CONFIG_FILE}
 }
 
 const KNOWN_OPTIONS = new Set([
-  "advisory", "allow", "branch", "description", "dry-run", "exclude", "h", "heading", "help", "highlight", "hook",
-  "limit", "message", "mode", "name", "no-restart", "note", "operation", "path", "percent", "port", "profile",
-  "project", "proposal", "repository", "root", "scope", "session", "strict", "target", "task", "text", "title", "version", "view", "watch",
+  "advisory", "allow", "branch", "budget", "depth", "description", "dry-run", "exclude", "files", "goal", "h", "heading", "help", "highlight", "hook",
+  "json", "kind", "limit", "message", "mode", "name", "no-restart", "note", "operation", "path", "percent", "port", "profile", "query",
+  "no-local", "project", "proposal", "repository", "root", "scope", "section", "session", "status", "strict", "target", "task", "text", "title", "version", "view", "watch",
 ]);
 
 function packageVersion() {
@@ -167,7 +199,21 @@ if (args.watch === true || args.watch === "") {
   process.exit(2);
 }
 
-const root = path.resolve(args.root || process.cwd());
+const requestedRoot = path.resolve(args.root || process.cwd());
+const documentationCommand = ["context", "docs"].includes(command);
+if (documentationCommand && (args.repository === true || args.project === true)) {
+  console.error("--repository and --project each require a value.");
+  process.exit(2);
+}
+const sharedDocumentationTarget = documentationCommand && args.repository && args.repository !== true;
+if (documentationCommand && (Boolean(args.repository && args.repository !== true) !== Boolean(args.project && args.project !== true))) {
+  console.error("Shared-only documentation requires both --repository <git-url> and --project <project-id>.");
+  process.exit(2);
+}
+const root = documentationCommand && !sharedDocumentationTarget ? resolveDocumentationProjectRoot(requestedRoot) : requestedRoot;
+const documentationTargetOptions = sharedDocumentationTarget
+  ? { repository: String(args.repository), projectId: String(args.project) }
+  : {};
 let rootStats;
 try {
   rootStats = fs.statSync(root);
@@ -179,7 +225,114 @@ if (!rootStats?.isDirectory()) {
   process.exit(2);
 }
 
-if (command !== "shared" && ["setup", "start", "doctor", "guard", "brief", "agent"].includes(command) && readSharedProjectConnection(root)) {
+if (command === "hub") {
+  const action = args._[1] || "start";
+  try {
+    if (action === "list" || action === "status") {
+      console.log(JSON.stringify({
+        runtime: readContextHubRuntime(),
+        registry: readContextHubRegistry(),
+        projects: listContextHubProjects(),
+      }, null, 2));
+      process.exit(0);
+    }
+    if (action === "add-shared") {
+      if (!args.repository || args.repository === true) throw new Error("Usage: context-room hub add-shared --repository <git-url>");
+      console.log(JSON.stringify(registerContextHubSharedRepository(args.repository), null, 2));
+      process.exit(0);
+    }
+    if (action === "proposals") {
+      let proposals = contextHubUiState(root).proposals;
+      if (args.project && args.project !== true) proposals = proposals.filter((proposal) => proposal.projectId === args.project || proposal.projectTitle === args.project);
+      if (args.session && args.session !== true) proposals = proposals.filter((proposal) => proposal.sessionId === args.session);
+      console.log(JSON.stringify(proposals, null, 2));
+      process.exit(0);
+    }
+    if (action === "open") {
+      const active = readContextHubRuntime();
+      if (!active) throw new Error("Context Hub is not running; run context-room hub first");
+      const query = new URLSearchParams({ hub: "1" });
+      if (args.project && args.project !== true) {
+        const requestedProject = String(args.project);
+        const project = contextHubUiState(root).projects.find((item) => (
+          item.id === requestedProject
+          || item.projectKey === requestedProject
+          || item.shared?.projectId === requestedProject
+          || item.title.toLowerCase() === requestedProject.toLowerCase()
+        ));
+        if (!project) throw new Error(`Unknown Context Hub project: ${requestedProject}`);
+        query.set("project", project.id);
+      }
+      const search = [
+        args.session && args.session !== true ? String(args.session) : "",
+        args.proposal && args.proposal !== true ? String(args.proposal) : "",
+      ].filter(Boolean).join(" ");
+      if (search) query.set("q", search);
+      console.log(`Context Room Hub: ${active.url}/?${query.toString()}`);
+      process.exit(0);
+    }
+    if (action !== "start") throw new Error(`Unknown hub command: ${action}`);
+    let focusedProject = null;
+    if (!args["no-local"]) {
+      initializeContextRoomProject(root, { title: args.title });
+      const connection = readSharedProjectConnection(root);
+      focusedProject = registerContextHubProject(root, {
+        title: args.title,
+        shared: connection ? { repository: connection.repository, projectId: connection.projectId } : null,
+      });
+    }
+    const runtime = readContextHubRuntime();
+    if (runtime) {
+      try {
+        const response = await fetch(runtime.url + "/api/health", { signal: AbortSignal.timeout(1500) });
+        const health = response.ok ? await response.json() : null;
+        const expectedRoot = runtime.root ? fs.realpathSync(runtime.root) : "";
+        const actualRoot = health?.root ? fs.realpathSync(health.root) : "";
+        if (response.ok && health?.ok === true && expectedRoot && actualRoot === expectedRoot) {
+          const focus = focusedProject ? `&project=${encodeURIComponent(focusedProject.id)}` : "";
+          console.log(`Context Room Hub: ${runtime.url}/?hub=1${focus}`);
+          console.log(`Already running since: ${runtime.startedAt || "unknown"}`);
+          process.exit(0);
+        }
+      } catch {}
+      clearContextHubRuntime(runtime.pid);
+    }
+    if (args.port === true || args.port === "") throw new Error("--port requires a number");
+    const hostRoot = contextHubHostRoot();
+    fs.mkdirSync(hostRoot, { recursive: true });
+    initializeContextRoomProject(hostRoot, {
+      title: "Context Room Hub",
+      allowedPaths: [],
+      watchAllow: [],
+      reviewAgentInstructions: false,
+    });
+    const preferredPort = args.port === undefined ? 4317 : Number(args.port);
+    const port = await selectAvailableContextRoomPort(preferredPort, { allowFallback: args.port === undefined });
+    const { server } = createMemoryServer({ root: hostRoot, port, registerInHub: false });
+    await new Promise((resolve, reject) => {
+      const onError = (error) => reject(error);
+      server.once("error", onError);
+      server.listen(port, "127.0.0.1", () => { server.off("error", onError); resolve(); });
+    });
+    const url = `http://127.0.0.1:${port}`;
+    writeContextHubRuntime({ port, root: hostRoot, url });
+    const focus = focusedProject ? `&project=${encodeURIComponent(focusedProject.id)}` : "";
+    console.log(`Context Room Hub: ${url}/?hub=1${focus}`);
+    console.log(`Projects: ${listContextHubProjects().length}`);
+    const close = () => server.close(() => {
+      clearContextHubRuntime(process.pid);
+      process.exit(0);
+    });
+    process.on("SIGINT", close);
+    process.on("SIGTERM", close);
+    await new Promise(() => {});
+  } catch (error) {
+    console.error(`Context Room Hub failed: ${error.message}`);
+    process.exit(1);
+  }
+}
+
+if (command !== "shared" && !sharedDocumentationTarget && ["setup", "start", "doctor", "guard", "brief", "context", "agent"].includes(command) && readSharedProjectConnection(root)) {
   try {
     const shared = syncSharedContext(root, { allowOffline: true });
     if (!shared.online) console.error(`Shared context offline: using ${shared.revision.slice(0, 12)} (${shared.fetchError})`);
@@ -202,11 +355,16 @@ if (command === "shared") {
       }
       const detected = detectSharedProject(root, { repository: args.repository, projectId: args.project || "" });
       const bindingRoot = detected.projectRoot;
-      console.log(JSON.stringify(connectSharedContext(bindingRoot, {
+      const result = connectSharedContext(bindingRoot, {
         repository: args.repository,
         projectId: detected.projectId,
         sync: false,
-      }), null, 2));
+      });
+      if (!process.env.NODE_TEST_CONTEXT) registerContextHubSharedRepository(args.repository);
+      if (!process.env.NODE_TEST_CONTEXT && fs.existsSync(path.join(bindingRoot, CONFIG_FILE))) {
+        registerContextHubProject(bindingRoot, { shared: { repository: args.repository, projectId: detected.projectId } });
+      }
+      console.log(JSON.stringify(result, null, 2));
       process.exit(0);
     }
     if (action === "setup" || action === "connect") {
@@ -216,7 +374,12 @@ if (command === "shared") {
       const detected = detectSharedProject(root, { repository: args.repository, projectId: args.project || "" });
       const setupRoot = detected.projectRoot;
       initializeContextRoomProject(setupRoot);
-      console.log(JSON.stringify(connectSharedContext(setupRoot, { repository: args.repository, projectId: detected.projectId }), null, 2));
+      const result = connectSharedContext(setupRoot, { repository: args.repository, projectId: detected.projectId });
+      if (!process.env.NODE_TEST_CONTEXT) {
+        registerContextHubSharedRepository(args.repository);
+        registerContextHubProject(setupRoot, { shared: { repository: args.repository, projectId: detected.projectId } });
+      }
+      console.log(JSON.stringify(result, null, 2));
       process.exit(0);
     }
     if (action === "sync") {
@@ -237,12 +400,15 @@ if (command === "shared") {
       process.exit(result.verified ? 0 : 1);
     }
     if (action === "proposals" || action === "list") {
-      console.log(JSON.stringify(listSharedProposals(root), null, 2));
+      let proposals = listSharedProposals(root);
+      if (args.project && args.project !== true) proposals = proposals.filter((proposal) => proposal.projectId === args.project);
+      if (args.session && args.session !== true) proposals = proposals.filter((proposal) => proposal.sessionId === args.session);
+      console.log(JSON.stringify(proposals, null, 2));
       process.exit(0);
     }
     if (action === "propose" || action === "proposal-create") {
       if (!args.description) throw new Error("--description is required when creating a proposal");
-      console.log(JSON.stringify(createSharedProposal(root, {
+      console.log(JSON.stringify(ensureSharedProposal(root, {
         title: args.title || args.task || "Shared context change",
         description: args.description,
         scope: args.scope || "project",
@@ -299,6 +465,78 @@ if (command === "shared") {
   }
 }
 
+if (command === "context") {
+  const action = args._[1] || "ask";
+  if (action !== "ask") {
+    console.error(`Unknown context command: ${action}`);
+    process.exit(1);
+  }
+  const task = args.task && args.task !== true ? String(args.task) : args._.slice(2).join(" ").trim();
+  if (!task) {
+    console.error("Usage: context-room context ask \"what the agent needs to do\" [--root . | --repository <git-url> --project <project-id>] [--goal \"desired outcome\"] [--files path,...] [--depth quick|standard|exhaustive] [--budget 1200] [--session <task-id>] [--json]");
+    process.exit(2);
+  }
+  try {
+    const result = runDocumentationAgent({
+      root,
+      ...documentationTargetOptions,
+      cliPath: fileURLToPath(import.meta.url),
+      task,
+      goal: args.goal && args.goal !== true ? String(args.goal) : "",
+      files: splitList(args.files),
+      depth: args.depth && args.depth !== true ? String(args.depth) : "standard",
+      budget: args.budget === undefined ? undefined : args.budget,
+      sessionId: args.session && args.session !== true ? String(args.session) : undefined,
+    });
+    if (args.json) console.log(JSON.stringify(result.packet, null, 2));
+    else process.stdout.write(renderDocumentationPacket(result.packet));
+    process.exit(0);
+  } catch (error) {
+    console.error(`Context Room documentation agent failed: ${error.message}`);
+    process.exit(1);
+  }
+}
+
+if (command === "docs") {
+  const action = args._[1] || "capabilities";
+  const selector = args._[2] || args.path || "";
+  const sessionId = args.session && args.session !== true ? String(args.session) : "";
+  try {
+    if (action === "capabilities") {
+      console.log(JSON.stringify(documentationCapabilities(root, { ...documentationTargetOptions, sessionId }), null, 2));
+      process.exit(0);
+    }
+    if (action === "search") {
+      const query = args.query && args.query !== true ? String(args.query) : args._.slice(2).join(" ").trim();
+      console.log(JSON.stringify(searchDocumentation(root, query, {
+        ...documentationTargetOptions,
+        status: args.status && args.status !== true ? String(args.status) : "",
+        kind: args.kind && args.kind !== true ? String(args.kind) : "",
+        limit: args.limit,
+        budget: args.budget,
+        sessionId,
+      }), null, 2));
+      process.exit(0);
+    }
+    if (action === "read") {
+      console.log(JSON.stringify(readDocumentation(root, selector, { ...documentationTargetOptions, section: args.section, budget: args.budget, sessionId }), null, 2));
+      process.exit(0);
+    }
+    if (action === "related") {
+      console.log(JSON.stringify(relatedDocumentation(root, selector, { ...documentationTargetOptions, sessionId }), null, 2));
+      process.exit(0);
+    }
+    if (action === "trace") {
+      console.log(JSON.stringify(traceDocumentation(root, selector, { ...documentationTargetOptions, section: args.section, sessionId }), null, 2));
+      process.exit(0);
+    }
+    throw new Error(`Unknown docs command: ${action}`);
+  } catch (error) {
+    console.error(`Context Room docs failed: ${error.message}`);
+    process.exit(1);
+  }
+}
+
 if (command === "init") {
   let result;
   try {
@@ -316,6 +554,7 @@ if (command === "init") {
   else console.log(`Documentation discovered: ${result.documentationPaths.length}`);
   console.log(`Watched paths: ${result.config.watchAllow.length}`);
   console.log(`Hub sections: ${result.config.hubSections.length}`);
+  if (!process.env.NODE_TEST_CONTEXT) registerContextHubProject(root, { title: args.title });
   console.log(`Agent setup guide: ${result.agentContextPath}`);
   console.log(`Agent next step: read ${JSON.stringify(result.agentContextPath)} and follow its setup checklist.`);
   console.log(`Run: context-room setup --root ${quotedCliValue(root)}`);
@@ -523,7 +762,7 @@ if (command === "start" || command === "setup") {
       allowedPaths: splitList(args.allow),
       watchAllow: splitList(args.watch),
     });
-    ({ server } = createMemoryServer({ root, port }));
+    ({ server } = createMemoryServer({ root, port, registerInHub: true }));
   } catch (error) {
     console.error(`Context Room setup failed: ${error.message}`);
     process.exit(1);

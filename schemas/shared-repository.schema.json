@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://raw.githubusercontent.com/Swarek/context-room/main/schemas/shared-repository.schema.json",
+  "$id": "https://unpkg.com/context-room@latest/schemas/shared-repository.schema.json",
   "title": "Context Room shared repository",
   "type": "object",
   "additionalProperties": false,

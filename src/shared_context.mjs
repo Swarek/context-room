@@ -9,8 +9,8 @@ export const SHARED_REPOSITORY_CONFIG = ".context-room/shared-repository.json";
 export const SHARED_REVIEW_CONFIG = ".context-room/shared-review.json";
 export const SHARED_REPOSITORY_SCHEMA_VERSION = 1;
 const MAX_SHARED_TEXT_BYTES = 750_000;
-const SHARED_REPOSITORY_SCHEMA_URL = "https://raw.githubusercontent.com/Swarek/context-room/main/schemas/shared-repository.schema.json";
-const SHARED_PROJECTS_SCHEMA_URL = "https://raw.githubusercontent.com/Swarek/context-room/main/schemas/shared-projects.schema.json";
+const SHARED_REPOSITORY_SCHEMA_URL = "https://unpkg.com/context-room@latest/schemas/shared-repository.schema.json";
+const SHARED_PROJECTS_SCHEMA_URL = "https://unpkg.com/context-room@latest/schemas/shared-projects.schema.json";
 const SHARED_REVIEW_TEXT_EXTENSIONS = new Set([
   ".md", ".mdx", ".csv", ".tsv", ".txt", ".json", ".jsonc", ".jsonl", ".yaml", ".yml", ".toml", ".ini",
   ".mjs", ".cjs", ".js", ".jsx", ".ts", ".tsx", ".py", ".sh", ".bash", ".zsh", ".css", ".scss", ".sass",
@@ -70,6 +70,14 @@ function tryGit(cwd, args) {
   } catch {
     return "";
   }
+}
+
+function gitObjectExists(cwd, object) {
+  return spawnSync("git", ["cat-file", "-e", String(object)], {
+    cwd,
+    encoding: "utf8",
+    stdio: ["ignore", "ignore", "ignore"],
+  }).status === 0;
 }
 
 function splitNull(value) {
@@ -403,6 +411,59 @@ function repositoryCheckout(repository) {
 
 function sharedStatePath(repository) {
   return path.join(repositoryCacheRoot(repository), "state.json");
+}
+
+function syncSharedRepositoryState(repository, { allowOffline = true } = {}) {
+  const safeRemote = safeRepository(repository);
+  const checkout = ensureRepositoryClone(safeRemote);
+  let fetchError = "";
+  try {
+    runGit(checkout, ["fetch", "--prune", "origin"], { stdio: ["ignore", "ignore", "pipe"] });
+  } catch (error) {
+    fetchError = String(error.stderr || error.message || error).trim();
+    if (!allowOffline) throw new Error(`Unable to refresh shared context: ${fetchError}`);
+  }
+  const state = readJson(sharedStatePath(safeRemote), {});
+  let descriptor;
+  try {
+    descriptor = readRemoteSharedDescriptor(checkout, state.defaultBranch || "");
+  } catch (error) {
+    if (!fetchError || !state.revision || !state.repositoryConfig || !state.catalog) throw error;
+    descriptor = {
+      revision: safeRevision(state.revision, "cached shared revision"),
+      config: normalizedRepositoryConfig(state.repositoryConfig),
+      catalog: normalizedProjectsCatalog(state.catalog),
+    };
+  }
+  assertSafeTreeEntries(checkout, descriptor.revision, []);
+  const cacheRoot = repositoryCacheRoot(safeRemote);
+  const snapshot = path.join(cacheRoot, "snapshots", descriptor.revision);
+  fs.mkdirSync(path.dirname(snapshot), { recursive: true });
+  materializeSnapshot(checkout, descriptor.revision, snapshot);
+  const repositoryConfig = readSharedRepositoryConfig(snapshot);
+  const catalog = normalizedProjectsCatalog(readJson(path.join(snapshot, repositoryConfig.projectsFile)));
+  const nextState = {
+    version: 1,
+    repository: safeRemote,
+    defaultBranch: repositoryConfig.defaultBranch,
+    revision: descriptor.revision,
+    syncedAt: new Date().toISOString(),
+    online: !fetchError,
+    fetchError,
+    repositoryConfig,
+    catalog,
+  };
+  writeJson(sharedStatePath(safeRemote), nextState);
+  return {
+    connection: { repository: safeRemote, projectId: "global", projectRoot: "" },
+    repositoryConfig,
+    catalog,
+    revision: descriptor.revision,
+    online: !fetchError,
+    fetchError,
+    cacheRoot,
+    snapshot,
+  };
 }
 
 function ensureRepositoryClone(repository) {
@@ -1168,6 +1229,106 @@ export function createSharedProposal(root, { title, description = "", scope = "p
   return registry.proposals[proposal];
 }
 
+function proposalScopeId(connection, scope) {
+  if (scope === "global") return "global";
+  if (scope !== "project") throw new Error("Proposal scope must be project or global");
+  return safeId(connection.projectId, "projectId");
+}
+
+function proposalSessionMatches(entry, connection, scope, sessionId) {
+  return entry
+    && safeSessionId(entry.sessionId) === sessionId
+    && String(entry.scope || "project") === scope
+    && String(entry.scope === "global" ? "global" : entry.projectId) === proposalScopeId(connection, scope);
+}
+
+function remoteBranchRevision(checkout, branch) {
+  const safeBranch = safeBranchName(branch, "proposal branch");
+  const revision = tryGit(checkout, ["rev-parse", `refs/remotes/origin/${safeBranch}^{commit}`]);
+  return revision ? safeRevision(revision, "proposal head") : "";
+}
+
+function ensureProposalWorktree(checkout, repository, proposal) {
+  const proposalRoot = path.join(repositoryCacheRoot(repository), "proposals", hashKey(proposal.branch));
+  if (fs.existsSync(proposalRoot)) {
+    const actualHead = tryGit(proposalRoot, ["rev-parse", "HEAD"]);
+    if (!actualHead) throw new Error(`Proposal workspace is not a Git worktree: ${proposalRoot}`);
+    return proposalRoot;
+  }
+  fs.mkdirSync(path.dirname(proposalRoot), { recursive: true });
+  const localHead = tryGit(checkout, ["rev-parse", `refs/heads/${proposal.branch}^{commit}`]);
+  if (localHead && safeRevision(localHead, "local proposal head") !== proposal.head) {
+    throw new Error(`Local proposal branch diverges from origin/${proposal.branch}; resolve it before resuming this session`);
+  }
+  if (localHead) {
+    runGit(checkout, ["worktree", "add", proposalRoot, proposal.branch], { stdio: ["ignore", "ignore", "pipe"] });
+  } else {
+    runGit(checkout, ["worktree", "add", "-b", proposal.branch, proposalRoot, proposal.head], { stdio: ["ignore", "ignore", "pipe"] });
+  }
+  return proposalRoot;
+}
+
+function proposalRegistryEntryFromRemote(proposal, proposalRoot) {
+  return {
+    branch: proposal.branch,
+    root: proposalRoot,
+    baseRevision: proposal.baseRevision,
+    projectId: proposal.projectId,
+    scope: proposal.scope,
+    title: proposal.title,
+    description: proposal.description,
+    sourceRemote: proposal.sourceRemote || "",
+    sourceBranch: proposal.sourceBranch || "",
+    sourceCommit: proposal.sourceCommit || "",
+    sessionId: proposal.sessionId,
+    createdAt: proposal.createdAt || proposal.updatedAt || new Date().toISOString(),
+    updatedAt: proposal.updatedAt || new Date().toISOString(),
+    lastPublishedHead: proposal.head,
+  };
+}
+
+export function ensureSharedProposal(root, { title, description = "", scope = "project", branch = "", sessionId = process.env.CODEX_THREAD_ID || "" } = {}) {
+  const normalizedSession = safeSessionId(sessionId);
+  if (!normalizedSession || branch) {
+    return { ...createSharedProposal(root, { title, description, scope, branch, sessionId: normalizedSession }), reused: false };
+  }
+  const synced = syncSharedContext(root, { allowOffline: false });
+  const { connection } = synced;
+  const registryFile = proposalRegistryPath(connection.repository);
+  const registry = readJson(registryFile, { version: 1, proposals: {} });
+  const checkout = repositoryCheckout(connection.repository);
+  const remoteProposals = listRemoteSharedProposals(synced);
+  const terminalBranches = new Set(remoteProposals
+    .filter((proposal) => ["accepted", "merged"].includes(proposal.reviewStatus))
+    .map((proposal) => proposal.branch));
+  const localMatches = Object.values(registry.proposals || {}).filter((entry) => (
+    proposalSessionMatches(entry, connection, scope, normalizedSession)
+    && fs.existsSync(entry.root)
+    && !terminalBranches.has(entry.branch)
+    && (!entry.lastPublishedHead || remoteBranchRevision(checkout, entry.branch))
+  ));
+  const remoteMatches = remoteProposals.filter((proposal) => (
+    proposalSessionMatches(proposal, connection, scope, normalizedSession)
+    && !["accepted", "merged"].includes(proposal.reviewStatus)
+  ));
+  const matches = new Map();
+  for (const entry of localMatches) matches.set(entry.branch, { kind: "local", entry });
+  for (const proposal of remoteMatches) matches.set(proposal.branch, { kind: "remote", proposal });
+  if (matches.size > 1) {
+    throw new Error(`Several open proposals match session ${normalizedSession} and scope ${proposalScopeId(connection, scope)}: ${[...matches.keys()].join(", ")}`);
+  }
+  const match = [...matches.values()][0];
+  if (!match) {
+    return { ...createSharedProposal(root, { title, description, scope, sessionId: normalizedSession }), reused: false };
+  }
+  if (match.kind === "local") return { ...match.entry, reused: true };
+  const proposalRoot = ensureProposalWorktree(checkout, connection.repository, match.proposal);
+  const entry = proposalRegistryEntryFromRemote(match.proposal, proposalRoot);
+  registry.proposals[entry.branch] = entry;
+  writeJson(registryFile, registry);
+  return { ...entry, reused: true };
+}
+
 function proposalCommitMessage(entry, message) {
   const trailers = [
     `Context-Room-Title: ${proposalTitle(entry.title)}`,
@@ -1245,8 +1406,291 @@ export function listSharedProposals(root, { allProjects = true } = {}) {
   return listRemoteSharedProposals(synced, { allProjects });
 }
 
+function sharedSessionProposalOverlay(synced, projectId, sessionId) {
+  const normalizedSession = safeSessionId(sessionId);
+  const normalizedProject = safeId(projectId, "projectId");
+  const proposals = normalizedSession ? listRemoteSharedProposals(synced).filter((proposal) => (
+    proposal.sessionId === normalizedSession
+    && (proposal.scope === "global" || (normalizedProject !== "global" && proposal.projectId === normalizedProject))
+    && proposal.reviewStatus !== "merged"
+  )).map((proposal) => ({
+    branch: proposal.branch,
+    head: proposal.head,
+    baseRevision: proposal.baseRevision || synced.revision,
+    projectId: proposal.projectId,
+    scope: proposal.scope,
+    title: proposal.title,
+    description: proposal.description,
+    files: proposal.files,
+    reviewStatus: proposal.reviewStatus,
+    hasConflict: proposal.hasConflict,
+  })) : [];
+  return {
+    version: 1,
+    sessionId: normalizedSession,
+    repository: synced.connection.repository,
+    projectId: normalizedProject,
+    acceptedRevision: synced.revision,
+    proposals,
+  };
+}
+
+export function resolveSharedSessionProposals(root, { sessionId = process.env.CODEX_THREAD_ID || "" } = {}) {
+  const normalizedSession = safeSessionId(sessionId);
+  const connection = readSharedProjectConnection(root);
+  if (!normalizedSession || !connection) return { version: 1, sessionId: normalizedSession, repository: "", projectId: "", proposals: [] };
+  const synced = syncSharedContext(root, { allowOffline: true });
+  return sharedSessionProposalOverlay(synced, synced.connection.projectId, normalizedSession);
+}
+
+export function resolveSharedDocumentationTarget(repository, {
+  projectId,
+  sessionId = process.env.CODEX_THREAD_ID || "",
+  allowOffline = true,
+  acceptedRevision = process.env.CONTEXT_ROOM_DOC_ACCEPTED_REVISION || "",
+} = {}) {
+  const frozenRevision = acceptedRevision ? safeRevision(acceptedRevision, "accepted shared revision") : "";
+  let synced;
+  if (frozenRevision) {
+    const safeRemote = safeRepository(repository);
+    const checkout = ensureRepositoryClone(safeRemote);
+    if (!gitObjectExists(checkout, `${frozenRevision}^{commit}`)) {
+      throw new Error(`Accepted shared revision is unavailable locally: ${frozenRevision}`);
+    }
+    assertSafeTreeEntries(checkout, frozenRevision, []);
+    const cacheRoot = repositoryCacheRoot(safeRemote);
+    const snapshot = path.join(cacheRoot, "snapshots", frozenRevision);
+    fs.mkdirSync(path.dirname(snapshot), { recursive: true });
+    materializeSnapshot(checkout, frozenRevision, snapshot);
+    const repositoryConfig = readSharedRepositoryConfig(snapshot);
+    const catalog = normalizedProjectsCatalog(readJson(path.join(snapshot, repositoryConfig.projectsFile)));
+    const state = readJson(sharedStatePath(safeRemote), {});
+    synced = {
+      connection: { repository: safeRemote, projectId: "global", projectRoot: "" },
+      repositoryConfig,
+      catalog,
+      revision: frozenRevision,
+      online: Boolean(state.online),
+      fetchError: String(state.fetchError || ""),
+      cacheRoot,
+      snapshot,
+    };
+  } else synced = syncSharedRepositoryState(repository, { allowOffline });
+  const normalizedProject = safeId(projectId, "projectId");
+  const project = normalizedProject === "global"
+    ? { id: "global", title: "Global skills" }
+    : synced.catalog.projects.find((item) => item.id === normalizedProject);
+  if (!project) throw new Error(`Shared project is not registered in ${synced.repositoryConfig.projectsFile}: ${normalizedProject}`);
+  const projectRoot = normalizedProject === "global"
+    ? ""
+    : path.join(synced.snapshot, synced.repositoryConfig.projectsPath, normalizedProject);
+  if (projectRoot && (!fs.existsSync(projectRoot) || !fs.statSync(projectRoot).isDirectory())) {
+    throw new Error(`Shared project does not exist in origin/${synced.repositoryConfig.defaultBranch}: ${normalizedProject}`);
+  }
+  const roots = [];
+  const addRoot = (repositoryPath) => {
+    const absolutePath = path.join(synced.snapshot, ...repositoryPath.split("/"));
+    if (fs.existsSync(absolutePath) && fs.statSync(absolutePath).isDirectory()) roots.push({ repositoryPath, absolutePath });
+  };
+  if (normalizedProject !== "global") {
+    addRoot(`${synced.repositoryConfig.projectsPath}/${normalizedProject}/docs`);
+    addRoot(`${synced.repositoryConfig.projectsPath}/${normalizedProject}/skills`);
+  }
+  addRoot(synced.repositoryConfig.globalSkillsPath);
+  return {
+    mode: "shared-only",
+    repository: synced.connection.repository,
+    repositoryName: synced.repositoryConfig.name,
+    projectId: normalizedProject,
+    projectTitle: project.title,
+    revision: synced.revision,
+    defaultBranch: synced.repositoryConfig.defaultBranch,
+    online: synced.online,
+    fetchError: synced.fetchError,
+    root: synced.snapshot,
+    roots,
+    proposalOverlay: sharedSessionProposalOverlay(synced, normalizedProject, sessionId),
+  };
+}
+
+export function readSharedDocumentationProposalDocuments(target = {}, overlay = {}) {
+  const sessionId = safeSessionId(overlay.sessionId || "");
+  if (!sessionId || !Array.isArray(overlay.proposals) || !overlay.proposals.length) return [];
+  const repository = safeRepository(target.repository);
+  const projectId = safeId(target.projectId, "projectId");
+  const acceptedRevision = safeRevision(target.revision || overlay.acceptedRevision, "accepted shared revision");
+  if (safeRepository(overlay.repository) !== repository) throw new Error("Session proposal overlay repository does not match this project");
+  if (safeId(overlay.projectId, "projectId") !== projectId) throw new Error("Session proposal overlay project does not match this project");
+  if (safeRevision(overlay.acceptedRevision, "session proposal accepted revision") !== acceptedRevision) {
+    throw new Error("Session proposal overlay accepted revision does not match this documentation target");
+  }
+  const checkout = repositoryCheckout(repository);
+  const config = readSharedRepositoryConfig(path.join(repositoryCacheRoot(repository), "snapshots", acceptedRevision));
+  const documents = [];
+  for (const rawProposal of overlay.proposals) {
+    const identity = proposalIdentity(config, rawProposal.branch);
+    if (identity.scope !== "global" && (projectId === "global" || identity.projectId !== projectId)) {
+      throw new Error(`Session proposal is outside this project: ${rawProposal.branch}`);
+    }
+    const head = safeRevision(rawProposal.head, "session proposal head");
+    const baseRevision = safeRevision(rawProposal.baseRevision, "session proposal base");
+    if (!gitObjectExists(checkout, `${head}^{commit}`)) throw new Error(`Session proposal commit is unavailable locally: ${head}`);
+    const files = Array.isArray(rawProposal.files) && rawProposal.files.length
+      ? rawProposal.files.map((file) => safeRelativePath(file, "session proposal file"))
+      : gitChangedPaths(checkout, `${baseRevision}...${head}`);
+    assertPathsInProposalScope(files, identity);
+    assertReviewableChangedPaths(checkout, baseRevision, head, files);
+    for (const filePath of files) {
+      if (!/[.](?:md|mdx|html?|txt)$/i.test(filePath)) continue;
+      const existsAtHead = gitObjectExists(checkout, `${head}:${filePath}`);
+      const content = existsAtHead
+        ? String(runGit(checkout, ["show", `${head}:${filePath}`]))
+        : `# Deleted in session proposal\n\n${filePath} is deleted by ${rawProposal.branch}.\n`;
+      documents.push({
+        path: filePath,
+        content,
+        deleted: !existsAtHead,
+        proposal: {
+          branch: rawProposal.branch,
+          head,
+          baseRevision,
+          sessionId,
+          projectId: identity.projectId,
+          scope: identity.scope,
+          title: proposalTitle(rawProposal.title || rawProposal.branch),
+          description: proposalDescription(rawProposal.description || ""),
+          reviewStatus: String(rawProposal.reviewStatus || "ready"),
+          hasConflict: Boolean(rawProposal.hasConflict),
+        },
+      });
+    }
+  }
+  return documents;
+}
+
+export function readSharedSessionProposalDocuments(root, overlay = {}) {
+  const connection = readSharedProjectConnection(root);
+  const sessionId = safeSessionId(overlay.sessionId || "");
+  if (!connection || !sessionId || !Array.isArray(overlay.proposals) || !overlay.proposals.length) return [];
+  return readSharedDocumentationProposalDocuments({
+    repository: connection.repository,
+    projectId: connection.projectId,
+    revision: overlay.acceptedRevision,
+  }, overlay);
+}
+
+export function listRegisteredSharedRepositories() {
+  const registry = readJson(registryPath(), { bindings: [] });
+  return [...new Set((registry.bindings || []).flatMap((binding) => {
+    try { return [safeRepository(binding.repository)]; } catch { return []; }
+  }))];
+}
+
+export function listSharedRepositoryProposals(repository, { allowOffline = true } = {}) {
+  const synced = syncSharedRepositoryState(repository, { allowOffline });
+  return {
+    repository: synced.connection.repository,
+    repositoryName: synced.repositoryConfig.name,
+    status: {
+      online: synced.online,
+      fetchError: synced.fetchError,
+      revision: synced.revision,
+      defaultBranch: synced.repositoryConfig.defaultBranch,
+      syncedAt: readJson(sharedStatePath(synced.connection.repository), {}).syncedAt || null,
+    },
+    projects: synced.catalog.projects,
+    proposals: listRemoteSharedProposals(synced),
+  };
+}
+
+function gitIsAncestor(cwd, ancestor, descendant) {
+  const result = spawnSync("git", ["merge-base", "--is-ancestor", ancestor, descendant], { cwd, encoding: "utf8" });
+  return result.status === 0;
+}
+
+function proposalHasConflict(cwd, mainRevision, proposalHead) {
+  const result = spawnSync("git", ["merge-tree", "--write-tree", mainRevision, proposalHead], {
+    cwd,
+    encoding: "utf8",
+    maxBuffer: 16 * 1024 * 1024,
+  });
+  if (result.status === 0) return false;
+  if (result.status === 1) return true;
+  return null;
+}
+
+function sharedReviewActivityIndex(repository, checkout, mainRevision) {
+  const authorityRoot = path.join(sharedHome(), "review-authority");
+  const index = new Map();
+  if (!fs.existsSync(authorityRoot)) return index;
+  for (const name of fs.readdirSync(authorityRoot)) {
+    if (!/^[a-f0-9-]{36}\.json$/i.test(name)) continue;
+    try {
+      const review = readJson(path.join(authorityRoot, name));
+      if (!review || safeRepository(review.repository) !== repository) continue;
+      const proposal = safeBranchName(review.proposal, "proposal branch");
+      const proposalHead = safeRevision(review.proposalHead, "reviewed proposal head");
+      const accepted = review.accepted?.accepted ? {
+        accepted: true,
+        acceptedAt: review.acceptedAt || null,
+        commit: safeRevision(review.accepted.commit, "accepted commit"),
+        acceptanceBranch: safeBranchName(review.accepted.acceptanceBranch, "acceptance branch"),
+        pullRequestUrl: String(review.accepted.pullRequestUrl || ""),
+        merged: gitIsAncestor(checkout, review.accepted.commit, mainRevision),
+      } : null;
+      const activity = {
+        proposalHead,
+        openedAt: String(review.createdAt || ""),
+        accepted,
+      };
+      if (!index.has(proposal)) index.set(proposal, []);
+      index.get(proposal).push(activity);
+    } catch {}
+  }
+  for (const activities of index.values()) {
+    activities.sort((left, right) => String(right.accepted?.acceptedAt || right.openedAt).localeCompare(String(left.accepted?.acceptedAt || left.openedAt)));
+  }
+  return index;
+}
+
+function sharedRemoteAcceptanceIndex(synced, checkout) {
+  const prefix = `refs/remotes/origin/${synced.repositoryConfig.acceptancePrefix}`;
+  const output = tryGit(checkout, ["for-each-ref", "--format=%(refname:strip=3)%09%(objectname)%09%(committerdate:iso8601)", prefix]);
+  const index = new Map();
+  for (const line of output.split("\n").filter(Boolean)) {
+    const [acceptanceBranch, commitValue, acceptedAt] = line.split("\t");
+    try {
+      const commit = safeRevision(commitValue, "accepted commit");
+      const metadata = String(runGit(checkout, [
+        "log",
+        "-1",
+        "--format=%(trailers:key=Context-Room-Proposal,valueonly)%x00%(trailers:key=Context-Room-Proposal-Head,valueonly)%x00%(trailers:key=Context-Room-Session,valueonly)",
+        commit,
+      ])).split("\0").map((value) => value.trim());
+      if (!metadata[0] || !metadata[1]) continue;
+      const proposal = safeBranchName(metadata[0], "proposal branch");
+      const proposalHead = safeRevision(metadata[1], "proposal head");
+      const item = {
+        accepted: true,
+        acceptedAt,
+        commit,
+        acceptanceBranch: safeBranchName(acceptanceBranch, "acceptance branch"),
+        pullRequestUrl: githubPullRequestUrl(synced.connection.repository, synced.repositoryConfig.defaultBranch, acceptanceBranch),
+        merged: gitIsAncestor(checkout, commit, synced.revision),
+        proposalHead,
+        sessionId: safeSessionId(metadata[2]),
+      };
+      const previous = index.get(proposal);
+      if (!previous || String(item.acceptedAt).localeCompare(String(previous.acceptedAt)) > 0) index.set(proposal, item);
+    } catch {}
+  }
+  return index;
+}
+
 function listRemoteSharedProposals(synced, { allProjects = true } = {}) {
   const checkout = repositoryCheckout(synced.connection.repository);
+  const reviewActivity = sharedReviewActivityIndex(synced.connection.repository, checkout, synced.revision);
+  const remoteAcceptance = sharedRemoteAcceptanceIndex(synced, checkout);
   const prefix = `refs/remotes/origin/${synced.repositoryConfig.proposalPrefix}`;
   const output = tryGit(checkout, ["for-each-ref", "--format=%(refname:strip=3)%09%(objectname)%09%(committerdate:iso8601)%09%(authorname)%09%(authoremail)%09%(subject)", prefix]);
   return output.split("\n").filter(Boolean).flatMap((line) => {
@@ -1257,28 +1701,66 @@ function listRemoteSharedProposals(synced, { allProjects = true } = {}) {
       let sessionId = "";
       let title = subject;
       let description = "";
+      let baseRevision = "";
+      let sourceRemote = "";
+      let sourceBranch = "";
+      let sourceCommit = "";
       try {
         const metadata = String(runGit(checkout, [
           "log",
           "-1",
-          "--format=%(trailers:key=Context-Room-Title,valueonly)%x00%(trailers:key=Context-Room-Description-Base64,valueonly)%x00%(trailers:key=Context-Room-Session,valueonly)",
+          "--format=%(trailers:key=Context-Room-Title,valueonly)%x00%(trailers:key=Context-Room-Description-Base64,valueonly)%x00%(trailers:key=Context-Room-Session,valueonly)%x00%(trailers:key=Context-Room-Base,valueonly)%x00%(trailers:key=Context-Room-Source-Remote,valueonly)%x00%(trailers:key=Context-Room-Source-Branch,valueonly)%x00%(trailers:key=Context-Room-Source-Commit,valueonly)",
           proposalHead,
         ])).split("\0").map((value) => value.trim());
         title = proposalTitle(metadata[0] || subject);
         description = decodeProposalDescription(metadata[1]);
         sessionId = safeSessionId(metadata[2]);
+        baseRevision = metadata[3] ? safeRevision(metadata[3], "proposal base") : "";
+        sourceRemote = String(metadata[4] || "");
+        sourceBranch = String(metadata[5] || "");
+        sourceCommit = metadata[6] ? safeRevision(metadata[6], "source commit") : "";
       } catch {}
       const files = gitChangedPaths(checkout, `${synced.revision}...${proposalHead}`);
+      const activities = reviewActivity.get(branch) || [];
+      const currentActivity = activities.find((activity) => activity.proposalHead === proposalHead) || null;
+      const latestActivity = activities[0] || null;
+      const durableAccepted = remoteAcceptance.get(branch);
+      const accepted = currentActivity?.accepted || (durableAccepted?.proposalHead === proposalHead ? durableAccepted : null);
+      const reviewStatus = accepted?.merged
+        ? "merged"
+        : accepted
+          ? "accepted"
+          : currentActivity
+            ? "in_review"
+            : latestActivity
+              ? "updated"
+              : "ready";
+      let mainAdvancedBy = 0;
+      if (baseRevision && baseRevision !== synced.revision && gitIsAncestor(checkout, baseRevision, synced.revision)) {
+        mainAdvancedBy = Number(tryGit(checkout, ["rev-list", "--count", `${baseRevision}..${synced.revision}`])) || 0;
+      }
       return [{
         ...identity,
+        repository: synced.connection.repository,
+        repositoryName: synced.repositoryConfig.name,
+        projectTitle: synced.catalog.projects.find((project) => project.id === identity.projectId)?.title || (identity.projectId === "global" ? "Global skills" : identity.projectId),
         head: proposalHead,
+        baseRevision,
         updatedAt,
         author: { name: authorName, email: authorEmail },
         title,
         description,
         sessionId,
+        sourceRemote,
+        sourceBranch,
+        sourceCommit,
         files,
         fileCount: files.length,
+        reviewStatus,
+        reviewActivity: currentActivity || latestActivity,
+        updatedSinceReview: reviewStatus === "updated",
+        mainAdvancedBy,
+        hasConflict: mainAdvancedBy > 0 ? proposalHasConflict(checkout, synced.revision, proposalHead) : false,
       }];
     } catch {
       return [];
@@ -1290,6 +1772,15 @@ function listRemoteSharedProposals(synced, { allProjects = true } = {}) {
 
 export function materializeSharedReview(root, { proposal } = {}) {
   const synced = syncSharedContext(root, { allowOffline: false });
+  return materializeSharedReviewFromState(synced, { proposal });
+}
+
+export function materializeSharedRepositoryReview(repository, { proposal } = {}) {
+  const synced = syncSharedRepositoryState(repository, { allowOffline: false });
+  return materializeSharedReviewFromState(synced, { proposal });
+}
+
+function materializeSharedReviewFromState(synced, { proposal } = {}) {
   const match = listRemoteSharedProposals(synced).find((item) => item.branch === proposal);
   if (!match) throw new Error(`Remote proposal not found: ${proposal}`);
   const checkout = repositoryCheckout(synced.connection.repository);
@@ -1394,6 +1885,16 @@ function addIntentToAdd(root, files) {
   }
 }
 
+function acceptedProposalCommitMessage(review, message) {
+  const trailers = [
+    `Context-Room-Proposal: ${safeBranchName(review.proposal, "proposal branch")}`,
+    `Context-Room-Proposal-Head: ${safeRevision(review.proposalHead, "proposal head")}`,
+    review.sessionId ? `Context-Room-Session: ${safeSessionId(review.sessionId)}` : "",
+    `Context-Room-Project: ${safeId(review.projectId, "projectId")}`,
+  ].filter(Boolean);
+  return `${String(message || "Accept shared context proposal").trim()}\n\n${trailers.join("\n")}`;
+}
+
 export function acceptSharedReview(reviewRoot, { message = "Accept shared context proposal" } = {}) {
   const resolvedReviewRoot = path.resolve(reviewRoot);
   const review = readSharedReview(resolvedReviewRoot);
@@ -1430,7 +1931,7 @@ export function acceptSharedReview(reviewRoot, { message = "Accept shared contex
       runGit(acceptanceRoot, ["diff", "--cached", "--quiet"]);
       return { accepted: false, reason: "Accepted result is already present on main", proposal: review.proposal };
     } catch {}
-    runGit(acceptanceRoot, ["commit", "-m", String(message || "Accept shared context proposal")], { stdio: ["ignore", "ignore", "pipe"] });
+    runGit(acceptanceRoot, ["commit", "-m", acceptedProposalCommitMessage(review, message)], { stdio: ["ignore", "ignore", "pipe"] });
     const acceptedCommit = safeRevision(tryGit(acceptanceRoot, ["rev-parse", "HEAD"]), "accepted commit");
     assertSafeTreeEntries(acceptanceRoot, acceptedCommit, policy.allowedPrefixes);
     assertReviewableChangedPaths(acceptanceRoot, currentMain, acceptedCommit, workspace.files);

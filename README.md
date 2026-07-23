@@ -2,7 +2,7 @@
 
 Local-first documentation control room for AI-assisted projects.
 
-Context Room gives a repository a browser UI to map important docs, edit safe text files, review watched doc changes, and generate deterministic context briefs before agent work.
+Context Room gives a repository a browser UI to map important docs, edit safe text files, review watched doc changes, generate deterministic context briefs, and call a documentation-only Codex researcher before agent work.
 
 ## Use It For
 
@@ -11,6 +11,7 @@ Context Room gives a repository a browser UI to map important docs, edit safe te
 - Review important doc changes before they become trusted context.
 - Inspect startup context, startup skills, and hooks that can affect agents.
 - Run local checks with no LLM call.
+- Give a working agent a compact, source-linked context packet through a fresh documentation-only Codex process.
 - Report watched doc changes before commits without blocking by default.
 - Share accepted documentation and global or project skills across repositories without giving agents a direct edit path to the accepted snapshot.
 
@@ -52,6 +53,7 @@ Open the printed `/api/health` URL and confirm that `root` is the intended proje
 - Runtime review state and external baselines live under `.context-room/`.
 - `docs/agent-configuration.md`: full config guide for agents and humans.
 - `schemas/config.schema.json`: JSON Schema for config validation and editor autocomplete.
+- `schemas/doc-context.schema.json`: structured evidence contract for documentation research.
 - `schemas/shared-repository.schema.json`: JSON Schema for the optional shared repository manifest.
 - `schemas/shared-projects.schema.json`: JSON Schema for its project catalog and cwd mappings.
 
@@ -63,9 +65,20 @@ Runtime files under `.context-room/` are excluded from Git where possible. Commi
 context-room init [--title "My Project"] [--allow docs/,src/] [--watch docs/]
 context-room setup [--root .] [--title "My Project"] [--port 4317]
 context-room start [--root .] [--port 4317]
+context-room hub [--root .] [--port 4317] [--no-local]
+context-room hub list
+context-room hub add-shared --repository <git-url>
+context-room hub proposals [--project <project-id>] [--session <task-id>]
+context-room hub open [--project <project-id>] [--session <task-id>] [--proposal proposal/...]
 context-room doctor [--root .] [--strict]
 context-room guard [--root .] [--profile advisory|review-only|strict] [--operation commit|push|pull-request|merge]
 context-room brief [--root .] [--task "change billing onboarding"] [--limit 12]
+context-room context ask "change billing onboarding" [--root . | --repository <git-url> --project <project-id>] [--goal "outcome"] [--files path,...] [--depth quick|standard|exhaustive] [--budget 1200] [--session <task-id>] [--json]
+context-room docs capabilities [--root . | --repository <git-url> --project <project-id>] [--session <task-id>]
+context-room docs search "query" [--status current|proposal] [--kind canonical] [--limit 8] [--budget 1200] [--session <task-id>]
+context-room docs read path[#section] [--budget 1600] [--session <task-id>]
+context-room docs related path [--session <task-id>]
+context-room docs trace path[#section] [--session <task-id>]
 context-room agent queue [--root .]
 context-room agent open [--root .] [--path docs/INDEX.md] [--view hub|settings|file|diff]
 context-room agent annotate --root . --path docs/INDEX.md --note "Human-facing note"
@@ -76,7 +89,7 @@ context-room shared bind --root . --repository <git-url> [--project <project-id>
 context-room shared setup --root . --repository <git-url> [--project <project-id>]
 context-room shared sync|status|proposals --root .
 context-room shared secure-github|security-check --root .
-context-room shared propose --root . --title "Change" --description "Current proposal summary" [--scope project|global] [--session <task-id>]
+context-room shared propose --root . --title "Change" --description "Complete current agent recap" [--scope project|global] [--session <task-id>]
 context-room shared publish --root . --proposal proposal/... [--title "Updated name"] [--description "Required when updating"] [--message "..."]
 context-room shared review --root . --proposal proposal/... [--port 4317]
 context-room install-hooks [--root .]
@@ -89,7 +102,10 @@ context-room update-all [--dry-run] [--no-restart] [--exclude /path]
 - `guard` and `review-only` are non-blocking. `--profile strict` can always fail; a selected `--operation` fails when review is pending.
 - The Review settings tab stores owner-selected gates outside project config. Local hooks cover commit, push, and local merge; pull requests and hosted merges need a required provider check.
 - `brief` ranks relevant docs locally and deterministically. It does not call an LLM.
+- `context ask` starts a fresh read-only, ephemeral Codex researcher for one task and returns a schema-constrained documentation packet. It can use the detected local project or target a shared repository directly with `--repository` and `--project`, without creating local project state. The researcher uses only the deterministic `docs` subcommands and never inspects code. Accepted shared revisions and same-session proposals are frozen for the call; proposal evidence stays pending, never current.
+- `docs` exposes section-level search, exact reads, reference traversal, provenance, hashes, and project-specific canonical subjects without calling a model.
 - `agent` commands let an agent open files, inspect the queue, leave annotations for the human, and manage explicit folder watch rules without making review decisions.
+- `hub` starts or reuses one computer-wide cockpit for local projects and shared proposals. Local files retain their normal project review queue; shared changes retain exact-hash proposal review.
 - `shared` commands connect any compatible shared-context Git repository, refresh its accepted default-branch snapshot, manage scoped proposal worktrees, and open the normal review UI against an exact proposal commit. See [Shared context](docs/features/shared-context.md).
 - `update-all` installs the latest npm release globally and restarts every verified active room it discovers except a Context Room development checkout. Before acting, it verifies each room's canonical project root through `/api/health`, so paths containing spaces are not inferred from process command text.
 
@@ -128,7 +144,7 @@ The reusable HTML examples are available directly at:
 
 ```json
 {
-  "$schema": "https://raw.githubusercontent.com/Swarek/context-room/main/schemas/config.schema.json",
+  "$schema": "https://unpkg.com/context-room@latest/schemas/config.schema.json",
   "title": "My Project",
   "projectOnly": true,
   "allowedPaths": ["docs/", "README.md", "AGENTS.md"],
@@ -185,13 +201,18 @@ Rules that matter:
 - [Feature documentation](docs/features/index.md): clear docs for each user-facing feature.
 - [Agent configuration](docs/agent-configuration.md): config fields, metadata, and agent setup.
 - [Shared context](docs/features/shared-context.md): generic shared repositories, proposals, partial acceptance, skills, freshness, and permissions.
+- [Context Hub](docs/features/context-hub.md): one UI for local-only, shared-only, and linked local-plus-shared projects.
+- [Documentation research agent](docs/features/documentation-agent.md): working-agent launcher, dedicated documentation CLI, Codex isolation, evidence schema, and safety boundaries.
+- [Documentation lifecycle](docs/features/documentation-lifecycle.md): creation, scheduled audit, task proposal reuse, and local/shared/mixed routing.
 
 ## Development
 
 ```bash
 npm test
 node bin/context-room.mjs doctor --root .
+npm run package:privacy
+npm pack --dry-run
 node bin/context-room.mjs start --root .
 ```
 
-The package has no runtime dependencies beyond Node.js built-ins.
+`package:privacy` inspects the exact npm file list and rejects absolute user-home paths or email addresses before publication.

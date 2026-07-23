@@ -4,8 +4,8 @@ context_room:
   scope: context-room
   status: current
   canonical_for: shared context repositories
-  last_verified: 2026-07-21
-  sources: [src/shared_context.mjs, bin/context-room.mjs, src/context_room.mjs, schemas/shared-repository.schema.json, schemas/shared-projects.schema.json, schemas/config.schema.json]
+  last_verified: 2026-07-22
+  sources: [src/shared_context.mjs, src/context_hub.mjs, bin/context-room.mjs, src/context_room.mjs, schemas/shared-repository.schema.json, schemas/shared-projects.schema.json, schemas/config.schema.json]
 ---
 
 # Shared Context
@@ -48,7 +48,7 @@ The generated repository manifest contains the paths and branch conventions used
 
 ```json
 {
-  "$schema": "https://raw.githubusercontent.com/Swarek/context-room/main/schemas/shared-repository.schema.json",
+  "$schema": "https://unpkg.com/context-room@latest/schemas/shared-repository.schema.json",
   "version": 1,
   "name": "Company Shared Context",
   "defaultBranch": "main",
@@ -64,7 +64,7 @@ The generated repository manifest contains the paths and branch conventions used
 
 ```json
 {
-  "$schema": "https://raw.githubusercontent.com/Swarek/context-room/main/schemas/shared-projects.schema.json",
+  "$schema": "https://unpkg.com/context-room@latest/schemas/shared-projects.schema.json",
   "version": 1,
   "projects": [
     {
@@ -127,10 +127,15 @@ Create a project-scoped proposal from the latest accepted remote commit:
 context-room shared propose \
   --root . \
   --title "Clarify onboarding" \
-  --description "Clarify the owner-visible onboarding steps and their prerequisites."
+  --description "Clarify the owner-visible onboarding steps and their prerequisites." \
+  --session "$CODEX_THREAD_ID"
 ```
 
-The command prints a proposal branch and a writable worktree path. Make the documentation or skill changes inside that returned worktree, then publish the exact proposal:
+The description is the current **agent recap** shown before the diffs. Keep it cumulative and replace it whenever the proposal changes.
+
+The command prints a proposal branch and a writable worktree path. With a task ID, it first looks for one open proposal with the same repository and project or global scope. It returns that worktree instead of creating a second proposal, including when the remote branch must be reattached on another local checkout. More than one matching open proposal is an explicit error. Accepted or merged proposals are terminal and are never reused.
+
+Make the documentation or skill changes inside the returned worktree, then publish the exact proposal:
 
 ```bash
 context-room shared publish \
@@ -150,11 +155,13 @@ context-room shared publish \
   --message "Update onboarding proposal"
 ```
 
-`--title` is optional during an update; `--description` is required. Context Room refuses an update without it, so the proposal inbox never silently keeps an older description after the branch changes.
+`--title` is optional during an update; `--description` is required. Context Room refuses an update without it, so the proposal inbox never silently keeps an older agent recap after the branch changes.
 
 Project proposals may change only `projects/<project-id>/docs/` and `projects/<project-id>/skills/`. A global proposal uses `--scope global`, receives a `proposal/global/...` branch by default, and may change only the configured global skills directory. The explicit branch scope must match the requested scope.
 
-Context Room repeats that validation after fetching the remote branch, so bypassing the local publish command does not widen the review. Proposal files must be reviewable UTF-8 text supported by Context Room and no larger than 750 KB. Symlinks, gitlinks, binaries, and special files are rejected. The proposal commit records its current name and description, accepted-doc base, plus the source repository, branch, commit, and Codex task ID when those are available. `shared propose` reads `CODEX_THREAD_ID` automatically in Codex; `--session <task-id>` can attach an explicit identity in another agent runtime. This identity is metadata for finding a proposal, not an authorization token.
+Context Room repeats that validation after fetching the remote branch, so bypassing the local publish command does not widen the review. Proposal files must be reviewable UTF-8 text supported by Context Room and no larger than 750 KB. Symlinks, gitlinks, binaries, and special files are rejected.
+
+The proposal commit records its current name and description, accepted-doc base, plus the source repository, branch, commit, and Codex task ID when those are available. `shared propose` reads `CODEX_THREAD_ID` automatically in Codex; `--session <task-id>` can attach an explicit identity in another agent runtime. This identity selects one open proposal per repository and project/global scope and lets Context Hub find it. It is metadata, not an authorization token. One task may legitimately own a project proposal and a separate global proposal.
 
 `--branch proposal/...` can provide an explicit unique branch name. Otherwise Context Room derives one from the project or global scope, timestamp, and title.
 
@@ -177,9 +184,13 @@ The review command:
 4. applies the proposal as uncommitted changes; and
 5. starts the normal Context Room review UI for those changes.
 
-Every connected project room can act as the shared proposal cockpit. It lists proposals for every project in the shared repository, not only the project used to launch Context Room. **Browse all** opens a full-screen proposal inbox with project and text filters; the search covers title, description, changed paths, branch, author, commit hash, and linked Codex task ID. Each proposal row shows its name, latest description, changed-file count, and a short path preview. Selecting it opens a larger overview with the full current description, complete changed-file list, author, update time, branch, hash, and linked session before any review room is created.
+Every project room can open Context Hub, which aggregates every registered shared repository instead of only the repository connected to the current project. Its inbox links proposals to local projects when that relationship exists, while shared-only projects remain reviewable without a local folder. Search covers project and repository names, title, agent recap, changed paths, branch, author, commit hash, and linked Codex task ID.
+
+The same inbox also exposes local review work, but local files never become proposals. Opening a local item starts that project's isolated normal room and review queue. Opening a shared item creates the exact-hash proposal review described below. The overview labels the latest description as the agent recap and keeps the full task ID visible before the owner opens files. See [Context Hub](context-hub.md).
 
 Pressing **Open files to review** creates a dedicated exact-hash review server and worktree. The review is embedded below the proposal overview instead of replacing the cockpit URL. Several opened reviews remain mounted while the owner switches between them, so unsaved browser state is not discarded. Returning to the normal project context only hides the workspace. Reopening the same unchanged proposal reuses its exact review room; if the branch moves, Context Room presents the new hash as a separate review and the old review remains bound to the hash already examined. Local-only projects keep the existing UI without these controls.
+
+Context Hub records whether the current proposal hash is new, already opened, updated after an earlier review, accepted into a pull-request branch, or merged. If `main` advanced since the proposal base, the inbox shows the commit distance and a merge-conflict signal when Git can calculate it.
 
 Use the existing inline controls to accept or reject each change. Rejecting a change block rewrites the review worktree to remove that block; accepting it keeps the proposed result. This means the final worktree diff contains only the parts the human chose to accept.
 
@@ -206,6 +217,8 @@ A skill is shared when its directory contains `<skill-directory>/SKILL.md`.
 - Refresh removes a managed link when its accepted skill is deleted or renamed, without touching unmanaged paths.
 
 Skills therefore follow the same trust path as documentation: proposal, exact-commit human review, accepted branch, human pull-request merge, then refresh of the read-only snapshot.
+
+The recommended global documentation-maintenance and audit skills are described in [Documentation lifecycle](documentation-lifecycle.md). They use the same links and proposal boundaries; they do not receive a separate path to accepted content.
 
 ## Permission Boundary
 

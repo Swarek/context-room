@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
 
@@ -12,17 +12,28 @@ import {
   connectSharedContext,
   createSharedProposal,
   detectSharedProject,
+  ensureSharedProposal,
   initializeSharedRepository,
+  listSharedRepositoryProposals,
   listSharedProposals,
+  materializeSharedRepositoryReview,
   materializeSharedReview,
   publishSharedProposal,
   readSharedProjectConnection,
+  resolveSharedSessionProposals,
   secureSharedGitHubRepository,
   sharedContextStatus,
   syncSharedContext,
 } from "../src/shared_context.mjs";
 import {
+  buildDocumentationCorpus,
+  readDocumentation,
+  runDocumentationAgent,
+  searchDocumentation,
+} from "../src/doc_agent.mjs";
+import {
   initializeContextRoomProject,
+  contextHubUiState,
   createMemoryServer,
   deleteMemoryPaths,
   listExplorerFiles,
@@ -42,8 +53,15 @@ test("shared proposal selector and exact-hash pull-request delivery are present 
   assert.match(html, /id="sharedProposalSelect"/);
   assert.match(html, /id="sharedProposalBrowser"/);
   assert.match(html, /id="sharedProposalWorkspace"/);
+  assert.match(html, /id="contextHubOpen"/);
+  assert.match(html, />Context Hub</);
+  assert.match(html, />Local \+ shared</);
+  assert.match(html, /Local files use the project review queue directly/);
+  assert.match(html, /\/api\/context-hub\/review/);
   assert.match(html, /id="sharedProposalSearch"/);
   assert.match(html, /id="sharedProposalOverviewDescription"/);
+  assert.match(html, /id="sharedProposalOverviewRecapLabel"/);
+  assert.match(html, /Agent recap · updated with the latest publish/);
   assert.match(html, /id="sharedProposalFiles"/);
   assert.match(html, /id="sharedProposalOpenReview"/);
   assert.match(html, /\/?embedded=1/);
@@ -51,6 +69,7 @@ test("shared proposal selector and exact-hash pull-request delivery are present 
   assert.match(html, /id="sharedProposalAccept"/);
   assert.match(html, /Open review/);
   assert.match(html, /expectedProposalHead: review\.proposalHead/);
+  assert.match(html, /const wasOpen = state\.sharedProposalWorkspaceOpen/);
   assert.match(html, /Prepare pull request/);
   assert.doesNotMatch(html, /Accept into main/);
 });
@@ -338,6 +357,7 @@ test("proposal updates require and expose fresh descriptive metadata, and expire
   writeFile(proposal.root, "projects/demo/docs/README.md", "# Demo\n\nFirst proposal.\n");
   publishSharedProposal(fixture.project, { proposal: proposal.branch });
   const review = materializeSharedReview(fixture.project, { proposal: proposal.branch });
+  assert.equal(listSharedProposals(fixture.project).find((item) => item.branch === proposal.branch).reviewStatus, "in_review");
 
   writeFile(proposal.root, "projects/demo/docs/README.md", "# Demo\n\nChanged proposal.\n");
   assert.throws(
@@ -354,7 +374,289 @@ test("proposal updates require and expose fresh descriptive metadata, and expire
   assert.equal(listed.head, republished.head);
   assert.equal(listed.title, "Change demo guidance");
   assert.equal(listed.description, "The updated proposal now replaces the first sentence with the final guidance.");
+  assert.equal(listed.reviewStatus, "updated");
+  assert.equal(listed.updatedSinceReview, true);
   assert.throws(() => acceptSharedReview(review.reviewRoot), /Proposal changed after review/);
+});
+
+test("session-scoped proposal ensure reuses one workspace per project or global scope", (t) => {
+  const fixture = makeFixture();
+  withSharedHome(t, fixture);
+  connectSharedContext(fixture.project, { repository: fixture.remote, projectId: "demo" });
+
+  const first = ensureSharedProposal(fixture.project, {
+    title: "Document the session",
+    description: "Summarize every documentation change from this working session.",
+    sessionId: "session-docs-123",
+  });
+  writeFile(first.root, "projects/demo/docs/README.md", "# Demo\n\nStill being edited.\n");
+  const reused = ensureSharedProposal(fixture.project, {
+    title: "A later message in the same session",
+    description: "This input must not create another proposal workspace.",
+    sessionId: "session-docs-123",
+  });
+  assert.equal(first.reused, false);
+  assert.equal(reused.reused, true);
+  assert.equal(reused.branch, first.branch);
+  assert.equal(reused.root, first.root);
+  assert.equal(fs.readFileSync(path.join(reused.root, "projects/demo/docs/README.md"), "utf8"), "# Demo\n\nStill being edited.\n");
+
+  const global = ensureSharedProposal(fixture.project, {
+    title: "Update the global workflow",
+    description: "Keep global skills in a separate proposal with the same session identity.",
+    scope: "global",
+    sessionId: "session-docs-123",
+  });
+  assert.equal(global.reused, false);
+  assert.notEqual(global.branch, first.branch);
+  assert.match(global.branch, /^proposal\/global\//);
+});
+
+test("a published session proposal can be rehydrated after its local workspace is removed", (t) => {
+  const fixture = makeFixture();
+  withSharedHome(t, fixture);
+  connectSharedContext(fixture.project, { repository: fixture.remote, projectId: "demo" });
+  const proposal = ensureSharedProposal(fixture.project, {
+    title: "Resume on another checkout",
+    description: "Publish a proposal that can be attached again from its commit metadata.",
+    sessionId: "session-resume-123",
+  });
+  configureGit(proposal.root);
+  writeFile(proposal.root, "projects/demo/docs/README.md", "# Demo\n\nPublished session proposal.\n");
+  const published = publishSharedProposal(fixture.project, { proposal: proposal.branch });
+
+  const sharedHome = process.env.CONTEXT_ROOM_SHARED_HOME;
+  const registryPath = fs.readdirSync(sharedHome)
+    .map((entry) => path.join(sharedHome, entry, "proposals.json"))
+    .find((candidate) => fs.existsSync(candidate));
+  const checkout = path.join(path.dirname(registryPath), "repository");
+  git(checkout, ["worktree", "remove", "--force", proposal.root]);
+  const registry = JSON.parse(fs.readFileSync(registryPath, "utf8"));
+  delete registry.proposals[proposal.branch];
+  fs.writeFileSync(registryPath, JSON.stringify(registry, null, 2) + "\n");
+
+  const resumed = ensureSharedProposal(fixture.project, {
+    title: "Ignored because the remote proposal is authoritative",
+    description: "Ignored until the proposal is republished with a fresh cumulative description.",
+    sessionId: "session-resume-123",
+  });
+  assert.equal(resumed.reused, true);
+  assert.equal(resumed.branch, proposal.branch);
+  assert.equal(git(resumed.root, ["rev-parse", "HEAD"]), published.head);
+  assert.equal(fs.readFileSync(path.join(resumed.root, "projects/demo/docs/README.md"), "utf8"), "# Demo\n\nPublished session proposal.\n");
+});
+
+test("documentation research keeps accepted truth separate from the current session proposal overlay", (t) => {
+  const fixture = makeFixture();
+  withSharedHome(t, fixture);
+  connectSharedContext(fixture.project, { repository: fixture.remote, projectId: "demo" });
+
+  const projectProposal = ensureSharedProposal(fixture.project, {
+    title: "Document pending session behavior",
+    description: "Add one pending project document and delete one accepted project document.",
+    sessionId: "session-overlay-a",
+  });
+  configureGit(projectProposal.root);
+  writeFile(projectProposal.root, "projects/demo/docs/PENDING.md", "# Pending session\n\nPending session alpha.\n");
+  fs.rmSync(path.join(projectProposal.root, "projects/demo/docs/README.md"));
+  publishSharedProposal(fixture.project, { proposal: projectProposal.branch });
+
+  const globalProposal = ensureSharedProposal(fixture.project, {
+    title: "Update global workflow",
+    description: "Add pending global guidance for this same documentation session.",
+    scope: "global",
+    sessionId: "session-overlay-a",
+  });
+  configureGit(globalProposal.root);
+  writeFile(globalProposal.root, "skills/global/global-workflow/SKILL.md", "---\nname: global-workflow\ndescription: Demo global workflow.\n---\n\n# Global workflow\n\nGlobal pending alpha.\n");
+  publishSharedProposal(fixture.project, { proposal: globalProposal.branch });
+
+  const otherSession = ensureSharedProposal(fixture.project, {
+    title: "Another session",
+    description: "This proposal must remain invisible to session overlay A.",
+    sessionId: "session-overlay-b",
+  });
+  configureGit(otherSession.root);
+  writeFile(otherSession.root, "projects/demo/docs/OTHER-SESSION.md", "# Other session\n\nInvisible session beta.\n");
+  publishSharedProposal(fixture.project, { proposal: otherSession.branch });
+
+  const corpus = buildDocumentationCorpus(fixture.project, { sessionId: "session-overlay-a" });
+  assert.equal(corpus.session.id, "session-overlay-a");
+  assert.equal(corpus.session.proposals.length, 2);
+  assert.ok(corpus.documents.some((document) => document.source === "shared-accepted" && document.repositoryPath === undefined));
+  assert.equal(corpus.documents.some((document) => /OTHER-SESSION/.test(document.repositoryPath || "")), false);
+
+  const defaultSearch = searchDocumentation(fixture.project, "Pending session alpha", { sessionId: "session-overlay-a" });
+  assert.equal(defaultSearch.results.some((result) => result.truthState === "proposal"), false);
+  const pendingSearch = searchDocumentation(fixture.project, "Pending session alpha", { sessionId: "session-overlay-a", status: "proposal" });
+  assert.equal(pendingSearch.results[0].repositoryPath, "projects/demo/docs/PENDING.md");
+  assert.equal(pendingSearch.results[0].proposal.sessionId, "session-overlay-a");
+  assert.equal(pendingSearch.results[0].proposal.head, pendingSearch.results[0].revision);
+  const deletion = searchDocumentation(fixture.project, "Deleted in session proposal", { sessionId: "session-overlay-a", status: "proposal" });
+  assert.equal(deletion.results[0].repositoryPath, "projects/demo/docs/README.md");
+  assert.equal(deletion.results[0].deleted, true);
+
+  const frozen = resolveSharedSessionProposals(fixture.project, { sessionId: "session-overlay-a" });
+  const packet = {
+    summary: "The current session proposes one pending project-document change.",
+    currentFacts: [],
+    constraints: [],
+    decisions: [],
+    targetDifferences: [],
+    pendingSessionChanges: [{
+      claim: "The proposal adds pending session alpha.",
+      path: pendingSearch.results[0].path,
+      repositoryPath: pendingSearch.results[0].repositoryPath,
+      section: pendingSearch.results[0].section,
+      truthState: "proposal",
+      revision: pendingSearch.results[0].revision,
+      contentHash: pendingSearch.results[0].contentHash,
+      deleted: false,
+      proposal: pendingSearch.results[0].proposal,
+    }],
+    unknowns: [],
+    conflicts: [],
+    optionalReads: [],
+    coverage: { project: "demo", docsRevision: "replaced", scope: "standard", sourcesExamined: 1, pathsExamined: [pendingSearch.results[0].path] },
+  };
+  const researched = runDocumentationAgent({
+    root: fixture.project,
+    cliPath: cli,
+    task: "Use the pending session documentation",
+    sessionId: "session-overlay-a",
+    proposalOverlay: frozen,
+    codexBin: "/test/codex",
+    spawnSyncImpl() { return { status: 0, signal: null, stdout: JSON.stringify(packet), stderr: "" }; },
+  });
+  assert.equal(researched.packet.pendingSessionChanges[0].proposal.head, pendingSearch.results[0].proposal.head);
+  const wrongHead = structuredClone(packet);
+  wrongHead.pendingSessionChanges[0].proposal.head = "f".repeat(40);
+  assert.throws(() => runDocumentationAgent({
+    root: fixture.project,
+    cliPath: cli,
+    task: "Reject stale pending evidence",
+    sessionId: "session-overlay-a",
+    proposalOverlay: frozen,
+    codexBin: "/test/codex",
+    spawnSyncImpl() { return { status: 0, signal: null, stdout: JSON.stringify(wrongHead), stderr: "" }; },
+  }), /exact proposal head/);
+
+  writeFile(projectProposal.root, "projects/demo/docs/PENDING.md", "# Pending session\n\nPending session alpha, second head.\n");
+  publishSharedProposal(fixture.project, {
+    proposal: projectProposal.branch,
+    description: "Keep the deletion and replace the pending project guidance with its second version.",
+  });
+  const frozenCorpus = buildDocumentationCorpus(fixture.project, { sessionId: "session-overlay-a", proposalOverlay: frozen });
+  const frozenPath = frozenCorpus.documents.find((document) => document.repositoryPath === "projects/demo/docs/PENDING.md").path;
+  assert.doesNotMatch(readDocumentation(fixture.project, frozenPath, { corpus: frozenCorpus }).content, /second head/);
+  const liveCorpus = buildDocumentationCorpus(fixture.project, { sessionId: "session-overlay-a" });
+  const livePath = liveCorpus.documents.find((document) => document.repositoryPath === "projects/demo/docs/PENDING.md").path;
+  assert.match(readDocumentation(fixture.project, livePath, { corpus: liveCorpus }).content, /second head/);
+
+  const sharedOnlyRoot = path.join(fixture.base, "shared-only-cwd");
+  fs.mkdirSync(sharedOnlyRoot, { recursive: true });
+  const sharedOnlyOptions = {
+    repository: fixture.remote,
+    projectId: "demo",
+    sessionId: "session-overlay-a",
+  };
+  const sharedOnlyCorpus = buildDocumentationCorpus(sharedOnlyRoot, sharedOnlyOptions);
+  assert.equal(sharedOnlyCorpus.target.mode, "shared-only");
+  assert.equal(sharedOnlyCorpus.target.projectId, "demo");
+  assert.equal(sharedOnlyCorpus.revision.local, "not-applicable");
+  assert.equal(sharedOnlyCorpus.revision.shared, sharedOnlyCorpus.session.proposals[0].baseRevision);
+  assert.equal(sharedOnlyCorpus.documents.some((document) => document.path === "projects/demo/docs/README.md" && document.source === "shared-accepted"), true);
+  assert.equal(sharedOnlyCorpus.documents.some((document) => document.path === "projects/demo/skills/demo-workflow/SKILL.md"), true);
+  assert.equal(sharedOnlyCorpus.documents.some((document) => document.path === "skills/global/global-workflow/SKILL.md"), true);
+  assert.equal(sharedOnlyCorpus.documents.some((document) => /OTHER-SESSION/.test(document.repositoryPath || "")), false);
+  assert.equal(fs.existsSync(path.join(sharedOnlyRoot, ".context-room")), false);
+  const sharedOnlyDefault = searchDocumentation(sharedOnlyRoot, "Pending session alpha", sharedOnlyOptions);
+  assert.equal(sharedOnlyDefault.results.some((result) => result.truthState === "proposal"), false);
+  const sharedOnlyPending = searchDocumentation(sharedOnlyRoot, "second head", { ...sharedOnlyOptions, status: "proposal" });
+  assert.equal(sharedOnlyPending.results[0].repositoryPath, "projects/demo/docs/PENDING.md");
+  const sharedOnlyPacket = structuredClone(packet);
+  sharedOnlyPacket.pendingSessionChanges = [{
+    claim: "The latest proposal updates the pending session guidance.",
+    path: sharedOnlyPending.results[0].path,
+    repositoryPath: sharedOnlyPending.results[0].repositoryPath,
+    section: sharedOnlyPending.results[0].section,
+    truthState: "proposal",
+    revision: sharedOnlyPending.results[0].revision,
+    contentHash: sharedOnlyPending.results[0].contentHash,
+    deleted: false,
+    proposal: sharedOnlyPending.results[0].proposal,
+  }];
+  sharedOnlyPacket.coverage.pathsExamined = [sharedOnlyPending.results[0].path];
+
+  const fakeCodex = path.join(fixture.base, "shared-only-codex.mjs");
+  fs.writeFileSync(fakeCodex, `#!/usr/bin/env node
+let prompt = "";
+process.stdin.setEncoding("utf8");
+process.stdin.on("data", (chunk) => { prompt += chunk; });
+process.stdin.on("end", () => {
+  if (!prompt.includes("--repository") || !prompt.includes("--project") || !process.env.CONTEXT_ROOM_DOC_ACCEPTED_REVISION) process.exit(9);
+  process.stdout.write(${JSON.stringify(JSON.stringify(sharedOnlyPacket))});
+});
+`, "utf8");
+  fs.chmodSync(fakeCodex, 0o755);
+  const sharedOnlyCli = spawnSync(process.execPath, [
+    cli,
+    "context", "ask", "Use the pending session documentation",
+    `--repository=${fixture.remote}`,
+    "--project=demo",
+    "--session=session-overlay-a",
+    "--json",
+  ], {
+    cwd: sharedOnlyRoot,
+    encoding: "utf8",
+    env: { ...process.env, CONTEXT_ROOM_CODEX_BIN: fakeCodex, NODE_TEST_CONTEXT: "1" },
+  });
+  assert.equal(sharedOnlyCli.status, 0, sharedOnlyCli.stderr);
+  assert.equal(JSON.parse(sharedOnlyCli.stdout).pendingSessionChanges[0].proposal.sessionId, "session-overlay-a");
+  assert.equal(fs.existsSync(path.join(sharedOnlyRoot, ".context-room")), false);
+});
+
+test("a registered shared repository can be browsed and reviewed without a local project connection", (t) => {
+  const fixture = makeFixture();
+  withSharedHome(t, fixture);
+  connectSharedContext(fixture.project, { repository: fixture.remote, projectId: "demo" });
+  const proposal = createSharedProposal(fixture.project, {
+    title: "Shared-only review",
+    description: "Review this proposal directly from the global Context Hub.",
+    branch: "proposal/demo/shared-only",
+  });
+  configureGit(proposal.root);
+  writeFile(proposal.root, "projects/demo/docs/README.md", "# Demo\n\nShared-only review.\n");
+  const published = publishSharedProposal(fixture.project, { proposal: proposal.branch });
+
+  const repositoryState = listSharedRepositoryProposals(fixture.remote, { allowOffline: false });
+  assert.equal(repositoryState.projects.some((project) => project.id === "demo"), true);
+  assert.equal(repositoryState.proposals.some((item) => item.branch === proposal.branch && item.head === published.head), true);
+  const review = materializeSharedRepositoryReview(fixture.remote, { proposal: proposal.branch });
+  assert.equal(review.metadata.proposalHead, published.head);
+  assert.equal(review.metadata.repository, fixture.remote);
+});
+
+test("Context Hub exposes global proposal scopes as filterable shared projects", (t) => {
+  const fixture = makeFixture();
+  withSharedHome(t, fixture);
+  connectSharedContext(fixture.project, { repository: fixture.remote, projectId: "demo" });
+  const proposal = createSharedProposal(fixture.project, {
+    title: "Global workflow update",
+    description: "Update the workflow shared by every connected project.",
+    scope: "global",
+    branch: "proposal/global/workflow-update",
+  });
+  configureGit(proposal.root);
+  writeFile(proposal.root, "skills/global/global-workflow/SKILL.md", "# Updated global workflow\n");
+  publishSharedProposal(fixture.project, { proposal: proposal.branch });
+
+  const hub = contextHubUiState(fixture.project);
+  const globalProject = hub.projects.find((project) => project.projectKey.endsWith(":global"));
+  assert.equal(globalProject?.title, "Global skills");
+  assert.equal(globalProject?.mode, "shared");
+  assert.equal(globalProject?.sharedProposalCount, 1);
+  assert.equal(hub.proposals.find((item) => item.branch === proposal.branch)?.projectKey, globalProject.projectKey);
 });
 
 test("project proposals cannot modify global or another project scope", (t) => {

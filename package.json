@@ -1,16 +1,9 @@
 {
   "name": "context-room",
-  "version": "0.1.9",
+  "version": "0.2.0",
   "description": "Local-first documentation control room for AI-assisted projects.",
   "type": "module",
-  "homepage": "https://github.com/Swarek/context-room#readme",
-  "repository": {
-    "type": "git",
-    "url": "git+https://github.com/Swarek/context-room.git"
-  },
-  "bugs": {
-    "url": "https://github.com/Swarek/context-room/issues"
-  },
+  "homepage": "https://www.npmjs.com/package/context-room",
   "bin": {
     "context-room": "bin/context-room.mjs"
   },
@@ -32,6 +25,7 @@
     "init": "node bin/context-room.mjs init",
     "doctor": "node bin/context-room.mjs doctor",
     "test": "node --check src/context_room.mjs && node --check bin/context-room.mjs && node --check scripts/update-context-rooms.mjs && node --test test/*.test.mjs",
+    "package:privacy": "node scripts/check-package-privacy.mjs",
     "update:rooms": "node scripts/update-context-rooms.mjs",
     "pack:dry-run": "npm pack --dry-run"
   },
@@ -46,7 +40,6 @@
     "review-queue",
     "developer-tools"
   ],
-  "author": "Mathis Blanc",
   "license": "MIT",
   "dependencies": {
     "ws": "^8.21.1"

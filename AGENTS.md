@@ -18,6 +18,8 @@ These instructions apply to this repository. Use them for Context Room product, 
 
 - Product/source map: `docs/product-overview.md`.
 - Feature behavior: `docs/features/index.md`, then the relevant feature page.
+- Documentation creation, audit, and consumption: `docs/features/documentation-lifecycle.md`.
+- Global local/shared cockpit: `docs/features/context-hub.md`.
 - Visual HTML documents: `docs/features/html-visual-documents.md`.
 - Visual pattern contracts: `docs/features/html-visual-patterns.md`.
 - Visual catalogs: `docs/context-room-visual-components.html` and `docs/context-room-data-visual-components.html`.
@@ -57,5 +59,6 @@ node bin/context-room.mjs doctor --root .
 For package/release work, also run:
 
 ```bash
+npm run package:privacy
 npm pack --dry-run
 ```

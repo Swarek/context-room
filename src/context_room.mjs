@@ -18,13 +18,22 @@ import {
 import {
   SHARED_REVIEW_CONFIG,
   acceptSharedReview,
+  listRegisteredSharedRepositories,
+  listSharedRepositoryProposals,
   listSharedProposals,
+  materializeSharedRepositoryReview,
   materializeSharedReview,
   readSharedProjectConnection,
   readSharedReview,
   sharedContextStatus,
   syncSharedContext,
 } from "./shared_context.mjs";
+import {
+  listContextHubProjects,
+  readContextHubRegistry,
+  recordContextHubProjectOpened,
+  registerContextHubProject,
+} from "./context_hub.mjs";
 
 export { DOC_METADATA_KINDS, DOC_METADATA_STATUSES, parseDocMetadata } from "./doc_metadata.mjs";
 
@@ -54,7 +63,7 @@ const AGENT_CONTEXT_ASSET_FILENAMES = [
   "features/shared-context.md",
 ];
 export const GLOBAL_PREFERENCES_FILE = "~/.context-room/preferences.json";
-const CONFIG_SCHEMA_URL = "https://raw.githubusercontent.com/Swarek/context-room/main/schemas/config.schema.json";
+const CONFIG_SCHEMA_URL = "https://unpkg.com/context-room@latest/schemas/config.schema.json";
 const DOCQA_REVIEW_STATE = `${CONFIG_DIR}/review-state.json`;
 const DOCQA_REVIEW_BASELINES = `${CONFIG_DIR}/review-baselines`;
 const DOCQA_GLOBAL_REVIEW_LEDGER = `${CONFIG_DIR}/review-ledger.json`;
@@ -423,7 +432,7 @@ const DEFAULT_HUB_CARD_VISIBILITY = Object.fromEntries(DEFAULT_HUB_CARDS.map((ca
 const HERMES_MEMORY_FILES = [
   {
     path: "~/.hermes/memories/USER.md",
-    label: "Hermes memory · Mathis",
+    label: "Hermes memory · user",
     category: "1 · injected by Hermes",
     impact: "Global Hermes user memory. Injected into sessions when user memory is active.",
   },
@@ -446,7 +455,7 @@ const HERMES_CRON_FILES = [
 
 const CORE_FILES = [
   { path: ".hermes.md", label: "Hermes · project context", category: "1 · injected by Hermes", impact: "Project context loaded automatically when Hermes works in this repo. This is the short Context Room map." },
-  { path: "memory/USER.md", label: "Project context · Mathis", category: "3 · Project folders", impact: "Short user memory in the Context Room repo. Separate from global Hermes memory." },
+  { path: "memory/USER.md", label: "Project context · user", category: "3 · Project folders", impact: "Short user memory in the Context Room repo. Separate from global Hermes memory." },
   { path: "memory/MEMORY.md", label: "Project context · system", category: "3 · Project folders", impact: "Short system memory in the Context Room repo. Separate from global Hermes memory." },
   { path: "memory/budget.md", label: "Memory budgets", category: "3 · Project folders", impact: "Size limits for Project context files." },
   { path: "memory/index.csv", label: "Memory index", category: "4 · indexes & registers", impact: "Navigation index for memory files." },
@@ -7009,6 +7018,171 @@ function sharedContextUiState(root) {
   }
 }
 
+function contextHubRepositoryId(repository) {
+  return createHash("sha256").update(String(repository || "")).digest("hex").slice(0, 16);
+}
+
+function contextHubLocalProjectSummary(project, currentRoot) {
+  let queue = [];
+  let queueError = "";
+  if (project.available) {
+    try {
+      queue = buildAgentReviewQueue(project.root).queue || [];
+    } catch (error) {
+      queueError = error.message;
+    }
+  }
+  return {
+    ...project,
+    current: project.available && safeRealPath(project.root) === safeRealPath(currentRoot),
+    localReviewCount: queue.length,
+    localReviewFiles: queue.slice(0, 12).map((item) => item.path),
+    localReviewError: queueError,
+  };
+}
+
+export function contextHubUiState(root) {
+  const currentRoot = path.resolve(root);
+  const localProjects = listContextHubProjects().map((project) => contextHubLocalProjectSummary(project, currentRoot));
+  const registry = readContextHubRegistry();
+  const repositories = [...new Set([
+    ...registry.sharedRepositories.map((entry) => entry.repository),
+    ...listRegisteredSharedRepositories(),
+    ...localProjects.flatMap((project) => project.shared?.repository ? [project.shared.repository] : []),
+  ])];
+  const sharedRepositories = [];
+  const proposals = [];
+  const repositoryErrors = [];
+  for (const repository of repositories) {
+    try {
+      const shared = listSharedRepositoryProposals(repository, { allowOffline: true });
+      const repositoryId = contextHubRepositoryId(repository);
+      sharedRepositories.push({
+        id: repositoryId,
+        repository,
+        name: shared.repositoryName,
+        status: shared.status,
+        projects: shared.projects,
+      });
+      for (const proposal of shared.proposals) {
+        proposals.push({
+          ...proposal,
+          id: `proposal:${repositoryId}:${proposal.branch}`,
+          type: "shared",
+          repositoryId,
+          repository,
+          repositoryName: shared.repositoryName,
+          projectKey: `shared:${repositoryId}:${proposal.projectId}`,
+        });
+      }
+    } catch (error) {
+      repositoryErrors.push({ repository, error: error.message });
+    }
+  }
+  const projects = localProjects.map((project) => {
+    const sharedRepository = project.shared
+      ? sharedRepositories.find((repository) => repository.repository === project.shared.repository)
+      : null;
+    const sharedProject = sharedRepository?.projects.find((item) => item.id === project.shared?.projectId) || null;
+    const linkedProposals = project.shared
+      ? proposals.filter((proposal) => proposal.repository === project.shared.repository && proposal.projectId === project.shared.projectId)
+      : [];
+    return {
+      ...project,
+      projectKey: `local:${project.id}`,
+      mode: project.shared ? "hybrid" : "local",
+      sharedTitle: sharedProject?.title || "",
+      sharedProposalCount: linkedProposals.length,
+    };
+  });
+  for (const repository of sharedRepositories) {
+    for (const sharedProject of repository.projects) {
+      const linkedLocal = projects.find((project) => project.shared?.repository === repository.repository && project.shared?.projectId === sharedProject.id);
+      const proposalCount = proposals.filter((proposal) => proposal.repository === repository.repository && proposal.projectId === sharedProject.id).length;
+      const sharedKey = `shared:${repository.id}:${sharedProject.id}`;
+      for (const proposal of proposals.filter((item) => item.projectKey === sharedKey)) {
+        if (linkedLocal) proposal.projectKey = linkedLocal.projectKey;
+      }
+      if (linkedLocal) continue;
+      projects.push({
+        id: sharedKey,
+        projectKey: sharedKey,
+        root: "",
+        title: sharedProject.title || sharedProject.id,
+        available: false,
+        current: false,
+        mode: "shared",
+        shared: { repository: repository.repository, projectId: sharedProject.id },
+        sharedTitle: sharedProject.title || sharedProject.id,
+        sharedProposalCount: proposalCount,
+        localReviewCount: 0,
+        localReviewFiles: [],
+        localReviewError: "",
+      });
+    }
+  }
+  for (const proposal of proposals) {
+    if (projects.some((project) => project.projectKey === proposal.projectKey)) continue;
+    const scopedProposals = proposals.filter((item) => item.projectKey === proposal.projectKey);
+    projects.push({
+      id: proposal.projectKey,
+      projectKey: proposal.projectKey,
+      root: "",
+      title: proposal.projectTitle || (proposal.projectId === "global" ? "Global skills" : proposal.projectId),
+      available: false,
+      current: false,
+      mode: "shared",
+      shared: { repository: proposal.repository, projectId: proposal.projectId },
+      sharedTitle: proposal.projectTitle || proposal.projectId,
+      sharedProposalCount: scopedProposals.length,
+      localReviewCount: 0,
+      localReviewFiles: [],
+      localReviewError: "",
+    });
+  }
+  const localItems = projects.filter((project) => project.mode !== "shared").map((project) => ({
+    id: `local:${project.id}`,
+    type: "local",
+    projectKey: project.projectKey,
+    projectId: project.id,
+    title: project.title,
+    description: project.localReviewCount
+      ? `${project.localReviewCount} local file${project.localReviewCount === 1 ? "" : "s"} waiting for the normal project review.`
+      : "The local project is connected and its review queue is clear.",
+    files: project.localReviewFiles,
+    fileCount: project.localReviewCount,
+    reviewStatus: project.available ? (project.localReviewCount ? "local_changes" : "clean") : "unavailable",
+    updatedAt: project.lastOpenedAt,
+    current: project.current,
+    available: project.available,
+    root: project.root,
+    shared: project.shared,
+  }));
+  const items = [...proposals, ...localItems].sort((left, right) => {
+    const rank = { updated: 0, ready: 1, local_changes: 1, in_review: 2, accepted: 3, clean: 4, merged: 5, unavailable: 6 };
+    const statusRank = (rank[left.reviewStatus] ?? 4) - (rank[right.reviewStatus] ?? 4);
+    return statusRank || String(right.updatedAt || "").localeCompare(String(left.updatedAt || ""));
+  });
+  return {
+    enabled: true,
+    generatedAt: new Date().toISOString(),
+    currentProjectId: contextRoomProjectId(currentRoot),
+    projects,
+    sharedRepositories,
+    proposals,
+    items,
+    repositoryErrors,
+    summary: {
+      projects: projects.length,
+      localProjects: projects.filter((project) => project.mode !== "shared").length,
+      sharedProjects: projects.filter((project) => project.mode !== "local").length,
+      sharedRepositories: sharedRepositories.length,
+      proposals: proposals.length,
+      localReviews: localItems.reduce((total, item) => total + item.fileCount, 0),
+    },
+  };
+}
+
 function sharedRequestError(message, statusCode = 400, code = "shared_context_request_failed") {
   const error = new Error(message);
   error.statusCode = statusCode;
@@ -7033,10 +7207,19 @@ export function createMemoryServer({
   globalPreferencesPath = null,
   codexComposerInsert = insertIntoActiveCodexComposer,
   codexReferenceInsert = insertFileReferenceIntoActiveCodexComposer,
+  registerInHub = false,
 } = {}) {
   const projectId = contextRoomProjectId(root);
+  if (registerInHub && !process.env.NODE_TEST_CONTEXT && !fs.existsSync(path.join(path.resolve(root), SHARED_REVIEW_CONFIG))) {
+    try {
+      const connection = readSharedProjectConnection(root);
+      registerContextHubProject(root, { shared: connection ? { repository: connection.repository, projectId: connection.projectId } : null });
+    } catch {}
+  }
   const sharedReviewServers = new Set();
   const sharedReviewRooms = new Map();
+  const contextHubProjectServers = new Set();
+  const contextHubProjectRooms = new Map();
   ensureBackgroundWorker(root, "files");
   void readBackgroundReports(root).catch(() => {});
   const lastSelectedPath = normalizeRelPath(readCollaborationSessionState(root).selectedPath || "");
@@ -7069,16 +7252,22 @@ export function createMemoryServer({
       await routeRequest(req, res, root, globalPreferencesPath, {
         codexComposerInsert,
         codexReferenceInsert,
-        startSharedReview: async (proposal) => {
+        startSharedReview: async ({ proposal, repository = "" }) => {
           if (fs.existsSync(path.join(path.resolve(root), SHARED_REVIEW_CONFIG))) {
             throw sharedRequestError("This Context Room already represents an exact proposal review", 409, "shared_context_review_already_open");
           }
-          const remoteProposal = listSharedProposals(root).find((item) => item.branch === proposal);
+          const remoteState = repository
+            ? listSharedRepositoryProposals(repository, { allowOffline: false })
+            : { repository: readSharedProjectConnection(root)?.repository || "", proposals: listSharedProposals(root) };
+          const remoteProposal = remoteState.proposals.find((item) => item.branch === proposal);
           if (!remoteProposal) throw sharedRequestError(`Remote proposal not found: ${proposal}`, 404, "shared_context_proposal_not_found");
-          const reviewKey = `${remoteProposal.branch}@${remoteProposal.head}`;
+          const reviewRepository = repository || remoteState.repository || remoteProposal.repository;
+          const reviewKey = `${reviewRepository}\0${remoteProposal.branch}@${remoteProposal.head}`;
           const existing = sharedReviewRooms.get(reviewKey);
           if (existing) return existing;
-          const result = materializeSharedReview(root, { proposal });
+          const result = repository
+            ? materializeSharedRepositoryReview(repository, { proposal })
+            : materializeSharedReview(root, { proposal });
           const allowedPaths = sharedReviewAllowedPaths(result.repositoryConfig, result.metadata.projectId);
           initializeContextRoomProject(result.reviewRoot, {
             title: `Review · ${proposal}`,
@@ -7087,7 +7276,7 @@ export function createMemoryServer({
             reviewAgentInstructions: false,
           });
           const reviewPort = await selectAvailableContextRoomPort(DEFAULT_PORT, { allowFallback: true });
-          const reviewRoom = createMemoryServer({ root: result.reviewRoot, port: reviewPort, globalPreferencesPath });
+          const reviewRoom = createMemoryServer({ root: result.reviewRoot, port: reviewPort, globalPreferencesPath, registerInHub: false });
           await listenContextRoomServer(reviewRoom.server, reviewPort);
           sharedReviewServers.add(reviewRoom.server);
           reviewRoom.server.once("close", () => sharedReviewServers.delete(reviewRoom.server));
@@ -7098,6 +7287,32 @@ export function createMemoryServer({
           };
           sharedReviewRooms.set(reviewKey, opened);
           reviewRoom.server.once("close", () => sharedReviewRooms.delete(reviewKey));
+          return opened;
+        },
+        startContextHubProject: async (requestedProjectId) => {
+          const project = listContextHubProjects().find((item) => item.id === requestedProjectId);
+          if (!project) throw sharedRequestError(`Unknown local project: ${requestedProjectId}`, 404, "context_hub_project_not_found");
+          if (!project.available) throw sharedRequestError(`Local project is unavailable: ${project.root}`, 409, "context_hub_project_unavailable");
+          recordContextHubProjectOpened(project.id);
+          if (safeRealPath(project.root) === safeRealPath(root)) {
+            return { current: true, project, port, url: "" };
+          }
+          if (readSharedProjectConnection(project.root)) syncSharedContext(project.root, { allowOffline: true });
+          const existing = contextHubProjectRooms.get(project.id);
+          if (existing) return existing;
+          const projectPort = await selectAvailableContextRoomPort(DEFAULT_PORT, { allowFallback: true });
+          const projectRoom = createMemoryServer({ root: project.root, port: projectPort, globalPreferencesPath, registerInHub: false });
+          await listenContextRoomServer(projectRoom.server, projectPort);
+          contextHubProjectServers.add(projectRoom.server);
+          projectRoom.server.once("close", () => contextHubProjectServers.delete(projectRoom.server));
+          const opened = {
+            current: false,
+            project,
+            port: projectPort,
+            url: `http://127.0.0.1:${projectPort}`,
+          };
+          contextHubProjectRooms.set(project.id, opened);
+          projectRoom.server.once("close", () => contextHubProjectRooms.delete(project.id));
           return opened;
         },
       });
@@ -7114,6 +7329,9 @@ export function createMemoryServer({
     for (const reviewServer of sharedReviewServers) reviewServer.close();
     sharedReviewServers.clear();
     sharedReviewRooms.clear();
+    for (const projectServer of contextHubProjectServers) projectServer.close();
+    contextHubProjectServers.clear();
+    contextHubProjectRooms.clear();
     stopBackgroundWatch();
     closeBackgroundWorkers(root);
     clearBackgroundCacheState(root);
@@ -7125,6 +7343,7 @@ async function routeRequest(req, res, root, globalPreferencesPath = null, {
   codexComposerInsert = insertIntoActiveCodexComposer,
   codexReferenceInsert = insertFileReferenceIntoActiveCodexComposer,
   startSharedReview = null,
+  startContextHubProject = null,
 } = {}) {
   const url = new URL(req.url, `http://${req.headers.host || "localhost"}`);
 
@@ -7134,6 +7353,39 @@ async function routeRequest(req, res, root, globalPreferencesPath = null, {
   }
   if (req.method === "GET" && url.pathname === "/api/shared-context") {
     sendJson(res, 200, sharedContextUiState(root));
+    return;
+  }
+  if (req.method === "GET" && url.pathname === "/api/context-hub") {
+    sendJson(res, 200, contextHubUiState(root));
+    return;
+  }
+  if (req.method === "POST" && url.pathname === "/api/context-hub/refresh") {
+    sendJson(res, 200, contextHubUiState(root));
+    return;
+  }
+  if (req.method === "POST" && url.pathname === "/api/context-hub/project") {
+    const body = await readJsonBody(req);
+    const requestedProjectId = String(body.projectId || "").trim();
+    if (!requestedProjectId) throw sharedRequestError("projectId is required", 400, "context_hub_project_required");
+    if (!startContextHubProject) throw sharedRequestError("Local project opening is unavailable", 503, "context_hub_project_open_unavailable");
+    const result = await startContextHubProject(requestedProjectId);
+    sendJson(res, 201, result);
+    return;
+  }
+  if (req.method === "POST" && url.pathname === "/api/context-hub/review") {
+    const body = await readJsonBody(req);
+    const proposal = String(body.proposal || "").trim();
+    const repository = String(body.repository || "").trim();
+    if (!proposal) throw sharedRequestError("proposal is required", 400, "shared_context_proposal_required");
+    if (!repository) throw sharedRequestError("repository is required", 400, "shared_context_repository_required");
+    if (!startSharedReview) throw sharedRequestError("Shared proposal review is unavailable", 503, "shared_context_review_unavailable");
+    const result = await startSharedReview({ proposal, repository });
+    sendJson(res, 201, {
+      url: result.url,
+      port: result.port,
+      reviewRoot: result.reviewRoot,
+      review: result.metadata,
+    });
     return;
   }
   if (req.method === "POST" && url.pathname === "/api/shared-context/refresh") {
@@ -7147,7 +7399,7 @@ async function routeRequest(req, res, root, globalPreferencesPath = null, {
     const proposal = String(body.proposal || "").trim();
     if (!proposal) throw sharedRequestError("proposal is required", 400, "shared_context_proposal_required");
     if (!startSharedReview) throw sharedRequestError("Shared proposal review is unavailable", 503, "shared_context_review_unavailable");
-    const result = await startSharedReview(proposal);
+    const result = await startSharedReview({ proposal });
     sendJson(res, 201, {
       url: result.url,
       port: result.port,
@@ -9176,20 +9428,34 @@ export function renderAppHtml() {
     }
     .shared-proposal-workspace { position: fixed; inset: 0; z-index: 80; display: grid; grid-template-rows: auto minmax(0, 1fr); background: var(--bg); color: var(--text); }
     .shared-proposal-workspace[hidden] { display: none !important; }
-    .shared-proposal-workspace-head { display: flex; align-items: center; gap: 10px; min-height: 64px; padding: 10px 14px; border-bottom: 1px solid var(--line); background: var(--panel-strong); }
-    .shared-proposal-workspace-title { min-width: 210px; }
+    .context-hub-open { color: var(--text); background: color-mix(in srgb, var(--accent) 9%, transparent); }
+    .context-hub-open::before { content: "⌘"; margin-right: 6px; color: var(--accent); font-weight: 800; }
+    .shared-proposal-workspace-head { display: grid; grid-template-columns: auto minmax(190px, .7fr) auto minmax(240px, 1.2fr) minmax(150px, .55fr) minmax(150px, .55fr) auto; align-items: center; gap: 8px; min-height: 68px; padding: 10px 14px; border-bottom: 1px solid var(--line); background: var(--panel-strong); }
+    .shared-proposal-workspace-title { min-width: 0; }
     .shared-proposal-workspace-title strong { display: block; font-size: 15px; }
-    .shared-proposal-workspace-title span { display: block; margin-top: 2px; color: var(--muted); font: 10px/1.25 ui-monospace, SFMono-Regular, Menlo, monospace; }
-    .shared-proposal-search { width: min(360px, 32vw); min-height: 34px; padding: 7px 10px; border: 1px solid var(--line); border-radius: 8px; background: var(--panel); color: var(--text); }
-    .shared-proposal-filter { width: min(220px, 20vw); min-height: 34px; padding: 6px 28px 6px 9px; border: 1px solid var(--line); border-radius: 8px; background: var(--panel); color: var(--text); }
-    .shared-proposal-workspace-body { min-height: 0; display: grid; grid-template-columns: minmax(340px, 420px) minmax(0, 1fr); }
+    .shared-proposal-workspace-title span { display: block; margin-top: 2px; color: var(--muted); font-size: 10px; line-height: 1.25; }
+    .context-hub-views { display: inline-flex; align-items: center; min-height: 36px; padding: 3px; border: 1px solid var(--line); border-radius: 8px; background: var(--surface-sidebar); }
+    .context-hub-view { min-height: 28px; padding: 0 10px; border: 0; border-radius: 5px; background: transparent; color: var(--muted); font-size: 11px; font-weight: 700; cursor: pointer; }
+    .context-hub-view:hover { color: var(--text); }
+    .context-hub-view.active { background: var(--panel-strong); color: var(--text); box-shadow: 0 3px 10px rgba(0,0,0,.18); }
+    .context-hub-view:focus-visible { outline: 2px solid color-mix(in srgb, var(--accent) 60%, transparent); outline-offset: 2px; }
+    .shared-proposal-search { width: 100%; min-width: 0; min-height: 36px; padding: 7px 10px; border: 1px solid var(--line); border-radius: 8px; background: var(--panel); color: var(--text); }
+    .shared-proposal-search::placeholder { color: color-mix(in srgb, var(--muted) 92%, var(--text)); }
+    .shared-proposal-filter { width: 100%; min-width: 0; min-height: 36px; padding: 6px 28px 6px 9px; border: 1px solid var(--line); border-radius: 8px; background: var(--panel); color: var(--text); }
+    .shared-proposal-workspace-body { min-height: 0; display: grid; grid-template-columns: minmax(350px, 430px) minmax(0, 1fr); }
     .shared-proposal-list-panel { position: relative; inset: auto; z-index: auto; width: auto; height: auto; min-height: 0; max-height: none; overflow: auto; border-right: 1px solid var(--line); background: var(--surface-sidebar); transform: none; }
+    .context-hub-list-status { position: sticky; top: 0; z-index: 2; min-height: 34px; padding: 9px 14px; border-bottom: 1px solid var(--line); background: var(--surface-sidebar); color: var(--muted); font-size: 10px; line-height: 1.4; }
+    .context-hub-list-status[data-error="true"] { color: var(--danger); }
     .shared-proposal-list { display: grid; }
+    .context-hub-group-title { position: sticky; top: 34px; z-index: 1; padding: 8px 14px; border-bottom: 1px solid var(--line); background: color-mix(in srgb, var(--surface-sidebar) 96%, var(--panel)); color: var(--muted); font-size: 10px; font-weight: 780; }
     .shared-proposal-card { width: 100%; padding: 14px 16px; border: 0; border-bottom: 1px solid var(--line); border-radius: 0; background: transparent; color: var(--text); text-align: left; cursor: pointer; }
     .shared-proposal-card:hover { background: color-mix(in srgb, var(--accent) 6%, transparent); }
     .shared-proposal-card.active { background: color-mix(in srgb, var(--accent) 11%, var(--surface-sidebar)); }
+    .shared-proposal-card[data-source="local"].active { background: color-mix(in srgb, var(--good) 9%, var(--surface-sidebar)); }
     .shared-proposal-card:focus-visible { position: relative; outline: 2px solid color-mix(in srgb, var(--accent) 62%, transparent); outline-offset: -3px; }
     .shared-proposal-card-top { display: flex; align-items: center; gap: 7px; }
+    .context-hub-source { display: inline-flex; align-items: center; min-height: 21px; padding: 2px 7px; border-radius: 999px; background: color-mix(in srgb, var(--accent) 14%, transparent); color: var(--accent); font-size: 9px; line-height: 1.2; font-weight: 800; white-space: nowrap; }
+    .context-hub-source[data-source="local"] { background: color-mix(in srgb, var(--good) 13%, transparent); color: color-mix(in srgb, var(--good) 82%, white); }
     .shared-proposal-project { padding: 2px 6px; border-radius: 999px; background: color-mix(in srgb, var(--accent) 15%, transparent); color: var(--accent); font: 10px/1.25 ui-monospace, SFMono-Regular, Menlo, monospace; }
     .shared-proposal-card-title { display: block; margin-top: 9px; font-size: 14px; line-height: 1.3; font-weight: 720; }
     .shared-proposal-card-description { display: -webkit-box; margin-top: 5px; overflow: hidden; color: var(--text-soft); font-size: 11px; line-height: 1.4; -webkit-box-orient: vertical; -webkit-line-clamp: 2; }
@@ -9197,6 +9463,9 @@ export function renderAppHtml() {
     .shared-proposal-card-file { display: block; min-width: 0; overflow: hidden; color: var(--muted); font: 10px/1.3 ui-monospace, SFMono-Regular, Menlo, monospace; text-overflow: ellipsis; white-space: nowrap; }
     .shared-proposal-card-meta, .shared-proposal-card-identity { display: block; margin-top: 5px; color: var(--muted); font: 10px/1.35 ui-monospace, SFMono-Regular, Menlo, monospace; overflow-wrap: anywhere; }
     .shared-proposal-card-state { margin-left: auto; color: var(--muted); font: 10px/1.2 ui-monospace, SFMono-Regular, Menlo, monospace; }
+    .shared-proposal-card-state[data-state="updated"], .shared-proposal-card-state[data-state="local_changes"] { color: var(--accent-2); }
+    .shared-proposal-card-state[data-state="accepted"], .shared-proposal-card-state[data-state="merged"], .shared-proposal-card-state[data-state="clean"] { color: var(--good); }
+    .shared-proposal-card-state[data-state="unavailable"] { color: var(--danger); }
     .shared-proposal-empty { padding: 18px 10px; color: var(--muted); text-align: center; }
     .shared-proposal-review-panel { min-width: 0; min-height: 0; display: grid; grid-template-rows: auto minmax(220px, 1fr); background: var(--bg); }
     .shared-proposal-overview { min-width: 0; padding: 18px 22px 16px; border-bottom: 1px solid var(--line); background: var(--panel); }
@@ -9204,8 +9473,12 @@ export function renderAppHtml() {
     .shared-proposal-overview-top { display: flex; align-items: center; gap: 8px; }
     .shared-proposal-overview-state { color: var(--muted); font: 10px/1.2 ui-monospace, SFMono-Regular, Menlo, monospace; }
     .shared-proposal-overview h2 { margin: 10px 0 0; color: var(--text); font-size: 20px; line-height: 1.2; letter-spacing: -0.02em !important; }
+    .shared-proposal-recap-label { margin: 12px 0 0; color: var(--muted); font: 9px/1.2 ui-monospace, SFMono-Regular, Menlo, monospace; letter-spacing: 0.08em; text-transform: uppercase; }
     .shared-proposal-description { max-width: 72ch; margin: 7px 0 0; color: var(--text-soft); font-size: 12px; line-height: 1.5; white-space: pre-wrap; }
     .shared-proposal-overview-meta { display: flex; flex-wrap: wrap; gap: 5px 14px; margin-top: 11px; color: var(--muted); font: 10px/1.35 ui-monospace, SFMono-Regular, Menlo, monospace; }
+    .context-hub-relationship { display: flex; flex-wrap: wrap; gap: 6px; max-width: 74ch; margin-top: 11px; color: var(--text-soft); font-size: 11px; line-height: 1.45; }
+    .context-hub-relationship:empty { display: none; }
+    .context-hub-relationship span { padding: 6px 8px; border-radius: 6px; background: var(--surface-floating-soft); }
     .shared-proposal-overview-actions { display: flex; align-items: center; gap: 10px; margin-top: 13px; }
     .shared-proposal-overview-actions .primary { min-height: 36px; }
     .shared-proposal-change-summary { color: var(--muted); font-size: 11px; }
@@ -9217,19 +9490,22 @@ export function renderAppHtml() {
     .shared-proposal-frames, .shared-proposal-frame { width: 100%; height: 100%; min-height: 0; border: 0; background: var(--bg); }
     .shared-proposal-frame[hidden], .shared-proposal-review-empty[hidden] { display: none !important; }
     @media (max-width: 900px) {
-      .shared-proposal-workspace-head { flex-wrap: wrap; }
-      .shared-proposal-workspace-title { min-width: 0; flex: 1 1 auto; }
-      .shared-proposal-search, .shared-proposal-filter { width: auto; flex: 1 1 180px; }
+      .shared-proposal-workspace-head { grid-template-columns: auto minmax(0, 1fr) auto auto; }
+      .context-hub-views { grid-column: 3; }
+      .shared-proposal-workspace-head > .dock-button:last-child { grid-column: 4; }
+      .shared-proposal-search { grid-column: 1 / 3; }
+      .context-hub-source-filter { grid-column: 3; }
+      #sharedProposalProjectFilter { grid-column: 4; }
       .shared-proposal-workspace-body { grid-template-columns: minmax(280px, 340px) minmax(0, 1fr); }
       .shared-proposal-files { grid-template-columns: 1fr; }
     }
     @media (max-width: 680px) {
-      .shared-proposal-workspace-head { gap: 7px; padding: 8px; }
-      .shared-proposal-workspace-head > .dock-button:first-child { order: 0; }
-      .shared-proposal-workspace-title { order: 1; }
-      .shared-proposal-search { order: 3; flex-basis: calc(65% - 6px); }
-      .shared-proposal-filter { order: 4; flex-basis: calc(35% - 6px); }
-      .shared-proposal-workspace-head > .dock-button:last-child { order: 2; }
+      .shared-proposal-workspace-head { grid-template-columns: auto minmax(0, 1fr) auto; gap: 7px; padding: 8px; }
+      .context-hub-views { grid-column: 1 / 3; grid-row: 2; }
+      .shared-proposal-workspace-head > .dock-button:last-child { grid-column: 3; grid-row: 1; }
+      .shared-proposal-search { grid-column: 1 / -1; grid-row: 3; }
+      .context-hub-source-filter { grid-column: 1 / 2; grid-row: 4; }
+      #sharedProposalProjectFilter { grid-column: 2 / -1; grid-row: 4; }
       .shared-proposal-workspace-body { grid-template-columns: 1fr; grid-template-rows: minmax(230px, 38vh) minmax(0, 1fr); }
       .shared-proposal-list-panel { border-right: 0; border-bottom: 1px solid var(--line); }
       .shared-proposal-overview { padding: 14px 16px 13px; }
@@ -9393,6 +9669,7 @@ export function renderAppHtml() {
     <main>
       <div class="workspace-chrome">
         <div class="workspace-dock" role="toolbar" aria-label="Workspace navigation">
+          <button id="contextHubOpen" class="dock-button context-hub-open" type="button" title="Open every local project and shared proposal">Workspace</button>
           <button id="hub" class="dock-button" type="button" title="Open settings">Settings</button>
           <button id="back" class="dock-button" type="button" title="Previous file" aria-label="Previous file">←</button>
           <button id="forward" class="dock-button" type="button" title="Next file" aria-label="Next file">→</button>
@@ -9488,26 +9765,39 @@ export function renderAppHtml() {
     <header class="shared-proposal-workspace-head">
       <button id="sharedProposalWorkspaceClose" class="dock-button" type="button">← Context</button>
       <div class="shared-proposal-workspace-title">
-        <strong id="sharedProposalWorkspaceHeading">Proposal inbox</strong>
-        <span id="sharedProposalWorkspaceSummary">Choose a proposal to inspect</span>
+        <strong id="sharedProposalWorkspaceHeading">Context Hub</strong>
+        <span id="sharedProposalWorkspaceSummary">Local work and shared proposals, together</span>
       </div>
-      <input id="sharedProposalSearch" class="shared-proposal-search" type="search" placeholder="Search proposals or changed files…" aria-label="Search proposals" />
-      <select id="sharedProposalProjectFilter" class="shared-proposal-filter" aria-label="Filter proposals by project"></select>
+      <div class="context-hub-views" role="tablist" aria-label="Context Hub view">
+        <button id="contextHubInboxTab" class="context-hub-view active" type="button" role="tab" aria-selected="true" data-context-hub-view="inbox">Inbox</button>
+        <button id="contextHubProjectsTab" class="context-hub-view" type="button" role="tab" aria-selected="false" data-context-hub-view="projects">Projects</button>
+      </div>
+      <input id="sharedProposalSearch" class="shared-proposal-search" type="search" placeholder="Search projects, proposals, files or sessions…" aria-label="Search Context Hub" />
+      <select id="contextHubSourceFilter" class="shared-proposal-filter context-hub-source-filter" aria-label="Filter by source">
+        <option value="all">Local + shared</option>
+        <option value="shared">Shared proposals</option>
+        <option value="local">Local projects</option>
+      </select>
+      <select id="sharedProposalProjectFilter" class="shared-proposal-filter" aria-label="Filter by project"></select>
       <button id="sharedProposalWorkspaceRefresh" class="dock-button" type="button">Refresh</button>
     </header>
     <div class="shared-proposal-workspace-body">
-      <aside class="shared-proposal-list-panel" aria-label="Available proposals">
+      <aside class="shared-proposal-list-panel" aria-label="Context Hub items">
+        <div id="contextHubListStatus" class="context-hub-list-status" aria-live="polite"></div>
         <div id="sharedProposalList" class="shared-proposal-list"></div>
       </aside>
-      <section class="shared-proposal-review-panel" aria-label="Selected proposal review">
+      <section class="shared-proposal-review-panel" aria-label="Selected Context Hub item">
         <article id="sharedProposalOverview" class="shared-proposal-overview" hidden>
           <div class="shared-proposal-overview-top">
+            <span id="contextHubOverviewSource" class="context-hub-source"></span>
             <span id="sharedProposalOverviewProject" class="shared-proposal-project"></span>
             <span id="sharedProposalOverviewState" class="shared-proposal-overview-state"></span>
           </div>
           <h2 id="sharedProposalOverviewTitle"></h2>
+          <p id="sharedProposalOverviewRecapLabel" class="shared-proposal-recap-label"></p>
           <p id="sharedProposalOverviewDescription" class="shared-proposal-description"></p>
           <div id="sharedProposalOverviewMeta" class="shared-proposal-overview-meta"></div>
+          <div id="contextHubOverviewRelationship" class="context-hub-relationship"></div>
           <div id="sharedProposalFiles" class="shared-proposal-files"></div>
           <div class="shared-proposal-overview-actions">
             <button id="sharedProposalOpenReview" class="dock-button primary" type="button">Open files to review</button>
@@ -9515,7 +9805,7 @@ export function renderAppHtml() {
           </div>
         </article>
         <div class="shared-proposal-review-stage">
-          <div id="sharedProposalReviewEmpty" class="shared-proposal-review-empty">Select a proposal to inspect its latest description and changed files before opening the exact-hash review.</div>
+          <div id="sharedProposalReviewEmpty" class="shared-proposal-review-empty">Choose a local project or shared proposal. Context Room will always use the correct review workflow.</div>
           <div id="sharedProposalFrames" class="shared-proposal-frames"></div>
         </div>
       </section>
@@ -9533,6 +9823,12 @@ export function renderAppHtml() {
 		const state = { root: null, projectId: null, projectReloading: false, files: [], directories: [], startupContextFiles: [], startupSkillFolders: [], startupHookFiles: [], startupHooksHelpOpen: false, startupHookFilter: "all", hubDisclosuresOpen: new Set(), activeStartupSkillExplorer: null, activeStartupContextExplorer: null, startupSkillCreateFolder: null, startupContextContextTarget: null, selectedStartupContext: null, docqa: null, doctor: null, backgroundReportRenderKey: "", contextHealthStatusFilter: "open", contextHealthSeverityFilter: "triggered", contextHealthCategoryFilter: "all", contextHealthRefreshing: false, contextHealthCodexSending: false, settings: null, settingsOpen: false, settingsSection: "review", page: "hub", pendingMarkdown: null, availableHubCards: [], hubFolders: [], hubSections: [], rootHubSections: [], activeHubCardId: null, selectedReview: null, deletionBatchExpanded: false, deletionBatchLoading: false, deletionBatchItems: [], deletionBatchKey: "", deletionBatchReportedCount: 0, deletionBatchError: "", selectedDeletionReviews: new Set(), reviewModePath: null, reviewModeStatus: null, reviewSessions: {}, reviewFinalizationPromise: null, selected: null, selectedReadOnly: false, selectedDiff: null, fileLoadError: null, fileConflict: null, externalChange: null, conflictCompare: false, conflictMergeText: null, conflictMergeKey: "", conflictMergeMode: "auto", diffCollapsed: false, saved: "", savedHash: null, dirty: false, mode: "view", homeView: "root", planetStack: ["root"], filePanel: false, history: [], historyIndex: -1, pathFilters: [], explorerWatchFilter: "all", explorerRenderKey: "", explorerSearchFrame: 0, selectedForDelete: new Set(), selectionRequest: 0, openingFilePath: null, fileContentReadyPath: null, mobileSidebarTouched: false, sessionStateTimer: null, agentCommandTimer: null, lastAgentCommandId: "", pendingAgentCommand: null, agentAnnotations: {}, userActiveAt: 0, userScrollIntentAt: 0, refreshInFlight: false, reportsRefreshInFlight: false, backgroundRefreshTimer: null, filePrefetches: new Map(), prefetchTimer: null, prefetchPath: "", lastDiffRefreshAt: 0, lastReportRefreshAt: 0, lastFullRefreshAt: 0, navigationRestoreAttempted: false, bootStartedAt: Date.now(), bootMilestones: {}, markdownHighlightFrame: 0, markdownHighlightText: "", markdownHighlightLastText: "", docLinkModifierActive: false, expanded: new Set(["data", "automations", "integrations", "skills", "tools", "~", "~/.hermes", "~/.hermes/memories", "~/.hermes/skills"]) };
 		state.sharedContext = null;
 		state.sharedContextBusy = false;
+		state.contextHub = null;
+		state.contextHubBusy = false;
+		state.contextHubView = "inbox";
+		state.contextHubSource = "all";
+		state.contextHubSelection = "";
+		state.contextHubProjectRooms = new Map();
 		state.sharedReviewRooms = new Map();
 		state.sharedReviewKey = "";
 		state.sharedProposalWorkspaceOpen = false;
@@ -9621,7 +9917,7 @@ function shortSharedHash(value) {
 }
 
 function sharedProposalKey(item) {
-  return (item?.branch || "") + "@" + (item?.head || item?.proposalHead || "");
+  return (item?.repository || "") + "::" + (item?.branch || item?.proposal || "") + "@" + (item?.head || item?.proposalHead || "");
 }
 
 function sharedProposalLabel(item) {
@@ -9630,22 +9926,86 @@ function sharedProposalLabel(item) {
 }
 
 function sharedProposalSearchText(item) {
-  return [item.projectId, item.title, item.description, item.branch, item.author?.name, item.author?.email, item.sessionId, item.head, ...(item.files || [])]
+  return [item.type, item.projectId, item.projectTitle, item.title, item.description, item.branch, item.repositoryName, item.repository, item.author?.name, item.author?.email, item.sessionId, item.head, item.root, ...(item.files || [])]
     .filter(Boolean)
     .join(" ")
     .toLowerCase();
 }
 
+function contextHubStatusLabel(status, count = 0) {
+  return ({
+    updated: "Updated after review",
+    ready: "Ready to review",
+    in_review: "Review in progress",
+    accepted: "Pull request ready",
+    merged: "Merged",
+    local_changes: count + " local file" + (count === 1 ? "" : "s"),
+    clean: "Local queue clear",
+    shared_proposals: count + " proposal" + (count === 1 ? "" : "s"),
+    shared_clear: "No proposals",
+    unavailable: "Folder unavailable",
+  })[status] || "Available";
+}
+
+function contextHubProjectForItem(item) {
+  return (state.contextHub?.projects || []).find((project) => project.projectKey === item?.projectKey) || null;
+}
+
+function contextHubVisibleItems() {
+  const hub = state.contextHub || { items: [], projects: [] };
+  if (state.contextHubView === "projects") {
+    return (hub.projects || []).map((project) => ({
+      id: "project:" + project.projectKey,
+      type: "project",
+      projectKey: project.projectKey,
+      projectId: project.id,
+      title: project.title,
+      description: project.mode === "hybrid"
+        ? "Local project connected to shared documentation and skills."
+        : project.mode === "shared"
+          ? project.shared?.projectId === "global"
+            ? "Global shared context and skills. Every change uses a proposal review."
+            : "Shared project without a local folder connected on this computer."
+          : "Local Context Room project.",
+      files: project.localReviewFiles || [],
+      fileCount: project.localReviewCount || 0,
+      proposalCount: project.sharedProposalCount || 0,
+      reviewStatus: project.available
+        ? (project.localReviewCount ? "local_changes" : "clean")
+        : project.mode === "shared"
+          ? (project.sharedProposalCount ? "shared_proposals" : "shared_clear")
+          : "unavailable",
+      updatedAt: project.lastOpenedAt,
+      project,
+      root: project.root,
+      source: project.mode,
+    }));
+  }
+  return (hub.items || []).filter((item) => item.type === "shared" || item.reviewStatus !== "clean");
+}
+
+function contextHubHideFrames(except = null) {
+  for (const room of state.sharedReviewRooms.values()) room.frame.hidden = room !== except;
+  for (const room of state.contextHubProjectRooms.values()) room.frame.hidden = room !== except;
+}
+
 function setSharedProposalWorkspaceOpen(open) {
+  const wasOpen = state.sharedProposalWorkspaceOpen;
   state.sharedProposalWorkspaceOpen = Boolean(open);
   const workspace = el("sharedProposalWorkspace");
   if (!workspace) return;
   workspace.hidden = !state.sharedProposalWorkspaceOpen;
   if (state.sharedProposalWorkspaceOpen) {
-    const proposals = Array.isArray(state.sharedContext?.proposals) ? state.sharedContext.proposals : [];
+    const hubQuery = new URLSearchParams(window.location.search);
+    const requestedProjectId = hubQuery.get("project") || "";
+    if (!wasOpen && !state.sharedProposalSearch && hubQuery.get("q")) state.sharedProposalSearch = hubQuery.get("q");
+    const requestedProject = (state.contextHub?.projects || []).find((project) => project.id === requestedProjectId);
+    if (!wasOpen && requestedProject && !state.sharedProposalProject) state.sharedProposalProject = requestedProject.projectKey;
+    const items = contextHubVisibleItems();
     const selectedFromDock = el("sharedProposalSelect")?.value || "";
-    if (!proposals.some((item) => item.branch === state.sharedProposalSelection)) {
-      state.sharedProposalSelection = proposals.some((item) => item.branch === selectedFromDock) ? selectedFromDock : (proposals[0]?.branch || "");
+    const dockProposal = (state.contextHub?.proposals || []).find((item) => item.branch === selectedFromDock);
+    if (!items.some((item) => item.id === state.contextHubSelection)) {
+      state.contextHubSelection = dockProposal?.id || items[0]?.id || "";
     }
     renderSharedProposalWorkspace();
     window.requestAnimationFrame(() => el("sharedProposalSearch")?.focus());
@@ -9660,82 +10020,150 @@ function renderSharedProposalWorkspace() {
   const empty = el("sharedProposalReviewEmpty");
   const overview = el("sharedProposalOverview");
   if (!list || !projectFilter || !search || !summary || !empty || !overview) return;
-  const proposals = Array.isArray(state.sharedContext?.proposals) ? state.sharedContext.proposals : [];
-  const projects = [...new Set(proposals.map((item) => item.projectId || "global"))].sort();
+  const hub = state.contextHub || { projects: [], items: [], summary: {}, repositoryErrors: [] };
+  const projects = hub.projects || [];
   projectFilter.innerHTML = '<option value="">All projects</option>'
-    + projects.map((projectId) => '<option value="' + escapeHtml(projectId) + '">' + escapeHtml(projectId) + '</option>').join("");
-  projectFilter.value = projects.includes(state.sharedProposalProject) ? state.sharedProposalProject : "";
+    + projects.map((project) => '<option value="' + escapeHtml(project.projectKey) + '">' + escapeHtml(project.title) + '</option>').join("");
+  projectFilter.value = projects.some((project) => project.projectKey === state.sharedProposalProject) ? state.sharedProposalProject : "";
   state.sharedProposalProject = projectFilter.value;
   if (search.value !== state.sharedProposalSearch) search.value = state.sharedProposalSearch;
+  const sourceFilter = el("contextHubSourceFilter");
+  if (sourceFilter) sourceFilter.value = state.contextHubSource;
+  document.querySelectorAll("[data-context-hub-view]").forEach((button) => {
+    const active = button.dataset.contextHubView === state.contextHubView;
+    button.classList.toggle("active", active);
+    button.setAttribute("aria-selected", String(active));
+  });
   const needle = state.sharedProposalSearch.trim().toLowerCase();
-  const visible = proposals.filter((item) => (
-    (!state.sharedProposalProject || item.projectId === state.sharedProposalProject)
+  const visible = contextHubVisibleItems().filter((item) => {
+    const source = item.type === "shared" || item.project?.mode === "shared" ? "shared" : item.project?.mode === "hybrid" ? "hybrid" : "local";
+    return (
+    (!state.sharedProposalProject || item.projectKey === state.sharedProposalProject)
+    && (state.contextHubSource === "all" || source === state.contextHubSource || (source === "hybrid" && ["local", "shared"].includes(state.contextHubSource)))
     && (!needle || sharedProposalSearchText(item).includes(needle))
-  ));
-  if (!visible.some((item) => item.branch === state.sharedProposalSelection)) state.sharedProposalSelection = visible[0]?.branch || "";
-  const selected = proposals.find((item) => item.branch === state.sharedProposalSelection) || null;
-  const totalFiles = proposals.reduce((total, item) => total + Number(item.fileCount || item.files?.length || 0), 0);
-  summary.textContent = proposals.length + " proposal" + (proposals.length === 1 ? "" : "s") + " · " + totalFiles + " file" + (totalFiles === 1 ? "" : "s") + " · " + projects.length + " project" + (projects.length === 1 ? "" : "s");
-  list.innerHTML = visible.length ? visible.map((item) => {
-    const key = sharedProposalKey(item);
-    const opened = state.sharedReviewRooms.has(key);
-    const active = state.sharedProposalSelection === item.branch;
-    const author = item.author?.name || item.author?.email || "Unknown author";
+  );
+  });
+  if (!visible.some((item) => item.id === state.contextHubSelection)) state.contextHubSelection = visible[0]?.id || "";
+  const selected = visible.find((item) => item.id === state.contextHubSelection) || null;
+  const hubSummary = hub.summary || {};
+  summary.textContent = (hubSummary.localProjects || 0) + " local · " + (hubSummary.sharedProjects || 0) + " shared · " + (hubSummary.proposals || 0) + " proposal" + (hubSummary.proposals === 1 ? "" : "s");
+  const listStatus = el("contextHubListStatus");
+  if (listStatus) {
+    const errorCount = hub.repositoryErrors?.length || 0;
+    listStatus.dataset.error = String(errorCount > 0);
+    listStatus.textContent = state.contextHubBusy
+      ? "Refreshing projects and shared repositories…"
+      : errorCount
+        ? errorCount + " shared repositor" + (errorCount === 1 ? "y could not refresh." : "ies could not refresh.") + " Local projects remain available."
+        : visible.length + " item" + (visible.length === 1 ? "" : "s") + " shown";
+  }
+  const groups = state.contextHubView === "projects"
+    ? [
+        ["Local + shared", visible.filter((item) => item.project?.mode === "hybrid")],
+        ["Local", visible.filter((item) => item.project?.mode === "local")],
+        ["Shared", visible.filter((item) => item.project?.mode === "shared")],
+      ]
+    : [
+        ["Needs attention", visible.filter((item) => ["updated", "ready", "local_changes"].includes(item.reviewStatus))],
+        ["In progress", visible.filter((item) => ["in_review", "accepted"].includes(item.reviewStatus))],
+        ["Other", visible.filter((item) => !["updated", "ready", "local_changes", "in_review", "accepted"].includes(item.reviewStatus))],
+      ];
+  const renderItem = (item) => {
+    const key = item.type === "shared" ? sharedProposalKey(item) : "local:" + item.projectId;
+    const opened = item.type === "shared" ? state.sharedReviewRooms.has(key) : state.contextHubProjectRooms.has(key);
+    const active = state.contextHubSelection === item.id;
+    const author = item.type === "shared" ? (item.author?.name || item.author?.email || "Unknown author") : (item.root || "No local folder connected");
     const updated = item.updatedAt ? new Date(item.updatedAt).toLocaleString() : "Unknown date";
     const files = Array.isArray(item.files) ? item.files : [];
     const fileCount = Number(item.fileCount || files.length || 0);
     const previewFiles = files.slice(0, 2).map((file) => '<span class="shared-proposal-card-file" title="' + escapeHtml(file) + '">↳ ' + escapeHtml(file) + '</span>').join("");
     const moreFiles = fileCount > 2 ? '<span class="shared-proposal-card-file">+' + (fileCount - 2) + ' more</span>' : '';
-    return '<button class="shared-proposal-card' + (active ? ' active' : '') + '" type="button" data-shared-proposal-select="' + escapeHtml(item.branch) + '" title="Inspect ' + escapeHtml(item.title || item.branch) + '">'
-      + '<span class="shared-proposal-card-top"><span class="shared-proposal-project">' + escapeHtml(item.projectId || "global") + '</span><span class="shared-proposal-card-state">' + (opened ? "Review ready" : fileCount + " file" + (fileCount === 1 ? "" : "s")) + '</span></span>'
-      + '<span class="shared-proposal-card-title">' + escapeHtml(item.title || item.branch) + '</span>'
-      + '<span class="shared-proposal-card-description">' + escapeHtml(item.description || "No description supplied for this legacy proposal.") + '</span>'
+    const source = item.type === "shared" ? "shared" : "local";
+    const sourceLabel = item.type === "shared" ? "Shared proposal" : item.project?.mode === "hybrid" ? "Local + shared" : item.project?.mode === "shared" ? "Shared project" : "Local";
+    const projectLabel = item.type === "shared" ? (item.projectTitle || item.projectId || "global") : (item.project?.title || item.title);
+    const statusLabel = opened ? (item.type === "shared" ? "Review open" : "Project open") : contextHubStatusLabel(item.reviewStatus, item.proposalCount || fileCount);
+    return '<button class="shared-proposal-card' + (active ? ' active' : '') + '" data-source="' + source + '" type="button" data-context-hub-item="' + escapeHtml(item.id) + '" title="Inspect ' + escapeHtml(item.title || item.branch) + '">'
+      + '<span class="shared-proposal-card-top"><span class="context-hub-source" data-source="' + source + '">' + escapeHtml(sourceLabel) + '</span><span class="shared-proposal-project">' + escapeHtml(projectLabel) + '</span><span class="shared-proposal-card-state" data-state="' + escapeHtml(item.reviewStatus || "") + '">' + escapeHtml(statusLabel) + '</span></span>'
+      + '<span class="shared-proposal-card-title">' + escapeHtml(item.title || item.branch || projectLabel) + '</span>'
+      + '<span class="shared-proposal-card-description">' + escapeHtml(item.description || "No description supplied for this proposal.") + '</span>'
       + '<span class="shared-proposal-card-files">' + previewFiles + moreFiles + '</span>'
       + '<span class="shared-proposal-card-meta">' + escapeHtml(author + " · " + updated) + '</span>'
       + '</button>';
-  }).join("") : '<div class="shared-proposal-empty">No proposal matches these filters.</div>';
-  renderSharedProposalOverview(selected);
+  };
+  list.innerHTML = visible.length
+    ? groups.filter(([, items]) => items.length).map(([label, items]) => '<div class="context-hub-group-title">' + escapeHtml(label) + ' · ' + items.length + '</div>' + items.map(renderItem).join("")).join("")
+    : '<div class="shared-proposal-empty">Nothing matches these filters. Try all sources or clear the search.</div>';
+  renderContextHubOverview(selected);
 }
 
-function renderSharedProposalOverview(item) {
+function renderContextHubOverview(item) {
   const overview = el("sharedProposalOverview");
   const empty = el("sharedProposalReviewEmpty");
   if (!overview || !empty) return;
   overview.hidden = !item;
   if (!item) {
-    for (const room of state.sharedReviewRooms.values()) room.frame.hidden = true;
+    contextHubHideFrames();
     empty.hidden = false;
-    empty.textContent = "No proposal is selected.";
+    empty.textContent = "No Context Hub item is selected.";
     return;
   }
-  const key = sharedProposalKey(item);
-  const room = state.sharedReviewRooms.get(key);
+  const project = item.project || contextHubProjectForItem(item);
+  const source = item.type === "shared" ? "shared" : "local";
+  const key = item.type === "shared" ? sharedProposalKey(item) : "local:" + item.projectId;
+  const room = item.type === "shared" ? state.sharedReviewRooms.get(key) : state.contextHubProjectRooms.get(key);
   const files = Array.isArray(item.files) ? item.files : [];
   const fileCount = Number(item.fileCount || files.length || 0);
-  const author = item.author?.name || item.author?.email || "Unknown author";
+  const author = item.type === "shared" ? (item.author?.name || item.author?.email || "Unknown author") : (item.root || project?.root || "No local folder connected");
   const updated = item.updatedAt ? new Date(item.updatedAt).toLocaleString() : "Unknown date";
-  const session = item.sessionId ? "session " + item.sessionId : "no linked session";
-  el("sharedProposalOverviewProject").textContent = item.projectId || "global";
-  el("sharedProposalOverviewState").textContent = room ? "Exact review ready" : "Not opened yet";
+  const session = item.type === "shared" ? (item.sessionId ? "session " + item.sessionId : "no linked session") : "normal local review";
+  const sourceBadge = el("contextHubOverviewSource");
+  sourceBadge.dataset.source = source;
+  sourceBadge.textContent = item.type === "shared" ? "Shared proposal" : project?.mode === "hybrid" ? "Local + shared" : "Local";
+  el("sharedProposalOverviewProject").textContent = item.type === "shared" ? (item.projectTitle || item.projectId || "global") : (project?.title || item.title);
+  el("sharedProposalOverviewState").textContent = room ? (item.type === "shared" ? "Exact review open" : "Local project open") : contextHubStatusLabel(item.reviewStatus, item.proposalCount || fileCount);
   el("sharedProposalOverviewTitle").textContent = item.title || item.branch;
-  el("sharedProposalOverviewDescription").textContent = item.description || "No description was supplied for this legacy proposal. Republish it through the CLI to attach an up-to-date description.";
-  el("sharedProposalOverviewMeta").innerHTML = '<span>' + escapeHtml(author + " · " + updated) + '</span><span>' + escapeHtml(item.branch + " · @" + shortSharedHash(item.head)) + '</span><span>' + escapeHtml(session) + '</span>';
+  el("sharedProposalOverviewRecapLabel").textContent = item.type === "shared" ? "Agent recap · updated with the latest publish" : "Local project";
+  el("sharedProposalOverviewDescription").textContent = item.description || (item.type === "shared" ? "No description was supplied for this legacy proposal. Republish it through the CLI to attach an up-to-date description." : "Open the project to work with its normal local files and review queue.");
+  el("sharedProposalOverviewMeta").innerHTML = item.type === "shared"
+    ? '<span>' + escapeHtml(author + " · " + updated) + '</span><span>' + escapeHtml(item.repositoryName + " · " + item.branch + " · @" + shortSharedHash(item.head)) + '</span><span>' + escapeHtml(session) + '</span>'
+    : '<span>' + escapeHtml(author) + '</span><span>' + escapeHtml(updated) + '</span><span>' + escapeHtml(session) + '</span>';
+  const relationship = el("contextHubOverviewRelationship");
+  relationship.innerHTML = item.type === "shared"
+    ? '<span>Changes are isolated on a proposal branch.</span><span>Human decisions stay bound to @' + escapeHtml(shortSharedHash(item.head)) + '.</span>'
+      + (item.mainAdvancedBy ? '<span>Main advanced by ' + Number(item.mainAdvancedBy) + ' commit' + (Number(item.mainAdvancedBy) === 1 ? '' : 's') + (item.hasConflict === true ? ' · conflict detected' : '') + '.</span>' : '')
+    : '<span>Local files use the project review queue directly; no proposal branch is created.</span>'
+      + (project?.mode === "hybrid" ? '<span>Shared docs and skills for this project still use proposals.</span>' : '');
   el("sharedProposalFiles").innerHTML = files.length
     ? files.map((file) => '<span class="shared-proposal-file" title="' + escapeHtml(file) + '">' + escapeHtml(file) + '</span>').join("")
     : '<span class="shared-proposal-file">Changed-file details unavailable for this legacy proposal.</span>';
   const openButton = el("sharedProposalOpenReview");
-  openButton.dataset.sharedProposal = item.branch;
-  openButton.textContent = room ? "Resume exact review" : "Open " + fileCount + " file" + (fileCount === 1 ? "" : "s") + " to review";
-  el("sharedProposalChangeSummary").textContent = "Bound to @" + shortSharedHash(item.head);
-  for (const candidate of state.sharedReviewRooms.values()) candidate.frame.hidden = candidate !== room;
-  state.sharedReviewKey = room ? key : "";
+  openButton.hidden = false;
+  openButton.dataset.contextHubAction = item.type === "shared" ? "proposal" : "project";
+  openButton.dataset.sharedProposal = item.branch || "";
+  openButton.dataset.sharedRepository = item.repository || "";
+  openButton.dataset.contextHubProject = item.projectId || project?.id || "";
+  if (item.type === "shared") {
+    openButton.textContent = room ? "Resume exact review" : "Open " + fileCount + " file" + (fileCount === 1 ? "" : "s") + " to review";
+    el("sharedProposalChangeSummary").textContent = "Bound to @" + shortSharedHash(item.head);
+  } else if (project?.mode === "shared" || !item.available && !project?.available) {
+    openButton.textContent = "Show this project's proposals";
+    openButton.dataset.contextHubAction = "filter-project";
+    el("sharedProposalChangeSummary").textContent = "No local folder connected";
+  } else {
+    openButton.textContent = room ? "Resume local project" : item.current ? "Return to current project" : "Open local project";
+    el("sharedProposalChangeSummary").textContent = fileCount ? fileCount + " file" + (fileCount === 1 ? "" : "s") + " in the local review queue" : "Local review queue clear";
+  }
+  contextHubHideFrames(room || null);
+  state.sharedReviewKey = item.type === "shared" && room ? key : "";
   empty.hidden = Boolean(room);
-  if (!room) empty.textContent = "The review opens only when you are ready. This overview always reflects the proposal's latest published commit.";
+  if (!room) empty.textContent = item.type === "shared"
+    ? "The exact-hash review opens only when you are ready. The overview always reflects the latest published commit."
+    : "Open the local project to edit files and use its normal review queue without creating a proposal.";
 }
 
-function selectSharedProposal(proposal) {
-  if (!(state.sharedContext?.proposals || []).some((item) => item.branch === proposal)) return;
-  state.sharedProposalSelection = proposal;
+function selectContextHubItem(itemId) {
+  if (!contextHubVisibleItems().some((item) => item.id === itemId)) return;
+  state.contextHubSelection = itemId;
   renderSharedProposalWorkspace();
 }
 
@@ -9743,20 +10171,23 @@ function activateSharedReviewRoom(key) {
   const room = state.sharedReviewRooms.get(key);
   if (!room) return;
   state.sharedReviewKey = key;
-  state.sharedProposalSelection = room.result.review.proposal;
-  for (const item of state.sharedReviewRooms.values()) item.frame.hidden = item !== room;
+  const proposal = (state.contextHub?.proposals || []).find((item) => sharedProposalKey(item) === key);
+  if (proposal) state.contextHubSelection = proposal.id;
+  contextHubHideFrames(room);
   room.frame.hidden = false;
   el("sharedProposalReviewEmpty").hidden = true;
   renderSharedProposalWorkspace();
   setStatus("reviewing " + room.result.review.proposal + " @" + shortSharedHash(room.result.review.proposalHead));
 }
 
-async function openSharedProposal(proposal) {
+async function openSharedProposal(proposal, repository = "") {
   if (!proposal || state.sharedContextBusy) return;
-  const item = (state.sharedContext?.proposals || []).find((candidate) => candidate.branch === proposal);
+  const currentRepository = repository || state.sharedContext?.status?.connection?.repository || state.sharedContext?.status?.repository || "";
+  const item = (state.contextHub?.proposals || []).find((candidate) => candidate.branch === proposal && (!currentRepository || candidate.repository === currentRepository))
+    || (state.sharedContext?.proposals || []).find((candidate) => candidate.branch === proposal);
   if (!item) throw new Error("Proposal is no longer available: " + proposal);
   setSharedProposalWorkspaceOpen(true);
-  state.sharedProposalSelection = proposal;
+  state.contextHubSelection = item.id || state.contextHubSelection;
   const key = sharedProposalKey(item);
   if (state.sharedReviewRooms.has(key)) {
     activateSharedReviewRoom(key);
@@ -9767,12 +10198,12 @@ async function openSharedProposal(proposal) {
   renderSharedProposalWorkspace();
   setStatus("materializing exact proposal review...");
   try {
-    const result = await api("/api/shared-context/review", {
+    const result = await api(item.repository ? "/api/context-hub/review" : "/api/shared-context/review", {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ proposal }),
+      body: JSON.stringify({ proposal, repository: item.repository || undefined }),
     });
-    const resultKey = sharedProposalKey({ branch: result.review.proposal, head: result.review.proposalHead });
+    const resultKey = sharedProposalKey({ repository: item.repository || result.review.repository, branch: result.review.proposal, head: result.review.proposalHead });
     let room = state.sharedReviewRooms.get(resultKey);
     if (!room) {
       const frame = document.createElement("iframe");
@@ -9789,6 +10220,72 @@ async function openSharedProposal(proposal) {
   } finally {
     state.sharedContextBusy = false;
     renderSharedContextControls();
+    renderSharedProposalWorkspace();
+  }
+}
+
+async function openContextHubProject(projectId) {
+  if (!projectId || state.contextHubBusy) return;
+  const project = (state.contextHub?.projects || []).find((item) => item.id === projectId);
+  if (!project) throw new Error("Local project is no longer registered.");
+  if (project.current) {
+    setSharedProposalWorkspaceOpen(false);
+    return;
+  }
+  const key = "local:" + project.id;
+  const existing = state.contextHubProjectRooms.get(key);
+  if (existing) {
+    contextHubHideFrames(existing);
+    existing.frame.hidden = false;
+    renderSharedProposalWorkspace();
+    return;
+  }
+  state.contextHubBusy = true;
+  renderSharedProposalWorkspace();
+  setStatus("opening local project…");
+  try {
+    const result = await api("/api/context-hub/project", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ projectId }),
+    });
+    if (result.current) {
+      setSharedProposalWorkspaceOpen(false);
+      return;
+    }
+    const frame = document.createElement("iframe");
+    frame.className = "shared-proposal-frame";
+    frame.title = "Local Context Room · " + result.project.title;
+    frame.src = result.url + "/?embedded=project";
+    frame.hidden = true;
+    frame.addEventListener("load", () => setStatus("local project ready · " + result.project.title));
+    el("sharedProposalFrames").append(frame);
+    const room = { result, frame };
+    state.contextHubProjectRooms.set(key, room);
+    contextHubHideFrames(room);
+    frame.hidden = false;
+    renderSharedProposalWorkspace();
+  } finally {
+    state.contextHubBusy = false;
+    renderSharedProposalWorkspace();
+  }
+}
+
+async function refreshContextHubUi() {
+  if (state.contextHubBusy) return;
+  state.contextHubBusy = true;
+  renderSharedProposalWorkspace();
+  setStatus("refreshing Context Hub…");
+  try {
+    state.contextHub = await api("/api/context-hub/refresh", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: "{}",
+    });
+    renderSharedProposalWorkspace();
+    setStatus(state.contextHub.repositoryErrors?.length ? "Context Hub refreshed with shared repository warnings" : "Context Hub refreshed");
+  } finally {
+    state.contextHubBusy = false;
     renderSharedProposalWorkspace();
   }
 }
@@ -9868,6 +10365,7 @@ async function refreshSharedContextUi() {
       headers: { "content-type": "application/json" },
       body: "{}",
     });
+    state.contextHub = await api("/api/context-hub");
     renderSharedContextControls();
     renderSharedProposalWorkspace();
     await loadFiles();
@@ -9884,7 +10382,7 @@ async function openSelectedSharedProposal() {
 }
 
 function sharedReviewIsEmbedded() {
-  return new URLSearchParams(window.location.search).get("embedded") === "1";
+  return Boolean(new URLSearchParams(window.location.search).get("embedded"));
 }
 
 function openSharedExternalUrl(url) {
@@ -11456,15 +11954,22 @@ async function loadFiles(options = {}) {
   if (options.initial) state.bootMilestones.requestsStarted = Date.now() - state.bootStartedAt;
   const reportsRequest = options.initial ? api("/api/reports") : null;
   const sharedRequest = options.initial ? api("/api/shared-context") : null;
+  const contextHubRequest = options.initial ? api("/api/context-hub") : null;
   const [data, settingsData] = await Promise.all([api(filesApiPath()), api("/api/settings")]);
-  const sharedData = sharedRequest ? await sharedRequest : null;
+  const [sharedData, contextHubData] = await Promise.all([
+    sharedRequest || Promise.resolve(null),
+    contextHubRequest || Promise.resolve(null),
+  ]);
   if (options.initial) state.bootMilestones.coreDataReady = Date.now() - state.bootStartedAt;
   acceptContextRoomRoot(data.root);
   state.files = data.files;
   state.directories = data.directories || [];
   if (sharedData) state.sharedContext = sharedData;
+  if (contextHubData) state.contextHub = contextHubData;
   applySettingsPayload(settingsData);
   renderSharedContextControls();
+  if (options.initial && sharedReviewIsEmbedded()) el("contextHubOpen").hidden = true;
+  if (options.initial && new URLSearchParams(window.location.search).get("hub") === "1") setSharedProposalWorkspaceOpen(true);
   state.lastFullRefreshAt = Date.now();
   const clearedMissingSelection = reconcileMissingSelectedFile();
   renderFiles();
@@ -18112,12 +18617,18 @@ el("refreshDocQa")?.addEventListener("click", () => loadFiles({ waitForBackgroun
 el("refreshContextHealth")?.addEventListener("click", () => refreshContextHealthAnalysis().catch((error) => setStatus(error.message)));
 el("sendContextHealthToCodex")?.addEventListener("click", () => sendContextHealthIssuesToCodex().catch((error) => setStatus(error.message)));
 el("sharedContextRefresh")?.addEventListener("click", () => refreshSharedContextUi().catch((error) => setStatus(error.message)));
+el("contextHubOpen")?.addEventListener("click", () => setSharedProposalWorkspaceOpen(true));
 el("sharedProposalBrowser")?.addEventListener("click", () => setSharedProposalWorkspaceOpen(true));
 el("sharedProposalReview")?.addEventListener("click", () => openSelectedSharedProposal().catch((error) => setStatus(error.message)));
 el("sharedProposalAccept")?.addEventListener("click", () => acceptCurrentSharedProposal().catch((error) => setStatus(error.message)));
 el("sharedProposalSelect")?.addEventListener("change", renderSharedContextControls);
 el("sharedProposalWorkspaceClose")?.addEventListener("click", () => setSharedProposalWorkspaceOpen(false));
-el("sharedProposalWorkspaceRefresh")?.addEventListener("click", () => refreshSharedContextUi().catch((error) => setStatus(error.message)));
+el("sharedProposalWorkspaceRefresh")?.addEventListener("click", () => refreshContextHubUi().catch((error) => setStatus(error.message)));
+document.querySelectorAll("[data-context-hub-view]").forEach((button) => button.addEventListener("click", () => {
+  state.contextHubView = button.dataset.contextHubView;
+  state.contextHubSelection = "";
+  renderSharedProposalWorkspace();
+}));
 el("sharedProposalSearch")?.addEventListener("input", (event) => {
   state.sharedProposalSearch = event.target.value;
   renderSharedProposalWorkspace();
@@ -18126,13 +18637,54 @@ el("sharedProposalProjectFilter")?.addEventListener("change", (event) => {
   state.sharedProposalProject = event.target.value;
   renderSharedProposalWorkspace();
 });
+el("contextHubSourceFilter")?.addEventListener("change", (event) => {
+  state.contextHubSource = event.target.value;
+  state.contextHubSelection = "";
+  renderSharedProposalWorkspace();
+});
 el("sharedProposalList")?.addEventListener("click", (event) => {
-  const button = event.target.closest("[data-shared-proposal-select]");
+  const button = event.target.closest("[data-context-hub-item]");
   if (!button) return;
-  selectSharedProposal(button.dataset.sharedProposalSelect);
+  selectContextHubItem(button.dataset.contextHubItem);
 });
 el("sharedProposalOpenReview")?.addEventListener("click", (event) => {
-  openSharedProposal(event.currentTarget.dataset.sharedProposal).catch((error) => setStatus(error.message));
+  const button = event.currentTarget;
+  if (button.dataset.contextHubAction === "proposal") {
+    openSharedProposal(button.dataset.sharedProposal, button.dataset.sharedRepository).catch((error) => setStatus(error.message));
+  } else if (button.dataset.contextHubAction === "project") {
+    openContextHubProject(button.dataset.contextHubProject).catch((error) => setStatus(error.message));
+  } else if (button.dataset.contextHubAction === "filter-project") {
+    const project = (state.contextHub?.projects || []).find((item) => item.id === button.dataset.contextHubProject);
+    if (project) {
+      state.contextHubView = "inbox";
+      state.contextHubSource = "shared";
+      state.sharedProposalProject = project.projectKey;
+      state.contextHubSelection = "";
+      renderSharedProposalWorkspace();
+    }
+  }
+});
+document.addEventListener("keydown", (event) => {
+  if (!state.sharedProposalWorkspaceOpen) return;
+  if (event.key === "Escape") {
+    event.preventDefault();
+    setSharedProposalWorkspaceOpen(false);
+    return;
+  }
+  if (event.key === "/" && !["INPUT", "TEXTAREA", "SELECT"].includes(document.activeElement?.tagName)) {
+    event.preventDefault();
+    el("sharedProposalSearch")?.focus();
+    return;
+  }
+  if (!["j", "k"].includes(event.key) || ["INPUT", "TEXTAREA", "SELECT"].includes(document.activeElement?.tagName)) return;
+  const buttons = [...document.querySelectorAll("[data-context-hub-item]")];
+  if (!buttons.length) return;
+  event.preventDefault();
+  const current = buttons.findIndex((button) => button.dataset.contextHubItem === state.contextHubSelection);
+  const offset = event.key === "j" ? 1 : -1;
+  const next = buttons[(Math.max(0, current) + offset + buttons.length) % buttons.length];
+  selectContextHubItem(next.dataset.contextHubItem);
+  next.focus();
 });
 document.querySelectorAll("[data-home-action]").forEach((button) => button.addEventListener("click", () => homeAction(button.dataset.homeAction)));
 document.querySelectorAll("[data-home-file]").forEach((button) => button.addEventListener("click", () => selectFile(button.dataset.homeFile).catch((error) => setStatus(error.message))));
@@ -18187,7 +18739,7 @@ if (process.argv[1] === __filename) {
   const port = await selectAvailableContextRoomPort(preferredPort, { allowFallback: portArgIndex < 0 });
   const rootArgIndex = process.argv.indexOf("--root");
   const root = rootArgIndex >= 0 ? path.resolve(process.argv[rootArgIndex + 1]) : process.cwd();
-  const { server } = createMemoryServer({ root, port });
+  const { server } = createMemoryServer({ root, port, registerInHub: true });
   server.listen(port, "127.0.0.1", () => {
     console.log(`Context Room: http://127.0.0.1:${port}`);
     console.log(`Root: ${root}`);

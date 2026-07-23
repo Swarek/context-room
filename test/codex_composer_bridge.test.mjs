@@ -49,8 +49,8 @@ test("Codex composer expression inserts escaped text without starting a turn", (
 test("compact Codex references use native line labels and include unsaved bytes only when required", () => {
   assert.equal(codexReferenceLineLabel(14, 14), "L14");
   assert.equal(codexReferenceLineLabel(14, 16), "L14–16");
-  assert.equal(codexNativeMentionPath("/Users/mathis/project/hicharlie.fr/docs/guide.md", "docs/guide.md"), "hicharlie.fr/docs/guide.md");
-  assert.equal(codexNativeMentionPath("/Users/mathis/.codex/AGENTS.md", "~/.codex/AGENTS.md"), "~/.codex/AGENTS.md");
+  assert.equal(codexNativeMentionPath("/Users/example/project/acme-app/docs/guide.md", "docs/guide.md"), "acme-app/docs/guide.md");
+  assert.equal(codexNativeMentionPath("/Users/example/.codex/AGENTS.md", "~/.codex/AGENTS.md"), "~/.codex/AGENTS.md");
   assert.equal(buildCompactCodexReferenceText({ displayPath: "docs/guide.md", startLine: 14, endLine: 16 }), "@docs/guide.md L14–16 ");
   assert.equal(buildCompactCodexReferenceText({ displayPath: "docs/guide.md", startLine: 14, endLine: 16, nativeMention: true }), "L14–16 ");
   assert.equal(
@@ -62,14 +62,14 @@ test("compact Codex references use native line labels and include unsaved bytes 
 test("Codex mention candidate selection prefers the exact main checkout path", () => {
   const reference = {
     displayPath: "qa-reports/JOURNAL-ARCHIVE.md",
-    absolutePath: "/Users/mathis/project/hicharlie.fr/qa-reports/JOURNAL-ARCHIVE.md",
+    absolutePath: "/Users/example/project/acme-app/qa-reports/JOURNAL-ARCHIVE.md",
   };
   const candidates = [
-    { label: "JOURNAL-ARCHIVE.md", detail: ".claude/worktrees/visual/hicharlie.fr/qa-reports" },
-    { label: "JOURNAL-ARCHIVE.md", detail: "hicharlie.fr/qa-reports" },
+    { label: "JOURNAL-ARCHIVE.md", detail: ".claude/worktrees/visual/acme-app/qa-reports" },
+    { label: "JOURNAL-ARCHIVE.md", detail: "acme-app/qa-reports" },
   ];
 
   assert.ok(codexMentionCandidateScore(candidates[1], reference) > codexMentionCandidateScore(candidates[0], reference));
   assert.equal(selectCodexMentionCandidateIndex(candidates, reference), 1);
-  assert.equal(selectCodexMentionCandidateIndex([{ label: "other.md", detail: "hicharlie.fr/qa-reports" }], reference), -1);
+  assert.equal(selectCodexMentionCandidateIndex([{ label: "other.md", detail: "acme-app/qa-reports" }], reference), -1);
 });

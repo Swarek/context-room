@@ -1,5 +1,5 @@
 {
-  "$schema": "https://raw.githubusercontent.com/Swarek/context-room/main/schemas/config.schema.json",
+  "$schema": "https://unpkg.com/context-room@latest/schemas/config.schema.json",
   "title": "Agentic Codebase",
   "allowedPaths": [
     "README.md",

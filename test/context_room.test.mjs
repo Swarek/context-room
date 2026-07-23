@@ -3125,7 +3125,7 @@ test("invalid folder watch modes, paths, and snapshot members never mutate confi
 
 test("doc QA detects watched changes when context root is a git subdirectory", () => {
   const repo = makeRoot();
-  const root = path.join(repo, "hicharlie.fr");
+  const root = path.join(repo, "example-app");
   fs.mkdirSync(root);
   execFileSync("git", ["init"], { cwd: repo, stdio: "ignore" });
   execFileSync("git", ["config", "user.email", "context-room@example.test"], { cwd: repo, stdio: "ignore" });
@@ -3588,7 +3588,7 @@ test("doc QA can require human review for unchanged important docs", () => {
 
 test("revertMemoryFile restores tracked changes in a git subdirectory", () => {
   const repo = makeRoot();
-  const root = path.join(repo, "hicharlie.fr");
+  const root = path.join(repo, "example-app");
   fs.mkdirSync(root);
   execFileSync("git", ["init"], { cwd: repo, stdio: "ignore" });
   execFileSync("git", ["config", "user.email", "context-room@example.test"], { cwd: repo, stdio: "ignore" });
@@ -3686,7 +3686,7 @@ test("file diff skips repository-wide work outside Git", () => {
 
 test("review base reads HEAD content for changed files from a git subdirectory", () => {
   const repo = makeRoot();
-  const root = path.join(repo, "hicharlie.fr");
+  const root = path.join(repo, "example-app");
   fs.mkdirSync(path.join(root, "docs"), { recursive: true });
   execFileSync("git", ["init"], { cwd: repo, stdio: "ignore" });
   execFileSync("git", ["config", "user.email", "context-room@example.test"], { cwd: repo, stdio: "ignore" });
@@ -4130,12 +4130,12 @@ ${status === null ? "" : `  status: ${status}\n`}  canonical_for: ${canonicalFor
 
 test("documentation graph resolves inline references from project sub-roots", () => {
   const root = makeRoot();
-  fs.mkdirSync(path.join(root, "projects", "hicharlie", "website", "docs"), { recursive: true });
-  fs.writeFileSync(path.join(root, "projects", "hicharlie", "website", "docs", "PRODUCT.md"), "# Product\n");
-  fs.writeFileSync(path.join(root, "projects", "hicharlie", "website", "docs", "DEPLOYMENT.md"), `---
+  fs.mkdirSync(path.join(root, "projects", "demo-project", "website", "docs"), { recursive: true });
+  fs.writeFileSync(path.join(root, "projects", "demo-project", "website", "docs", "PRODUCT.md"), "# Product\n");
+  fs.writeFileSync(path.join(root, "projects", "demo-project", "website", "docs", "DEPLOYMENT.md"), `---
 context_room:
   kind: procedure
-  scope: hicharlie
+  scope: demo-project
   status: current
   canonical_for: deployment
   last_verified: 2026-06-26
@@ -4145,13 +4145,13 @@ context_room:
 See \`docs/PRODUCT.md\`.
 `);
   initializeContextRoomProject(root, {
-    allowedPaths: ["projects/hicharlie/website/docs/"],
-    watchAllow: ["projects/hicharlie/website/docs/"],
+    allowedPaths: ["projects/demo-project/website/docs/"],
+    watchAllow: ["projects/demo-project/website/docs/"],
   });
 
   const graph = buildDocumentationGraph(root);
 
-  assert.equal(graph.healthIssues.some((issue) => issue.type === "broken_reference" && issue.path === "projects/hicharlie/website/docs/DEPLOYMENT.md"), false);
+  assert.equal(graph.healthIssues.some((issue) => issue.type === "broken_reference" && issue.path === "projects/demo-project/website/docs/DEPLOYMENT.md"), false);
 });
 
 test("documentation graph ignores non-context-room YAML frontmatter", () => {
