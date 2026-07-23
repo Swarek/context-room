@@ -26,6 +26,7 @@
     "doctor": "node bin/context-room.mjs doctor",
     "test": "node --check src/context_room.mjs && node --check bin/context-room.mjs && node --check scripts/update-context-rooms.mjs && node --test test/*.test.mjs",
     "package:privacy": "node scripts/check-package-privacy.mjs",
+    "prepack": "npm run package:privacy",
     "update:rooms": "node scripts/update-context-rooms.mjs",
     "pack:dry-run": "npm pack --dry-run"
   },
