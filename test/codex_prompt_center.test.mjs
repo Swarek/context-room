@@ -440,6 +440,7 @@ test("durable JSON schemas match the strict Rust catalog, manifest, publication 
     "history_semantics",
     "executable_contract",
     "configurable_elsewhere",
+    "client_owned",
     "server_owned",
   ]);
   assert.deepEqual(catalogSchema.$defs.overrideConflict.properties.code.enum, [
@@ -1007,6 +1008,19 @@ test("catalog authority classes, effective content, and editable strategy fail c
   assert.equal(validProtected.editable, false);
   assert.equal(validProtected.official, null);
   assert.equal(validProtected.effective, null);
+
+  const clientOwnedCatalog = fixtureCatalog();
+  const clientOwnedTarget = clientOwnedCatalog.groups[1].targets[0];
+  clientOwnedTarget.id = "protected/client/tui_init";
+  clientOwnedTarget.label = "TUI /init command prompt";
+  clientOwnedTarget.securityClass = "client_owned";
+  const clientOwned = createCodexPromptCenterProvider({
+    storageRoot: makeStorage(t),
+    catalog: clientOwnedCatalog,
+  }).readTarget(clientOwnedTarget.id);
+  assert.equal(clientOwned.kind, "protected");
+  assert.equal(clientOwned.editable, false);
+  assert.equal(clientOwned.securityClass, "client_owned");
 
   const serverOwnedCatalog = fixtureCatalog();
   serverOwnedCatalog.groups[1].targets[0] = strictCatalogTarget({
