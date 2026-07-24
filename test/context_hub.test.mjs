@@ -76,6 +76,8 @@ test("Context Hub API combines local queues and opens another project in the sam
   await new Promise((resolve) => room.server.listen(0, "127.0.0.1", resolve));
   t.after(() => room.server.close());
   const origin = `http://127.0.0.1:${room.server.address().port}`;
+  const rootPage = await fetch(origin + "/");
+  assert.equal(rootPage.headers.get("content-security-policy"), "frame-ancestors 'self'");
   const hubResponse = await fetch(origin + "/api/context-hub");
   assert.equal(hubResponse.status, 200);
   const hub = await hubResponse.json();
@@ -91,6 +93,14 @@ test("Context Hub API combines local queues and opens another project in the sam
   assert.equal(openedResponse.status, 201);
   const opened = await openedResponse.json();
   assert.equal(opened.current, false);
+  const childPage = await fetch(opened.url + "/");
+  const childPolicy = childPage.headers.get("content-security-policy");
+  assert.equal(
+    childPolicy,
+    `frame-ancestors 'self' http://127.0.0.1:${room.server.address().port} http://localhost:${room.server.address().port}`,
+  );
+  assert.doesNotMatch(childPolicy, /(?:\*|https?:\/\/example)/);
+  assert.equal(childPage.headers.get("x-frame-options"), null);
   const healthResponse = await fetch(opened.url + "/api/health");
   const health = await healthResponse.json();
   assert.equal(fs.realpathSync(health.root), fs.realpathSync(second));

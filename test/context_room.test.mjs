@@ -333,6 +333,7 @@ test("init writes a reusable project config without LifeOS-specific paths", () =
   assert.equal(result.agentContextPath, path.join(root, AGENT_CONTEXT_FILE));
   assert.equal(fs.existsSync(path.join(root, AGENT_CONTEXT_FILE)), true);
   assert.equal(fs.existsSync(path.join(root, AGENT_CONTEXT_DIR, "README.md")), true);
+  assert.equal(fs.existsSync(path.join(root, AGENT_CONTEXT_DIR, "features", "codex-prompt-center.md")), true);
   assert.equal(fs.existsSync(path.join(root, AGENT_CONTEXT_DIR, "html-visual-documents.md")), true);
   assert.equal(fs.existsSync(path.join(root, AGENT_CONTEXT_DIR, "html-visual-patterns.md")), true);
   assert.equal(fs.existsSync(path.join(root, AGENT_CONTEXT_DIR, "context-room-visual-components.html")), true);
@@ -1276,6 +1277,25 @@ test("agent HTML context uses a stable project path and refreshes generated copi
   assert.equal(refreshed.entryPath, entryPath);
   assert.equal(refreshed.updated, 1);
   assert.equal(fs.readFileSync(patternsPath, "utf8"), relocatedPatterns);
+  for (const generatedPath of refreshed.files.filter((filePath) => filePath.endsWith(".md"))) {
+    const content = fs.readFileSync(generatedPath, "utf8");
+    for (const match of content.matchAll(/\]\(([^)]+)\)/g)) {
+      const destination = match[1];
+      if (/^(?:https?:|mailto:|#)/.test(destination)) continue;
+      const localDestination = destination.split("#", 1)[0];
+      assert.equal(
+        fs.existsSync(path.resolve(path.dirname(generatedPath), localDestination)),
+        true,
+        `${path.relative(root, generatedPath)} has a broken generated link to ${destination}`,
+      );
+    }
+  }
+  const promptGuide = fs.readFileSync(
+    path.join(root, AGENT_CONTEXT_DIR, "features", "codex-prompt-center.md"),
+    "utf8",
+  );
+  assert.match(promptGuide, /https:\/\/unpkg\.com\/context-room@latest\/schemas\/codex-prompt-catalog-v1\.schema\.json/);
+  assert.match(promptGuide, /https:\/\/unpkg\.com\/context-room@latest\/docs\/features\/context-hub\.md/);
 });
 
 test("allowed paths are driven by project config", () => {

@@ -1,0 +1,154 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://unpkg.com/context-room@latest/schemas/codex-prompt-overrides-v1.schema.json",
+  "title": "Codex prompt overrides v1",
+  "description": "Strict schema for prompt-overrides/overrides.json.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "revision",
+    "overrides"
+  ],
+  "properties": {
+    "schemaVersion": {
+      "const": 1
+    },
+    "revision": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 9007199254740991
+    },
+    "overrides": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/override"
+      }
+    }
+  },
+  "$defs": {
+    "hash": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    },
+    "patch": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "before",
+        "after",
+        "expectedMatches"
+      ],
+      "properties": {
+        "before": {
+          "type": "string",
+          "minLength": 1
+        },
+        "after": {
+          "type": "string"
+        },
+        "expectedMatches": {
+          "const": 1
+        }
+      }
+    },
+    "override": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "targetId",
+        "patches",
+        "replacement"
+      ],
+      "properties": {
+        "targetId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "officialHash": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/hash"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "patches": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/patch"
+          }
+        },
+        "replacement": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "allOf": [
+        {
+          "oneOf": [
+            {
+              "properties": {
+                "patches": {
+                  "type": "array",
+                  "minItems": 1
+                },
+                "replacement": {
+                  "type": "null"
+                }
+              }
+            },
+            {
+              "properties": {
+                "patches": {
+                  "type": "array",
+                  "maxItems": 0
+                },
+                "replacement": {
+                  "type": "string"
+                }
+              }
+            }
+          ]
+        },
+        {
+          "if": {
+            "properties": {
+              "targetId": {
+                "const": "model/base/*"
+              }
+            },
+            "required": [
+              "targetId"
+            ]
+          },
+          "then": {
+            "properties": {
+              "officialHash": {
+                "type": "null"
+              },
+              "replacement": {
+                "type": "null"
+              }
+            }
+          },
+          "else": {
+            "required": [
+              "officialHash"
+            ],
+            "properties": {
+              "officialHash": {
+                "$ref": "#/$defs/hash"
+              }
+            }
+          }
+        }
+      ]
+    }
+  },
+  "$comment": "Each prompt string and every resolved effective prompt is additionally limited to 28672 UTF-8 bytes and approximately 8192 tokens. The runtime also validates the targetId allowlist and unique target IDs."
+}

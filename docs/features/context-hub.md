@@ -4,8 +4,8 @@ context_room:
   scope: context-room
   status: current
   canonical_for: global Context Hub
-  last_verified: 2026-07-22
-  sources: [src/context_hub.mjs, src/context_room.mjs, src/shared_context.mjs, bin/context-room.mjs, docs/features/shared-context.md]
+  last_verified: 2026-07-23
+  sources: [src/context_hub.mjs, src/context_room.mjs, src/codex_prompt_center.mjs, src/shared_context.mjs, bin/context-room.mjs, docs/features/shared-context.md, docs/features/codex-prompt-center.md]
 ---
 
 # Context Hub
@@ -48,7 +48,7 @@ Normal `init`, `setup`, and `start` flows register their initialized project aut
 
 `hub proposals` exposes the aggregated proposal index to agents and can filter by project or Codex task ID. `hub open` prints a deep link into the running Hub with the same focus.
 
-## Inbox And Projects
+## Inbox, Projects, And Codex Prompts
 
 **Inbox** combines work that may need attention:
 
@@ -59,6 +59,8 @@ Normal `init`, `setup`, and `start` flows register their initialized project aut
 **Projects** shows every registered project, including clean local projects and shared projects with no local folder. Filters can narrow by project or by local versus shared source. Search covers project names, proposal metadata, paths, sessions, hashes, roots, and repositories. The selected-proposal overview labels the recap explicitly before the owner opens the diff.
 
 Repository-wide proposal scopes appear as a dedicated **Global skills** project. They stay searchable and filterable without being duplicated under every project that consumes them.
+
+**Codex prompts** loads a compatible installed Codex runtime's global prompt catalog on demand. It groups every runtime-published target without hardcoding mode or model names, compares official, effective-after-restart, and runtime-loaded versions, and saves exact private overlays. Runtime receipts prove local resolution by target, not mode selection or task delivery. Prompt state is not project configuration and never enters the local or shared review workflow. See [Codex Prompt Center](codex-prompt-center.md).
 
 Keyboard shortcuts inside the Hub:
 
@@ -77,7 +79,8 @@ The global registry lives at `$HOME/.context-room/hub/registry.json`. The runnin
 ## Source Map
 
 - `src/context_hub.mjs`: global project, shared-repository, and runtime registry.
-- `src/context_room.mjs`: aggregate Hub state, inbox UI, project-room isolation, and exact review embedding.
+- `src/context_room.mjs`: aggregate Hub state, inbox UI, prompt-center UI, project-room isolation, and exact review embedding.
+- `src/codex_prompt_center.mjs`: runtime-published prompt catalog, private overlays, and load receipts.
 - `src/shared_context.mjs`: shared-only repository listing, proposal lifecycle signals, and exact review materialization.
 - `bin/context-room.mjs`: `context-room hub` commands and automatic registration.
 - [Shared context](shared-context.md): proposal, acceptance, skills, freshness, and permission contracts.

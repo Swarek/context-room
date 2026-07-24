@@ -202,6 +202,8 @@ Rules that matter:
 - [Agent configuration](docs/agent-configuration.md): config fields, metadata, and agent setup.
 - [Shared context](docs/features/shared-context.md): generic shared repositories, proposals, partial acceptance, skills, freshness, and permissions.
 - [Context Hub](docs/features/context-hub.md): one UI for local-only, shared-only, and linked local-plus-shared projects.
+- [Codex Prompt Center](docs/features/codex-prompt-center.md): edit runtime-published Codex prompt targets through exact private overlays, inspect per-process runtime-loaded proof, then quit Codex completely, reopen it, and create a new task.
+- Codex Prompt Center contracts: [catalog/snapshot v1](schemas/codex-prompt-catalog-v1.schema.json), [overrides v1](schemas/codex-prompt-overrides-v1.schema.json), [publication state v2](schemas/codex-prompt-publication-state-v2.schema.json), and [runtime receipt v2](schemas/codex-prompt-runtime-receipt-v2.schema.json).
 - [Documentation research agent](docs/features/documentation-agent.md): working-agent launcher, dedicated documentation CLI, Codex isolation, evidence schema, and safety boundaries.
 - [Documentation lifecycle](docs/features/documentation-lifecycle.md): creation, scheduled audit, task proposal reuse, and local/shared/mixed routing.
 

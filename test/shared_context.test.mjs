@@ -856,6 +856,11 @@ test("shared Context Room API lists proposals and opens an exact review room", a
   const opened = await reviewResponse.json();
   assert.equal(opened.review.proposalHead, published.head);
   assert.equal(readMemoryWebappSettings(opened.reviewRoot).reviewAgentInstructions, false);
+  const reviewPage = await fetch(opened.url + "/");
+  assert.equal(
+    reviewPage.headers.get("content-security-policy"),
+    `frame-ancestors 'self' http://127.0.0.1:${room.server.address().port} http://localhost:${room.server.address().port}`,
+  );
   const exactResponse = await fetch(opened.url + "/api/shared-context");
   const exact = await exactResponse.json();
   assert.equal(exact.mode, "review");
