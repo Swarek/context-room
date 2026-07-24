@@ -213,6 +213,7 @@
             "history_semantics",
             "executable_contract",
             "configurable_elsewhere",
+            "client_owned",
             "server_owned"
           ]
         }
@@ -471,7 +472,8 @@
                       "lifecycle_managed",
                       "history_semantics",
                       "executable_contract",
-                      "configurable_elsewhere"
+                      "configurable_elsewhere",
+                      "client_owned"
                     ]
                   }
                 },
@@ -534,7 +536,8 @@
                   "lifecycle_managed",
                   "history_semantics",
                   "executable_contract",
-                  "configurable_elsewhere"
+                  "configurable_elsewhere",
+                  "client_owned"
                 ]
               }
             }

@@ -51,7 +51,7 @@ The catalog is intentionally broader than the editor. Context Room discovers gro
 
 - **Editable here**: the runtime publishes an official baseline, an effective value, `editable: true`, `securityClass: local_user_editable`, an allowed editable runtime status, and one coherent override strategy. Only model-base, developer, local compaction, and selectable collaboration targets can enter this class.
 - **Configurable elsewhere**: another local Codex configuration or task-history surface owns the value. Prompt Center shows the owner and read-only reason instead of competing with it.
-- **Protected**: security-, protocol-, enforcement-, lifecycle-, or platform-coupled instructions are metadata-only. Prompt text and hashes are not published to Context Room.
+- **Protected**: security-, protocol-, enforcement-, lifecycle-, platform-, or client-owned instructions are metadata-only. Prompt text and hashes are not published to Context Room.
 - **Server-owned**: a remote service owns the instruction. The target is metadata-only and cannot be replaced locally.
 
 The platform-supplied system prompt and remote/server compaction instructions cannot be read or replaced through this local integration. Prompt Center shows only their metadata and read-only reason. This boundary is enforced by both the JSON catalog contract and Context Room's runtime checks; a forged `editable: true` flag is rejected.

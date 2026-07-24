@@ -228,6 +228,7 @@ const CATALOG_SECURITY_CLASSES = new Set([
   "history_semantics",
   "executable_contract",
   "configurable_elsewhere",
+  "client_owned",
   "server_owned",
 ]);
 const CATALOG_OVERRIDE_CONFLICT_CODES = new Set([
@@ -267,6 +268,7 @@ const PROTECTED_SECURITY_CLASSES = new Set([
   "history_semantics",
   "executable_contract",
   "configurable_elsewhere",
+  "client_owned",
 ]);
 function promptCenterError(message, statusCode = 400, code = "codex_prompt_request_failed", details = undefined) {
   const error = new Error(message);
