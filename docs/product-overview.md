@@ -5,7 +5,7 @@ context_room:
   status: current
   canonical_for: product overview
   last_verified: 2026-07-23
-  sources: [README.md, bin/context-room.mjs, src/context_room.mjs, src/context_hub.mjs, src/doc_agent.mjs, src/shared_context.mjs, schemas/config.schema.json, schemas/doc-context.schema.json, schemas/shared-repository.schema.json, docs/agent-configuration.md]
+  sources: [README.md, bin/context-room.mjs, src/context_room.mjs, src/codex_prompt_center.mjs, src/context_hub.mjs, src/doc_agent.mjs, src/shared_context.mjs, schemas/config.schema.json, schemas/codex-prompt-catalog-v1.schema.json, schemas/codex-prompt-overrides-v1.schema.json, schemas/codex-prompt-publication-state-v2.schema.json, schemas/codex-prompt-runtime-receipt-v2.schema.json, schemas/doc-context.schema.json, schemas/shared-repository.schema.json, docs/agent-configuration.md]
 ---
 
 # Product Overview
@@ -28,7 +28,8 @@ Projects that need cross-project documentation or skills can add the optional [S
 ## Main Surfaces
 
 - Hub: card-based navigation from `hubSections`.
-- Context Hub: one computer-local inbox and project switcher for local review queues and shared proposals, while each opened project keeps an isolated server and identity.
+- Context Hub: one computer-local inbox and project switcher for local review queues and shared proposals, plus a lazy global Codex Prompt Center; each opened project keeps an isolated server and identity.
+- Codex Prompt Center: runtime-published prompt targets with official, effective-after-restart, and runtime-loaded views; exact overrides remain private to `$CODEX_HOME`, while protected and server-owned targets stay visible and read-only.
 - Explorer and editor: safe project text, with editing limited by `allowedPaths` and four explicit folder watch modes.
 - Changed files to review: Git-backed review queue, required review paths, project `AGENTS.md` files unless implicit review is disabled, and every skill exposed by Startup skills.
 - Startup context: project instruction files by default, with ancestor and global discovery available by opt-in.
@@ -69,6 +70,7 @@ Feature-level docs live in [Features](features/index.md).
 - `context_room` metadata: optional Markdown frontmatter used by `doctor`, graph health, and briefs.
 - `~/.context-room/shared/registry.json`: user-approved source-repository and subpath bindings for generic shared context.
 - `$HOME/.context-room/hub/registry.json`: local project and shared-repository catalog used by the global Context Hub.
+- `$CODEX_HOME/prompt-overrides/`: private Codex-owned prompt catalog, exact overrides, hash-only runtime receipts, and immutable per-process catalog snapshots; it is never project configuration.
 - `<shared-repository>/.context-room/shared-repository.json`: versioned contract for a shared repository's branch and path layout.
 - `schemas/doc-context.schema.json`: structured evidence contract returned by the documentation research agent.
 
@@ -78,14 +80,19 @@ Feature-level docs live in [Features](features/index.md).
 - `src/context_room.mjs`: server, file access, review queue, graph, brief, UI, and API.
 - `src/shared_context.mjs`: shared repository sync, snapshots, skill links, proposals, review materialization, and acceptance.
 - `src/context_hub.mjs`: global project/shared-repository registration and single-Hub runtime discovery.
+- `src/codex_prompt_center.mjs`: generic Codex prompt catalog, exact overlays, private storage, optimistic concurrency, and per-process receipt/snapshot proof.
 - `src/doc_agent.mjs`: documentation-only corpus, section retrieval, Codex researcher invocation, and evidence packet rendering.
 - `src/codex_composer_bridge.mjs`: loopback-only insertion into the active Codex composer.
 - `src/doc_metadata.mjs`: Markdown metadata parsing.
 - `src/yaml_utils.mjs`: YAML helpers.
 - `schemas/config.schema.json`: config contract.
+- `schemas/codex-prompt-catalog-v1.schema.json`: strict runtime catalog and immutable snapshot contract.
+- `schemas/codex-prompt-overrides-v1.schema.json`: strict private override-manifest contract.
+- `schemas/codex-prompt-runtime-receipt-v2.schema.json`: strict hash-only runtime receipt contract.
 - `schemas/shared-repository.schema.json`: shared repository manifest contract.
 - `schemas/doc-context.schema.json`: documentation research output contract.
 - `test/context_room.test.mjs`: CLI, config, review, startup scanner, and UI behavior tests.
+- `test/codex_prompt_center.test.mjs`: synthetic prompt catalog, overlay, storage, receipt, privacy, and API tests.
 - `test/shared_context.test.mjs`: shared snapshots, skills, offline fallback, proposal scope, hash expiry, and partial-acceptance tests.
 - `test/doc_agent.test.mjs`: documentation corpus, retrieval, provenance, prompt boundaries, and Codex invocation tests.
 - `docs/agent-configuration.md`: detailed config guide.

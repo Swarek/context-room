@@ -4,8 +4,8 @@ context_room:
   scope: context-room
   status: current
   canonical_for: settings
-  last_verified: 2026-07-20
-  sources: [src/context_room.mjs, schemas/config.schema.json, docs/agent-configuration.md]
+  last_verified: 2026-07-23
+  sources: [src/context_room.mjs, src/codex_prompt_center.mjs, schemas/config.schema.json, docs/agent-configuration.md, docs/features/codex-prompt-center.md]
 ---
 
 # Settings
@@ -13,6 +13,8 @@ context_room:
 ## Purpose
 
 Settings separates project setup from computer-wide preferences without exposing every option at once.
+
+Codex prompts are not a Settings category. They use the global [Codex Prompt Center](codex-prompt-center.md), whose versioned runtime catalog, conflict handling, and private storage are separate from project configuration and appearance preferences.
 
 ## Categories
 

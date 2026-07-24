@@ -1,0 +1,1106 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://unpkg.com/context-room@latest/schemas/codex-prompt-catalog-v1.schema.json",
+  "title": "Codex prompt catalog v1",
+  "description": "Strict schema for prompt-overrides/catalog.json and immutable runtime catalog snapshots.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "runtimeVersion",
+    "catalogRevision",
+    "groups"
+  ],
+  "properties": {
+    "schemaVersion": {
+      "const": 1
+    },
+    "runtimeVersion": {
+      "type": "string"
+    },
+    "catalogRevision": {
+      "$ref": "#/$defs/hash"
+    },
+    "groups": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/group"
+      }
+    }
+  },
+  "$defs": {
+    "hash": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    },
+    "nullableHash": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/hash"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "nullableString": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "overrideConflict": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "code",
+        "message",
+        "sourceTargetId"
+      ],
+      "properties": {
+        "code": {
+          "enum": [
+            "official_hash_mismatch",
+            "strategy_mismatch",
+            "patch_anchor_mismatch",
+            "effective_prompt_too_large",
+            "target_became_personality_dependent"
+          ]
+        },
+        "message": {
+          "type": "string",
+          "minLength": 1
+        },
+        "sourceTargetId": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "target": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "label",
+        "kind",
+        "editable",
+        "runtimeStatus",
+        "officialHash",
+        "officialText",
+        "effectiveHash",
+        "effectiveText",
+        "targetPattern",
+        "sourceTargetId",
+        "readOnlyReason",
+        "overrideStrategy",
+        "overrideConflict",
+        "source",
+        "securityClass"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "label": {
+          "type": "string",
+          "minLength": 1
+        },
+        "kind": {
+          "enum": [
+            "model_base",
+            "developer",
+            "compact",
+            "collaboration",
+            "protected",
+            "server_owned"
+          ]
+        },
+        "editable": {
+          "type": "boolean"
+        },
+        "runtimeStatus": {
+          "enum": [
+            "active",
+            "available_local_only",
+            "bundled",
+            "cached",
+            "catalogued",
+            "configured",
+            "selectable",
+            "dormant",
+            "override_conflict",
+            "pattern",
+            "shadowed_by_explicit_config",
+            "shadowed_by_session_history",
+            "personality_dependent",
+            "protected",
+            "server_owned"
+          ]
+        },
+        "officialHash": {
+          "$ref": "#/$defs/nullableHash"
+        },
+        "officialText": {
+          "$ref": "#/$defs/nullableString"
+        },
+        "effectiveHash": {
+          "$ref": "#/$defs/nullableHash"
+        },
+        "effectiveText": {
+          "$ref": "#/$defs/nullableString"
+        },
+        "targetPattern": {
+          "$ref": "#/$defs/nullableString"
+        },
+        "sourceTargetId": {
+          "anyOf": [
+            {
+              "type": "string",
+              "minLength": 1
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "readOnlyReason": {
+          "$ref": "#/$defs/nullableString"
+        },
+        "overrideStrategy": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "enum": [
+            "patch",
+            "replacement",
+            null
+          ]
+        },
+        "overrideConflict": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/overrideConflict"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "source": {
+          "type": "string"
+        },
+        "securityClass": {
+          "enum": [
+            "local_user_editable",
+            "dormant",
+            "advanced_pattern",
+            "config_shadowed",
+            "session_history",
+            "dynamic_assembly",
+            "enforcement_coupled",
+            "security_critical",
+            "contract_coupled",
+            "state_assembled",
+            "protocol_coupled",
+            "privacy_sensitive",
+            "dynamic_capability",
+            "authority_sensitive",
+            "runtime_generated",
+            "lifecycle_managed",
+            "history_semantics",
+            "executable_contract",
+            "configurable_elsewhere",
+            "server_owned"
+          ]
+        }
+      },
+      "allOf": [
+        {
+          "oneOf": [
+            {
+              "properties": {
+                "officialHash": {
+                  "$ref": "#/$defs/hash"
+                },
+                "officialText": {
+                  "type": "string"
+                }
+              }
+            },
+            {
+              "properties": {
+                "officialHash": {
+                  "type": "null"
+                },
+                "officialText": {
+                  "type": "null"
+                }
+              }
+            }
+          ]
+        },
+        {
+          "oneOf": [
+            {
+              "properties": {
+                "effectiveHash": {
+                  "$ref": "#/$defs/hash"
+                },
+                "effectiveText": {
+                  "type": "string"
+                }
+              }
+            },
+            {
+              "properties": {
+                "effectiveHash": {
+                  "type": "null"
+                },
+                "effectiveText": {
+                  "type": "null"
+                }
+              }
+            }
+          ]
+        },
+        {
+          "if": {
+            "properties": {
+              "editable": {
+                "const": true
+              }
+            },
+            "required": [
+              "editable"
+            ]
+          },
+          "then": {
+            "properties": {
+              "kind": {
+                "enum": [
+                  "model_base",
+                  "developer",
+                  "compact",
+                  "collaboration"
+                ]
+              },
+              "runtimeStatus": {
+                "enum": [
+                  "active",
+                  "available_local_only",
+                  "bundled",
+                  "cached",
+                  "catalogued",
+                  "configured",
+                  "selectable",
+                  "override_conflict"
+                ]
+              },
+              "officialHash": {
+                "$ref": "#/$defs/hash"
+              },
+              "officialText": {
+                "type": "string"
+              },
+              "effectiveHash": {
+                "$ref": "#/$defs/hash"
+              },
+              "effectiveText": {
+                "type": "string"
+              },
+              "targetPattern": {
+                "type": "null"
+              },
+              "readOnlyReason": {
+                "type": "null"
+              },
+              "overrideStrategy": {
+                "enum": [
+                  "patch",
+                  "replacement"
+                ]
+              },
+              "securityClass": {
+                "const": "local_user_editable"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "securityClass": {
+                "const": "local_user_editable"
+              }
+            },
+            "required": [
+              "securityClass"
+            ]
+          },
+          "then": {
+            "properties": {
+              "editable": {
+                "const": true
+              },
+              "kind": {
+                "enum": [
+                  "model_base",
+                  "developer",
+                  "compact",
+                  "collaboration"
+                ]
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "editable": {
+                "const": true
+              },
+              "officialText": {
+                "const": ""
+              }
+            },
+            "required": [
+              "editable",
+              "officialText"
+            ]
+          },
+          "then": {
+            "properties": {
+              "overrideStrategy": {
+                "const": "replacement"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "editable": {
+                "const": true
+              },
+              "officialText": {
+                "type": "string",
+                "minLength": 1
+              }
+            },
+            "required": [
+              "editable",
+              "officialText"
+            ]
+          },
+          "then": {
+            "properties": {
+              "overrideStrategy": {
+                "const": "patch"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "runtimeStatus": {
+                "const": "override_conflict"
+              }
+            },
+            "required": [
+              "runtimeStatus"
+            ]
+          },
+          "then": {
+            "properties": {
+              "sourceTargetId": {
+                "type": "null"
+              },
+              "overrideConflict": {
+                "$ref": "#/$defs/overrideConflict"
+              }
+            }
+          },
+          "else": {
+            "properties": {
+              "overrideConflict": {
+                "type": "null"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "anyOf": [
+              {
+                "properties": {
+                  "kind": {
+                    "const": "protected"
+                  }
+                },
+                "required": [
+                  "kind"
+                ]
+              },
+              {
+                "properties": {
+                  "runtimeStatus": {
+                    "const": "protected"
+                  }
+                },
+                "required": [
+                  "runtimeStatus"
+                ]
+              },
+              {
+                "properties": {
+                  "securityClass": {
+                    "enum": [
+                      "enforcement_coupled",
+                      "security_critical",
+                      "contract_coupled",
+                      "state_assembled",
+                      "protocol_coupled",
+                      "privacy_sensitive",
+                      "dynamic_capability",
+                      "authority_sensitive",
+                      "runtime_generated",
+                      "lifecycle_managed",
+                      "history_semantics",
+                      "executable_contract",
+                      "configurable_elsewhere"
+                    ]
+                  }
+                },
+                "required": [
+                  "securityClass"
+                ]
+              }
+            ]
+          },
+          "then": {
+            "properties": {
+              "kind": {
+                "const": "protected"
+              },
+              "editable": {
+                "const": false
+              },
+              "runtimeStatus": {
+                "const": "protected"
+              },
+              "officialHash": {
+                "type": "null"
+              },
+              "officialText": {
+                "type": "null"
+              },
+              "effectiveHash": {
+                "type": "null"
+              },
+              "effectiveText": {
+                "type": "null"
+              },
+              "targetPattern": {
+                "type": "null"
+              },
+              "sourceTargetId": {
+                "type": "null"
+              },
+              "readOnlyReason": {
+                "type": "string",
+                "minLength": 1
+              },
+              "overrideStrategy": {
+                "type": "null"
+              },
+              "overrideConflict": {
+                "type": "null"
+              },
+              "securityClass": {
+                "enum": [
+                  "enforcement_coupled",
+                  "security_critical",
+                  "contract_coupled",
+                  "state_assembled",
+                  "protocol_coupled",
+                  "privacy_sensitive",
+                  "dynamic_capability",
+                  "authority_sensitive",
+                  "runtime_generated",
+                  "lifecycle_managed",
+                  "history_semantics",
+                  "executable_contract",
+                  "configurable_elsewhere"
+                ]
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "anyOf": [
+              {
+                "properties": {
+                  "kind": {
+                    "const": "server_owned"
+                  }
+                },
+                "required": [
+                  "kind"
+                ]
+              },
+              {
+                "properties": {
+                  "runtimeStatus": {
+                    "const": "server_owned"
+                  }
+                },
+                "required": [
+                  "runtimeStatus"
+                ]
+              },
+              {
+                "properties": {
+                  "securityClass": {
+                    "const": "server_owned"
+                  }
+                },
+                "required": [
+                  "securityClass"
+                ]
+              }
+            ]
+          },
+          "then": {
+            "properties": {
+              "kind": {
+                "const": "server_owned"
+              },
+              "editable": {
+                "const": false
+              },
+              "runtimeStatus": {
+                "const": "server_owned"
+              },
+              "officialHash": {
+                "type": "null"
+              },
+              "officialText": {
+                "type": "null"
+              },
+              "effectiveHash": {
+                "type": "null"
+              },
+              "effectiveText": {
+                "type": "null"
+              },
+              "targetPattern": {
+                "type": "null"
+              },
+              "sourceTargetId": {
+                "type": "null"
+              },
+              "readOnlyReason": {
+                "type": "string",
+                "minLength": 1
+              },
+              "overrideStrategy": {
+                "type": "null"
+              },
+              "overrideConflict": {
+                "type": "null"
+              },
+              "securityClass": {
+                "const": "server_owned"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "anyOf": [
+              {
+                "properties": {
+                  "id": {
+                    "const": "model/base/*"
+                  }
+                },
+                "required": [
+                  "id"
+                ]
+              },
+              {
+                "properties": {
+                  "runtimeStatus": {
+                    "const": "pattern"
+                  }
+                },
+                "required": [
+                  "runtimeStatus"
+                ]
+              },
+              {
+                "properties": {
+                  "securityClass": {
+                    "const": "advanced_pattern"
+                  }
+                },
+                "required": [
+                  "securityClass"
+                ]
+              },
+              {
+                "properties": {
+                  "targetPattern": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "targetPattern"
+                ]
+              }
+            ]
+          },
+          "then": {
+            "properties": {
+              "id": {
+                "const": "model/base/*"
+              },
+              "kind": {
+                "const": "model_base"
+              },
+              "editable": {
+                "const": false
+              },
+              "runtimeStatus": {
+                "const": "pattern"
+              },
+              "officialHash": {
+                "type": "null"
+              },
+              "officialText": {
+                "type": "null"
+              },
+              "effectiveHash": {
+                "type": "null"
+              },
+              "effectiveText": {
+                "type": "null"
+              },
+              "targetPattern": {
+                "const": "model/base/{modelSlug}"
+              },
+              "sourceTargetId": {
+                "enum": [
+                  "model/base/*",
+                  null
+                ]
+              },
+              "readOnlyReason": {
+                "type": "string",
+                "minLength": 1
+              },
+              "overrideStrategy": {
+                "type": "null"
+              },
+              "overrideConflict": {
+                "type": "null"
+              },
+              "securityClass": {
+                "const": "advanced_pattern"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "anyOf": [
+              {
+                "properties": {
+                  "runtimeStatus": {
+                    "const": "shadowed_by_explicit_config"
+                  }
+                },
+                "required": [
+                  "runtimeStatus"
+                ]
+              },
+              {
+                "properties": {
+                  "securityClass": {
+                    "const": "config_shadowed"
+                  }
+                },
+                "required": [
+                  "securityClass"
+                ]
+              }
+            ]
+          },
+          "then": {
+            "properties": {
+              "kind": {
+                "enum": [
+                  "model_base",
+                  "developer",
+                  "compact"
+                ]
+              },
+              "editable": {
+                "const": false
+              },
+              "runtimeStatus": {
+                "const": "shadowed_by_explicit_config"
+              },
+              "officialHash": {
+                "$ref": "#/$defs/hash"
+              },
+              "officialText": {
+                "type": "string"
+              },
+              "effectiveHash": {
+                "$ref": "#/$defs/hash"
+              },
+              "effectiveText": {
+                "type": "string"
+              },
+              "targetPattern": {
+                "type": "null"
+              },
+              "sourceTargetId": {
+                "type": "null"
+              },
+              "readOnlyReason": {
+                "type": "string",
+                "minLength": 1
+              },
+              "overrideStrategy": {
+                "type": "null"
+              },
+              "overrideConflict": {
+                "type": "null"
+              },
+              "securityClass": {
+                "const": "config_shadowed"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "anyOf": [
+              {
+                "properties": {
+                  "runtimeStatus": {
+                    "const": "dormant"
+                  }
+                },
+                "required": [
+                  "runtimeStatus"
+                ]
+              },
+              {
+                "properties": {
+                  "securityClass": {
+                    "const": "dormant"
+                  }
+                },
+                "required": [
+                  "securityClass"
+                ]
+              }
+            ]
+          },
+          "then": {
+            "properties": {
+              "kind": {
+                "const": "collaboration"
+              },
+              "editable": {
+                "const": false
+              },
+              "runtimeStatus": {
+                "const": "dormant"
+              },
+              "targetPattern": {
+                "type": "null"
+              },
+              "sourceTargetId": {
+                "type": "null"
+              },
+              "readOnlyReason": {
+                "type": "string",
+                "minLength": 1
+              },
+              "overrideStrategy": {
+                "type": "null"
+              },
+              "overrideConflict": {
+                "type": "null"
+              },
+              "securityClass": {
+                "const": "dormant"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "anyOf": [
+              {
+                "properties": {
+                  "runtimeStatus": {
+                    "const": "shadowed_by_session_history"
+                  }
+                },
+                "required": [
+                  "runtimeStatus"
+                ]
+              },
+              {
+                "properties": {
+                  "securityClass": {
+                    "const": "session_history"
+                  }
+                },
+                "required": [
+                  "securityClass"
+                ]
+              }
+            ]
+          },
+          "then": {
+            "properties": {
+              "kind": {
+                "const": "model_base"
+              },
+              "editable": {
+                "const": false
+              },
+              "runtimeStatus": {
+                "const": "shadowed_by_session_history"
+              },
+              "officialHash": {
+                "$ref": "#/$defs/hash"
+              },
+              "officialText": {
+                "type": "string"
+              },
+              "effectiveHash": {
+                "$ref": "#/$defs/hash"
+              },
+              "effectiveText": {
+                "type": "string"
+              },
+              "targetPattern": {
+                "type": "null"
+              },
+              "sourceTargetId": {
+                "type": "null"
+              },
+              "readOnlyReason": {
+                "type": "string",
+                "minLength": 1
+              },
+              "overrideStrategy": {
+                "type": "null"
+              },
+              "overrideConflict": {
+                "type": "null"
+              },
+              "securityClass": {
+                "const": "session_history"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "runtimeStatus": {
+                "const": "personality_dependent"
+              }
+            },
+            "required": [
+              "runtimeStatus"
+            ]
+          },
+          "then": {
+            "properties": {
+              "kind": {
+                "const": "model_base"
+              },
+              "editable": {
+                "const": false
+              },
+              "officialHash": {
+                "$ref": "#/$defs/hash"
+              },
+              "officialText": {
+                "type": "string"
+              },
+              "effectiveHash": {
+                "$ref": "#/$defs/hash"
+              },
+              "effectiveText": {
+                "type": "string"
+              },
+              "targetPattern": {
+                "type": "null"
+              },
+              "sourceTargetId": {
+                "type": "null"
+              },
+              "readOnlyReason": {
+                "type": "string",
+                "minLength": 1
+              },
+              "overrideStrategy": {
+                "type": "null"
+              },
+              "overrideConflict": {
+                "type": "null"
+              },
+              "securityClass": {
+                "const": "dynamic_assembly"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "securityClass": {
+                "const": "dynamic_assembly"
+              }
+            },
+            "required": [
+              "securityClass"
+            ]
+          },
+          "then": {
+            "anyOf": [
+              {
+                "properties": {
+                  "runtimeStatus": {
+                    "const": "personality_dependent"
+                  }
+                },
+                "required": [
+                  "runtimeStatus"
+                ]
+              },
+              {
+                "properties": {
+                  "runtimeStatus": {
+                    "const": "override_conflict"
+                  },
+                  "overrideConflict": {
+                    "type": "object",
+                    "properties": {
+                      "code": {
+                        "const": "target_became_personality_dependent"
+                      }
+                    },
+                    "required": [
+                      "code"
+                    ]
+                  }
+                },
+                "required": [
+                  "runtimeStatus",
+                  "overrideConflict"
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "overrideConflict": {
+                "type": "object",
+                "properties": {
+                  "code": {
+                    "const": "target_became_personality_dependent"
+                  }
+                },
+                "required": [
+                  "code"
+                ]
+              }
+            },
+            "required": [
+              "overrideConflict"
+            ]
+          },
+          "then": {
+            "properties": {
+              "kind": {
+                "const": "model_base"
+              },
+              "editable": {
+                "const": false
+              },
+              "officialHash": {
+                "$ref": "#/$defs/hash"
+              },
+              "officialText": {
+                "type": "string"
+              },
+              "effectiveHash": {
+                "$ref": "#/$defs/hash"
+              },
+              "effectiveText": {
+                "type": "string"
+              },
+              "targetPattern": {
+                "type": "null"
+              },
+              "readOnlyReason": {
+                "type": "string",
+                "minLength": 1
+              },
+              "overrideStrategy": {
+                "type": "null"
+              },
+              "securityClass": {
+                "const": "dynamic_assembly"
+              }
+            }
+          }
+        }
+      ]
+    },
+    "group": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "label",
+        "targets"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "label": {
+          "type": "string",
+          "minLength": 1
+        },
+        "targets": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/target"
+          }
+        }
+      }
+    }
+  },
+  "$comment": "Prompt strings are additionally limited by the runtime to 28672 UTF-8 bytes and approximately 8192 tokens; JSON Schema cannot express UTF-8 byte length."
+}

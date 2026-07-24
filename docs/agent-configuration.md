@@ -4,8 +4,8 @@ context_room:
   scope: context-room
   status: current
   canonical_for: agent configuration
-  last_verified: 2026-07-21
-  sources: [bin/context-room.mjs, src/context_room.mjs, src/shared_context.mjs, schemas/config.schema.json]
+  last_verified: 2026-07-23
+  sources: [bin/context-room.mjs, src/context_room.mjs, src/codex_prompt_center.mjs, src/shared_context.mjs, schemas/config.schema.json, schemas/codex-prompt-catalog-v1.schema.json, schemas/codex-prompt-overrides-v1.schema.json, schemas/codex-prompt-publication-state-v2.schema.json, schemas/codex-prompt-runtime-receipt-v2.schema.json]
 ---
 
 # Agent configuration guide
@@ -25,6 +25,14 @@ Appearance preferences are shared across every Context Room on the computer and 
 ```
 
 Use the Settings screen to change the app theme, hidden-file visibility, or `Auto-open Git diff`. Project paths, review rules, scanners, templates, and hub cards remain local to `.context-room/config.json`.
+
+Codex prompt overrides are also computer-wide, but they are not preferences and never belong in project configuration:
+
+```text
+$CODEX_HOME/prompt-overrides/
+```
+
+Use **Context Hub → Codex prompts** to inspect the runtime-published catalog and edit only targets marked `securityClass: local_user_editable`. Context Room writes the strict private `overrides.json` contract; a compatible Codex runtime regenerates the catalog and per-process runtime receipts. After a change, quit Codex completely (`⌘Q` on macOS), reopen it, then create a new task. See [Codex Prompt Center](features/codex-prompt-center.md).
 
 The human-owned review gate is also stored separately:
 
